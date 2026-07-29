@@ -1,0 +1,29 @@
+Fonts referenced in the HTML file
+================================
+
+Source: https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap
+
+Requested weights:
+  - Inter: 400, 500, 600, 700, 800
+  - JetBrains Mono: 400, 500, 600
+
+Each woff2 is a variable font: a single file contains all the
+requested weights for a given family + unicode subset.
+
+Files
+-----
+Family             Subset         File                                          Bytes
+--------------------------------------------------------------------------------------
+Inter              cyrillic-ext   Inter-CyrillicExt.woff2                       25960
+Inter              cyrillic       Inter-Cyrillic.woff2                          18748
+Inter              greek-ext      Inter-GreekExt.woff2                          11232
+Inter              greek          Inter-Greek.woff2                             18996
+Inter              vietnamese     Inter-Vietnamese.woff2                        10252
+Inter              latin-ext      Inter-LatinExt.woff2                          85068
+Inter              latin          Inter-Latin.woff2                             48256
+JetBrains Mono     cyrillic-ext   JetBrainsMono-CyrillicExt.woff2                1640
+JetBrains Mono     cyrillic       JetBrainsMono-Cyrillic.woff2                   8872
+JetBrains Mono     greek          JetBrainsMono-Greek.woff2                      6836
+JetBrains Mono     vietnamese     JetBrainsMono-Vietnamese.woff2                 5888
+JetBrains Mono     latin-ext      JetBrainsMono-LatinExt.woff2                  11624
+JetBrains Mono     latin          JetBrainsMono-Latin.woff2                     31432
