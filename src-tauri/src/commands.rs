@@ -1,0 +1,1588 @@
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
+
+use crate::agent_brain::AgentBrain;
+use crate::browser_backend::{
+    NavEvent, create_windows, get_agent_config, navigate_agent_window, record_nav_event,
+    record_setup_completion,
+};
+use crate::context_manager::ContextManager;
+use crate::errors::AgentError;
+use crate::orchestrator::{AppState, OrchestratorStatus, SessionConfig, SessionType};
+use crate::session_runner::{run_debate, run_setup};
+use serde::Serialize;
+use serde_json::json;
+use tauri::{AppHandle, Emitter, Manager};
+use uuid::Uuid;
+
+fn redact_diagnostic_text(value: &str) -> String {
+    let mut redact_next = false;
+    value
+        .split_whitespace()
+        .map(|part| {
+            if redact_next {
+                redact_next = false;
+                return "[REDACTED]".to_string();
+            }
+
+            let lower = part.to_ascii_lowercase();
+            if lower == "bearer" {
+                redact_next = true;
+                return part.to_string();
+            }
+            if lower.contains("api_key")
+                || lower.contains("apikey")
+                || lower.starts_with("sk-")
+                || lower.starts_with("token-")
+            {
+                return "[REDACTED]".to_string();
+            }
+
+            let is_long_secret_like = part.len() >= 32
+                && part.chars().any(|ch| ch.is_ascii_alphabetic())
+                && part.chars().any(|ch| ch.is_ascii_digit())
+                && !part.contains('/');
+            if is_long_secret_like {
+                "[REDACTED]".to_string()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn settings_command_error(stage: &str, error: impl std::fmt::Display) -> String {
+    let detail = redact_diagnostic_text(&error.to_string());
+    let message = format!("{stage}: {detail}");
+    tracing::error!("[SETTINGS] {message}");
+    message
+}
+
+fn validate_brain_fields(base_url: &str, model: &str) -> Result<(), String> {
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        return Err("API base URL is required".to_string());
+    }
+
+    let parsed =
+        reqwest::Url::parse(base_url).map_err(|e| format!("API base URL is invalid: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("API base URL must be an absolute http:// or https:// URL".to_string());
+    }
+    if model.trim().is_empty() {
+        return Err("Model name is required".to_string());
+    }
+    Ok(())
+}
+
+fn validate_session_agents(agent_ids: &[String], leader_agent_id: &str) -> Result<(), String> {
+    if agent_ids.len() < 2 {
+        return Err("Select at least two participants.".to_string());
+    }
+
+    let mut seen = HashSet::new();
+    for agent_id in agent_ids {
+        if !seen.insert(agent_id.clone()) {
+            return Err(format!("Duplicate participant selected: {agent_id}"));
+        }
+        if get_agent_config(agent_id).is_none() {
+            return Err(format!("Unknown participant selected: {agent_id}"));
+        }
+    }
+
+    if !seen.contains(leader_agent_id) {
+        return Err(format!(
+            "Selected leader must also be included in participants: {leader_agent_id}"
+        ));
+    }
+
+    Ok(())
+}
+
+// ── Session management ────────────────────────────────────────────────────────
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn start_session(
+    project_brief: String,
+    session_type: String,
+    agent_ids: Vec<String>,
+    leader_agent_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    validate_session_agents(&agent_ids, &leader_agent_id)?;
+
+    // IMP-3: Concurrency guard — prevent two sessions from running simultaneously.
+    // compare_exchange(false → true): if already true, return error immediately.
+    state
+        .session_active
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .map_err(|_| {
+            "A session is already active. Use Stop to end it before starting a new one.".to_string()
+        })?;
+
+    let stype = match session_type.as_str() {
+        "architecture" => SessionType::Architecture,
+        "mvp" => SessionType::Mvp,
+        "api" => SessionType::Api,
+        "security" => SessionType::Security,
+        _ => SessionType::Custom,
+    };
+
+    let config = SessionConfig {
+        session_id: Uuid::new_v4().to_string(),
+        project_brief: project_brief.clone(),
+        session_type: stype.clone(),
+        agent_ids: agent_ids.clone(),
+        leader_agent_id: leader_agent_id.clone(),
+    };
+    let setup_order = config.setup_order();
+    let setup_generation = state
+        .setup_generation
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+
+    tracing::info!(
+        "[SETUP] generation={} session_id={} selected_leader_id={} selected_agent_ids={:?} setup_order={:?}",
+        setup_generation,
+        config.session_id,
+        leader_agent_id,
+        agent_ids,
+        setup_order
+    );
+
+    // IMP-7: Record session start so recovery can find it on next launch.
+    // session_complete = false until AgentDecision::Complete is reached.
+    {
+        let mut store = state.settings_store.lock().await;
+        store
+            .set("last_session_id", &config.session_id)
+            .map_err(|e| e.to_string())?;
+        store
+            .set("session_complete", "false")
+            .map_err(|e| e.to_string())?;
+    }
+
+    // IMP-10: Reset brain fail counter for the new session.
+    state.brain_fail_count.store(0, Ordering::SeqCst);
+
+    // Task 10 (HIGH-7): reset per-agent token counts at the session boundary.
+    // Previously these accumulated across the entire app process lifetime —
+    // a session starting now must not inherit counts from whatever ran before
+    // it. token_budget stays a plain in-memory tokio::sync::Mutex (no rusqlite
+    // involved), so this is a direct lock + call, not a db_helpers call.
+    {
+        let mut tb = state.token_budget.lock().await;
+        tb.reset_all();
+    }
+
+    // Update orchestrator
+    {
+        let mut orch = state.orchestrator.lock().await;
+        orch.status = OrchestratorStatus::Setup;
+        orch.current_session = Some(config.clone());
+        orch.current_iteration = 0;
+    }
+
+    // Reset context manager
+    {
+        let mut ctx = state.context_manager.lock().await;
+        *ctx = ContextManager::new(project_brief, stype);
+    }
+
+    // Create transcript session.
+    //
+    // Task 9 (HIGH-5/HIGH-6): transcript_store is now Arc<std::sync::Mutex<_>>
+    // (see orchestrator.rs) instead of Arc<tokio::sync::Mutex<_>>, so this
+    // synchronous rusqlite write runs inside db_helpers::run_blocking — off
+    // the async runtime thread, with retry/backoff on transient failure —
+    // instead of directly on it via `.lock().await`.
+    {
+        let store = state.transcript_store.clone();
+        let cfg = config.clone();
+        crate::db_helpers::run_blocking(move || {
+            let mut guard = store.lock().map_err(|_| {
+                AgentError::DatabaseError("transcript store lock poisoned".to_string())
+            })?;
+            guard.create_session(&cfg)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    // Build a fresh std::sync::mpsc channel and create windows.
+    let (std_nav_tx, std_nav_rx) = std::sync::mpsc::sync_channel::<NavEvent>(256);
+    let browser_diagnostics = {
+        let mut browser = state.browser_state.lock().await;
+        let new_browser = crate::browser_backend::BrowserState::new(std_nav_tx.clone());
+        *browser = new_browser;
+        if let Err(error) = create_windows(
+            &app,
+            &mut browser,
+            &agent_ids,
+            &leader_agent_id,
+            &config.session_id,
+            setup_generation,
+            &setup_order,
+        ) {
+            state.session_active.store(false, Ordering::SeqCst);
+            {
+                let mut orch = state.orchestrator.lock().await;
+                orch.status = OrchestratorStatus::Ended;
+            }
+            return Err(error.to_string());
+        }
+        browser.diagnostics.clone()
+    };
+
+    // Bridge std::sync::mpsc → tokio::sync::mpsc for async session runner.
+    let (tokio_tx, tokio_rx) = tokio::sync::mpsc::channel::<NavEvent>(256);
+    let bridge_app = app.clone();
+    std::thread::spawn(move || {
+        while let Ok(event) = std_nav_rx.recv() {
+            record_nav_event(&bridge_app, &browser_diagnostics, &event);
+            if tokio_tx.blocking_send(event).is_err() {
+                break;
+            }
+        }
+    });
+
+    app.emit(
+        "session-status",
+        json!({
+            "status": "setup",
+            "session_id": config.session_id.clone(),
+            "setup_generation": setup_generation,
+            "selected_leader_id": leader_agent_id.clone(),
+            "selected_agent_ids": agent_ids.clone(),
+            "setup_order": setup_order.clone(),
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Clone all Arc fields so the spawned task owns them.
+    let config_clone = config.clone();
+    let app_clone = app.clone();
+
+    let orch_clone = state.orchestrator.clone();
+    let ts_clone = state.transcript_store.clone();
+    let tb_clone = state.token_budget.clone();
+    let sv_clone = state.session_vault.clone();
+    let bs_clone = state.browser_state.clone();
+    let ctx_clone = state.context_manager.clone();
+    let bp_clone = state.blueprint_store.clone();
+    let ss_clone = state.settings_store.clone();
+    let ab_clone = state.agent_brain.clone();
+    let aut_clone = state.ask_user_tx.clone();
+    let ab2_clone = state.agent_brain_2.clone();
+    // IMP-3 / IMP-5 / IMP-10: new fields
+    let sa_clone = state.session_active.clone();
+    let mh_clone = state.model_health.clone();
+    let bfc_clone = state.brain_fail_count.clone();
+    let mem_clone = state.memory_store.clone();
+    let memory_health = state.last_memory_health.clone();
+    let setup_generation_clone = state.setup_generation.clone();
+
+    tokio::spawn(async move {
+        let state_ref = AppState {
+            orchestrator: orch_clone.clone(),
+            transcript_store: ts_clone,
+            token_budget: tb_clone,
+            session_vault: sv_clone,
+            browser_state: bs_clone,
+            context_manager: ctx_clone,
+            blueprint_store: bp_clone,
+            settings_store: ss_clone,
+            agent_brain: ab_clone,
+            ask_user_tx: aut_clone,
+            agent_brain_2: ab2_clone,
+            session_active: sa_clone.clone(),
+            model_health: mh_clone,
+            brain_fail_count: bfc_clone,
+            memory_store: mem_clone,
+            last_memory_health: memory_health,
+            setup_generation: setup_generation_clone,
+        };
+
+        let mut nav_rx = tokio_rx;
+
+        // Browser readiness is not a terminal session failure. Keep the
+        // windows/session/generation alive and wait for a focused retry.
+        loop {
+            match run_setup(&config_clone, &state_ref, &app_clone, &mut nav_rx).await {
+                Ok(()) => break,
+                Err(e) => {
+                    let agent_id = {
+                        let browser = state_ref.browser_state.lock().await;
+                        browser.diagnostics.mark_setup_failed_recoverable()
+                    };
+                    let message = format!("Complete login/loading/security check in the model window, then retry setup. {}", e);
+                    app_clone.emit("boss-message", json!({ "text": message, "message_type": "status" })).ok();
+                    app_clone.emit("setup-agent-failed", json!({
+                        "agent_id": agent_id,
+                        "recoverable": true
+                    })).ok();
+                    match nav_rx.recv().await {
+                        Some(NavEvent::ResumeRequested(_)) => continue,
+                        Some(NavEvent::SetupManualConfirmed(agent_id)) => {
+                            app_clone.emit("setup-agent-complete", json!({
+                                "agent_id": agent_id,
+                                "conversation_url": ""
+                            })).ok();
+                            continue;
+                        }
+                        Some(NavEvent::SessionAborted) | None => {
+                            let mut orch = orch_clone.lock().await;
+                            orch.status = OrchestratorStatus::Ended;
+                            app_clone.emit("session-status", json!({ "status": "ended" })).ok();
+                            sa_clone.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                        Some(_) => continue,
+                    }
+                }
+            }
+        }
+
+        // Transition to running
+        {
+            let mut orch = state_ref.orchestrator.lock().await;
+            orch.status = OrchestratorStatus::Running;
+        }
+
+        // IMP-3: sa_clone stays accessible after state_ref is moved into run_debate.
+        // Debate / autonomous loop phase
+        if let Err(e) = run_debate(config_clone, state_ref, app_clone.clone(), nav_rx).await {
+            app_clone
+                .emit(
+                    "boss-message",
+                    json!({
+                        "text": format!("Debate error: {}", e),
+                        "message_type": "status"
+                    }),
+                )
+                .ok();
+            {
+                let mut orch = orch_clone.lock().await;
+                orch.status = OrchestratorStatus::Ended;
+            }
+            app_clone
+                .emit("session-status", json!({ "status": "ended" }))
+                .ok();
+        }
+
+        // IMP-3: reset flag in ALL remaining exit paths — exit paths 2 and 3.
+        // run_debate either completed successfully (Ok) or errored (Err);
+        // either way the session loop is over.
+        sa_clone.store(false, Ordering::SeqCst);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn pause_session(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let mut orch = state.orchestrator.lock().await;
+    orch.status = OrchestratorStatus::Paused;
+    app.emit("session-status", json!({ "status": "paused" }))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn resume_session(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let mut orch = state.orchestrator.lock().await;
+    orch.status = OrchestratorStatus::Running;
+    app.emit("session-status", json!({ "status": "running" }))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn abort_session(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    // IMP-3: Reset session_active so a new session can be started.
+    state.session_active.store(false, Ordering::SeqCst);
+
+    {
+        let mut ask = state.ask_user_tx.lock().await;
+        *ask = None;
+    }
+
+    {
+        let browser = state.browser_state.lock().await;
+        let _ = browser.nav_tx.try_send(NavEvent::SessionAborted);
+    }
+
+    {
+        let mut orch = state.orchestrator.lock().await;
+        orch.status = OrchestratorStatus::Ended;
+    }
+
+    app.emit("session-status", json!({ "status": "ended" }))
+        .map_err(|e| e.to_string())
+}
+
+// ── User interaction ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn user_input(text: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut ctx = state.context_manager.lock().await;
+    ctx.set_pending_user_input(text);
+    Ok(())
+}
+
+/// D-041: Deliver the user's answer from the AskUser popup to the suspended
+/// run_agent_loop.  Uses take() to atomically remove the sender and prevent
+/// any possibility of a double-send (RISK-ASKCHANNEL resolved).
+/// Returns Err if no question is currently pending.
+#[tauri::command]
+pub async fn provide_user_answer(
+    answer: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // take() atomically removes the sender and clears the Option.
+    let tx = {
+        let mut lock = state.ask_user_tx.lock().await;
+        lock.take()
+    }; // lock drops here
+
+    match tx {
+        Some(sender) => sender
+            .send(answer)
+            .map_err(|_| "Answer channel dropped — session may have ended".to_string()),
+        None => Err("No pending ask_user question".to_string()),
+    }
+}
+
+/// D-039/D-038 (ATOMIC): Construct AgentBrain first (validation). If that
+/// succeeds, read any existing fallback config from settings and attach it.
+/// Only then write to the DB. Only then update AppState.
+/// On any failure the state is unchanged.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_agent_brain_config(
+    api_key: String,
+    base_url: String,
+    model: String,
+    system_prompt: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    validate_brain_fields(&base_url, &model)
+        .map_err(|e| settings_command_error("Agent brain validation failed", e))?;
+
+    // STEP A: Construct primary brain first. Fail fast before any DB writes.
+    let brain = AgentBrain::new(
+        api_key.clone(),
+        base_url.clone(),
+        model.clone(),
+        system_prompt.clone(),
+    )
+    .map_err(|e| settings_command_error("Agent brain validation failed", e))?;
+
+    // STEP B: Read any existing fallback config so it can be attached to the
+    // new brain instance. Lock is scoped — dropped before Step C.
+    let (fb_key, fb_url, fb_model) = {
+        let store = state.settings_store.lock().await;
+        let k = store
+            .get_fallback_api_key()
+            .map_err(|e| settings_command_error("Failed to read fallback brain config", e))?
+            .unwrap_or_default();
+        let u = store
+            .get_fallback_base_url()
+            .map_err(|e| settings_command_error("Failed to read fallback brain config", e))?
+            .unwrap_or_default();
+        let m = store
+            .get_fallback_model()
+            .map_err(|e| settings_command_error("Failed to read fallback brain config", e))?
+            .unwrap_or_default();
+        (k, u, m)
+    }; // settings_store lock drops here
+
+    // Attach fallback if configured.
+    let brain = if !fb_key.is_empty() && !fb_url.is_empty() && !fb_model.is_empty() {
+        brain.with_fallback(fb_key, fb_url, fb_model)
+    } else {
+        brain
+    };
+
+    // STEP C: Persist primary config to DB.
+    {
+        let mut store = state.settings_store.lock().await;
+        store
+            .set("brain_api_key", &api_key)
+            .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
+        store
+            .set("brain_base_url", &base_url)
+            .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
+        store
+            .set("brain_model", &model)
+            .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
+        store
+            .set("brain_system_prompt", &system_prompt)
+            .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
+    } // lock drops here
+
+    // STEP D: Update live brain in AppState. Tokio's mutex lock is infallible,
+    // so there is no error value to map as "Failed to update live agent brain".
+    // Only reached if A–C all succeeded.
+    {
+        let mut brain_lock = state.agent_brain.lock().await;
+        *brain_lock = Some(brain);
+    }
+
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn setup_agent_sent(
+    agent_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let mut browser = state.browser_state.lock().await;
+    browser.pending_sends.insert(agent_id);
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn captcha_resolved(
+    agent_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let mut browser = state.browser_state.lock().await;
+    browser.captcha_resolved.insert(agent_id.clone());
+    browser
+        .nav_tx
+        .try_send(NavEvent::ResumeRequested(agent_id))
+        .map_err(|e| format!("Could not resume browser readiness wait: {e}"))?;
+    Ok(())
+}
+
+/// Re-focus and re-probe the agent currently blocked in Phase 1 setup without
+/// creating a new session or changing setup_order/setup_generation.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn retry_setup_agent(
+    agent_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let config = {
+        let orchestrator = state.orchestrator.lock().await;
+        orchestrator.current_session.clone()
+    }.ok_or_else(|| "No setup session is active".to_string())?;
+    if !config.agent_ids.iter().any(|id| id == &agent_id) {
+        return Err("Agent is not part of the active setup".to_string());
+    }
+    let agent = get_agent_config(&agent_id).ok_or_else(|| "Unknown setup agent".to_string())?;
+    let (window, diagnostics, window_kind, nav_tx) = {
+        let browser = state.browser_state.lock().await;
+        let is_leader = agent_id == config.leader_agent_id;
+        let window = browser.select_window(is_leader)
+            .ok_or_else(|| "Model window is not available".to_string())?;
+        (window, browser.diagnostics.clone(), if is_leader { "leader" } else { "nav" }, browser.nav_tx.clone())
+    };
+    navigate_agent_window(&app, &diagnostics, &window, &agent_id, window_kind, agent.base_url)
+        .map_err(|error| error.to_string())?;
+    nav_tx.try_send(NavEvent::ResumeRequested(agent_id))
+        .map_err(|error| format!("Could not request setup retry: {error}"))?;
+    Ok(())
+}
+
+/// User-confirmed recovery path for a prompt that was visibly sent or answered
+/// but whose browser event was missed. This advances only the currently
+/// expected setup agent; it neither clicks Send nor manufactures a browser
+/// send/response signal.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn confirm_setup_agent(
+    agent_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if !state.session_active.load(Ordering::SeqCst) {
+        return Err("No active setup session".to_string());
+    }
+    let setup_order = {
+        let orchestrator = state.orchestrator.lock().await;
+        let config = orchestrator
+            .current_session
+            .as_ref()
+            .ok_or_else(|| "No setup session is active".to_string())?;
+        if orchestrator.status != OrchestratorStatus::Setup {
+            return Err("Manual confirmation is only available during setup".to_string());
+        }
+        config.setup_order()
+    };
+    if !setup_order.iter().any(|id| id == &agent_id) {
+        return Err("Agent is not part of the active setup order".to_string());
+    }
+    let (diagnostics, nav_tx) = {
+        let browser = state.browser_state.lock().await;
+        if !browser.diagnostics.is_expected_unfinished(&agent_id) {
+            return Err("Only the current unfinished setup agent can be confirmed".to_string());
+        }
+        (browser.diagnostics.clone(), browser.nav_tx.clone())
+    };
+    record_setup_completion(&diagnostics, &agent_id, "user_confirmed_manual");
+    nav_tx
+        .try_send(NavEvent::SetupManualConfirmed(agent_id))
+        .map_err(|error| format!("Could not deliver manual setup confirmation: {error}"))?;
+    Ok(())
+}
+
+/// User-confirmed active-turn recovery. The response is accepted only for the
+/// exact agent and turn the autonomous loop is currently awaiting; it is
+/// delivered as its own NavEvent rather than impersonating browser capture.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn provide_manual_model_response(
+    agent_id: String,
+    turn_number: u32,
+    response: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if !state.session_active.load(Ordering::SeqCst) {
+        return Err("No active session".to_string());
+    }
+    if response.trim().is_empty() {
+        return Err("Model response cannot be empty".to_string());
+    }
+    {
+        let orchestrator = state.orchestrator.lock().await;
+        if orchestrator.status != OrchestratorStatus::Running {
+            return Err("Manual response is only available while a session is running".to_string());
+        }
+    }
+    let nav_tx = {
+        let browser = state.browser_state.lock().await;
+        if browser.active_turn.as_ref() != Some(&(agent_id.clone(), turn_number)) {
+            return Err("This model and turn are not currently awaiting a response".to_string());
+        }
+        browser.nav_tx.clone()
+    };
+    nav_tx
+        .try_send(NavEvent::ManualResponse {
+            agent_id,
+            turn: turn_number,
+            response,
+        })
+        .map_err(|error| format!("Could not deliver manual model response: {error}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn rate_limit_decision(
+    agent_id: String,
+    decision: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let mut orch = state.orchestrator.lock().await;
+    orch.rate_limit_decisions.insert(agent_id.clone(), decision);
+    app.emit(
+        "rate-limit-reached",
+        json!({ "agent_id": agent_id, "estimated_reset_mins": 5 }),
+    )
+    .map_err(|e| e.to_string())
+}
+
+// ── Settings & configuration ──────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_agent_brain_config(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let config = state
+        .settings_store
+        .lock()
+        .await
+        .get_agent_brain_config()
+        .map_err(|e| e.to_string())?;
+
+    serde_json::to_string(&config).map_err(|e| e.to_string())
+}
+
+/// D-039: Save and activate the secondary (alternative) agent brain.
+/// Follows the same ATOMIC pattern as save_agent_brain_config.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_secondary_brain_config(
+    api_key: String,
+    base_url: String,
+    model: String,
+    system_prompt: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    validate_brain_fields(&base_url, &model)
+        .map_err(|e| settings_command_error("Secondary brain validation failed", e))?;
+
+    // STEP A: Validate by constructing brain2 first.
+    let brain2 = AgentBrain::new(
+        api_key.clone(),
+        base_url.clone(),
+        model.clone(),
+        system_prompt.clone(),
+    )
+    .map_err(|e| settings_command_error("Secondary brain validation failed", e))?;
+
+    // STEP B: Persist.
+    {
+        let mut store = state.settings_store.lock().await;
+        store
+            .set("brain2_api_key", &api_key)
+            .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
+        store
+            .set("brain2_base_url", &base_url)
+            .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
+        store
+            .set("brain2_model", &model)
+            .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
+        store
+            .set("brain2_system_prompt", &system_prompt)
+            .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
+    }
+
+    // STEP C: Update AppState.
+    {
+        let mut lock = state.agent_brain_2.lock().await;
+        *lock = Some(brain2);
+    }
+
+    Ok(())
+}
+
+/// D-039: Return the secondary brain config as JSON.
+#[tauri::command]
+pub async fn get_secondary_brain_config(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let config = state
+        .settings_store
+        .lock()
+        .await
+        .get_secondary_brain_config()
+        .map_err(|e| e.to_string())?;
+
+    serde_json::to_string(&config).map_err(|e| e.to_string())
+}
+
+/// Task 5 (HIGH-3): D-038's fallback brain had storage keys and retry logic
+/// fully implemented in settings_store.rs / agent_brain.rs, but no command
+/// ever let the user write to those keys — this is the missing piece.
+///
+/// Same ATOMIC shape as save_agent_brain_config / save_secondary_brain_config:
+/// persist to DB first, then — if a primary brain is already configured and
+/// live — update it in place so the change takes effect immediately rather
+/// than only on the next save_agent_brain_config call. Passing all three
+/// fields empty clears the fallback (AgentBrain::without_fallback()).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_fallback_brain_config(
+    api_key: String,
+    base_url: String,
+    model: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let clears_fallback =
+        api_key.trim().is_empty() && base_url.trim().is_empty() && model.trim().is_empty();
+    if !clears_fallback {
+        validate_brain_fields(&base_url, &model)
+            .map_err(|e| settings_command_error("Fallback brain validation failed", e))?;
+        if api_key.trim().is_empty() {
+            return Err(settings_command_error(
+                "Fallback brain validation failed",
+                "API key is required",
+            ));
+        }
+    }
+
+    let config = crate::settings_store::FallbackBrainConfig {
+        api_key: api_key.clone(),
+        base_url: base_url.clone(),
+        model: model.clone(),
+    };
+
+    // STEP A: Persist.
+    {
+        let mut store = state.settings_store.lock().await;
+        store
+            .save_fallback_brain_config(&config)
+            .map_err(|e| settings_command_error("Failed to save fallback brain settings", e))?;
+    }
+
+    // STEP B: Keep a live primary brain in sync, if one is configured.
+    {
+        let mut brain_lock = state.agent_brain.lock().await;
+        if let Some(existing) = brain_lock.take() {
+            let updated = if !clears_fallback {
+                existing.with_fallback(api_key, base_url, model)
+            } else {
+                existing.without_fallback()
+            };
+            *brain_lock = Some(updated);
+        }
+    }
+
+    Ok(())
+}
+
+/// Task 5: return the fallback brain config as JSON, mirroring
+/// get_secondary_brain_config's shape.
+#[tauri::command]
+pub async fn get_fallback_brain_config(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let config = state
+        .settings_store
+        .lock()
+        .await
+        .get_fallback_brain_config()
+        .map_err(|e| e.to_string())?;
+
+    serde_json::to_string(&config).map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_prompt_template(
+    template_name: String,
+    content: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let key = match template_name.as_str() {
+        "leader_priming" => "prompt_leader_priming",
+        "participant_priming" => "prompt_participant_priming",
+        "agent_system" => "brain_system_prompt",
+        _ => return Err(format!("Unknown template name: {}", template_name)),
+    };
+
+    state
+        .settings_store
+        .lock()
+        .await
+        .set(key, &content)
+        .map_err(|e| settings_command_error("Failed to save prompt template", e))?;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_prompt_template(
+    template_name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let key = match template_name.as_str() {
+        "leader_priming" => "prompt_leader_priming",
+        "participant_priming" => "prompt_participant_priming",
+        "agent_system" => "brain_system_prompt",
+        _ => return Err(format!("Unknown template name: {}", template_name)),
+    };
+
+    Ok(state
+        .settings_store
+        .lock()
+        .await
+        .get(key)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default())
+}
+
+// ── Data retrieval ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct DiagnosticSnapshot {
+    app_data_dir: String,
+    settings_db_exists: bool,
+    memory_db_exists: bool,
+    transcript_db_exists: bool,
+    blueprint_db_exists: bool,
+    session_active: bool,
+    primary_agent_brain_configured: bool,
+    fallback_brain_settings_present: bool,
+    secondary_brain_configured: bool,
+    memory_health: crate::memory_store::MemoryHealth,
+    /// Compatibility fields: these reflect the Tauri window lookup.
+    leader_window_exists: bool,
+    nav_window_exists: bool,
+    leader_window_handle_exists: bool,
+    nav_window_handle_exists: bool,
+    leader_tauri_lookup_exists: bool,
+    nav_tauri_lookup_exists: bool,
+    browser_diagnostics: Vec<crate::browser_backend::BrowserDiagnosticRecord>,
+    command_timestamp: String,
+}
+
+/// Secret-free runtime snapshot for diagnosing configuration and persistence
+/// failures. Configuration values are reduced to booleans before serialization.
+#[tauri::command]
+pub async fn get_diagnostic_snapshot(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| settings_command_error("Failed to resolve app data directory", e))?;
+
+    let (primary_configured, fallback_present, secondary_configured) = {
+        let store = state.settings_store.lock().await;
+        let primary = store
+            .get_agent_brain_config()
+            .map_err(|e| settings_command_error("Failed to read diagnostic settings", e))?;
+        let fallback = store
+            .get_fallback_brain_config()
+            .map_err(|e| settings_command_error("Failed to read diagnostic settings", e))?;
+        let secondary = store
+            .get_secondary_brain_config()
+            .map_err(|e| settings_command_error("Failed to read diagnostic settings", e))?;
+
+        (
+            !primary.base_url.trim().is_empty() && !primary.model.trim().is_empty(),
+            !fallback.api_key.trim().is_empty()
+                && !fallback.base_url.trim().is_empty()
+                && !fallback.model.trim().is_empty(),
+            !secondary.base_url.trim().is_empty() && !secondary.model.trim().is_empty(),
+        )
+    };
+
+    let memory_store = state.memory_store.clone();
+    let memory_health = crate::db_helpers::run_blocking(move || {
+        let memory = memory_store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("memory store lock poisoned".to_string()))?;
+        Ok(memory.check_health())
+    })
+    .await
+    .map_err(|e| settings_command_error("Failed to read memory health", e))?;
+
+    let (browser_diagnostics, leader_window_handle_exists, nav_window_handle_exists) = {
+        let browser = state.browser_state.lock().await;
+        (
+            browser.diagnostics.snapshot(),
+            browser.leader_window.is_some(),
+            browser.nav_window.is_some(),
+        )
+    };
+    let leader_tauri_lookup_exists = app
+        .get_webview_window(crate::browser_backend::LEADER_WINDOW_LABEL)
+        .is_some();
+    let nav_tauri_lookup_exists = app
+        .get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL)
+        .is_some();
+
+    let snapshot = DiagnosticSnapshot {
+        app_data_dir: app_data_dir.to_string_lossy().into_owned(),
+        settings_db_exists: app_data_dir.join("settings.db").is_file(),
+        memory_db_exists: app_data_dir.join("memory.db").is_file(),
+        transcript_db_exists: app_data_dir.join("transcript.db").is_file(),
+        blueprint_db_exists: app_data_dir.join("blueprint.db").is_file(),
+        session_active: state.session_active.load(Ordering::SeqCst),
+        primary_agent_brain_configured: primary_configured,
+        fallback_brain_settings_present: fallback_present,
+        secondary_brain_configured: secondary_configured,
+        memory_health,
+        leader_window_exists: leader_tauri_lookup_exists,
+        nav_window_exists: nav_tauri_lookup_exists,
+        leader_window_handle_exists,
+        nav_window_handle_exists,
+        leader_tauri_lookup_exists,
+        nav_tauri_lookup_exists,
+        browser_diagnostics,
+        command_timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+
+    serde_json::to_string(&snapshot)
+        .map_err(|e| settings_command_error("Failed to serialize diagnostic snapshot", e))
+}
+
+#[tauri::command]
+pub async fn get_transcript(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let session_id = {
+        let orch = state.orchestrator.lock().await;
+        orch.current_session
+            .as_ref()
+            .map(|s| s.session_id.clone())
+            .unwrap_or_default()
+    };
+    if session_id.is_empty() {
+        return Ok("[]".to_string());
+    }
+
+    // Task 9: transcript_store is now Arc<std::sync::Mutex<_>> — see
+    // orchestrator.rs and db_helpers.rs for the full rationale.
+    let store = state.transcript_store.clone();
+    let sid = session_id.clone();
+    let records = crate::db_helpers::run_blocking(move || {
+        let guard = store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        guard.get_transcript(&sid)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(serde_json::to_string(&records).unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn get_session_list(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    // Task 9: transcript_store is now Arc<std::sync::Mutex<_>>.
+    let store = state.transcript_store.clone();
+    let sessions = crate::db_helpers::run_blocking(move || {
+        let guard = store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        guard.list_sessions()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(serde_json::to_string(&sessions).unwrap_or_default())
+}
+
+/// CRIT-6 (Task 8): Validate `format` against the IPC.md contract ('markdown'
+/// | 'txt') before doing anything else — an unrecognised string now fails
+/// loudly instead of silently falling through to plaintext.
+///
+/// HIGH-8 (Task 3): `session_id` is now an explicit, optional parameter.
+/// Previously the backend silently ignored whatever `session_id` the
+/// frontend sent and always derived it from the live orchestrator state —
+/// so clicking "Export" on any *past* session in the sidebar history
+/// actually exported whichever session was currently active, not the one
+/// the user clicked. Sidebar.tsx already sends `session_id` on every export
+/// call; this makes that value do something. Omitting it (or sending an
+/// empty string) preserves the original "export the active session"
+/// behaviour for any other caller (e.g. a download button inside an active
+/// session view) that doesn't have a specific past session_id to give.
+///
+/// Task 9: blueprint_store is now Arc<std::sync::Mutex<_>>.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn export_blueprint(
+    format: String,
+    session_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    if format != "markdown" && format != "txt" {
+        return Err(format!(
+            "Invalid export format '{}'. Expected 'markdown' or 'txt'.",
+            format
+        ));
+    }
+
+    let resolved_session_id = match session_id {
+        Some(sid) if !sid.is_empty() => sid,
+        _ => {
+            let orch = state.orchestrator.lock().await;
+            orch.current_session
+                .as_ref()
+                .map(|s| s.session_id.clone())
+                .unwrap_or_default()
+        }
+    };
+    if resolved_session_id.is_empty() {
+        return Err("No active session".to_string());
+    }
+
+    let store = state.blueprint_store.clone();
+    let sid = resolved_session_id.clone();
+    let fmt = format.clone();
+    let content = crate::db_helpers::run_blocking(move || {
+        let guard = store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("blueprint store lock poisoned".to_string()))?;
+        if fmt == "markdown" {
+            guard.export_markdown(&sid)
+        } else {
+            guard.export_plaintext(&sid)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let ext = if format == "markdown" { "md" } else { "txt" };
+    let id_prefix_len = resolved_session_id.len().min(8);
+    let filename = format!(
+        "blueprint-{}.{}",
+        &resolved_session_id[..id_prefix_len],
+        ext
+    );
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join(&filename);
+
+    std::fs::write(&path, &content).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// IMP-5: Return the real per-agent health map populated by run_agent_loop.
+/// Serialises HashMap<String, ModelHealth> directly.
+/// Returns empty JSON object ({}) before any session has run.
+#[tauri::command]
+pub async fn get_agent_health(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let health = state.model_health.lock().await;
+    serde_json::to_string(&*health).map_err(|e| e.to_string())
+}
+
+// ── Task 3 (CRIT-3, CRIT-4): Session CRUD ─────────────────────────────────────
+//
+// get_session_list (above) is backed by TranscriptStore's `sessions` table —
+// confirmed by direct read of transcript_store.rs, not assumed. These three
+// commands are net-new; none existed anywhere in the backend before this
+// batch, even though Sidebar.tsx already called all three.
+
+/// Delete a session and cascade the deletion across every store that holds
+/// session-scoped data: transcript turns + the session row itself
+/// (TranscriptStore), blueprint sections (BlueprintStore), and saved
+/// conversation URLs (SessionVault). Deliberately does NOT touch
+/// SessionVault's `cookies` table — cookies are keyed by agent_id (the
+/// user's login state with that model's website), not by session, and must
+/// survive deleting any number of sessions.
+///
+/// Refuses to delete the session that is currently active (session_active
+/// is true AND it's the orchestrator's current_session) — deleting state
+/// out from under a running autonomous loop would corrupt that session's
+/// in-flight writes, not just lose history.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn delete_session(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if state.session_active.load(Ordering::SeqCst) {
+        let orch = state.orchestrator.lock().await;
+        if let Some(current) = orch.current_session.as_ref() {
+            if current.session_id == session_id {
+                return Err(
+                    "Cannot delete the currently active session. Stop it first.".to_string()
+                );
+            }
+        }
+    }
+
+    // Transcript store: turns + session row.
+    {
+        let store = state.transcript_store.clone();
+        let sid = session_id.clone();
+        crate::db_helpers::run_blocking(move || {
+            let mut guard = store.lock().map_err(|_| {
+                AgentError::DatabaseError("transcript store lock poisoned".to_string())
+            })?;
+            guard.delete_session(&sid)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    // Blueprint store: sections. Zero sections is a normal outcome (e.g. a
+    // session deleted before any section was agreed) — not an error.
+    {
+        let store = state.blueprint_store.clone();
+        let sid = session_id.clone();
+        crate::db_helpers::run_blocking(move || {
+            let guard = store.lock().map_err(|_| {
+                AgentError::DatabaseError("blueprint store lock poisoned".to_string())
+            })?;
+            guard.delete_session_sections(&sid)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    // Session vault: saved conversation URLs only — cookies are untouched.
+    {
+        let vault = state.session_vault.clone();
+        let sid = session_id.clone();
+        crate::db_helpers::run_blocking(move || {
+            let mut guard = vault.lock().map_err(|_| {
+                AgentError::DatabaseError("session vault lock poisoned".to_string())
+            })?;
+            guard.delete_session_urls(&sid)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+/// Rename a session — updates `project_brief`, the same field Sidebar.tsx
+/// already displays (truncated) as the session's title in the list. There is
+/// no separate `title` column; adding one for text that would otherwise be
+/// identical to `project_brief` would just create two sources of truth for
+/// the same string.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn rename_session(
+    session_id: String,
+    title: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err("Title cannot be empty".to_string());
+    }
+    let new_title = trimmed.to_string();
+
+    let store = state.transcript_store.clone();
+    let sid = session_id.clone();
+    crate::db_helpers::run_blocking(move || {
+        let mut guard = store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        guard.rename_session(&sid, &new_title)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// JSON shape returned by get_session_details — strictly more than
+/// get_session_list's SessionSummary: adds turn_count, section_count, and the
+/// distinct set of agent_ids that actually participated, none of which
+/// get_session_list computes (it returns the raw `sessions` table rows only).
+#[derive(Serialize)]
+struct SessionDetails {
+    id: String,
+    project_brief: String,
+    session_type: String,
+    status: String,
+    created_at: i64,
+    turn_count: usize,
+    section_count: usize,
+    agent_ids: Vec<String>,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_session_details(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let ts_store = state.transcript_store.clone();
+    let sid = session_id.clone();
+    let (summary, records) = crate::db_helpers::run_blocking(move || {
+        let guard = ts_store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        let summary = guard
+            .get_session(&sid)?
+            .ok_or_else(|| AgentError::DatabaseError(format!("Session '{}' not found", sid)))?;
+        let records = guard.get_transcript(&sid)?;
+        Ok((summary, records))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let bp_store = state.blueprint_store.clone();
+    let sid_for_bp = session_id.clone();
+    let section_count = crate::db_helpers::run_blocking(move || {
+        let guard = bp_store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("blueprint store lock poisoned".to_string()))?;
+        Ok(guard.get_sections(&sid_for_bp)?.len())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut agent_ids: Vec<String> = records.iter().map(|r| r.agent_id.clone()).collect();
+    agent_ids.sort();
+    agent_ids.dedup();
+
+    let details = SessionDetails {
+        id: summary.id,
+        project_brief: summary.project_brief,
+        session_type: summary.session_type,
+        status: summary.status,
+        created_at: summary.created_at,
+        turn_count: records.len(),
+        section_count,
+        agent_ids,
+    };
+
+    serde_json::to_string(&details).map_err(|e| e.to_string())
+}
+
+// ── IMP-7: Session recovery ───────────────────────────────────────────────────
+
+/// IMP-7: Return whether an incomplete session exists that can be recovered.
+/// The frontend calls this on startup to decide whether to offer recovery.
+///
+/// Returns JSON: { "available": bool, "session_id": string }
+#[tauri::command]
+pub async fn get_recovery_state(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let store = state.settings_store.lock().await;
+
+    let session_id = store
+        .get("last_session_id")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+
+    let session_complete = store
+        .get("session_complete")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "true".to_string()); // default: nothing to recover
+
+    // Available only if we have a session that did NOT reach Complete.
+    let available = !session_id.is_empty() && session_complete == "false";
+
+    serde_json::to_string(&json!({
+        "available": available,
+        "session_id": session_id
+    }))
+    .map_err(|e| e.to_string())
+}
+
+/// IMP-7: Re-emit blueprint-section-added for every section of the given
+/// incomplete session.  Does NOT re-enter the autonomous loop — only replays
+/// the already-agreed sections so the user can see the partial blueprint.
+///
+/// Task 9: blueprint_store is now Arc<std::sync::Mutex<_>>.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn recover_session(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let store = state.blueprint_store.clone();
+    let sid = session_id.clone();
+    let sections = crate::db_helpers::run_blocking(move || {
+        let guard = store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("blueprint store lock poisoned".to_string()))?;
+        guard.get_sections(&sid)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    tracing::info!(
+        "[RECOVERY] Replaying {} sections for session {}",
+        sections.len(),
+        &session_id
+    );
+
+    for section in &sections {
+        let _ = app.emit(
+            "blueprint-section-added",
+            json!({
+                "section_id": &section.id,
+                "title":      &section.title,
+                "content":    &section.content
+            }),
+        );
+    }
+
+    Ok(())
+}
+
+// ── Phase 1 memory ───────────────────────────────────────────────────────────
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_project_memory(
+    state: tauri::State<'_, AppState>,
+    project_brief: String,
+) -> Result<String, String> {
+    let memory_store = state.memory_store.clone();
+    let entries = crate::db_helpers::run_blocking(move || {
+        let mut memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        memory.get_project_memory(&project_brief)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    serde_json::to_string(&entries).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_global_memory(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let memory_store = state.memory_store.clone();
+    let entries = crate::db_helpers::run_blocking(move || {
+        let memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        memory.get_global_memory()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    serde_json::to_string(&entries).map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn clear_project_memory(
+    state: tauri::State<'_, AppState>,
+    project_brief: String,
+) -> Result<(), String> {
+    let memory_store = state.memory_store.clone();
+    crate::db_helpers::run_blocking(move || {
+        let mut memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        memory.clear_project_memory(&project_brief)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_open_questions(
+    state: tauri::State<'_, AppState>,
+    project_brief: String,
+) -> Result<String, String> {
+    let memory_store = state.memory_store.clone();
+    let questions = crate::db_helpers::run_blocking(move || {
+        let memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        memory.get_open_questions(&project_brief)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    serde_json::to_string(&questions).map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_model_strengths(
+    state: tauri::State<'_, AppState>,
+    project_brief: String,
+) -> Result<String, String> {
+    let memory_store = state.memory_store.clone();
+    let strengths = crate::db_helpers::run_blocking(move || {
+        let memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        memory.get_model_strengths(&project_brief)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    serde_json::to_string(&strengths).map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_project_config(
+    state: tauri::State<'_, AppState>,
+    project_brief: String,
+    content: String,
+) -> Result<(), String> {
+    let memory_store = state.memory_store.clone();
+    crate::db_helpers::run_blocking(move || {
+        let mut memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        memory.save_project_config(&project_brief, &content)
+    })
+    .await
+    .map_err(|e| settings_command_error("Failed to save Project Context", e))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_project_config(
+    state: tauri::State<'_, AppState>,
+    project_brief: String,
+) -> Result<String, String> {
+    let memory_store = state.memory_store.clone();
+    crate::db_helpers::run_blocking(move || {
+        let memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        memory.get_project_config(&project_brief)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_memory_health(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let memory_store = state.memory_store.clone();
+    let health = crate::db_helpers::run_blocking(move || {
+        let memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Ok(memory.check_health())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    serde_json::to_string(&health).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn repair_memory_index(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let memory_store = state.memory_store.clone();
+    crate::db_helpers::run_blocking(move || {
+        let mut memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        memory.repair_fts_index()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_patterns(
+    state: tauri::State<'_, AppState>,
+    project_brief: String,
+) -> Result<String, String> {
+    let memory_store = state.memory_store.clone();
+    let patterns = crate::db_helpers::run_blocking(move || {
+        let memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        memory.get_patterns(&project_brief)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    serde_json::to_string(&patterns).map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn export_memory(
+    state: tauri::State<'_, AppState>,
+    destination_path: String,
+) -> Result<(), String> {
+    let memory_store = state.memory_store.clone();
+    crate::db_helpers::run_blocking(move || {
+        let memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        memory.export_to(&destination_path)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn restore_memory(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+    source_path: String,
+) -> Result<(), String> {
+    if state.session_active.load(Ordering::SeqCst) {
+        return Err(
+            "Cannot restore memory while a session is active. Stop the session first.".to_string(),
+        );
+    }
+
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let backup_dir = app_data_dir.join("memory_backups");
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let pre_restore_path = backup_dir.join(format!("pre_restore_{timestamp}.db"));
+    let memory_store = state.memory_store.clone();
+
+    crate::db_helpers::run_blocking(move || {
+        std::fs::create_dir_all(&backup_dir).map_err(|e| {
+            AgentError::DatabaseError(format!("could not create memory backup directory: {e}"))
+        })?;
+        let pre_restore_path = pre_restore_path.to_string_lossy().into_owned();
+        let mut memory = memory_store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        memory.export_to(&pre_restore_path)?;
+        memory.restore_from(&source_path)?;
+        let health = memory.check_health();
+        if !health.is_healthy {
+            return Err(AgentError::DatabaseError(format!(
+                "Restore completed but health check failed: {}. Pre-restore backup saved at {}",
+                health.issues.join("; "),
+                pre_restore_path
+            )));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
