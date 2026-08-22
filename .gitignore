@@ -1,0 +1,44 @@
+# Rust build artifacts
+src-tauri/target/
+src-tauri/.fingerprint/
+src-tauri/.rustc_info.json
+src-tauri/CACHEDIR.TAG
+
+# Node modules
+node_modules/
+src/node_modules/
+
+# Build output
+dist/
+src/dist/
+src/src/dist/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Vite cache
+.vite/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Aider
+.aider*
+
+# Logs
+*.log
+
+# Tauri generated
+src-tauri/gen/
