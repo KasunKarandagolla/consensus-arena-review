@@ -1782,26 +1782,20 @@ struct ArenaSignal {
 
 fn parse_arena_signal(url: &tauri::Url) -> Option<ArenaSignal> {
     let host = url.host_str().unwrap_or_default();
-    let path_segments = url
-        .path()
-        .trim_start_matches('/')
+    let path = url.path().trim_start_matches('/');
+
+    // For ALL signals, the action is the host (host-based protocol).
+    // The path contains positional arguments. Empty segments must be
+    // preserved because signals like prompt-injection and send-probe
+    // have fixed positional arguments where trailing ones may be empty.
+    let path_segments = path
         .split('/')
-        .filter(|segment| !segment.is_empty())
         .map(ToString::to_string)
         .collect::<Vec<_>>();
 
-    if !host.is_empty() {
-        return Some(ArenaSignal {
-            action: host.to_string(),
-            args: path_segments,
-        });
-    }
-
-    let mut segments = path_segments.into_iter();
-    let action = segments.next()?;
     Some(ArenaSignal {
-        action,
-        args: segments.collect(),
+        action: host.to_string(),
+        args: path_segments,
     })
 }
 
@@ -1903,6 +1897,44 @@ mod tests {
                     "1".to_string(),
                     "2".to_string(),
                     "0".to_string(),
+                ],
+            }
+        );
+
+        // Regression test for prompt-injection with empty trailing fields (role, contenteditable, error).
+        // The signal: arena://prompt-injection/deepseek/textarea-native-setter/1/1/262/1/TEXTAREA///
+        // has 10 positional args, with the last 3 being empty strings.
+        // parse_arena_signal must preserve empty segments for path-based signals.
+        assert_eq!(
+            parse("arena://prompt-injection/deepseek/textarea-native-setter/1/1/262/1/TEXTAREA///"),
+            ArenaSignal {
+                action: "prompt-injection".to_string(),
+                args: vec![
+                    "deepseek".to_string(),
+                    "textarea-native-setter".to_string(),
+                    "1".to_string(),
+                    "1".to_string(),
+                    "262".to_string(),
+                    "1".to_string(),
+                    "TEXTAREA".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                    "".to_string(),
+                ],
+            }
+        );
+
+        // Regression test for send-probe with full argument form including optional trailing fields.
+        // The long form has 18 args; trailing ones may be empty.
+        assert_eq!(
+            parse("arena://send-probe/chatgpt/1/1/1/2/0/5/3/2/10/45000/composer_detected/interactive"),
+            ArenaSignal {
+                action: "send-probe".to_string(),
+                args: vec![
+                    "chatgpt".to_string(), "1".to_string(), "1".to_string(), "1".to_string(),
+                    "2".to_string(), "0".to_string(), "5".to_string(), "3".to_string(),
+                    "2".to_string(), "10".to_string(), "45000".to_string(),
+                    "composer_detected".to_string(), "interactive".to_string(),
                 ],
             }
         );
@@ -3229,8 +3261,16 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         if (!trusted(event)) return;
         const target = event && event.target instanceof Element ? event.target : null;
         const button = target && target.closest('button,[role="button"],input[type="submit"],[aria-label],[title],[data-testid]');
-        if (button && isSendCandidate(button)) {
-            beginSendCheck(findInput(), 'trusted-click');
+        if (!button) return;
+        // Accept trusted clicks on composer-owned Send candidates.
+        // This includes both strong candidates (isSendCandidate) and icon-only
+        // candidates discovered by the composer-owned Send discovery logic.
+        // Forbidden controls are already excluded by collectSendCandidatesIn.
+        const input = findInput();
+        const candidates = collectSendButtonCandidates(input);
+        const isOwnedSendCandidate = candidates.some(function(c) { return c.el === button; });
+        if (isOwnedSendCandidate) {
+            beginSendCheck(input, 'trusted-click');
         }
     }
 
