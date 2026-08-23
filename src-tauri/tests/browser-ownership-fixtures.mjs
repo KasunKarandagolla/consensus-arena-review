@@ -428,8 +428,10 @@ function fixture3() {
   attach(body, globalSend);
 
   win.__caSubmitActivePrompt(input, 'chatgpt', 3);
+  // MAX_SUBMIT_ATTEMPTS is now 180 (~54s at 300ms). We need to flush enough timers
+  // to reach the error state. Use a guard matching the attempt budget.
   let guard = 0;
-  while (state.timers().length > 0 && guard < 60) { flushNextTimer(state); guard++; }
+  while (state.timers().length > 0 && guard < 200) { flushNextTimer(state); guard++; }
   assert(globalSend._clicked === 0, 'no global fallback Send clicked');
   const href = win.location.href;
   assert(href.includes('composer_not_found'), 'composer_not_found reported (' + href + ')');

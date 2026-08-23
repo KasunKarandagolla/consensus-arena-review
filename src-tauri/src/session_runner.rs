@@ -4,6 +4,7 @@ use crate::browser_backend::{
     record_prompt_injected, record_prompt_injection_error, record_prompt_injection_report,
     record_setup_completion,
     record_setup_expected_agent, record_setup_stale_signal, resolve_participant,
+    record_signal_metadata,
 };
 use crate::errors::AgentError;
 use crate::orchestrator::{AppState, SessionConfig};
@@ -21,7 +22,6 @@ const ROLES: &[&str] = &[
 
 enum SetupCompletionProof {
     SendDetected(String),
-    ResponseAfterInjection,
     UserConfirmedManual,
 }
 
@@ -534,7 +534,10 @@ pub async fn run_setup(
                             )));
                         }
                         Some(NavEvent::SetupResponseObserved(id)) if id == agent_id_clone => {
-                            break Ok(SetupCompletionProof::ResponseAfterInjection);
+                            // SetupResponseObserved is diagnostic only — does NOT complete setup.
+                            // Continue waiting for real SendDetected or manual confirmation.
+                            record_signal_metadata(&diagnostics, &NavEvent::SetupResponseObserved(id.clone()));
+                            continue;
                         }
                         Some(NavEvent::SetupManualConfirmed(id)) if id == agent_id_clone => {
                             break Ok(SetupCompletionProof::UserConfirmedManual);
@@ -551,7 +554,10 @@ pub async fn run_setup(
                         Some(NavEvent::Response(id, _, _) | NavEvent::Done(id, _))
                             if id == agent_id_clone =>
                         {
-                            break Ok(SetupCompletionProof::ResponseAfterInjection);
+                            // Response/Done during setup are diagnostic only — do NOT complete setup.
+                            // Continue waiting for real SendDetected or manual confirmation.
+                            record_signal_metadata(&diagnostics, &NavEvent::Response(id.clone(), 0, String::new()));
+                            continue;
                         }
                         Some(NavEvent::SessionAborted) => {
                             break Err(AgentError::UnknownError("Session aborted".to_string()));
@@ -574,9 +580,6 @@ pub async fn run_setup(
                 Ok(Ok(SetupCompletionProof::SendDetected(reason))) => {
                     record_setup_completion(&diagnostics, agent_id, &reason);
                     setup_completed_with_real_send = true;
-                }
-                Ok(Ok(SetupCompletionProof::ResponseAfterInjection)) => {
-                    record_setup_completion(&diagnostics, agent_id, "response_after_injection");
                 }
                 Ok(Ok(SetupCompletionProof::UserConfirmedManual)) => {
                     record_setup_completion(&diagnostics, agent_id, "user_confirmed_manual");
@@ -622,6 +625,10 @@ pub async fn run_setup(
             // submitted and no response was fabricated: the ACTIVE loop will
             // perform turn-1 and onward. Setup completion is an accelerator for
             // readiness, never a guarantee of submission.
+            // IMPORTANT: capability_verified does NOT create a conversation URL.
+            // Active routing requires a real saved conversation URL. We explicitly
+            // store None so active routing fails fast with a clear error instead of
+            // silently navigating to the base URL.
             record_setup_completion(&diagnostics, agent_id, "capability_verified");
         }
 

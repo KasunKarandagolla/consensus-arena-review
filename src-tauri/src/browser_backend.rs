@@ -626,7 +626,7 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
     }
 }
 
-fn record_signal_metadata(diagnostics: &BrowserDiagnostics, event: &NavEvent) {
+pub fn record_signal_metadata(diagnostics: &BrowserDiagnostics, event: &NavEvent) {
     let Some((agent_id, signal_type)) = nav_event_signal(event) else {
         return;
     };
@@ -3327,7 +3327,10 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         var method = 'none';
         var enabled = false;
         var attempts = 0;
-        var MAX_SUBMIT_ATTEMPTS = 40;
+        // Increased from 40 (~12s at 300ms) to 180 (~54s at 300ms) to tolerate
+        // delayed Send button activation during provider hydration (e.g., ChatGPT).
+        // Keeps polling frequently (250-300ms) but with a much larger budget.
+        var MAX_SUBMIT_ATTEMPTS = 180;
         function report(success) {
             try {
                 window.location.href = 'arena://active-submit/' + expectedAgentId + '/' + expectedTurn + '/' + (success ? '1' : '0') + '/' + encodeURIComponent(method) + '/' + (enabled ? '1' : '0') + '/' + encodeURIComponent(error);

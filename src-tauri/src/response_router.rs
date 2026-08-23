@@ -122,25 +122,6 @@ fn drain_stale_active_events(nav_rx: &mut Receiver<NavEvent>) -> usize {
     drained
 }
 
-/// Drain stale Ready events for a specific agent from the navigation channel.
-/// Used before fresh participant navigation to avoid consuming a setup-phase Ready signal.
-fn drain_stale_ready_events(nav_rx: &mut Receiver<NavEvent>, agent_id: &str) -> usize {
-    let mut drained = 0usize;
-    while let Ok(event) = nav_rx.try_recv() {
-        if matches!(event, NavEvent::Ready(ref id) if id == agent_id) {
-            drained = drained.saturating_add(1);
-            tracing::warn!("[ACTIVE] Drained stale Ready event for {} before fresh navigation", agent_id);
-        } else {
-            // Put non-Ready events back by re-sending them (best effort)
-            // Since we can't put them back in the channel, we log and continue
-            // The caller should handle this by not relying on perfect event preservation
-            tracing::warn!("[ACTIVE] Encountered non-Ready event during stale ready drain: {:?}", event);
-            // Note: we can't easily re-queue, so this is a best-effort drain
-        }
-    }
-    drained
-}
-
 /// Outcome of the active-turn auto-submit confirmation gate.
 enum SubmitOutcome {
     /// The page reported the exact (agent_id, turn) as submitted.
@@ -1534,14 +1515,16 @@ async fn inject_and_wait_with_retry(
             }));
         }
 
-        // Drain any stale Ready events for this agent before navigation.
-        // This prevents consuming a setup-phase Ready when we need a fresh one.
-        // clear_ready_timestamp only clears a diagnostic timestamp but does not
-        // remove buffered Ready events from the channel.
-        let drained = drain_stale_ready_events(nav_rx, target_model);
-        if drained > 0 {
-            tracing::warn!("[ACTIVE] Drained {} stale Ready events for {}", drained, target_model);
-        }
+        // NOTE: We no longer drain stale Ready events here because the drain function
+        // was unsafe — it consumed and discarded non-Ready events (SendDetected,
+        // Response, Done, ActiveSubmitReport, PromptInjectionReport, etc.) that
+        // could be lost. Instead, we rely on the navigation and wait_for_ready
+        // flow to naturally handle any stale events. If a stale Ready is in the
+        // channel, wait_for_ready will consume it, but the subsequent page load
+        // will emit a fresh Ready that will be properly waited for.
+        //
+        // The diagnostics clear_ready_timestamp is still called in the browser
+        // backend before navigation to reset the ready-state tracking.
 
         tracing::debug!(
             "[INJECT] → {} turn={} len={} (attempt {}) saved_url={}",
