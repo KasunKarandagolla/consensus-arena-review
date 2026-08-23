@@ -523,113 +523,104 @@ pub async fn run_setup(
         let mut conversation_url: Option<String> = None;
         let mut setup_completed_with_real_send = false;
 
-        if !setup_capability_verified {
-            let agent_id_clone = agent_id.clone();
-            let sent = tokio::time::timeout(std::time::Duration::from_secs(120), async {
-                loop {
-                    match nav_rx.recv().await {
-                        Some(NavEvent::SendDetected(id, reason)) if id == agent_id_clone => {
-                            break Ok(SetupCompletionProof::SendDetected(setup_send_reason(
-                                reason.as_deref(),
-                            )));
-                        }
-                        Some(NavEvent::SetupResponseObserved(id)) if id == agent_id_clone => {
-                            // SetupResponseObserved is diagnostic only — does NOT complete setup.
-                            // Continue waiting for real SendDetected or manual confirmation.
-                            record_signal_metadata(&diagnostics, &NavEvent::SetupResponseObserved(id.clone()));
-                            continue;
-                        }
-                        Some(NavEvent::SetupManualConfirmed(id)) if id == agent_id_clone => {
-                            break Ok(SetupCompletionProof::UserConfirmedManual);
-                        }
-                        Some(NavEvent::ChallengeDetected(id, indicator)) if id == agent_id_clone => {
-                            break Err(AgentError::CaptchaRequired(indicator));
-                        }
-                        Some(NavEvent::UnshowableUrl(id, url)) if id == agent_id_clone => {
-                            break Err(AgentError::NavigationFailed(format!(
-                                "{} navigated to a URL this WebView cannot display: {}",
-                                agent_config.display_name, url
-                            )));
-                        }
-                        Some(NavEvent::Response(id, _, _) | NavEvent::Done(id, _))
-                            if id == agent_id_clone =>
-                        {
-                            // Response/Done during setup are diagnostic only — do NOT complete setup.
-                            // Continue waiting for real SendDetected or manual confirmation.
-                            record_signal_metadata(&diagnostics, &NavEvent::Response(id.clone(), 0, String::new()));
-                            continue;
-                        }
-                        Some(NavEvent::SessionAborted) => {
-                            break Err(AgentError::UnknownError("Session aborted".to_string()));
-                        }
-                        Some(event) => {
-                            record_setup_stale_signal(&diagnostics, &agent_id_clone, &event);
-                            continue;
-                        }
-                        None => {
-                            break Err(AgentError::Timeout(
-                                "send detection channel closed".to_string(),
-                            ));
-                        }
+        // Setup ALWAYS waits for a real SendDetected or explicit user confirmation.
+        // capability_verified is a readiness diagnostic only — it confirms the
+        // composer accepted the prompt and an owned Send is enabled, but it does
+        // NOT prove the user submitted the priming prompt. We must wait for a
+        // trusted send signal or manual confirmation before marking setup complete.
+        let agent_id_clone = agent_id.clone();
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                match nav_rx.recv().await {
+                    Some(NavEvent::SendDetected(id, reason)) if id == agent_id_clone => {
+                        break Ok(SetupCompletionProof::SendDetected(setup_send_reason(
+                            reason.as_deref(),
+                        )));
                     }
-                }
-            })
-            .await;
-
-            match sent {
-                Ok(Ok(SetupCompletionProof::SendDetected(reason))) => {
-                    record_setup_completion(&diagnostics, agent_id, &reason);
-                    setup_completed_with_real_send = true;
-                }
-                Ok(Ok(SetupCompletionProof::UserConfirmedManual)) => {
-                    record_setup_completion(&diagnostics, agent_id, "user_confirmed_manual");
-                    setup_completed_with_real_send = true;
-                }
-                Ok(Err(error)) => {
-                    let message = error.to_string();
-                    if matches!(error, AgentError::CaptchaRequired(_)) {
-                        let _ = app.emit("captcha-detected", json!({ "agent_id": agent_id }));
-                        let _ = app.emit("boss-message", json!({
-                            "text": format!("{} needs verification. Complete the check in the model window, then click Resume.", agent_config.display_name),
-                            "message_type": "status"
-                        }));
+                    Some(NavEvent::SetupResponseObserved(id)) if id == agent_id_clone => {
+                        // SetupResponseObserved is diagnostic only — does NOT complete setup.
+                        // Continue waiting for real SendDetected or manual confirmation.
+                        record_signal_metadata(&diagnostics, &NavEvent::SetupResponseObserved(id.clone()));
+                        continue;
                     }
-                    record_browser_error(app, &diagnostics, agent_id, &message);
-                    let _ = app.emit(
-                        "boss-message",
-                        json!({
-                            "text": format!("{} setup stopped: {}", agent_config.display_name, message),
-                            "message_type": "status"
-                        }),
-                    );
-                    return Err(error);
-                }
-                Err(_) => {
-                    let message =
-                        diagnostics.send_detection_timeout_message(agent_id, &agent_config.display_name);
-                    record_browser_error(app, &diagnostics, agent_id, &message);
-                    let _ = app.emit(
-                        "boss-message",
-                        json!({
-                            "text": message.clone(),
-                            "message_type": "status"
-                        }),
-                    );
-                    return Err(AgentError::Timeout(message));
+                    Some(NavEvent::SetupManualConfirmed(id)) if id == agent_id_clone => {
+                        break Ok(SetupCompletionProof::UserConfirmedManual);
+                    }
+                    Some(NavEvent::ChallengeDetected(id, indicator)) if id == agent_id_clone => {
+                        break Err(AgentError::CaptchaRequired(indicator));
+                    }
+                    Some(NavEvent::UnshowableUrl(id, url)) if id == agent_id_clone => {
+                        break Err(AgentError::NavigationFailed(format!(
+                            "{} navigated to a URL this WebView cannot display: {}",
+                            agent_config.display_name, url
+                        )));
+                    }
+                    Some(NavEvent::Response(id, _, _) | NavEvent::Done(id, _))
+                        if id == agent_id_clone =>
+                    {
+                        // Response/Done during setup are diagnostic only — do NOT complete setup.
+                        // Continue waiting for real SendDetected or manual confirmation.
+                        record_signal_metadata(&diagnostics, &NavEvent::Response(id.clone(), 0, String::new()));
+                        continue;
+                    }
+                    Some(NavEvent::SessionAborted) => {
+                        break Err(AgentError::UnknownError("Session aborted".to_string()));
+                    }
+                    Some(event) => {
+                        record_setup_stale_signal(&diagnostics, &agent_id_clone, &event);
+                        continue;
+                    }
+                    None => {
+                        break Err(AgentError::Timeout(
+                            "send detection channel closed".to_string(),
+                        ));
+                    }
                 }
             }
-        } else {
-            // Strong capability proof (composer accepted priming verbatim, an
-            // owned Send is enabled, no injection error) advanced this agent
-            // without waiting for a human to submit. The priming text was NOT
-            // submitted and no response was fabricated: the ACTIVE loop will
-            // perform turn-1 and onward. Setup completion is an accelerator for
-            // readiness, never a guarantee of submission.
-            // IMPORTANT: capability_verified does NOT create a conversation URL.
-            // Active routing requires a real saved conversation URL. We explicitly
-            // store None so active routing fails fast with a clear error instead of
-            // silently navigating to the base URL.
-            record_setup_completion(&diagnostics, agent_id, "capability_verified");
+        })
+        .await;
+
+        match sent {
+            Ok(Ok(SetupCompletionProof::SendDetected(reason))) => {
+                record_setup_completion(&diagnostics, agent_id, &reason);
+                setup_completed_with_real_send = true;
+            }
+            Ok(Ok(SetupCompletionProof::UserConfirmedManual)) => {
+                record_setup_completion(&diagnostics, agent_id, "user_confirmed_manual");
+                setup_completed_with_real_send = true;
+            }
+            Ok(Err(error)) => {
+                let message = error.to_string();
+                if matches!(error, AgentError::CaptchaRequired(_)) {
+                    let _ = app.emit("captcha-detected", json!({ "agent_id": agent_id }));
+                    let _ = app.emit("boss-message", json!({
+                        "text": format!("{} needs verification. Complete the check in the model window, then click Resume.", agent_config.display_name),
+                        "message_type": "status"
+                    }));
+                }
+                record_browser_error(app, &diagnostics, agent_id, &message);
+                let _ = app.emit(
+                    "boss-message",
+                    json!({
+                        "text": format!("{} setup stopped: {}", agent_config.display_name, message),
+                        "message_type": "status"
+                    }),
+                );
+                return Err(error);
+            }
+            Err(_) => {
+                let message =
+                    diagnostics.send_detection_timeout_message(agent_id, &agent_config.display_name);
+                record_browser_error(app, &diagnostics, agent_id, &message);
+                let _ = app.emit(
+                    "boss-message",
+                    json!({
+                        "text": message.clone(),
+                        "message_type": "status"
+                    }),
+                );
+                return Err(AgentError::Timeout(message));
+            }
         }
 
         // Capture conversation URL ONLY when setup completed with a real Send
@@ -733,18 +724,18 @@ pub async fn run_debate(
 mod tests {
     use super::capability_verified;
 
-    // A. Strong setup capability proof completes setup (accelerator) — all four
-    //    signal strengths true and no injection error → the gate holds true.
+    // A. capability_verified returns true when all four signal strengths are true
+    //    and no injection error. This is a readiness diagnostic ONLY — it does
+    //    NOT complete setup. Setup still requires a trusted SendDetected or
+    //    explicit user confirmation.
     #[test]
-    fn strong_capability_proof_is_verified() {
+    fn capability_verified_returns_true_when_ready() {
         assert!(capability_verified(true, true, true, None));
     }
 
-    // B. Weak capability proof (any of the required fields false) must NOT
-    //    complete setup automatically; it falls through to the manual
-    //    send-detection / recovery path.
+    // B. Weak capability proof (any of the required fields false) returns false.
     #[test]
-    fn weak_capability_proof_not_verified() {
+    fn capability_verified_fails_when_weak() {
         assert!(!capability_verified(false, true, true, None), "prefix fail");
         assert!(!capability_verified(true, false, true, None), "suffix fail");
         assert!(!capability_verified(true, true, false, None), "send fail");
@@ -754,10 +745,9 @@ mod tests {
         );
     }
 
-    // C. Failed prompt integrity (injection error present) must NOT complete
-    //    setup even when the other signals look strong.
+    // C. Failed prompt integrity (injection error present) returns false.
     #[test]
-    fn failed_prompt_integrity_not_verified() {
+    fn capability_verified_fails_on_injection_error() {
         assert!(
             !capability_verified(
                 true,
@@ -768,9 +758,9 @@ mod tests {
         );
     }
 
-    // D. Disabled Send control must NOT complete setup.
+    // D. Disabled Send control returns false.
     #[test]
-    fn disabled_send_not_verified() {
+    fn capability_verified_fails_on_disabled_send() {
         assert!(!capability_verified(true, true, false, None));
     }
 
@@ -802,5 +792,16 @@ mod tests {
         // turn. It is a readiness signal; turnover is the ACTIVE loop's job.
         let verified = capability_verified(true, true, true, None);
         assert!(verified);
+    }
+
+    // G. capability_verified is a readiness diagnostic, NOT a setup completion proof.
+    //    It may be true while setup is still waiting for a real SendDetected.
+    #[test]
+    fn capability_verified_is_not_setup_completion_proof() {
+        // This test documents the invariant: capability_verified == true
+        // means "composer ready", NOT "setup complete".
+        let verified = capability_verified(true, true, true, None);
+        assert!(verified);
+        // Setup completion still requires SendDetected or UserConfirmedManual.
     }
 }
