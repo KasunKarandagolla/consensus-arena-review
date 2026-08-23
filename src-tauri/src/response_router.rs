@@ -122,6 +122,25 @@ fn drain_stale_active_events(nav_rx: &mut Receiver<NavEvent>) -> usize {
     drained
 }
 
+/// Drain stale Ready events for a specific agent from the navigation channel.
+/// Used before fresh participant navigation to avoid consuming a setup-phase Ready signal.
+fn drain_stale_ready_events(nav_rx: &mut Receiver<NavEvent>, agent_id: &str) -> usize {
+    let mut drained = 0usize;
+    while let Ok(event) = nav_rx.try_recv() {
+        if matches!(event, NavEvent::Ready(ref id) if id == agent_id) {
+            drained = drained.saturating_add(1);
+            tracing::warn!("[ACTIVE] Drained stale Ready event for {} before fresh navigation", agent_id);
+        } else {
+            // Put non-Ready events back by re-sending them (best effort)
+            // Since we can't put them back in the channel, we log and continue
+            // The caller should handle this by not relying on perfect event preservation
+            tracing::warn!("[ACTIVE] Encountered non-Ready event during stale ready drain: {:?}", event);
+            // Note: we can't easily re-queue, so this is a best-effort drain
+        }
+    }
+    drained
+}
+
 /// Outcome of the active-turn auto-submit confirmation gate.
 enum SubmitOutcome {
     /// The page reported the exact (agent_id, turn) as submitted.
@@ -828,10 +847,17 @@ pub async fn run_agent_loop(
                 )
                 .await
                 .map_err(|e| {
-                    AgentError::InjectionFailed(format!(
-                        "Route to {} failed after retries: {}",
-                        target_model, e
-                    ))
+                    // Only say "failed after retries" if retries were actually attempted.
+                    // Missing conversation URL is a setup completeness issue, not a retry failure.
+                    let msg = e.to_string();
+                    if msg.contains("No saved conversation URL") || msg.contains("Setup must complete with a real send") {
+                        AgentError::InjectionFailed(msg)
+                    } else {
+                        AgentError::InjectionFailed(format!(
+                            "Route to {} failed after retries: {}",
+                            target_model, e
+                        ))
+                    }
                 })?;
                 if target_model == "deepseek" {
                     deepseek_consulted = true;
@@ -955,10 +981,16 @@ pub async fn run_agent_loop(
                     )
                     .await
                     .map_err(|e| {
-                        AgentError::InjectionFailed(format!(
-                            "RouteCompare to {} failed after retries: {}",
-                            target_model, e
-                        ))
+                        // Only say "failed after retries" if retries were actually attempted.
+                        let msg = e.to_string();
+                        if msg.contains("No saved conversation URL") || msg.contains("Setup must complete with a real send") {
+                            AgentError::InjectionFailed(msg)
+                        } else {
+                            AgentError::InjectionFailed(format!(
+                                "RouteCompare to {} failed after retries: {}",
+                                target_model, e
+                            ))
+                        }
                     })?;
 
                     combined.push_str(&format!("[{} said]:\n{}\n\n", target_model, response));
@@ -1502,11 +1534,13 @@ async fn inject_and_wait_with_retry(
             }));
         }
 
-        // Clear any stale ready signal for this agent before navigation.
+        // Drain any stale Ready events for this agent before navigation.
         // This prevents consuming a setup-phase Ready when we need a fresh one.
-        {
-            let browser = state.browser_state.lock().await;
-            browser.diagnostics.clear_ready_timestamp(target_model);
+        // clear_ready_timestamp only clears a diagnostic timestamp but does not
+        // remove buffered Ready events from the channel.
+        let drained = drain_stale_ready_events(nav_rx, target_model);
+        if drained > 0 {
+            tracing::warn!("[ACTIVE] Drained {} stale Ready events for {}", drained, target_model);
         }
 
         tracing::debug!(

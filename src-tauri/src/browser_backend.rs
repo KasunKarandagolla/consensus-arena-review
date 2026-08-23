@@ -2885,27 +2885,33 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         ].join(' ').toLowerCase();
     }
 
-    function isSendCandidate(el) {
-        if (!el || !(el instanceof Element)) return false;
-        if (!isVisible(el) || !isEnabled(el)) return false;
-        const text = candidateText(el);
-        // P7: Comprehensive attachment/forbidden control detection.
-        // Check actual attribute values, not just concatenated text.
+    // Returns true if the element is a forbidden control (attachment, file upload,
+    // paperclip, voice/mic, stop/cancel/pause) that should never be treated as a
+    // Send button candidate. This is the single source of truth for forbidden
+    // control detection across isSendCandidate, scoreIconOnlySend, and
+    // findEnabledButton (PASS 2 icon-only fallback).
+    function isForbiddenControl(el) {
+        if (!el || !(el instanceof Element)) return true;
         var testId = (el.getAttribute('data-testid') || '').toLowerCase();
         var classAttr = (el.getAttribute('class') || '').toLowerCase();
         var ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
         var title = (el.getAttribute('title') || '').toLowerCase();
+        var text = candidateText(el);
 
-        // P7: Forbidden control indicators - any of these means NOT a Send candidate
+        // Attachment / file upload
         var isAttachmentLike = text.indexOf('attach') !== -1 ||
             testId.indexOf('attach') !== -1 ||
             classAttr.indexOf('attach') !== -1 ||
             ariaLabel.indexOf('attach') !== -1 ||
             title.indexOf('attach') !== -1;
         var isFileUploadLike = text.indexOf('file') !== -1 && text.indexOf('upload') !== -1;
+
+        // Paperclip icon
         var isPaperclip = text.indexOf('paperclip') !== -1 ||
             testId.indexOf('paperclip') !== -1 ||
             classAttr.indexOf('paperclip') !== -1;
+
+        // Voice / microphone
         var isVoice = text.indexOf('voice') !== -1 ||
             text.indexOf('microphone') !== -1 ||
             testId.indexOf('voice') !== -1 ||
@@ -2915,7 +2921,7 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
             ariaLabel.indexOf('voice') !== -1 ||
             ariaLabel.indexOf('microphone') !== -1;
 
-        // P7: Also check for stop/cancel/pause controls
+        // Stop / cancel / pause
         var isStop = text.indexOf('stop') !== -1 ||
             text.indexOf('cancel') !== -1 ||
             text.indexOf('pause') !== -1 ||
@@ -2924,8 +2930,16 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
             title.indexOf('stop') !== -1 ||
             title.indexOf('cancel') !== -1;
 
-        // P7: Reject if ANY forbidden indicator present
-        if (isAttachmentLike || isFileUploadLike || isPaperclip || isVoice || isStop) {
+        return isAttachmentLike || isFileUploadLike || isPaperclip || isVoice || isStop;
+    }
+
+    function isSendCandidate(el) {
+        if (!el || !(el instanceof Element)) return false;
+        if (!isVisible(el) || !isEnabled(el)) return false;
+        const text = candidateText(el);
+        // P7: Comprehensive attachment/forbidden control detection.
+        // Check actual attribute values, not just concatenated text.
+        if (isForbiddenControl(el)) {
             return false;
         }
 
@@ -2947,41 +2961,9 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         if (rect.width < 20 || rect.width > 80 || rect.height < 20 || rect.height > 80) return 0;
         const inputRect = input && input.getBoundingClientRect ? input.getBoundingClientRect() : null;
         if (inputRect && Math.abs(rect.top - inputRect.top) > 140 && Math.abs(rect.bottom - inputRect.bottom) > 140) return 0;
-        const text = candidateText(button);
-        // P7: Comprehensive forbidden control detection for icon-only fallback.
-        // Check actual attribute values, not just concatenated text.
-        var testId = (button.getAttribute('data-testid') || '').toLowerCase();
-        var classAttr = (button.getAttribute('class') || '').toLowerCase();
-        var ariaLabel = (button.getAttribute('aria-label') || '').toLowerCase();
-        var title = (button.getAttribute('title') || '').toLowerCase();
-
-        var isAttachmentLike = text.indexOf('attach') !== -1 ||
-            testId.indexOf('attach') !== -1 ||
-            classAttr.indexOf('attach') !== -1 ||
-            ariaLabel.indexOf('attach') !== -1 ||
-            title.indexOf('attach') !== -1;
-        var isFileUploadLike = text.indexOf('file') !== -1 && text.indexOf('upload') !== -1;
-        var isPaperclip = text.indexOf('paperclip') !== -1 ||
-            testId.indexOf('paperclip') !== -1 ||
-            classAttr.indexOf('paperclip') !== -1;
-        var isVoice = text.indexOf('voice') !== -1 ||
-            text.indexOf('microphone') !== -1 ||
-            testId.indexOf('voice') !== -1 ||
-            testId.indexOf('mic') !== -1 ||
-            classAttr.indexOf('voice') !== -1 ||
-            classAttr.indexOf('mic') !== -1 ||
-            ariaLabel.indexOf('voice') !== -1 ||
-            ariaLabel.indexOf('microphone') !== -1;
-        var isStop = text.indexOf('stop') !== -1 ||
-            text.indexOf('cancel') !== -1 ||
-            text.indexOf('pause') !== -1 ||
-            ariaLabel.indexOf('stop') !== -1 ||
-            ariaLabel.indexOf('cancel') !== -1 ||
-            title.indexOf('stop') !== -1 ||
-            title.indexOf('cancel') !== -1;
 
         // P7: HARD EXCLUSION - forbidden controls NEVER qualify as icon-only Send
-        if (isAttachmentLike || isFileUploadLike || isPaperclip || isVoice || isStop) {
+        if (isForbiddenControl(button)) {
             return 0;
         }
 
@@ -3441,38 +3423,7 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
                 if (!candidate || candidate.disabled || candidate.getAttribute('aria-disabled') === 'true') continue;
                 if (item.strong) continue; // Already handled in PASS 1
                 // P7: Exclude ALL forbidden controls from icon-only fallback
-                var text = candidateText(candidate);
-                var testId = (candidate.getAttribute('data-testid') || '').toLowerCase();
-                var classAttr = (candidate.getAttribute('class') || '').toLowerCase();
-                var ariaLabel = (candidate.getAttribute('aria-label') || '').toLowerCase();
-                var title = (candidate.getAttribute('title') || '').toLowerCase();
-
-                var isAttachmentLike = text.indexOf('attach') !== -1 ||
-                    testId.indexOf('attach') !== -1 ||
-                    classAttr.indexOf('attach') !== -1 ||
-                    ariaLabel.indexOf('attach') !== -1 ||
-                    title.indexOf('attach') !== -1;
-                var isFileUploadLike = text.indexOf('file') !== -1 && text.indexOf('upload') !== -1;
-                var isPaperclip = text.indexOf('paperclip') !== -1 ||
-                    testId.indexOf('paperclip') !== -1 ||
-                    classAttr.indexOf('paperclip') !== -1;
-                var isVoice = text.indexOf('voice') !== -1 ||
-                    text.indexOf('microphone') !== -1 ||
-                    testId.indexOf('voice') !== -1 ||
-                    testId.indexOf('mic') !== -1 ||
-                    classAttr.indexOf('voice') !== -1 ||
-                    classAttr.indexOf('mic') !== -1 ||
-                    ariaLabel.indexOf('voice') !== -1 ||
-                    ariaLabel.indexOf('microphone') !== -1;
-                var isStop = text.indexOf('stop') !== -1 ||
-                    text.indexOf('cancel') !== -1 ||
-                    text.indexOf('pause') !== -1 ||
-                    ariaLabel.indexOf('stop') !== -1 ||
-                    ariaLabel.indexOf('cancel') !== -1 ||
-                    title.indexOf('stop') !== -1 ||
-                    title.indexOf('cancel') !== -1;
-
-                if (isAttachmentLike || isFileUploadLike || isPaperclip || isVoice || isStop) {
+                if (isForbiddenControl(candidate)) {
                     logSendDiag('candidate-rejected-icon', { index: i, reason: 'forbidden-control', desc: describeCandidate(candidate) });
                     continue;
                 }

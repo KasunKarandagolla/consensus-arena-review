@@ -380,7 +380,10 @@ pub async fn run_setup(
                 function valueOf(target) {{ return target && target.tagName === 'TEXTAREA' ? target.value : (target && (target.innerText || target.textContent) || ''); }}
                 function selectContents(target) {{ const range = document.createRange(); range.selectNodeContents(target); const selection = getSelection(); if (selection) {{ selection.removeAllRanges(); selection.addRange(range); }} }}
                 function latestResponse() {{ for (const selector of ['[data-message-author-role="assistant"]','[data-testid="assistant-message"]','[class*="assistant-message"]','[class*="ai-message"]','.markdown','.prose']) {{ const items = document.querySelectorAll(selector); if (items.length) {{ const response = (items[items.length - 1].innerText || '').trim(); if (response) return response; }} }} return ''; }}
-                const baseline = latestResponse();
+                function isTrivialChange(text) {{ if (!text) return true; const t = text.trim(); if (t.length < 10) return true; if (/^(loading|thinking|generating|please wait|\.{{3,}}|…)$/i.test(t)) return true; return false; }}
+                let baseline = '';
+                let stableCount = 0;
+                let lastContent = '';
                 const el = findInput();
                 let method = 'none', error = '';
                 if (!el) {{ error = 'priming input field not found'; }} else {{
@@ -424,16 +427,31 @@ pub async fn run_setup(
                     const id = encodeURIComponent(window.__ca_agentId || '');
                     try {{ window.location.href = 'arena://prompt-injection/' + id + '/' + encodeURIComponent(method) + '/' + (prefixOk ? '1' : '0') + '/' + (suffixOk ? '1' : '0') + '/' + visibleText.length + '/' + (enabled ? '1' : '0') + '/' + encodeURIComponent(el ? el.tagName : '') + '/' + encodeURIComponent(el && el.getAttribute('role') || '') + '/' + encodeURIComponent(el && el.getAttribute('contenteditable') || '') + '/' + encodeURIComponent(error); }} catch (_) {{}}
                     let responseChecks = 0, responseEmitted = false;
+                    function captureBaseline() {{
+                        baseline = latestResponse() || '';
+                        lastContent = baseline;
+                        stableCount = 0;
+                    }}
                     function pollSetupResponse() {{
                         if (responseEmitted || ++responseChecks > 240) return;
-                        if (latestResponse() && latestResponse() !== baseline) {{
-                            responseEmitted = true;
-                            try {{ window.location.href = 'arena://setup-response/' + id; }} catch (_) {{}}
-                            return;
+                        const current = latestResponse() || '';
+                        if (current && !isTrivialChange(current)) {{
+                            if (current === lastContent) {{
+                                stableCount++;
+                                if (stableCount >= 2 && current !== baseline && current.length >= 20) {{
+                                    responseEmitted = true;
+                                    try {{ window.location.href = 'arena://setup-response/' + id; }} catch (_) {{}}
+                                    return;
+                                }}
+                            }} else {{
+                                stableCount = 0;
+                                lastContent = current;
+                            }}
                         }}
                         setTimeout(pollSetupResponse, 500);
                     }}
-                    setTimeout(pollSetupResponse, 1000);
+                    setTimeout(captureBaseline, 2000);
+                    setTimeout(pollSetupResponse, 2500);
                 }}
                 setTimeout(reportInjection, 300);
             }})();"#, priming_json);
