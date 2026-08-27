@@ -1,0 +1,29 @@
+{
+  "productName": "Consensus Arena",
+  "version": "0.1.0",
+  "identifier": "com.consensus.arena",
+  "build": {
+    "beforeDevCommand": "cd src && npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "cd src && npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "security": {
+      "csp": null,
+      "dangerousDisableAssetCspModification": true
+    },
+    "windows": [
+      {
+        "title": "Consensus Arena",
+        "width": 1400,
+        "height": 900
+      }
+    ]
+  },
+  "plugins": {
+    "sql": {},
+    "store": {},
+    "keyring": {}
+  }
+}

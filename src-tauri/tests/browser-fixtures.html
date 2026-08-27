@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Consensus Arena browser fixtures</title>
+<style>body{font:14px sans-serif;padding:20px}.fixture{margin:14px 0;padding:12px;border:1px solid #aaa}textarea,[contenteditable]{min-height:36px;width:420px;border:1px solid #777;padding:6px}</style>
+<h1>Deterministic generic-init fixtures</h1>
+<p>Open with a local development WebView and append <code>?fixture=…</code>; no network account is involved.</p>
+<div class="fixture" id="textarea"><h2>textarea composer auto-submit</h2><textarea placeholder="Message"></textarea><button aria-label="Send" onclick="this.dataset.submitted='true'">Send</button></div>
+<div class="fixture" id="contenteditable"><h2>contenteditable composer auto-submit</h2><div contenteditable="true" role="textbox"></div><button type="submit" onclick="this.dataset.submitted='true'">Send</button></div>
+<div class="fixture" id="prosemirror"><h2>ProseMirror composer</h2><div class="ProseMirror" contenteditable="true"></div><button aria-label="Send message">Send</button></div>
+<div class="fixture" id="placeholder-child"><h2>placeholder child</h2><div contenteditable="true" role="textbox"><p data-placeholder="Message"></p></div><button aria-label="Send">Send</button></div>
+<div class="fixture" id="disabled-send"><h2>disabled send until input</h2><textarea placeholder="Message" oninput="this.nextElementSibling.disabled=!this.value"></textarea><button disabled aria-label="Send" onclick="this.dataset.submitted='true'">Send</button></div>
+<div class="fixture" id="permanently-disabled-send"><h2>permanently disabled send blocks auto-submit</h2><textarea placeholder="Message"></textarea><button disabled aria-label="Send">Send</button></div>
+<div class="fixture" id="setup"><h2>setup injection only</h2><textarea placeholder="Message"></textarea><button aria-label="Send" onclick="this.dataset.submitted='true'">Send</button></div>
+<div class="fixture" id="delayed"><h2>delayed hydration (10 seconds)</h2><div class="loading">Loading…</div></div>
+<div class="fixture" id="login"><h2>login / empty shell</h2><p>Sign in to continue</p></div>
+<div class="fixture" id="response"><h2>response after injection, no send signal fixture</h2><textarea placeholder="Message"></textarea><button aria-label="Send">Send</button><div id="assistant"></div></div>
+<script>
+setTimeout(()=>{const root=document.querySelector('#delayed');root.innerHTML='<textarea placeholder="Message"></textarea><button aria-label="Send">Send</button>'},10000)
+document.querySelector('#response textarea').addEventListener('input',()=>setTimeout(()=>document.querySelector('#assistant').setAttribute('data-message-author-role','assistant'),300))
+</script>

@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default permissions",
+  "windows": ["*", "agent-chatgpt", "agent-claude", "agent-gemini", "agent-deepseek", "agent-qwen"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "core:window:allow-start-dragging",
+    "dialog:default"
+  ]
+}
