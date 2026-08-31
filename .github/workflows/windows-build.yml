@@ -52,10 +52,14 @@ jobs:
         shell: pwsh
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
+      - name: Tauri info (Windows)
+        shell: pwsh
+        run: npx tauri info
+
       - name: Build Tauri Windows (NSIS + MSI)
         shell: pwsh
-        run: npm run tauri build
-        # Produces src-tauri/target/release/bundle/nsis/*.exe and msi/*.msi
+        run: npx tauri build --bundles nsis
+        # Produces src-tauri/target/release/bundle/nsis/*.exe
 
       - name: Inspect bundles
         shell: pwsh
