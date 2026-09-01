@@ -1,4 +1,6 @@
-use crate::browser_harness::{self, BrowserEvent, BrowserTimeline, EventType};
+use crate::browser_harness::{
+    self, ActionRecord, ActionTarget, BoundingRect, BrowserEvent, BrowserTimeline, EventType, NavigationIntent, PageLifecycleEvent, SafeDomForensics, SafeElement,
+};
 use crate::errors::AgentError;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -174,6 +176,11 @@ pub struct BrowserDiagnostics {
     // per-agent current operation_id for correlation (spec 4)
     current_operation: Arc<Mutex<HashMap<String, String>>>,
     current_phase: Arc<Mutex<HashMap<String, String>>>,
+    // Cross-platform forensics extensions (§4-9, §17) — bounded 100 per agent
+    pub navigation_intents: Arc<Mutex<HashMap<String, std::collections::VecDeque<NavigationIntent>>>>,
+    pub lifecycle_events: Arc<Mutex<HashMap<String, std::collections::VecDeque<PageLifecycleEvent>>>>,
+    pub action_records: Arc<Mutex<HashMap<String, std::collections::VecDeque<ActionRecord>>>>,
+    pub safe_dom_snapshots: Arc<Mutex<HashMap<String, std::collections::VecDeque<SafeDomForensics>>>>,
 }
 
 impl BrowserDiagnostics {
@@ -186,7 +193,110 @@ impl BrowserDiagnostics {
             timeline: BrowserTimeline::new(),
             current_operation: Arc::new(Mutex::new(HashMap::new())),
             current_phase: Arc::new(Mutex::new(HashMap::new())),
+            navigation_intents: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_events: Arc::new(Mutex::new(HashMap::new())),
+            action_records: Arc::new(Mutex::new(HashMap::new())),
+            safe_dom_snapshots: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn record_navigation_intent(&self, agent_id: &str, window_label: &str, window_kind: &str, url: &str, reason: &str) -> String {
+        let intent_id = crate::browser_harness::new_navigation_intent_id();
+        let generation = self.setup_generation();
+        let operation_id = self.current_operation_id(agent_id);
+        let intent = NavigationIntent {
+            intent_id: intent_id.clone(),
+            agent_id: agent_id.to_string(),
+            window_label: window_label.to_string(),
+            window_kind: window_kind.to_string(),
+            url: crate::browser_harness::redact_url(url),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            reason: reason.to_string(),
+            setup_generation: generation,
+            operation_id: operation_id.clone(),
+        };
+        let mut map = self.navigation_intents.lock().unwrap_or_else(|p| p.into_inner());
+        let deque = map.entry(agent_id.to_string()).or_insert_with(std::collections::VecDeque::new);
+        if deque.len() >= crate::browser_harness::MAX_NAVIGATION_INTENT_RECORDS_PER_AGENT {
+            deque.pop_front();
+        }
+        deque.push_back(intent.clone());
+        self.emit_harness_event(agent_id, EventType::NavigationStarted, &self.current_phase_str(agent_id), &operation_id, url, serde_json::json!({ "navigation_intent_id": intent_id, "reason": reason, "intent_url": crate::browser_harness::redact_url(url) }));
+        intent_id
+    }
+
+    pub fn record_lifecycle_event(&self, agent_id: &str, event_type: &str, url: &str, title: &str) {
+        let generation = self.setup_generation();
+        let operation_id = self.current_operation_id(agent_id);
+        let window_info = self.records.lock().unwrap_or_else(|p| p.into_inner()).get(agent_id).map(|r| (r.window_label.clone(), r.window_kind.clone())).unwrap_or(("unknown".to_string(), "nav".to_string()));
+        let ev = PageLifecycleEvent {
+            event_type: event_type.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            url: crate::browser_harness::redact_url(url),
+            title: crate::browser_harness::sanitize_details_value(title),
+            agent_id: agent_id.to_string(),
+            window_label: window_info.0,
+            window_kind: window_info.1,
+            setup_generation: generation,
+            operation_id: operation_id.clone(),
+        };
+        let mut map = self.lifecycle_events.lock().unwrap_or_else(|p| p.into_inner());
+        let deque = map.entry(agent_id.to_string()).or_insert_with(std::collections::VecDeque::new);
+        if deque.len() >= crate::browser_harness::MAX_LIFECYCLE_RECORDS_PER_AGENT {
+            deque.pop_front();
+        }
+        deque.push_back(ev.clone());
+        let et = match event_type {
+            "DOMContentLoaded" => EventType::DomContentLoaded,
+            "load" => EventType::DocumentLoaded,
+            "beforeunload" => EventType::Unknown,
+            "pagehide" => EventType::Unknown,
+            "visibilitychange" => EventType::Unknown,
+            "pageshow" => EventType::Unknown,
+            "history_pushState" => EventType::Unknown,
+            "history_replaceState" => EventType::Unknown,
+            _ => EventType::Unknown,
+        };
+        self.emit_harness_event(agent_id, et, &self.current_phase_str(agent_id), &operation_id, url, serde_json::json!({ "lifecycle": event_type, "title": crate::browser_harness::sanitize_details_value(title) }));
+    }
+
+    pub fn record_safe_dom_forensics(&self, agent_id: &str, forensics: SafeDomForensics) {
+        let mut map = self.safe_dom_snapshots.lock().unwrap_or_else(|p| p.into_inner());
+        let deque = map.entry(agent_id.to_string()).or_insert_with(std::collections::VecDeque::new);
+        if deque.len() >= crate::browser_harness::MAX_SAFE_DOM_SNAPSHOTS_PER_AGENT {
+            deque.pop_front();
+        }
+        deque.push_back(forensics.clone());
+        self.emit_harness_event(agent_id, EventType::DomSnapshot, &self.current_phase_str(agent_id), &forensics.operation_id, &forensics.url, serde_json::to_value(&forensics).unwrap_or(serde_json::Value::Null));
+    }
+
+    pub fn record_action(&self, agent_id: &str, action: &str, actor: &str, reason: &str, target: ActionTarget) {
+        let operation_id = self.current_operation_id(agent_id);
+        let window_info = self.records.lock().unwrap_or_else(|p| p.into_inner()).get(agent_id).map(|r| (r.window_label.clone(), r.window_kind.clone())).unwrap_or(("unknown".to_string(), "nav".to_string()));
+        let rec = ActionRecord {
+            action: action.to_string(),
+            actor: actor.to_string(),
+            agent_id: agent_id.to_string(),
+            window_label: window_info.0,
+            window_kind: window_info.1,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            reason: reason.to_string(),
+            target: target.clone(),
+            operation_id: operation_id.clone(),
+        };
+        let mut map = self.action_records.lock().unwrap_or_else(|p| p.into_inner());
+        let deque = map.entry(agent_id.to_string()).or_insert_with(std::collections::VecDeque::new);
+        if deque.len() >= crate::browser_harness::MAX_ACTION_RECORDS_PER_AGENT {
+            deque.pop_front();
+        }
+        deque.push_back(rec.clone());
+        let et = match action {
+            "navigation" => EventType::NavigationStarted,
+            "click" => EventType::Unknown,
+            "input" => EventType::Unknown,
+            _ => EventType::Unknown,
+        };
+        self.emit_harness_event(agent_id, et, &self.current_phase_str(agent_id), &operation_id, "", serde_json::json!({ "action": action, "actor": actor, "reason": reason, "target": target }));
     }
 
     pub fn set_operation(&self, agent_id: &str, operation_id: &str, phase: &str) {
@@ -362,6 +472,22 @@ impl BrowserDiagnostics {
             .unwrap_or_else(|p| p.into_inner())
             .clear();
         self.current_phase
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.navigation_intents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.lifecycle_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.action_records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.safe_dom_snapshots
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
@@ -1189,6 +1315,9 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
         NavEvent::ResumeRequested(agent_id) => Some((agent_id.as_str(), "resume")),
         NavEvent::ManualResponse { agent_id, .. } => Some((agent_id.as_str(), "manual_response")),
         NavEvent::ConsoleDiagnostic { .. } => None,
+        NavEvent::PageLifecycle { agent_id, .. } => Some((agent_id.as_str(), "lifecycle")),
+        NavEvent::SafeDomForensics { agent_id, .. } => Some((agent_id.as_str(), "dom-forensics")),
+        NavEvent::ActionEvent { agent_id, .. } => Some((agent_id.as_str(), "action")),
         NavEvent::UnsupportedNavigation { .. } | NavEvent::SessionAborted => None,
     }
 }
@@ -1286,6 +1415,21 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             message,
             Some(url),
         );
+        return;
+    }
+
+    if let NavEvent::PageLifecycle { agent_id, window_label, event_type, url, title } = event {
+        diagnostics.record_lifecycle_event(agent_id, event_type, url, title);
+        return;
+    }
+
+    if let NavEvent::SafeDomForensics { agent_id, window_label: _, forensics } = event {
+        diagnostics.record_safe_dom_forensics(agent_id, forensics.clone());
+        return;
+    }
+
+    if let NavEvent::ActionEvent { agent_id, window_label: _, action, actor, reason, target } = event {
+        diagnostics.record_action(agent_id, action, actor, reason, target.clone());
         return;
     }
 
@@ -2137,6 +2281,26 @@ pub enum NavEvent {
         message: String,
         url: String,
     },
+    PageLifecycle {
+        agent_id: String,
+        window_label: String,
+        event_type: String,
+        url: String,
+        title: String,
+    },
+    SafeDomForensics {
+        agent_id: String,
+        window_label: String,
+        forensics: crate::browser_harness::SafeDomForensics,
+    },
+    ActionEvent {
+        agent_id: String,
+        window_label: String,
+        action: String,
+        actor: String,
+        reason: String,
+        target: crate::browser_harness::ActionTarget,
+    },
 }
 
 // ── BrowserState ──────────────────────────────────────────────────────────────
@@ -2291,6 +2455,7 @@ pub fn navigate_agent_window(
         );
     }
     diagnostics.record_arena_navigation_request(agent_id, &window_label, target_url, "navigation_started");
+    diagnostics.record_navigation_intent(agent_id, &window_label, window_kind, target_url, "app_navigation");
 
     let sanitized = sanitized_url(target_url);
     if let Some(record) = update_diagnostic(diagnostics, agent_id, |record| {
@@ -2843,6 +3008,78 @@ fn handle_arena_url(
                         url,
                     },
                 );
+            } else {
+                send_unknown_arena_signal(&tx, window_label, url);
+            }
+        }
+        ("lifecycle", args) => {
+            if args.len() >= 3 {
+                let agent_id = args[0].clone();
+                let event_type = args[1].clone();
+                let url = urlencoding::decode(&args[2]).unwrap_or_default().into_owned();
+                let title = if args.len() >= 4 {
+                    urlencoding::decode(&args[3]).unwrap_or_default().into_owned()
+                } else {
+                    String::new()
+                };
+                send_nav_event(
+                    &tx,
+                    NavEvent::PageLifecycle {
+                        agent_id,
+                        window_label: window_label.to_string(),
+                        event_type,
+                        url,
+                        title,
+                    },
+                );
+            } else {
+                send_unknown_arena_signal(&tx, window_label, url);
+            }
+        }
+        ("dom", args) => {
+            if !args.is_empty() {
+                let agent_id = args[0].clone();
+                let encoded = args[1..].join("/");
+                let json_str = urlencoding::decode(&encoded).unwrap_or_default().into_owned();
+                if let Ok(forensics) = serde_json::from_str::<crate::browser_harness::SafeDomForensics>(&json_str) {
+                    send_nav_event(
+                        &tx,
+                        NavEvent::SafeDomForensics {
+                            agent_id,
+                            window_label: window_label.to_string(),
+                            forensics,
+                        },
+                    );
+                } else {
+                    send_unknown_arena_signal(&tx, window_label, url);
+                }
+            } else {
+                send_unknown_arena_signal(&tx, window_label, url);
+            }
+        }
+        ("action", args) => {
+            if args.len() >= 5 {
+                let agent_id = args[0].clone();
+                let action = args[1].clone();
+                let actor = args[2].clone();
+                let reason = urlencoding::decode(&args[3]).unwrap_or_default().into_owned();
+                let encoded_target = args[4..].join("/");
+                let target_json = urlencoding::decode(&encoded_target).unwrap_or_default().into_owned();
+                if let Ok(target) = serde_json::from_str::<crate::browser_harness::ActionTarget>(&target_json) {
+                    send_nav_event(
+                        &tx,
+                        NavEvent::ActionEvent {
+                            agent_id,
+                            window_label: window_label.to_string(),
+                            action,
+                            actor,
+                            reason,
+                            target,
+                        },
+                    );
+                } else {
+                    send_unknown_arena_signal(&tx, window_label, url);
+                }
             } else {
                 send_unknown_arena_signal(&tx, window_label, url);
             }
@@ -4038,6 +4275,103 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         var _legacyCe = console.error;
         // no-op: legacy handler already replaced above; just ensure arena://log still works for any external callers
     } catch (e) {}
+})();
+
+// Cross-platform forensics: page lifecycle, history, safe DOM, action attribution
+(function() {
+    if (window.__ca_lifecycleInstalled) return;
+    window.__ca_lifecycleInstalled = true;
+    function getAgentIdLC() {
+        if (window.__ca_agentId) return window.__ca_agentId;
+        try { var p='__consensus_arena_agent__:'; if(typeof window.name==='string'&&window.name.indexOf(p)===0) return window.name.substring(p.length); } catch(e){}
+        return 'unknown';
+    }
+    function sendLifecycle(eventType) {
+        try {
+            var agentId = getAgentIdLC();
+            var url = ''; try { url = window.location.href.slice(0,500); } catch(e){}
+            var title=''; try { title = (document.title||'').slice(0,200); } catch(e){}
+            var encUrl = encodeURIComponent(url);
+            var encTitle = encodeURIComponent(title);
+            window.location.href = 'arena://lifecycle/' + encodeURIComponent(agentId) + '/' + encodeURIComponent(eventType) + '/' + encUrl + '/' + encTitle;
+        } catch(e){}
+    }
+    try { window.addEventListener('DOMContentLoaded', function(){ sendLifecycle('DOMContentLoaded'); }); } catch(e){}
+    try { window.addEventListener('load', function(){ sendLifecycle('load'); }); } catch(e){}
+    try { window.addEventListener('beforeunload', function(){ sendLifecycle('beforeunload'); }); } catch(e){}
+    try { window.addEventListener('pagehide', function(){ sendLifecycle('pagehide'); }); } catch(e){}
+    try { window.addEventListener('pageshow', function(){ sendLifecycle('pageshow'); }); } catch(e){}
+    try { window.addEventListener('unload', function(){ sendLifecycle('unload'); }); } catch(e){}
+    try { document.addEventListener('visibilitychange', function(){ sendLifecycle('visibilitychange:' + (document.visibilityState||'')); }); } catch(e){}
+    try { window.addEventListener('popstate', function(){ sendLifecycle('popstate'); }); } catch(e){}
+    try { window.addEventListener('hashchange', function(){ sendLifecycle('hashchange'); }); } catch(e){}
+    try {
+        var _origPush = history.pushState;
+        history.pushState = function() {
+            var ret = _origPush.apply(this, arguments);
+            try { sendLifecycle('history_pushState'); } catch(e){}
+            try { window.dispatchEvent(new Event('__ca_history')); } catch(e){}
+            return ret;
+        };
+        var _origReplace = history.replaceState;
+        history.replaceState = function() {
+            var ret = _origReplace.apply(this, arguments);
+            try { sendLifecycle('history_replaceState'); } catch(e){}
+            try { window.dispatchEvent(new Event('__ca_history')); } catch(e){}
+            return ret;
+        };
+    } catch(e){}
+    var _lastUrl = ''; try { _lastUrl = window.location.href; } catch(e){}
+    try { setInterval(function(){ try { if(window.location.href!==_lastUrl){ _lastUrl=window.location.href; sendLifecycle('url_changed_JS'); } } catch(e){} }, 1000); } catch(e){}
+    // Safe DOM forensics helper — called on demand via eval, not continuous
+    window.__ca_collectSafeDom = function(operationId) {
+        try {
+            var url=''; try{ url=window.location.href.slice(0,500);}catch(e){}
+            var title=''; try{ title=(document.title||'').slice(0,200);}catch(e){}
+            function safeEl(el){
+                if(!el||!(el instanceof Element)) return {tag:'',role:'',aria_label:'',name:'',enabled:false,visible:false,bounding_rect:null};
+                var rect=null; try{ var r=el.getBoundingClientRect(); rect={x:r.x,y:r.y,width:r.width,height:r.height}; }catch(e){}
+                var visible=false; try{ var s=getComputedStyle(el); visible=s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0; }catch(e){}
+                return {tag:el.tagName||'',role:el.getAttribute('role')||'',aria_label:el.getAttribute('aria-label')||'',name:(el.getAttribute('name')||el.textContent||'').slice(0,50),enabled:!el.disabled&&el.getAttribute('aria-disabled')!=='true',visible:visible,bounding_rect:rect};
+            }
+            var activeEl=null; try{ activeEl=document.activeElement; }catch(e){}
+            var active=safeEl(activeEl);
+            function collectLabels(selector, max){
+                var out=[]; try{ var nodes=document.querySelectorAll(selector); for(var i=0;i<nodes.length&&out.length<max;i++){ var n=nodes[i]; if(n instanceof Element){ var t=(n.textContent||n.getAttribute('aria-label')||'').trim().slice(0,50); if(t) out.push(t); } } }catch(e){}
+                return out;
+            }
+            var buttonLabels=collectLabels('button,[role="button"]',10);
+            var inputTypes=[]; try{ var ins=document.querySelectorAll('input'); for(var i=0;i<ins.length&&inputTypes.length<10;i++){ inputTypes.push((ins[i].type||'').slice(0,20)); } }catch(e){}
+            var inputPlaceholders=[]; try{ var ips=document.querySelectorAll('input[placeholder],textarea[placeholder]'); for(var i=0;i<ips.length&&inputPlaceholders.length<10;i++){ inputPlaceholders.push((ips[i].getAttribute('placeholder')||'').slice(0,30)); } }catch(e){}
+            var linkLabels=collectLabels('a',10);
+            function candidateButtons(keywords, max){
+                var cands=[]; try{ var btns=document.querySelectorAll('button,[role="button"],input[type="submit"],input[type="button"]'); for(var i=0;i<btns.length&&cands.length<max;i++){ var b=btns[i]; var txt=((b.textContent||b.value||b.getAttribute('aria-label')||'')+'').toLowerCase(); for(var k=0;k<keywords.length;k++){ if(txt.indexOf(keywords[k])!==-1){ cands.push(safeEl(b)); break; } } } }catch(e){}
+                return cands;
+            }
+            var forensics = {
+                url: url,
+                title: title,
+                active_element: active,
+                button_labels: buttonLabels,
+                input_types: inputTypes,
+                input_placeholders: inputPlaceholders,
+                link_labels: linkLabels,
+                candidate_login_buttons: candidateButtons(['login','sign in','sign-in','log in'],3),
+                candidate_next_buttons: candidateButtons(['next','continue'],3),
+                candidate_send_buttons: candidateButtons(['send','submit','arrow'],3),
+                candidate_attachment_buttons: candidateButtons(['attach','file','upload','clip'],3),
+                timestamp: new Date().toISOString(),
+                operation_id: operationId||''
+            };
+            var json = JSON.stringify(forensics);
+            if(json.length>4000) json=json.slice(0,4000)+' [truncated]';
+            var enc=json; try{ enc=encodeURIComponent(json); }catch(e){}
+            if(enc.length>6000) enc=encodeURIComponent(json.slice(0,3000)+' [truncated]');
+            window.location.href='arena://dom/' + encodeURIComponent(getAgentIdLC()) + '/' + enc;
+        } catch(e){}
+    };
+    // Initial lifecycle after install
+    try { setTimeout(function(){ sendLifecycle('forensics_ready'); }, 500); } catch(e){}
 })();
 
 // Main agent init

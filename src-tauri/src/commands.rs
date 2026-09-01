@@ -1040,6 +1040,13 @@ struct DiagnosticSnapshot {
     browser_timeline: Vec<crate::browser_harness::BrowserEvent>,
     browser_timeline_dropped: std::collections::HashMap<String, usize>,
     browser_timeline_count: usize,
+    // Cross-platform forensics extensions (§4-9, §14)
+    navigation_intents: Vec<crate::browser_harness::NavigationIntent>,
+    lifecycle_events: Vec<crate::browser_harness::PageLifecycleEvent>,
+    safe_dom_snapshots: Vec<crate::browser_harness::SafeDomForensics>,
+    action_records: Vec<crate::browser_harness::ActionRecord>,
+    // Recent failures + auth hints
+    recent_failures: Vec<serde_json::Value>,
     command_timestamp: String,
 }
 
@@ -1086,7 +1093,7 @@ pub async fn get_diagnostic_snapshot(
     .await
     .map_err(|e| settings_command_error("Failed to read memory health", e))?;
 
-    let (browser_diagnostics, browser_timeline, browser_timeline_dropped, browser_timeline_count) = {
+    let (browser_diagnostics, browser_timeline, browser_timeline_dropped, browser_timeline_count, navigation_intents, lifecycle_events, safe_dom_snapshots, action_records, recent_failures) = {
         let browser = state.browser_state.lock().await;
         let diag = browser.diagnostics.snapshot();
         let tl = browser.diagnostics.timeline.all_events_sorted();
@@ -1098,7 +1105,12 @@ pub async fn get_diagnostic_snapshot(
             }
         }
         let count = browser.diagnostics.timeline.total_events();
-        (diag, tl, dropped, count)
+        let nav_intents = browser.diagnostics.navigation_intents.lock().unwrap_or_else(|p| p.into_inner()).values().flat_map(|d| d.iter().cloned()).collect::<Vec<_>>();
+        let lifecycle = browser.diagnostics.lifecycle_events.lock().unwrap_or_else(|p| p.into_inner()).values().flat_map(|d| d.iter().cloned()).collect::<Vec<_>>();
+        let dom = browser.diagnostics.safe_dom_snapshots.lock().unwrap_or_else(|p| p.into_inner()).values().flat_map(|d| d.iter().cloned()).collect::<Vec<_>>();
+        let actions = browser.diagnostics.action_records.lock().unwrap_or_else(|p| p.into_inner()).values().flat_map(|d| d.iter().cloned()).collect::<Vec<_>>();
+        let recent_failures = tl.iter().filter(|e| e.event_type.contains("failed") || e.event_type.contains("error") || e.event_type.contains("blocked") || e.event_type.contains("missing")).take(20).map(|e| serde_json::json!({ "timestamp": e.timestamp, "agent_id": e.agent_id, "event_type": e.event_type, "operation_id": e.operation_id, "url": e.url })).collect::<Vec<_>>();
+        (diag, tl, dropped, count, nav_intents, lifecycle, dom, actions, recent_failures)
     };
     // Top-level console summary derived from per-agent vectors.
     let browser_console_error_count = browser_diagnostics
@@ -1138,6 +1150,11 @@ pub async fn get_diagnostic_snapshot(
         browser_timeline,
         browser_timeline_dropped,
         browser_timeline_count,
+        navigation_intents,
+        lifecycle_events,
+        safe_dom_snapshots,
+        action_records,
+        recent_failures,
         command_timestamp: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -1192,6 +1209,36 @@ pub async fn export_browser_diagnostics(state: tauri::State<'_, AppState>, app: 
     let console: Vec<_> = browser_diagnostics.iter().flat_map(|r| r.console_diagnostics.clone()).collect();
     let console_path = export_dir.join("console-errors.json");
     std::fs::write(&console_path, serde_json::to_string_pretty(&console).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    // Cross-platform forensics: lifecycle, dom, actions, intents
+    let (lifecycle, dom_snapshots, actions, intents, full_snapshot) = {
+        let browser = state.browser_state.lock().await;
+        let lc = browser.diagnostics.lifecycle_events.lock().unwrap_or_else(|p| p.into_inner()).values().flat_map(|d| d.iter().cloned()).collect::<Vec<_>>();
+        let dom = browser.diagnostics.safe_dom_snapshots.lock().unwrap_or_else(|p| p.into_inner()).values().flat_map(|d| d.iter().cloned()).collect::<Vec<_>>();
+        let acts = browser.diagnostics.action_records.lock().unwrap_or_else(|p| p.into_inner()).values().flat_map(|d| d.iter().cloned()).collect::<Vec<_>>();
+        let intents = browser.diagnostics.navigation_intents.lock().unwrap_or_else(|p| p.into_inner()).values().flat_map(|d| d.iter().cloned()).collect::<Vec<_>>();
+        // Full diagnostic snapshot for forensic file
+        let diag = browser.diagnostics.snapshot();
+        let tl = browser.diagnostics.timeline.all_events_sorted();
+        let snapshot = serde_json::json!({
+            "browser_diagnostics": diag,
+            "timeline": tl,
+            "lifecycle_events": lc.clone(),
+            "safe_dom_snapshots": dom.clone(),
+            "action_records": acts.clone(),
+            "navigation_intents": intents.clone(),
+        });
+        (lc, dom, acts, intents, snapshot)
+    };
+    let lifecycle_path = export_dir.join("lifecycle-events.json");
+    std::fs::write(&lifecycle_path, serde_json::to_string_pretty(&lifecycle).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let dom_path = export_dir.join("safe-dom-snapshots.json");
+    std::fs::write(&dom_path, serde_json::to_string_pretty(&dom_snapshots).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let actions_path = export_dir.join("action-records.json");
+    std::fs::write(&actions_path, serde_json::to_string_pretty(&actions).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let intents_path = export_dir.join("navigation-intents.json");
+    std::fs::write(&intents_path, serde_json::to_string_pretty(&intents).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let snapshot_path = export_dir.join("diagnostic-snapshot.json");
+    std::fs::write(&snapshot_path, serde_json::to_string_pretty(&full_snapshot).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     // BROWSER_RELIABILITY_REPORT.md
     let timeline_obj = {
         let browser = state.browser_state.lock().await;
@@ -1207,6 +1254,11 @@ pub async fn export_browser_diagnostics(state: tauri::State<'_, AppState>, app: 
         "browser_diagnostics": diag_path.to_string_lossy(),
         "navigation_history": nav_path.to_string_lossy(),
         "console_errors": console_path.to_string_lossy(),
+        "lifecycle_events": lifecycle_path.to_string_lossy(),
+        "safe_dom_snapshots": dom_path.to_string_lossy(),
+        "action_records": actions_path.to_string_lossy(),
+        "navigation_intents": intents_path.to_string_lossy(),
+        "diagnostic_snapshot": snapshot_path.to_string_lossy(),
     });
     Ok(serde_json::to_string(&result).map_err(|e| e.to_string())?)
 }

@@ -1012,6 +1012,220 @@ fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n { s.to_string() } else { format!("{} [truncated]", &s[..n]) }
 }
 
+// ── Cross-Platform Forensic Extensions (spec §4-12, §17-19) ─────────────────
+
+pub const MAX_LIFECYCLE_RECORDS_PER_AGENT: usize = 100;
+pub const MAX_ACTION_RECORDS_PER_AGENT: usize = 100;
+pub const MAX_NAVIGATION_INTENT_RECORDS_PER_AGENT: usize = 100;
+pub const MAX_SAFE_DOM_SNAPSHOTS_PER_AGENT: usize = 20;
+pub const MAX_BUTTON_LABELS: usize = 10;
+pub const MAX_LABEL_LENGTH: usize = 50;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NavigationIntent {
+    pub intent_id: String,
+    pub agent_id: String,
+    pub window_label: String,
+    pub window_kind: String,
+    pub url: String,
+    pub timestamp: String,
+    pub reason: String,
+    pub setup_generation: u32,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageLifecycleEvent {
+    pub event_type: String,
+    pub timestamp: String,
+    pub url: String,
+    pub title: String,
+    pub agent_id: String,
+    pub window_label: String,
+    pub window_kind: String,
+    pub setup_generation: u32,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundingRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafeElement {
+    pub tag: String,
+    pub role: String,
+    pub aria_label: String,
+    pub name: String,
+    pub enabled: bool,
+    pub visible: bool,
+    pub bounding_rect: Option<BoundingRect>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafeDomForensics {
+    pub url: String,
+    pub title: String,
+    pub active_element: SafeElement,
+    pub button_labels: Vec<String>,
+    pub input_types: Vec<String>,
+    pub input_placeholders: Vec<String>,
+    pub link_labels: Vec<String>,
+    pub candidate_login_buttons: Vec<SafeElement>,
+    pub candidate_next_buttons: Vec<SafeElement>,
+    pub candidate_send_buttons: Vec<SafeElement>,
+    pub candidate_attachment_buttons: Vec<SafeElement>,
+    pub timestamp: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionTarget {
+    pub tag: String,
+    pub role: String,
+    pub aria_label: String,
+    pub placeholder: String,
+    pub method: String,
+    pub text_length: usize,
+    pub text_hash: String,
+    pub classification: String,
+    pub enabled: bool,
+    pub visible: bool,
+    pub coordinates: Option<(f64, f64)>,
+    pub bounding_rect: Option<BoundingRect>,
+    pub selection_logic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRecord {
+    pub action: String,
+    pub actor: String,
+    pub agent_id: String,
+    pub window_label: String,
+    pub window_kind: String,
+    pub timestamp: String,
+    pub reason: String,
+    pub target: ActionTarget,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionResult {
+    pub action_id: String,
+    pub timestamp: String,
+    pub url_before: String,
+    pub url_after: String,
+    pub title_before: String,
+    pub title_after: String,
+    pub navigation_detected: bool,
+    pub lifecycle_events: Vec<String>,
+    pub console_errors_delta: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClassification {
+    NavigationStarted,
+    NavigationCompleted,
+    NavigationFailed,
+    UnexpectedRedirect,
+    UnexpectedReload,
+    NavigationTimeout,
+    LoginButtonMissing,
+    LoginClickFailed,
+    GoogleLoginDetected,
+    GoogleLoginActionFailed,
+    AuthRedirectDetected,
+    AuthCompletionDetected,
+    AuthStateUnknown,
+    PageNotLoaded,
+    PageHealthBlocked,
+    ChallengeDetected,
+    CaptchaDetected,
+    LoginRequired,
+    ComposerDetected,
+    ComposerMissing,
+    TargetNotFound,
+    WrongTargetRejected,
+    TargetDisabled,
+    TargetNotVisible,
+    TargetDetached,
+    ClickFailed,
+    InjectionFailed,
+    SubmissionFailed,
+    UnknownBrowserFailure,
+}
+
+impl FailureClassification {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NavigationStarted => "navigation_started",
+            Self::NavigationCompleted => "navigation_completed",
+            Self::NavigationFailed => "navigation_failed",
+            Self::UnexpectedRedirect => "unexpected_redirect",
+            Self::UnexpectedReload => "unexpected_reload",
+            Self::NavigationTimeout => "navigation_timeout",
+            Self::LoginButtonMissing => "login_button_missing",
+            Self::LoginClickFailed => "login_click_failed",
+            Self::GoogleLoginDetected => "google_login_detected",
+            Self::GoogleLoginActionFailed => "google_login_action_failed",
+            Self::AuthRedirectDetected => "auth_redirect_detected",
+            Self::AuthCompletionDetected => "auth_completion_detected",
+            Self::AuthStateUnknown => "auth_state_unknown",
+            Self::PageNotLoaded => "page_not_loaded",
+            Self::PageHealthBlocked => "page_health_blocked",
+            Self::ChallengeDetected => "challenge_detected",
+            Self::CaptchaDetected => "captcha_detected",
+            Self::LoginRequired => "login_required",
+            Self::ComposerDetected => "composer_detected",
+            Self::ComposerMissing => "composer_missing",
+            Self::TargetNotFound => "target_not_found",
+            Self::WrongTargetRejected => "wrong_target_rejected",
+            Self::TargetDisabled => "target_disabled",
+            Self::TargetNotVisible => "target_not_visible",
+            Self::TargetDetached => "target_detached",
+            Self::ClickFailed => "click_failed",
+            Self::InjectionFailed => "injection_failed",
+            Self::SubmissionFailed => "submission_failed",
+            Self::UnknownBrowserFailure => "unknown_browser_failure",
+        }
+    }
+}
+
+pub fn new_navigation_intent_id() -> String {
+    format!("nav-{}-{}", chrono::Utc::now().timestamp_millis(), uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"))
+}
+
+pub fn sanitize_button_label(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    if s.len() > MAX_LABEL_LENGTH {
+        s.truncate(MAX_LABEL_LENGTH);
+        s.push_str("…");
+    }
+    sanitize_details_value(&s)
+}
+
+pub fn classify_failure_from_timeline(events: &[BrowserEvent]) -> FailureClassification {
+    if events.is_empty() {
+        return FailureClassification::UnknownBrowserFailure;
+    }
+    let last = events.last().expect("non-empty");
+    match last.event_type.as_str() {
+        "navigation_failed" => FailureClassification::NavigationFailed,
+        "navigation_started" if last.details.get("unexpected").and_then(|v| v.as_bool()) == Some(true) => FailureClassification::UnexpectedReload,
+        "challenge_detected" | "captcha_detected" => FailureClassification::ChallengeDetected,
+        "composer_lost" | "input_lost" => FailureClassification::ComposerMissing,
+        "login_page_detected" => FailureClassification::LoginRequired,
+        "target_not_found" => FailureClassification::TargetNotFound,
+        "wrong_button_rejected_pre_click" => FailureClassification::WrongTargetRejected,
+        _ => FailureClassification::UnknownBrowserFailure,
+    }
+}
+
 // ── Helpers for JS snapshots ─────────────────────────────────────────────────
 
 pub fn empty_dom_snapshot() -> DomSnapshot {
@@ -1024,6 +1238,24 @@ pub fn empty_dom_snapshot() -> DomSnapshot {
         composer_identity: None,
         send_identity: None,
         attachment_identity: None,
+    }
+}
+
+pub fn empty_safe_dom_forensics(operation_id: &str, url: &str) -> SafeDomForensics {
+    SafeDomForensics {
+        url: redact_url(url),
+        title: "".to_string(),
+        active_element: SafeElement { tag: "".to_string(), role: "".to_string(), aria_label: "".to_string(), name: "".to_string(), enabled: false, visible: false, bounding_rect: None },
+        button_labels: Vec::new(),
+        input_types: Vec::new(),
+        input_placeholders: Vec::new(),
+        link_labels: Vec::new(),
+        candidate_login_buttons: Vec::new(),
+        candidate_next_buttons: Vec::new(),
+        candidate_send_buttons: Vec::new(),
+        candidate_attachment_buttons: Vec::new(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        operation_id: operation_id.to_string(),
     }
 }
 
@@ -1229,5 +1461,95 @@ mod tests {
         assert!(md.contains("ChatGPT"));
         assert!(md.contains("priming_injection_started"));
         assert!(md.contains("BROWSER_RELIABILITY_REPORT"));
+    }
+
+    #[test]
+    fn navigation_intent_id_unique_and_bounded() {
+        let id1 = new_navigation_intent_id();
+        let id2 = new_navigation_intent_id();
+        assert_ne!(id1, id2);
+        assert!(id1.starts_with("nav-"));
+    }
+
+    #[test]
+    fn failure_classification_maps_correctly() {
+        assert_eq!(FailureClassification::NavigationFailed.as_str(), "navigation_failed");
+        assert_eq!(FailureClassification::LoginButtonMissing.as_str(), "login_button_missing");
+        let ev = build_browser_event("s", "chatgpt", "ChatGPT", "arena-nav", "nav", 1, "priming", "op", "navigation_failed", "https://chatgpt.com/", serde_json::json!({}), None);
+        let cls = classify_failure_from_timeline(&[ev]);
+        assert_eq!(cls, FailureClassification::NavigationFailed);
+    }
+
+    #[test]
+    fn safe_dom_forensics_redacts_and_bounds() {
+        let mut forensics = empty_safe_dom_forensics("op-1", "https://example.com/?token=SECRET&next=/chat");
+        forensics.title = "Test Title ".repeat(50);
+        forensics.button_labels = vec!["a".repeat(100)];
+        let json = serde_json::to_string(&forensics).expect("serialize");
+        assert!(json.contains("example.com"));
+        assert!(!json.contains("SECRET"));
+        // label truncated
+        assert!(sanitize_button_label(&"a".repeat(100)).len() <= MAX_LABEL_LENGTH + 10);
+    }
+
+    #[test]
+    fn bounded_retention_respects_limits() {
+        // Simulate bounded retention for lifecycle (100)
+        let mut deque: std::collections::VecDeque<PageLifecycleEvent> = std::collections::VecDeque::new();
+        for i in 0..(MAX_LIFECYCLE_RECORDS_PER_AGENT + 10) {
+            if deque.len() >= MAX_LIFECYCLE_RECORDS_PER_AGENT {
+                deque.pop_front();
+            }
+            deque.push_back(PageLifecycleEvent {
+                event_type: "load".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                url: format!("https://example.com/{}", i),
+                title: "t".to_string(),
+                agent_id: "chatgpt".to_string(),
+                window_label: "arena-nav".to_string(),
+                window_kind: "nav".to_string(),
+                setup_generation: 1,
+                operation_id: "op".to_string(),
+            });
+        }
+        assert_eq!(deque.len(), MAX_LIFECYCLE_RECORDS_PER_AGENT);
+    }
+
+    #[test]
+    fn timeline_ordering_chronological() {
+        let tl = BrowserTimeline::new();
+        let ev1 = build_browser_event("s", "chatgpt", "ChatGPT", "arena-nav", "nav", 1, "priming", "op1", "navigation_started", "https://a.com/", serde_json::json!({}), None);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let ev2 = build_browser_event("s", "chatgpt", "ChatGPT", "arena-nav", "nav", 1, "priming", "op1", "dom_snapshot", "https://a.com/", serde_json::json!({}), None);
+        tl.record(ev2.clone());
+        tl.record(ev1.clone());
+        let sorted = tl.all_events_sorted();
+        assert!(sorted[0].timestamp <= sorted[1].timestamp);
+    }
+
+    #[test]
+    fn json_serialization_safe_dom_and_action() {
+        let forensics = empty_safe_dom_forensics("op", "https://example.com/");
+        let json = serde_json::to_string(&forensics).expect("serialize");
+        let de: SafeDomForensics = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(de.operation_id, "op");
+        let target = ActionTarget {
+            tag: "BUTTON".to_string(),
+            role: "button".to_string(),
+            aria_label: "Send".to_string(),
+            placeholder: "".to_string(),
+            method: "click".to_string(),
+            text_length: 4,
+            text_hash: "abc".to_string(),
+            classification: "Send".to_string(),
+            enabled: true,
+            visible: true,
+            coordinates: Some((10.0, 20.0)),
+            bounding_rect: Some(BoundingRect { x: 0.0, y: 0.0, width: 100.0, height: 30.0 }),
+            selection_logic: "text-match".to_string(),
+        };
+        let json2 = serde_json::to_string(&target).expect("serialize target");
+        let de2: ActionTarget = serde_json::from_str(&json2).expect("deserialize target");
+        assert_eq!(de2.classification, "Send");
     }
 }
