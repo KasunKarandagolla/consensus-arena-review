@@ -1,5 +1,12 @@
 import { create } from 'zustand'
 
+export interface Participant {
+  agent_id: string
+  display_name: string
+  base_url: string
+  is_custom: boolean
+}
+
 export interface BlueprintSection {
   id: string
   title: string
@@ -40,7 +47,18 @@ export interface ToastMessage {
   duration?: number
 }
 
+export type ActiveBrainKind = 'primary' | 'fallback' | 'secondary' | 'unavailable' | 'unknown'
+
+export interface ActiveBrainStatus {
+  kind: ActiveBrainKind
+  model: string
+}
+
 export interface AppStore {
+  // P3: unified participant registry (built-ins + persisted custom)
+  participants: Participant[]
+  setParticipants: (participants: Participant[]) => void
+
   // Session state
   sessionStatus: 'idle' | 'setup' | 'priming' | 'requirements' | 'running' | 'paused' | 'complete' | 'ended'
   setupProgress: string[]
@@ -52,6 +70,7 @@ export interface AppStore {
   setupFailedAgentId: string | null
   activeAgentId: string | null
   activeTurnNumber: number | null
+  activeBrain: ActiveBrainStatus
 
   // Blueprint
   blueprintSections: BlueprintSection[]
@@ -90,6 +109,7 @@ export interface AppStore {
   setSetupFailedAgentId: (id: string | null) => void
   setActiveAgentId: (id: string | null) => void
   setActiveTurn: (agentId: string | null, turnNumber: number | null) => void
+  setActiveBrain: (status: ActiveBrainStatus) => void
 
   clearSessionState: () => void
 
@@ -116,6 +136,17 @@ export interface AppStore {
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
+  participants: [
+    { agent_id: 'chatgpt', display_name: 'ChatGPT', base_url: 'https://chatgpt.com', is_custom: false },
+    { agent_id: 'claude', display_name: 'Claude', base_url: 'https://claude.ai', is_custom: false },
+    { agent_id: 'gemini', display_name: 'Gemini', base_url: 'https://gemini.google.com', is_custom: false },
+    { agent_id: 'deepseek', display_name: 'DeepSeek', base_url: 'https://chat.deepseek.com', is_custom: false },
+    { agent_id: 'qwen', display_name: 'Qwen', base_url: 'https://chat.qwen.ai', is_custom: false },
+    { agent_id: 'glm', display_name: 'GLM', base_url: 'https://chat.z.ai/', is_custom: false },
+    { agent_id: 'kimi', display_name: 'Kimi', base_url: 'https://www.kimi.com/', is_custom: false },
+  ],
+  setParticipants: (participants) => set({ participants }),
+
   sessionStatus: 'idle',
   setupProgress: [],
   selectedSessionId: null,
@@ -126,6 +157,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setupFailedAgentId: null,
   activeAgentId: null,
   activeTurnNumber: null,
+  activeBrain: { kind: 'unknown', model: '' },
   blueprintSections: [],
   liveStatusText: '',
   liveStatusExpanded: false,
@@ -153,6 +185,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setSetupFailedAgentId: (id) => set({ setupFailedAgentId: id }),
   setActiveAgentId: (id) => set({ activeAgentId: id }),
   setActiveTurn: (agentId, turnNumber) => set({ activeAgentId: agentId, activeTurnNumber: turnNumber }),
+  setActiveBrain: (status) => set({ activeBrain: status }),
 
   clearSessionState: () => set({
     blueprintSections: [],
@@ -167,6 +200,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     setupFailedAgentId: null,
     activeAgentId: null,
     activeTurnNumber: null,
+    activeBrain: { kind: 'unknown', model: '' },
   }),
 
   upsertBlueprintSection: (section) => set((s) => {

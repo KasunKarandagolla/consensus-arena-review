@@ -1,6 +1,7 @@
 /// <reference types="vite/client" />
 import { useEffect } from 'react'
 import { safeInvoke as invoke } from '@/lib/tauri'
+import { loadParticipants } from '@/lib/agents'
 import { useIpcListeners } from '@/hooks/useIpcListeners'
 import { useAppStore } from '@/stores/useAppStore'
 import Sidebar from '@/components/layout/Sidebar'
@@ -27,14 +28,25 @@ export default function App() {
   // `className="ca-xxx"` / `animation: 'ca-xxx ...'` reference is
   // unaffected since the class/keyframe names are identical.
 
-  // Check for recoverable session on startup
+  // Check for recoverable session on startup + load the unified participant
+  // registry (built-ins + persisted custom) so every participant consumer and
+  // name resolution is populated for the whole session.
   useEffect(() => {
+    void loadParticipants()
     invoke<string>('get_recovery_state')
       .then((raw) => {
         const state = JSON.parse(raw) as { available: boolean; session_id: string }
         if (state.available) setRecoveryState(state)
       })
       .catch(console.error)
+    invoke<string>('get_brain_status')
+      .then((raw) => {
+        try {
+          const status = JSON.parse(raw) as { kind: string; model: string }
+          useAppStore.getState().setActiveBrain({ kind: status.kind as import('@/stores/useAppStore').ActiveBrainKind, model: status.model })
+        } catch {}
+      })
+      .catch(() => {})
   }, [setRecoveryState])
 
   const isActive =

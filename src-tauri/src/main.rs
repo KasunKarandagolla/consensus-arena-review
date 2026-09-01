@@ -5,6 +5,7 @@ mod agentic_manager;
 mod agent_brain;
 mod blueprint_store;
 mod browser_backend;
+mod browser_harness;
 mod capability_registry;
 mod commands;
 mod context_manager;
@@ -116,9 +117,16 @@ fn main() {
             commands::get_secondary_brain_config,   // D-039
             commands::save_fallback_brain_config,   // Task 5 (HIGH-3)
             commands::get_fallback_brain_config,    // Task 5 (HIGH-3)
+            commands::save_custom_participants,     // P1
+            commands::get_custom_participants,      // P1
+            commands::get_participants,             // P3 unified registry
             commands::save_prompt_template,
             commands::get_prompt_template,
             commands::get_diagnostic_snapshot,
+            commands::get_browser_timeline,
+            commands::get_browser_reliability_report,
+            commands::export_browser_diagnostics,
+            commands::run_single_model_diagnostic,
             // Data retrieval
             commands::get_transcript,
             commands::get_session_list,
@@ -131,6 +139,9 @@ fn main() {
             // IMP-7: Session recovery
             commands::get_recovery_state,
             commands::recover_session,
+            // Connected Accounts Launch + Brain status
+            commands::launch_connected_account,
+            commands::get_brain_status,
             // Phase 1 memory
             commands::get_project_memory,
             commands::get_global_memory,

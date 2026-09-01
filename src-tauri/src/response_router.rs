@@ -1,5 +1,4 @@
 use std::sync::atomic::Ordering;
-use std::collections::HashMap;
 use std::time::Duration;
 use tauri::AppHandle;
 use tauri::Emitter;
@@ -7,12 +6,12 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
-use crate::agent_brain::{AgentBrain, AgentDecision};
+use crate::agent_brain::{AgentBrain, AgentDecision, BrainSource};
 use crate::blueprint_store::{BlueprintSection, SectionStatus};
 use crate::browser_backend::NavEvent;
 use crate::errors::{AgentError, ErrorKind};
 use crate::memory_store::SessionSummaryData;
-use crate::orchestrator::{AppState, ModelHealth, SessionConfig};
+use crate::orchestrator::{ActiveBrainKind, ActiveBrainStatus, AppState, ModelHealth, SessionConfig};
 
 struct PendingAdoptionCheck {
     model_id: String,
@@ -23,6 +22,13 @@ struct PendingAdoptionCheck {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const RESPONSE_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum number of submit-action retries before falling back to manual
+/// recovery. Attempt 0 is the initial auto-submit; attempts 1..=N re-invoke
+/// `window.__caRetrySubmit` with a freshly discovered composer.
+const MAX_SUBMIT_ACTION_RETRIES: u32 = 3;
+/// Timeout awaiting a fresh `ActiveSubmitReport` ack for each submit attempt.
+const SUBMIT_ACK_TIMEOUT_SECS: u64 = 30;
 
 /// IMP-2: Maximum number of retry attempts for participant injection.
 /// Attempt 0 is the initial try; attempts 1–3 are retries with backoff.
@@ -65,6 +71,153 @@ fn drain_stale_active_events(nav_rx: &mut Receiver<NavEvent>) -> usize {
     drained
 }
 
+/// Outcome of the active-turn auto-submit confirmation gate.
+enum SubmitOutcome {
+    /// The page reported the exact (agent_id, turn) as submitted.
+    Confirmed,
+    /// A response for this turn was already captured while awaiting the ack.
+    ResponseEarly(String),
+    /// Auto-submit could not be confirmed after bounded action retries.
+    /// The prompt remains in the composer; the user must send or paste.
+    ManualRecovery,
+}
+
+/// Wait for the single `ActiveSubmitReport` matching the exact (agent_id,
+/// turn). Returns `Some(text)` if a response for this turn arrives before the
+/// ack (rare), `None` on a successful ack, and `Err` on a failed ack.
+async fn await_submit_ack(
+    agent_id: &str,
+    turn: u32,
+    nav_rx: &mut Receiver<NavEvent>,
+) -> Result<Option<String>, AgentError> {
+    loop {
+        match nav_rx.recv().await {
+            Some(NavEvent::ActiveSubmitReport {
+                agent_id: ev_agent,
+                turn: ev_turn,
+                succeeded,
+                method,
+                send_enabled,
+                error,
+            }) if ev_agent == agent_id && ev_turn == turn => {
+                if succeeded {
+                    return Ok(None);
+                }
+                let detail =
+                    error.unwrap_or_else(|| format!("method={method} enabled={send_enabled}"));
+                return Err(AgentError::InjectionFailed(format!("submit failed: {detail}")));
+            }
+            Some(NavEvent::Response(ev_agent, ev_turn, text))
+                if ev_agent == agent_id && ev_turn == turn =>
+            {
+                tracing::warn!(
+                    "[SUBMIT] response for {agent_id} turn {turn} arrived before its ack; treating as confirmed"
+                );
+                return Ok(Some(text));
+            }
+            Some(NavEvent::ManualResponse {
+                agent_id: ev_agent,
+                turn: ev_turn,
+                response,
+            }) if ev_agent == agent_id && ev_turn == turn =>
+            {
+                return Ok(Some(response));
+            }
+            Some(NavEvent::SessionAborted) => {
+                return Err(AgentError::UnknownError("Session aborted".to_string()));
+            }
+            Some(NavEvent::Error(ev_agent)) if ev_agent == agent_id => {
+                return Err(AgentError::ExtractionFailed(format!(
+                    "Agent {} reported an error",
+                    ev_agent
+                )));
+            }
+            Some(_) => continue,
+            None => {
+                return Err(AgentError::NavigationFailed(
+                    "Navigation channel closed while awaiting submit ack".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+/// Confirm the active prompt was actually submitted. Each attempt awaits a
+/// fresh `ActiveSubmitReport` for the exact (agent_id, turn); on failure the
+/// submit ACTION is retried via `retry_active_submit` (bounded). Final failure
+/// downgrades to explicit manual recovery for the exact (agent_id, turn) so the
+/// turn is never silently advanced or left hanging.
+async fn confirm_active_submit(
+    window: &tauri::WebviewWindow,
+    agent_id: &str,
+    turn: u32,
+    nav_rx: &mut Receiver<NavEvent>,
+    app: &AppHandle,
+) -> Result<SubmitOutcome, AgentError> {
+    let mut last_error: Option<String> = None;
+
+    for attempt in 0..=MAX_SUBMIT_ACTION_RETRIES {
+        match timeout(
+            Duration::from_secs(SUBMIT_ACK_TIMEOUT_SECS),
+            await_submit_ack(agent_id, turn, nav_rx),
+        )
+        .await
+        {
+            Ok(Ok(Some(response))) => {
+                return Ok(SubmitOutcome::ResponseEarly(response));
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(
+                    "[SUBMIT] {agent_id} turn {turn} confirmed (attempt {attempt})"
+                );
+                return Ok(SubmitOutcome::Confirmed);
+            }
+            Ok(Err(e)) => {
+                last_error = Some(e.to_string());
+                tracing::warn!(
+                    "[SUBMIT] {agent_id} turn {turn} ack error (attempt {attempt}): {e}"
+                );
+            }
+            Err(_) => {
+                last_error = Some(format!(
+                    "no submit confirmation within {SUBMIT_ACK_TIMEOUT_SECS}s"
+                ));
+                tracing::warn!(
+                    "[SUBMIT] {agent_id} turn {turn} ack timeout (attempt {attempt}/{MAX_SUBMIT_ACTION_RETRIES})"
+                );
+            }
+        }
+
+        if attempt < MAX_SUBMIT_ACTION_RETRIES {
+            if let Err(e) = crate::browser_backend::retry_active_submit(window, agent_id, turn) {
+                tracing::warn!(
+                    "[SUBMIT] retry eval for {agent_id} turn {turn} failed: {e}"
+                );
+            }
+        }
+    }
+
+    let detail = last_error.unwrap_or_else(|| "unknown submit failure".to_string());
+    let display = crate::browser_backend::display_name_for(agent_id);
+    let _ = app.emit("boss-message", serde_json::json!({
+        "text": format!(
+            "Auto-submit for {} (turn {}) could not be confirmed: {}. The prompt may already be in the composer — press Send in that window or use Paste Response to continue.",
+            display, turn, detail
+        ),
+        "message_type": "status"
+    }));
+    let _ = app.emit("active-turn-state", serde_json::json!({
+        "event": "active_submit_failed",
+        "agent_id": agent_id,
+        "turn_number": turn,
+        "error": detail,
+    }));
+    Ok(SubmitOutcome::ManualRecovery)
+}
+
+/// Returns `Some(response)` only when the response was captured before the
+/// submit ack (rare); otherwise `None` and the caller waits via
+/// `wait_for_response`.
 async fn inject_active_prompt(
     window: tauri::WebviewWindow,
     agent_id: &str,
@@ -73,7 +226,7 @@ async fn inject_active_prompt(
     state: &AppState,
     app: &AppHandle,
     nav_rx: &mut Receiver<NavEvent>,
-) -> Result<(), AgentError> {
+) -> Result<Option<String>, AgentError> {
     {
         let mut browser = state.browser_state.lock().await;
         browser.begin_active_turn(agent_id, turn);
@@ -83,11 +236,43 @@ async fn inject_active_prompt(
         "agent_id": agent_id,
         "turn_number": turn,
     }));
-    crate::browser_backend::inject_to_window(window, agent_id, prompt, turn, nav_rx, false, true)
-        .await
-        .map_err(|error| {
-            AgentError::InjectionFailed(format!("Failed to inject active prompt for {agent_id}: {error}"))
-        })?;
+    crate::browser_backend::inject_to_window(
+        window.clone(),
+        agent_id,
+        prompt,
+        turn,
+        nav_rx,
+        false,
+        true,
+    )
+    .await
+    .map_err(|error| {
+        AgentError::InjectionFailed(format!(
+            "Failed to inject active prompt for {agent_id}: {error}"
+        ))
+    })?;
+
+    let outcome = confirm_active_submit(&window, agent_id, turn, nav_rx, app).await?;
+    let early_response = match outcome {
+        SubmitOutcome::Confirmed => None,
+        SubmitOutcome::ResponseEarly(response) => Some(response),
+        SubmitOutcome::ManualRecovery => {
+            let diagnostics = {
+                let browser = state.browser_state.lock().await;
+                browser.diagnostics.clone()
+            };
+            crate::browser_backend::record_browser_error(
+                app,
+                &diagnostics,
+                agent_id,
+                &format!(
+                    "auto-submit not confirmed after {MAX_SUBMIT_ACTION_RETRIES} action retries"
+                ),
+            );
+            None
+        }
+    };
+
     {
         let browser = state.browser_state.lock().await;
         browser.mark_active_waiting(agent_id, turn);
@@ -102,7 +287,7 @@ async fn inject_active_prompt(
         "agent_id": agent_id,
         "turn_number": turn,
     }));
-    Ok(())
+    Ok(early_response)
 }
 
 async fn finish_active_turn(state: &AppState, agent_id: &str, turn: u32) {
@@ -216,6 +401,13 @@ pub async fn run_agent_loop(
     // the rest of this session.  It never flips back — we keep using brain2.
     let mut use_secondary: bool = false;
 
+    // Initialize brain status to Unknown at session start
+    {
+        let mut ab = state.active_brain.lock().await;
+        *ab = ActiveBrainStatus { kind: ActiveBrainKind::Unknown, model: String::new() };
+    }
+    let _ = app.emit("brain-status", serde_json::json!({ "active": "unknown", "model": "" }));
+
     let drained = drain_stale_active_events(nav_rx);
     if drained > 0 {
         tracing::warn!("[ACTIVE] Drained {drained} setup-era events before turn 1");
@@ -230,7 +422,7 @@ pub async fn run_agent_loop(
         "Consensus Arena active turn 1 (session {}).\n\nProject brief:\n{}\n\nConstraints: work as the panel leader, keep the first draft practical and concise, and identify decisions or questions worth consulting another model on. Produce the first short proposal/blueprint draft now. Do not answer only CONSENSUS on this active turn. Respond now with the requested draft/proposal.",
         config.session_id, config.project_brief
     );
-    inject_active_prompt(
+    let early_turn1 = inject_active_prompt(
         leader_window,
         &leader_id,
         &first_prompt,
@@ -241,6 +433,7 @@ pub async fn run_agent_loop(
     )
     .await?;
     let mut next_leader_turn: u32 = 2;
+    let mut early_leader_response: Option<String> = early_turn1;
 
     loop {
         iteration += 1;
@@ -256,47 +449,50 @@ pub async fn run_agent_loop(
         );
 
         let active_turn = next_leader_turn.saturating_sub(1);
-        let leader_response = loop {
-            match wait_for_response(&leader_id, active_turn, nav_rx).await {
-                Ok(response) => break response,
-                Err(AgentError::Timeout(error)) => {
-                    let _ = app.emit("active-turn-state", serde_json::json!({
-                        "event": "active_turn_timeout",
-                        "agent_id": &leader_id,
-                        "turn_number": active_turn,
-                    }));
-                    let _ = app.emit(
-                        "boss-message",
-                        serde_json::json!({
-                            "text": format!("Leader response was not captured: {error}. Paste the visible response to continue, or wait for browser capture."),
-                            "message_type": "status"
-                        }),
-                    );
-                    // Keep the exact active turn registered so a manual response
-                    // remains valid after a browser-capture timeout.
+        let leader_response = match early_leader_response.take() {
+            Some(response) => response,
+            None => loop {
+                match wait_for_response(&leader_id, active_turn, nav_rx).await {
+                    Ok(response) => break response,
+                    Err(AgentError::Timeout(error)) => {
+                        let _ = app.emit("active-turn-state", serde_json::json!({
+                            "event": "active_turn_timeout",
+                            "agent_id": &leader_id,
+                            "turn_number": active_turn,
+                        }));
+                        let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Leader response was not captured: {error}. Paste the visible response to continue, or wait for browser capture."),
+                                "message_type": "status"
+                            }),
+                        );
+                        // Keep the exact active turn registered so a manual response
+                        // remains valid after a browser-capture timeout.
+                    }
+                    Err(error) => {
+                        finish_active_turn(state, &leader_id, active_turn).await;
+                        let diagnostics = {
+                            let browser = state.browser_state.lock().await;
+                            browser.diagnostics.clone()
+                        };
+                        crate::browser_backend::record_browser_error(
+                            app,
+                            &diagnostics,
+                            &leader_id,
+                            &error.to_string(),
+                        );
+                        let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Leader window stopped responding: {error}"),
+                                "message_type": "status"
+                            }),
+                        );
+                        return Err(error);
+                    }
                 }
-                Err(error) => {
-                    finish_active_turn(state, &leader_id, active_turn).await;
-                    let diagnostics = {
-                        let browser = state.browser_state.lock().await;
-                        browser.diagnostics.clone()
-                    };
-                    crate::browser_backend::record_browser_error(
-                        app,
-                        &diagnostics,
-                        &leader_id,
-                        &error.to_string(),
-                    );
-                    let _ = app.emit(
-                        "boss-message",
-                        serde_json::json!({
-                            "text": format!("Leader window stopped responding: {error}"),
-                            "message_type": "status"
-                        }),
-                    );
-                    return Err(error);
-                }
-            }
+            },
         };
         finish_active_turn(state, &leader_id, active_turn).await;
 
@@ -358,23 +554,53 @@ pub async fn run_agent_loop(
         // Call decide() on whichever brain is active.
         // Holding the brain2 guard across .await is acceptable for
         // tokio::sync::MutexGuard (it is Send).
-        let decision_result = if use_secondary {
+        let decision_result: Result<(AgentDecision, ActiveBrainKind, String), AgentError> = if use_secondary {
             let guard = state.agent_brain_2.lock().await;
             if let Some(b2) = guard.as_ref() {
-                b2.decide(&leader_response, &context, mem_ctx).await
+                let model = b2.model_name().to_string();
+                match b2.decide_with_source(&leader_response, &context, mem_ctx).await {
+                    Ok((decision, _source)) => Ok((decision, ActiveBrainKind::Secondary, model)),
+                    Err(e) => Err(e),
+                }
             } else {
                 drop(guard);
                 // No secondary configured — fall back to primary for this iter.
-                brain.decide(&leader_response, &context, mem_ctx).await
+                match brain.decide_with_source(&leader_response, &context, mem_ctx).await {
+                    Ok((decision, source)) => {
+                        let kind = if source == BrainSource::Fallback { ActiveBrainKind::Fallback } else { ActiveBrainKind::Primary };
+                        let model = if kind == ActiveBrainKind::Fallback { brain.fallback_model_name().unwrap_or(brain.model_name()).to_string() } else { brain.model_name().to_string() };
+                        Ok((decision, kind, model))
+                    }
+                    Err(e) => Err(e),
+                }
             }
         } else {
-            brain.decide(&leader_response, &context, mem_ctx).await
+            match brain.decide_with_source(&leader_response, &context, mem_ctx).await {
+                Ok((decision, source)) => {
+                    let kind = if source == BrainSource::Fallback { ActiveBrainKind::Fallback } else { ActiveBrainKind::Primary };
+                    let model = if kind == ActiveBrainKind::Fallback { brain.fallback_model_name().unwrap_or(brain.model_name()).to_string() } else { brain.model_name().to_string() };
+                    Ok((decision, kind, model))
+                }
+                Err(e) => Err(e),
+            }
         };
 
-        let mut decision = match decision_result {
-            Ok(d) => {
+        let decision = match decision_result {
+            Ok((d, kind, model)) => {
                 // Reset consecutive failure counter on success.
                 state.brain_fail_count.store(0, Ordering::SeqCst);
+                // Update active brain status and emit event
+                {
+                    let mut ab = state.active_brain.lock().await;
+                    *ab = ActiveBrainStatus { kind: kind.clone(), model: model.clone() };
+                }
+                let kind_str = match kind {
+                    ActiveBrainKind::Primary => "primary",
+                    ActiveBrainKind::Fallback => "fallback",
+                    ActiveBrainKind::Secondary => "secondary",
+                    _ => "unknown",
+                };
+                let _ = app.emit("brain-status", serde_json::json!({ "active": kind_str, "model": model, "iteration": iteration }));
                 d
             }
             Err(e) => {
@@ -384,6 +610,12 @@ pub async fn run_agent_loop(
                     count,
                     e
                 );
+                // Update active brain to unavailable
+                {
+                    let mut ab = state.active_brain.lock().await;
+                    *ab = ActiveBrainStatus { kind: ActiveBrainKind::Unavailable, model: String::new() };
+                }
+                let _ = app.emit("brain-status", serde_json::json!({ "active": "unavailable", "model": "", "iteration": iteration }));
                 unclassified_count = unclassified_count.saturating_add(1);
                 let _ = app.emit("agent_brain_decision_failed", serde_json::json!({
                     "iteration": iteration,
@@ -421,18 +653,12 @@ pub async fn run_agent_loop(
             }
         };
 
-        if deepseek_selected && !deepseek_consulted
-            && (consult_deepseek_once || leader_requests_consultation(&leader_response))
-            && !matches!(&decision, AgentDecision::Route { target_model, .. } if resolve_selected_agent_id(target_model, config).as_deref() == Some("deepseek"))
-        {
-            let _ = app.emit("agent_brain_decision_fallback", serde_json::json!({
-                "kind": "route", "target_agent_id": "deepseek", "reason": "required_or_requested_consultation",
-            }));
-            decision = AgentDecision::Route {
-                target_model: "deepseek".to_string(),
-                prompt: format!("Review the leader proposal for risks, simplifications, and missing MVP constraints. Return concise actionable critique for the leader.\n\nLeader proposal:\n{}", leader_response),
-            };
-        }
+        // A healthy AgentDecision returned by the brain is authoritative. No
+        // post-brain-success keyword override may replace it: the brain's own
+        // intelligence routes to the participant it selects (see the A3 probe,
+        // which returned Route(deepseek) directly). Only the error-arm fallback
+        // (a failure safety mechanism) may synthesize a decision when decide()
+        // itself fails.
 
         // D-040 [LOOP]
         tracing::debug!("[LOOP] iter={} decision={:?}", iteration, decision);
@@ -567,10 +793,7 @@ pub async fn run_agent_loop(
                 // navigation, injection, response wait, retries, and health updates.
                 let participant_response = inject_and_wait_with_retry(
                     &target_model,
-                    &format!(
-                        "Consensus Arena participant active turn {iteration}. You are {}.\n\nProject brief:\n{}\n\nLeader proposal:\n{}\n\nRequested review:\n{}\n\nReturn concise risks, simplifications, and actionable critique for the leader.",
-                        target_model, config.project_brief, leader_response, prompt
-                    ),
+                    &prompt,
                     iteration,
                     state,
                     nav_rx,
@@ -607,7 +830,7 @@ pub async fn run_agent_loop(
                     iteration,
                     return_prompt.len()
                 );
-                inject_active_prompt(
+                early_leader_response = inject_active_prompt(
                     leader_window,
                     &leader_id,
                     &return_prompt,
@@ -730,7 +953,7 @@ pub async fn run_agent_loop(
                     iteration,
                     combined_msg.len()
                 );
-                inject_active_prompt(
+                early_leader_response = inject_active_prompt(
                     leader_window,
                     &leader_id,
                     &combined_msg,
@@ -846,7 +1069,7 @@ pub async fn run_agent_loop(
                 let ack =
                     "Section recorded. Please continue with the next section or signal completion.";
                 tracing::debug!("[INJECT] Blueprint ack → {} turn={}", leader_id, iteration);
-                inject_active_prompt(
+                early_leader_response = inject_active_prompt(
                     leader_window,
                     &leader_id,
                     ack,
@@ -879,7 +1102,7 @@ pub async fn run_agent_loop(
                 tracing::debug!("[LOCK] released browser_state for Continue");
 
                 tracing::debug!("[INJECT] Continue → {} turn={}", leader_id, iteration);
-                inject_active_prompt(
+                early_leader_response = inject_active_prompt(
                     leader_window,
                     &leader_id,
                     "Please continue.",
@@ -1014,7 +1237,7 @@ pub async fn run_agent_loop(
                     iteration,
                     context_prompt.len()
                 );
-                inject_active_prompt(
+                early_leader_response = inject_active_prompt(
                     leader_window,
                     &leader_id,
                     &context_prompt,
@@ -1153,6 +1376,16 @@ async fn inject_and_wait_with_retry(
 
     let mut last_err: Option<AgentError> = None;
 
+    // P1: load the persisted custom participants once so the navigation-URL
+    // fallback can resolve a custom participant's base URL through the merged
+    // registry. Best-effort: a read failure falls back to built-ins only.
+    let custom = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .unwrap_or_default();
+
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
             // Exponential backoff: 2s, 4s, 8s — capped at 60 s.
@@ -1194,8 +1427,8 @@ async fn inject_and_wait_with_retry(
                 .get(target_model)
                 .and_then(|url| url.clone())
                 .or_else(|| {
-                    crate::browser_backend::get_agent_config(target_model)
-                        .map(|config| config.base_url.to_string())
+                    crate::browser_backend::resolve_participant(target_model, &custom)
+                        .map(|info| info.base_url)
                 })
                 .ok_or_else(|| {
                     AgentError::NavigationFailed(format!(
@@ -1251,7 +1484,7 @@ async fn inject_and_wait_with_retry(
             "turn_number": turn,
         }));
         match crate::browser_backend::inject_to_window(
-            nav_window,
+            nav_window.clone(),
             target_model,
             prompt,
             turn,
@@ -1290,18 +1523,62 @@ async fn inject_and_wait_with_retry(
                 continue; // retry
             }
             Ok(()) => {
-                let browser = state.browser_state.lock().await;
-                browser.mark_active_waiting(target_model, turn);
-                let _ = app.emit("active-turn-state", serde_json::json!({
-                    "event": "active_prompt_injected",
-                    "agent_id": target_model,
-                    "turn_number": turn,
-                }));
-                let _ = app.emit("active-turn-state", serde_json::json!({
-                    "event": "active_waiting_for_response",
-                    "agent_id": target_model,
-                    "turn_number": turn,
-                }));
+                let outcome = confirm_active_submit(
+                    &nav_window,
+                    target_model,
+                    turn,
+                    nav_rx,
+                    app,
+                )
+                .await?;
+                match outcome {
+                    SubmitOutcome::ResponseEarly(response) => {
+                        finish_active_turn(state, target_model, turn).await;
+                        let _ = app.emit("active-turn-state", serde_json::json!({
+                            "event": "active_response_captured",
+                            "agent_id": target_model,
+                            "turn_number": turn,
+                        }));
+                        let _ = app.emit("agent-message", serde_json::json!({
+                            "agent_id": target_model,
+                            "role": "participant",
+                            "response": &response,
+                            "tokens": 0,
+                            "iteration": turn,
+                            "source_type": "browser_or_manual"
+                        }));
+                        update_model_health(state, target_model, true, None).await;
+                        return Ok(response);
+                    }
+                    SubmitOutcome::ManualRecovery => {
+                        let browser = state.browser_state.lock().await;
+                        browser.mark_active_waiting(target_model, turn);
+                        let _ = app.emit("active-turn-state", serde_json::json!({
+                            "event": "active_prompt_injected",
+                            "agent_id": target_model,
+                            "turn_number": turn,
+                        }));
+                        let _ = app.emit("active-turn-state", serde_json::json!({
+                            "event": "active_waiting_for_response",
+                            "agent_id": target_model,
+                            "turn_number": turn,
+                        }));
+                    }
+                    SubmitOutcome::Confirmed => {
+                        let browser = state.browser_state.lock().await;
+                        browser.mark_active_waiting(target_model, turn);
+                        let _ = app.emit("active-turn-state", serde_json::json!({
+                            "event": "active_prompt_injected",
+                            "agent_id": target_model,
+                            "turn_number": turn,
+                        }));
+                        let _ = app.emit("active-turn-state", serde_json::json!({
+                            "event": "active_waiting_for_response",
+                            "agent_id": target_model,
+                            "turn_number": turn,
+                        }));
+                    }
+                }
             }
         }
 
@@ -1404,7 +1681,6 @@ async fn wait_for_response(
     nav_rx: &mut Receiver<NavEvent>,
 ) -> Result<String, AgentError> {
     let deadline = Duration::from_secs(RESPONSE_TIMEOUT_SECS);
-    let mut chunks: HashMap<String, (u32, HashMap<u32, String>)> = HashMap::new();
 
     loop {
         match timeout(deadline, nav_rx.recv()).await {
@@ -1412,28 +1688,6 @@ async fn wait_for_response(
                 // D-040 [NAV]
                 tracing::debug!("[NAV] {:?}", event);
                 match event {
-                    NavEvent::ResponseStart { agent_id: ev_agent, turn: ev_turn, message_id, chunk_count }
-                        if ev_agent == agent_id && ev_turn == turn => {
-                        chunks.insert(message_id, (chunk_count, HashMap::new()));
-                    }
-                    NavEvent::ResponseChunk { agent_id: ev_agent, turn: ev_turn, message_id, index, text }
-                        if ev_agent == agent_id && ev_turn == turn => {
-                        if let Some((_, received)) = chunks.get_mut(&message_id) {
-                            received.insert(index, text);
-                        }
-                    }
-                    NavEvent::ResponseEnd { agent_id: ev_agent, turn: ev_turn, message_id }
-                        if ev_agent == agent_id && ev_turn == turn => {
-                        if let Some((expected, received)) = chunks.remove(&message_id) {
-                            if received.len() == expected as usize {
-                                let mut response = String::new();
-                                for index in 0..expected {
-                                    if let Some(chunk) = received.get(&index) { response.push_str(chunk); } else { break; }
-                                }
-                                if !response.is_empty() { return Ok(response); }
-                            }
-                        }
-                    }
                     NavEvent::Response(ev_agent, ev_turn, text) => {
                         if ev_agent == agent_id && ev_turn == turn {
                             return Ok(text);
@@ -1485,5 +1739,130 @@ async fn wait_for_response(
                 )));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn active_submit_report(
+        agent_id: &str,
+        turn: u32,
+        succeeded: bool,
+        error: Option<&str>,
+    ) -> NavEvent {
+        NavEvent::ActiveSubmitReport {
+            agent_id: agent_id.to_string(),
+            turn,
+            succeeded,
+            method: "button_click".to_string(),
+            send_enabled: true,
+            error: error.map(|e| e.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_accepts_success_report_for_exact_agent_turn() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(active_submit_report("deepseek", 3, true, None)).await.unwrap();
+        drop(tx);
+        let result = await_submit_ack("deepseek", 3, &mut rx).await;
+        assert!(matches!(result, Ok(None)), "expected Ok(None), got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn ack_rejects_failure_report_for_exact_agent_turn() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(active_submit_report("chatgpt", 2, false, Some("enabled_send_button_not_found_after_retry")))
+            .await
+            .unwrap();
+        drop(tx);
+        let result = await_submit_ack("chatgpt", 2, &mut rx).await;
+        assert!(matches!(result, Err(AgentError::InjectionFailed(_))), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn ack_skips_stale_reports_from_other_agents_and_turns() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(active_submit_report("deepseek", 3, true, None)).await.unwrap();
+        tx.send(active_submit_report("chatgpt", 1, true, None)).await.unwrap();
+        tx.send(active_submit_report("chatgpt", 2, true, None)).await.unwrap();
+        drop(tx);
+        let result = await_submit_ack("chatgpt", 2, &mut rx).await;
+        assert!(matches!(result, Ok(None)), "expected Ok(None), got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn ack_captures_early_response_for_exact_agent_turn() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(NavEvent::Response("chatgpt".to_string(), 4, "early text".to_string()))
+            .await
+            .unwrap();
+        drop(tx);
+        let result = await_submit_ack("chatgpt", 4, &mut rx).await;
+        assert!(
+            matches!(result, Ok(Some(ref text)) if text == "early text"),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_accepts_manual_response_for_exact_agent_turn() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(NavEvent::ManualResponse {
+            agent_id: "deepseek".to_string(),
+            turn: 5,
+            response: "pasted".to_string(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let result = await_submit_ack("deepseek", 5, &mut rx).await;
+        assert!(
+            matches!(result, Ok(Some(ref text)) if text == "pasted"),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_surfaces_session_aborted() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(NavEvent::SessionAborted).await.unwrap();
+        drop(tx);
+        let result = await_submit_ack("chatgpt", 1, &mut rx).await;
+        assert!(matches!(result, Err(AgentError::UnknownError(_))), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn ack_errors_when_channel_closed_before_matching_report() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        drop(tx);
+        let result = await_submit_ack("chatgpt", 1, &mut rx).await;
+        assert!(
+            matches!(result, Err(AgentError::NavigationFailed(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_stale_active_events_consumes_pending_signals() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(active_submit_report("chatgpt", 1, false, None)).await.unwrap();
+        tx.send(NavEvent::Ready("chatgpt".to_string())).await.unwrap();
+        tx.send(NavEvent::Response("chatgpt".to_string(), 1, "stale".to_string()))
+            .await
+            .unwrap();
+        let drained = drain_stale_active_events(&mut rx);
+        assert_eq!(drained, 3);
+        assert!(rx.try_recv().is_err(), "channel should be empty after drain");
+    }
+
+    #[tokio::test]
+    async fn drain_stale_active_events_returns_zero_when_empty() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        drop(tx);
+        let drained = drain_stale_active_events(&mut rx);
+        assert_eq!(drained, 0);
     }
 }

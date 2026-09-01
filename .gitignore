@@ -1,12 +1,21 @@
-node_modules/
-dist/
-target/
+# Rust build artifacts
 src-tauri/target/
-.cargo-test-target/
-*.db
-*.sqlite
-*.sqlite3
-*.log
-.env
-.env.*
+
+# Node modules
+node_modules/
+src/node_modules/
+
+# Build output
+src/dist/
+src/src/dist/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Vite cache
+.vite/
+
+# OS files
 .DS_Store
+Thumbs.db
+.aider*

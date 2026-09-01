@@ -275,6 +275,12 @@ export function useIpcListeners() {
         store.addToast(fts_needs_repair ? `${text} Repair is available in Settings.` : text, 5000)
       }))
 
+      // brain-status
+      cleanups.push(await listen('brain-status', (e) => {
+        const { active, model } = e.payload as { active: string; model: string }
+        store.setActiveBrain({ kind: active as import('@/stores/useAppStore').ActiveBrainKind, model: model || '' })
+      }))
+
       // session-complete
       cleanups.push(await listen('session-complete', (_e) => {
         store.setSessionStatus('complete')

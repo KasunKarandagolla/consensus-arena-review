@@ -174,4 +174,130 @@ impl SettingsStore {
         self.set("brain2_system_prompt", &config.system_prompt)?;
         Ok(())
     }
+
+    // ── P1: persisted custom participants ─────────────────────────────────────
+
+    /// The `settings` table is a generic key→value store, so a persisted
+    /// participant list needs no schema migration: it is stored as a single
+    /// JSON array under the `custom_participants` key. Built-in participants
+    /// (the static `AGENTS` registry in browser_backend) are never persisted
+    /// here.
+    pub fn get_custom_participants(&self) -> Result<Vec<CustomParticipant>, AgentError> {
+        match self.get("custom_participants")? {
+            Some(raw) => {
+                if raw.trim().is_empty() {
+                    return Ok(Vec::new());
+                }
+                serde_json::from_str(&raw).map_err(|e| {
+                    AgentError::DatabaseError(format!(
+                        "Failed to parse persisted custom participants: {}",
+                        e
+                    ))
+                })
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Overwrite the entire persisted custom-participant list. Replaces the
+    /// stored JSON array. Storing an empty list clears it.
+    pub fn save_custom_participants(
+        &mut self,
+        participants: &[CustomParticipant],
+    ) -> Result<(), AgentError> {
+        let serialized = serde_json::to_string(participants).map_err(|e| {
+            AgentError::DatabaseError(format!(
+                "Failed to serialize custom participants: {}",
+                e
+            ))
+        })?;
+        self.set("custom_participants", &serialized)
+    }
+}
+
+/// P1: a user-defined participant backed by a URL. Deliberately carries only
+/// the fields the generic browser driver needs (id, display name, base URL).
+/// Browser interaction (input/send/response) remains entirely generic; no
+/// per-model strategy is stored here. The `agent_id` must not collide with a
+/// built-in participant.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct CustomParticipant {
+    pub agent_id: String,
+    pub display_name: String,
+    pub base_url: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CustomParticipant, SettingsStore};
+
+    /// Unique temp DB path per call so parallel tests never open/remove the
+    /// same SQLite file concurrently (a shared path caused flaky "readonly
+    /// database"/"disk I/O error" failures when the suite ran in isolation).
+    fn temp_store() -> (SettingsStore, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let unique = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "consensus-arena-settings-p1-{}-{}.db",
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.to_str().expect("temp path is utf8"))
+            .expect("settings store opens");
+        (store, path)
+    }
+
+    // P1: an empty / unset custom list reads back as an empty vec — no schema
+    // migration required and no error from a missing key.
+    #[test]
+    fn unset_custom_participants_reads_empty() {
+        let (store, _path) = temp_store();
+        let list = store.get_custom_participants().expect("reads empty list");
+        assert!(list.is_empty());
+    }
+
+    // P1: round-trip — persisted custom participants survive a fresh store open
+    // (i.e. an app restart) reading the same database file.
+    #[test]
+    fn custom_participants_round_trip_reopen() {
+        let (store, path) = temp_store();
+        let mut store = store;
+        let participants = vec![CustomParticipant {
+            agent_id: "acme".to_string(),
+            display_name: "Acme Bot".to_string(),
+            base_url: "https://acme.example.com".to_string(),
+        }];
+        store
+            .save_custom_participants(&participants)
+            .expect("saves list");
+
+        // Reopen the same file — simulates an app restart.
+        let reopened = SettingsStore::new(path.to_str().expect("temp path is utf8"))
+            .expect("reopens settings store");
+        let loaded = reopened
+            .get_custom_participants()
+            .expect("reads saved list");
+        assert_eq!(loaded, participants);
+    }
+
+    // P1: saving an empty list clears persisted custom participants.
+    #[test]
+    fn empty_save_clears_custom_participants() {
+        let (mut store, _path) = temp_store();
+        let participants = vec![CustomParticipant {
+            agent_id: "acme".to_string(),
+            display_name: "Acme Bot".to_string(),
+            base_url: "https://acme.example.com".to_string(),
+        }];
+        store
+            .save_custom_participants(&participants)
+            .expect("saves list");
+        store
+            .save_custom_participants(&[])
+            .expect("saves empty list");
+        let loaded = store.get_custom_participants().expect("reads cleared list");
+        assert!(loaded.is_empty());
+    }
 }

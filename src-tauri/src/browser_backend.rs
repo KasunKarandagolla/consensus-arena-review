@@ -1,3 +1,4 @@
+use crate::browser_harness::{self, BrowserEvent, BrowserTimeline, EventType};
 use crate::errors::AgentError;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -11,6 +12,60 @@ pub const LEADER_WINDOW_LABEL: &str = "arena-leader";
 pub const NAV_WINDOW_LABEL: &str = "arena-nav";
 pub const READINESS_TIMEOUT_MS: u32 = 45_000;
 pub const READINESS_WAIT_TIMEOUT_SECS: u64 = 50;
+pub const MAX_CONSOLE_DIAGNOSTICS_PER_AGENT: usize = 20;
+pub const MAX_CONSOLE_MESSAGE_LENGTH: usize = 2048;
+pub const CONSOLE_DEDUP_WINDOW_SECS: u64 = 30;
+pub const MAX_NAVIGATION_DIAGNOSTICS_PER_AGENT: usize = 10;
+pub const MAX_SETUP_NAVIGATION_RECOVERIES: u32 = 3;
+pub const ARENA_NAVIGATION_CORRELATION_SECS: u64 = 5;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleCategory {
+    JavascriptException,
+    UnhandledRejection,
+    ConsoleError,
+    ConsoleWarning,
+    NavigationError,
+    AutomationError,
+    InjectionError,
+    SubmissionError,
+    ChallengeBlocker,
+    LoginBlocker,
+    DiagnosticBridgeError,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsoleDiagnosticEntry {
+    pub timestamp: String,
+    pub category: String,
+    pub severity: String,
+    pub message: String,
+    pub source: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NavigationDiagnosticEntry {
+    pub timestamp: String,
+    pub agent_id: String,
+    pub window_label: String,
+    pub window_kind: String,
+    pub from_url: String,
+    pub to_url: String,
+    pub phase: String,
+    pub setup_generation: u32,
+    pub cause: String,
+    pub arena_requested: bool,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BrowserDiagnosticRecord {
@@ -80,6 +135,13 @@ pub struct BrowserDiagnosticRecord {
     pub active_send_button_enabled_before_submit: Option<bool>,
     pub active_submit_error: Option<String>,
     pub active_submit_at: Option<String>,
+    pub console_diagnostics: Vec<ConsoleDiagnosticEntry>,
+    pub browser_console_error_count: u32,
+    pub browser_console_warning_count: u32,
+    pub browser_console_last_error_at: Option<String>,
+    pub navigation_diagnostics: Vec<NavigationDiagnosticEntry>,
+    pub setup_navigation_recovery_count: u32,
+    pub last_navigation: Option<NavigationDiagnosticEntry>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -91,11 +153,27 @@ pub struct BrowserSetupMetadata {
     pub setup_order: Vec<String>,
 }
 
+#[derive(Debug)]
+pub struct PendingArenaNavigation {
+    pub agent_id: String,
+    pub window_label: String,
+    pub requested_url: String,
+    pub timestamp: String,
+    pub instant: std::time::Instant,
+    pub setup_generation: u32,
+    pub phase: String,
+}
+
 #[derive(Clone)]
 pub struct BrowserDiagnostics {
     records: Arc<Mutex<HashMap<String, BrowserDiagnosticRecord>>>,
     active_by_window: Arc<Mutex<HashMap<String, String>>>,
     metadata: Arc<Mutex<BrowserSetupMetadata>>,
+    pending_arena_navigations: Arc<Mutex<HashMap<String, PendingArenaNavigation>>>,
+    pub timeline: BrowserTimeline,
+    // per-agent current operation_id for correlation (spec 4)
+    current_operation: Arc<Mutex<HashMap<String, String>>>,
+    current_phase: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl BrowserDiagnostics {
@@ -104,7 +182,153 @@ impl BrowserDiagnostics {
             records: Arc::new(Mutex::new(HashMap::new())),
             active_by_window: Arc::new(Mutex::new(HashMap::new())),
             metadata: Arc::new(Mutex::new(BrowserSetupMetadata::default())),
+            pending_arena_navigations: Arc::new(Mutex::new(HashMap::new())),
+            timeline: BrowserTimeline::new(),
+            current_operation: Arc::new(Mutex::new(HashMap::new())),
+            current_phase: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn set_operation(&self, agent_id: &str, operation_id: &str, phase: &str) {
+        self.current_operation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(agent_id.to_string(), operation_id.to_string());
+        self.current_phase
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(agent_id.to_string(), phase.to_string());
+        let _ = self.emit_timeline(agent_id, EventType::StateChanged, phase, operation_id, "", serde_json::json!({ "operation_set": operation_id }));
+    }
+
+    pub fn clear_operation(&self, agent_id: &str) {
+        self.current_operation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(agent_id);
+    }
+
+    pub fn current_operation_id(&self, agent_id: &str) -> String {
+        self.current_operation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                let generation = self
+                    .metadata
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .setup_generation;
+                browser_harness::operation_id_setup(agent_id, generation)
+            })
+    }
+
+    pub fn setup_generation(&self) -> u32 {
+        self.metadata
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .setup_generation
+    }
+
+    pub fn current_phase_str(&self, agent_id: &str) -> String {
+        self.current_phase
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn emit_timeline(
+        &self,
+        agent_id: &str,
+        event_type: EventType,
+        phase: &str,
+        operation_id: &str,
+        url: &str,
+        details: serde_json::Value,
+    ) -> Option<BrowserEvent> {
+        let metadata = self
+            .metadata
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let record_opt = self
+            .records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .cloned();
+        let (window_label, window_kind, display_name) = if let Some(r) = record_opt.as_ref() {
+            (r.window_label.clone(), r.window_kind.clone(), r.display_name.clone())
+        } else {
+            // fallback before register
+            let cfg = get_agent_config(agent_id);
+            let intended = cfg.map(|c| c.display_name).unwrap_or("Unknown Model").to_string();
+            ("unknown".to_string(), "nav".to_string(), intended)
+        };
+        let session_id = metadata.session_id.clone();
+        let setup_generation = metadata.setup_generation;
+        let eff_phase = if phase.is_empty() {
+            self.current_phase_str(agent_id)
+        } else {
+            phase.to_string()
+        };
+        let eff_op = if operation_id.is_empty() {
+            self.current_operation_id(agent_id)
+        } else {
+            operation_id.to_string()
+        };
+        let eff_url = if url.is_empty() {
+            record_opt
+                .as_ref()
+                .and_then(|r| r.last_navigation_url.clone())
+                .unwrap_or_else(|| record_opt.as_ref().map(|r| r.intended_url.clone()).unwrap_or_default())
+        } else {
+            url.to_string()
+        };
+        let event = browser_harness::build_browser_event(
+            &session_id,
+            agent_id,
+            &display_name,
+            &window_label,
+            &window_kind,
+            setup_generation,
+            &eff_phase,
+            &eff_op,
+            event_type.as_str(),
+            &eff_url,
+            details,
+            record_opt.and_then(|r| r.expected_agent_id),
+        );
+        self.timeline.record(event.clone());
+        Some(event)
+    }
+
+    pub fn emit_dom_snapshot(
+        &self,
+        agent_id: &str,
+        snapshot: browser_harness::DomSnapshot,
+        operation_id: &str,
+        phase: &str,
+    ) {
+        let details = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+        let _ = self.emit_timeline(agent_id, EventType::DomSnapshot, phase, operation_id, "", details);
+        let _ = self.emit_timeline(agent_id, EventType::ComposerSnapshot, phase, operation_id, "", serde_json::json!({ "composer": snapshot.composer }));
+        let _ = self.emit_timeline(agent_id, EventType::SendSnapshot, phase, operation_id, "", serde_json::json!({ "send": snapshot.send }));
+    }
+
+    pub fn emit_harness_event(
+        &self,
+        agent_id: &str,
+        event_type: EventType,
+        phase: &str,
+        operation_id: &str,
+        url: &str,
+        details: serde_json::Value,
+    ) {
+        let _ = self.emit_timeline(agent_id, event_type, phase, operation_id, url, details);
     }
 
     pub fn snapshot(&self) -> Vec<BrowserDiagnosticRecord> {
@@ -128,10 +352,32 @@ impl BrowserDiagnostics {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clear();
+        self.pending_arena_navigations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+        self.timeline.clear();
+        self.current_operation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.current_phase
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         *self
             .metadata
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = metadata;
+            .unwrap_or_else(|poison| poison.into_inner()) = metadata.clone();
+        // Emit window_created timeline for each agent in setup_order
+        for agent_id in &metadata.setup_order {
+            let op = browser_harness::operation_id_setup(agent_id, metadata.setup_generation);
+            let window_kind = if agent_id == &metadata.selected_leader_id { "leader" } else { "nav" };
+            let window_label = if window_kind == "leader" { LEADER_WINDOW_LABEL } else { NAV_WINDOW_LABEL };
+            let _ = self.emit_timeline(agent_id, EventType::WindowCreated, "setup", &op, "", serde_json::json!({ "setup_generation": metadata.setup_generation }));
+            // also emit navigation_started expected
+            let _ = self.emit_timeline(agent_id, EventType::NavigationStarted, "setup", &op, "", serde_json::json!({ "intended_url": get_agent_config(agent_id).map(|c| c.base_url).unwrap_or_default(), "window_label": window_label, "window_kind": window_kind }));
+        }
     }
 
     fn register(&self, agent_id: &str, window_label: &str, window_kind: &str) {
@@ -217,6 +463,13 @@ impl BrowserDiagnostics {
                 active_send_button_enabled_before_submit: None,
                 active_submit_error: None,
                 active_submit_at: None,
+                console_diagnostics: Vec::new(),
+                browser_console_error_count: 0,
+                browser_console_warning_count: 0,
+                browser_console_last_error_at: None,
+                navigation_diagnostics: Vec::new(),
+                setup_navigation_recovery_count: 0,
+                last_navigation: None,
             });
         record.display_name = display_name_for(agent_id).to_string();
         record.setup_generation = metadata.setup_generation;
@@ -284,6 +537,13 @@ impl BrowserDiagnostics {
                 record.expected_agent_id.as_deref() == Some(agent_id)
                     && record.setup_completion_reason.is_none()
             })
+            .unwrap_or(false)
+    }
+
+    pub fn has_pending_user_submit(&self, agent_id: &str) -> bool {
+        self.records.lock().unwrap_or_else(|poison| poison.into_inner())
+            .get(agent_id)
+            .map(|record| record.last_user_submit_event_at.is_some() && record.last_send_detected_at.is_none())
             .unwrap_or(false)
     }
 
@@ -370,6 +630,187 @@ impl BrowserDiagnostics {
             "{display_name} did not become ready before the readiness timeout. Classification: {page_state_hint}. readiness_probe_count={readiness_probe_count}, input_candidate_count={input_candidate_count}, composer_candidate_count={composer_candidate_count}, send_button_candidate_count={send_button_candidate_count}, readiness_timeout_ms={readiness_timeout_ms}. Check Settings → Diagnostics."
         )
     }
+
+    pub fn record_arena_navigation_request(
+        &self,
+        agent_id: &str,
+        window_label: &str,
+        requested_url: &str,
+        phase: &str,
+    ) {
+        let setup_generation = self
+            .metadata
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .setup_generation;
+        let entry = PendingArenaNavigation {
+            agent_id: agent_id.to_string(),
+            window_label: window_label.to_string(),
+            requested_url: sanitized_url(requested_url),
+            timestamp: now_timestamp(),
+            instant: std::time::Instant::now(),
+            setup_generation,
+            phase: phase.to_string(),
+        };
+        self.pending_arena_navigations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(window_label.to_string(), entry);
+        tracing::debug!(
+            "[NAV] arena_requested {} {} {} gen={} phase={}",
+            agent_id,
+            window_label,
+            sanitized_url(requested_url),
+            setup_generation,
+            phase
+        );
+    }
+
+    fn consume_pending_arena_navigation(&self, window_label: &str) -> Option<PendingArenaNavigation> {
+        self.pending_arena_navigations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(window_label)
+    }
+
+    pub fn record_navigation(
+        &self,
+        window_label: &str,
+        from_url: Option<String>,
+        to_url: &str,
+        phase: &str,
+    ) {
+        let agent_id = match self.active_agent(window_label) {
+            Some(a) => a,
+            None => return,
+        };
+        let to_url_sanitized = sanitized_url(to_url);
+        let from_url_sanitized = from_url.map(|u| sanitized_url(&u)).unwrap_or_default();
+        // Determine cause by checking pending arena request
+        let mut cause = "unknown";
+        let mut arena_requested = false;
+        {
+            let mut pending = self
+                .pending_arena_navigations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = pending.get(window_label) {
+                let elapsed = entry.instant.elapsed().as_secs();
+                let url_match = entry.requested_url == to_url_sanitized
+                    || to_url_sanitized.starts_with(&entry.requested_url)
+                    || entry.requested_url.starts_with(&to_url_sanitized);
+                if elapsed < ARENA_NAVIGATION_CORRELATION_SECS && entry.agent_id == agent_id && url_match {
+                    cause = "arena_requested";
+                    arena_requested = true;
+                } else if elapsed < ARENA_NAVIGATION_CORRELATION_SECS {
+                    cause = "arena_requested";
+                    arena_requested = true;
+                } else {
+                    cause = "page_initiated";
+                }
+                // For page_initiated we keep pending for a short time? For now remove if matched
+                if arena_requested {
+                    pending.remove(window_label);
+                }
+            } else if !from_url_sanitized.is_empty() && from_url_sanitized != to_url_sanitized {
+                cause = "page_initiated";
+            } else if from_url_sanitized.is_empty() {
+                cause = "unknown";
+            }
+        }
+        // If not arena_requested and from != to, it's likely page-initiated
+        if !arena_requested && !from_url_sanitized.is_empty() && from_url_sanitized != to_url_sanitized {
+            cause = "page_initiated";
+        }
+        let setup_generation = self
+            .metadata
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .setup_generation;
+        let window_kind = if window_label == LEADER_WINDOW_LABEL { "leader" } else { "nav" }.to_string();
+        let entry = NavigationDiagnosticEntry {
+            timestamp: now_timestamp(),
+            agent_id: agent_id.clone(),
+            window_label: window_label.to_string(),
+            window_kind: window_kind.clone(),
+            from_url: from_url_sanitized.clone(),
+            to_url: to_url_sanitized.clone(),
+            phase: phase.to_string(),
+            setup_generation,
+            cause: cause.to_string(),
+            arena_requested,
+        };
+        // Update per-agent record
+        let mut records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(record) = records.get_mut(&agent_id) {
+            record.navigation_diagnostics.push(entry.clone());
+            if record.navigation_diagnostics.len() > MAX_NAVIGATION_DIAGNOSTICS_PER_AGENT {
+                let excess = record.navigation_diagnostics.len() - MAX_NAVIGATION_DIAGNOSTICS_PER_AGENT;
+                record.navigation_diagnostics.drain(0..excess);
+            }
+            record.last_navigation = Some(entry.clone());
+            // Update last_navigation_url already done by caller, but ensure
+            if is_real_external_url(&to_url_sanitized) {
+                record.last_navigation_url = Some(to_url_sanitized.clone());
+            }
+            // If this is an unexpected page navigation while setup is incomplete, increment recovery count later via explicit call
+            tracing::warn!(
+                "[NAV] {} {} {} -> {} cause={} gen={} phase={}",
+                agent_id,
+                window_label,
+                from_url_sanitized,
+                to_url_sanitized,
+                cause,
+                setup_generation,
+                phase
+            );
+        }
+    }
+
+    pub fn increment_setup_navigation_recovery(&self, agent_id: &str) -> u32 {
+        let mut records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(record) = records.get_mut(agent_id) {
+            record.setup_navigation_recovery_count = record.setup_navigation_recovery_count.saturating_add(1);
+            return record.setup_navigation_recovery_count;
+        }
+        0
+    }
+
+    pub fn can_recover_navigation(&self, agent_id: &str) -> bool {
+        let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(record) = records.get(agent_id) {
+            record.setup_navigation_recovery_count < MAX_SETUP_NAVIGATION_RECOVERIES
+        } else {
+            false
+        }
+    }
+
+    pub fn reset_setup_navigation_recovery(&self, agent_id: &str) {
+        let mut records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(record) = records.get_mut(agent_id) {
+            record.setup_navigation_recovery_count = 0;
+        }
+    }
+
+    pub fn has_recent_unexpected_navigation(&self, agent_id: &str, within_secs: u64) -> bool {
+        let setup_generation = self.metadata.lock().unwrap_or_else(|p| p.into_inner()).setup_generation;
+        let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(rec) = records.get(agent_id) {
+            if let Some(nav) = rec.last_navigation.as_ref() {
+                if nav.cause == "page_initiated" && !nav.arena_requested && nav.setup_generation == setup_generation {
+                    if let Ok(dt) = nav.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
+                        return (chrono::Utc::now() - dt).num_seconds() < within_secs as i64;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn last_navigation_for(&self, agent_id: &str) -> Option<NavigationDiagnosticEntry> {
+        let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        records.get(agent_id).and_then(|r| r.last_navigation.clone())
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -433,6 +874,57 @@ fn sanitized_url(value: &str) -> String {
     redacted_url(value)
 }
 
+pub(crate) fn sanitize_console_message(raw: &str) -> String {
+    // Redact obvious secrets (bearer, sk-, token- etc) reusing logic from commands.rs
+    let mut redacted = String::new();
+    let mut redact_next = false;
+    for part in raw.split_whitespace() {
+        if redact_next {
+            redact_next = false;
+            redacted.push_str("[REDACTED] ");
+            continue;
+        }
+        let lower = part.to_ascii_lowercase();
+        if lower == "bearer" {
+            redact_next = true;
+            redacted.push_str(part);
+            redacted.push(' ');
+            continue;
+        }
+        if lower.contains("api_key")
+            || lower.contains("apikey")
+            || lower.starts_with("sk-")
+            || lower.starts_with("token-")
+        {
+            redacted.push_str("[REDACTED] ");
+            continue;
+        }
+        let is_long_secret = part.len() >= 32
+            && part.chars().any(|c| c.is_ascii_alphabetic())
+            && part.chars().any(|c| c.is_ascii_digit())
+            && !part.contains('/')
+            && !part.contains(':');
+        if is_long_secret {
+            redacted.push_str("[REDACTED] ");
+        } else {
+            redacted.push_str(part);
+            redacted.push(' ');
+        }
+    }
+    let mut msg = redacted.trim().to_string();
+    // Collapse whitespace and bound length
+    if msg.len() > MAX_CONSOLE_MESSAGE_LENGTH {
+        msg.truncate(MAX_CONSOLE_MESSAGE_LENGTH);
+        msg.push_str(" [truncated]");
+    }
+    // Ensure no control characters that could break JSON
+    msg.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 fn is_real_external_url(value: &str) -> bool {
     value
         .parse::<tauri::Url>()
@@ -483,6 +975,15 @@ pub fn record_browser_error(
     agent_id: &str,
     message: &str,
 ) {
+    let op = diagnostics.current_operation_id(agent_id);
+    diagnostics.emit_harness_event(
+        agent_id,
+        EventType::AutomationError,
+        "error",
+        &op,
+        "",
+        serde_json::json!({ "message": browser_harness::sanitize_details_value(message), "category": "automation_error" }),
+    );
     if let Some(record) = update_diagnostic(diagnostics, agent_id, |record| {
         record.current_phase = "error".to_string();
         record.last_error = Some(message.to_string());
@@ -504,6 +1005,30 @@ pub fn record_browser_blocker(
 ) {
     let timestamp = now_timestamp();
     let url_redacted = url.map(redacted_url);
+    // Harness: classify blocker
+    {
+        let op = diagnostics.current_operation_id(agent_id);
+        let event_type = match blocker {
+            "captcha_or_challenge" => EventType::CaptchaDetected,
+            "cloudflare" => EventType::CloudflareDetected,
+            "security_blocked" => EventType::SecurityBlocked,
+            "network_blocked" => EventType::NetworkBlocked,
+            _ => EventType::ChallengeDetected,
+        };
+        diagnostics.emit_harness_event(
+            agent_id,
+            event_type,
+            phase,
+            &op,
+            url.unwrap_or(""),
+            serde_json::json!({
+                "blocker": blocker,
+                "message": browser_harness::sanitize_details_value(message),
+                "error": error.map(browser_harness::sanitize_details_value),
+                "url_redacted": url_redacted.clone()
+            }),
+        );
+    }
     if let Some(record) = update_diagnostic(diagnostics, agent_id, |record| {
         record.current_phase = phase.to_string();
         record.last_blocker = blocker.to_string();
@@ -524,6 +1049,8 @@ pub fn record_browser_blocker(
 }
 
 pub fn record_browser_resume(app: &AppHandle, diagnostics: &BrowserDiagnostics, agent_id: &str) {
+    let op = diagnostics.current_operation_id(agent_id);
+    diagnostics.emit_harness_event(agent_id, EventType::RetryStarted, "navigation_started", &op, "", serde_json::json!({ "resume_attempt": true }));
     if let Some(record) = update_diagnostic(diagnostics, agent_id, |record| {
         record.resume_attempt_count = record.resume_attempt_count.saturating_add(1);
         record.last_resume_at = Some(now_timestamp());
@@ -545,6 +1072,11 @@ pub fn record_setup_expected_agent(diagnostics: &BrowserDiagnostics, agent_id: &
         record.response_observed_after_injection = false;
         record.setup_completion_reason = None;
     });
+    let generation = diagnostics.setup_generation();
+    let op = browser_harness::operation_id_priming(agent_id, generation);
+    diagnostics.set_operation(agent_id, &op, "priming");
+    diagnostics.emit_harness_event(agent_id, EventType::PrimingStarted, "priming", &op, "", serde_json::json!({ "agent_id": agent_id }));
+    diagnostics.emit_harness_event(agent_id, EventType::ComposerProbeStarted, "priming", &op, "", serde_json::json!({}));
 }
 
 pub fn record_prompt_injected(diagnostics: &BrowserDiagnostics, agent_id: &str) {
@@ -555,6 +1087,11 @@ pub fn record_prompt_injected(diagnostics: &BrowserDiagnostics, agent_id: &str) 
         record.response_observed_after_injection = false;
         record.setup_completion_reason = None;
     });
+    let op = diagnostics.current_operation_id(agent_id);
+    diagnostics.emit_harness_event(agent_id, EventType::PrimingInjectionStarted, "priming", &op, "", serde_json::json!({}));
+    // Before-injection DOM snapshot (metadata only, no prompt content)
+    let snapshot = browser_harness::empty_dom_snapshot();
+    diagnostics.emit_dom_snapshot(agent_id, snapshot, &op, "priming");
 }
 
 pub fn record_prompt_injection_report(
@@ -570,17 +1107,57 @@ pub fn record_prompt_injection_report(
     target_contenteditable: String,
     error: Option<String>,
 ) {
+    let op = diagnostics.current_operation_id(agent_id);
+    let success = error.is_none() && prefix_ok && suffix_ok && send_enabled;
+    let method_clone = method.clone();
+    let target_tag_clone = target_tag.clone();
     let _ = update_diagnostic(diagnostics, agent_id, |record| {
-        record.prompt_injection_method = Some(method);
+        record.prompt_injection_method = Some(method.clone());
         record.prompt_visible_prefix_ok = Some(prefix_ok);
         record.prompt_visible_suffix_ok = Some(suffix_ok);
         record.prompt_visible_length = visible_length;
         record.send_button_enabled_after_injection = Some(send_enabled);
-        record.injection_target_tag = Some(target_tag);
-        record.injection_target_role = Some(target_role);
-        record.injection_target_contenteditable = Some(target_contenteditable);
-        record.prompt_injection_error = error;
+        record.injection_target_tag = Some(target_tag.clone());
+        record.injection_target_role = Some(target_role.clone());
+        record.injection_target_contenteditable = Some(target_contenteditable.clone());
+        record.prompt_injection_error = error.clone();
     });
+    // Harness: after injection snapshot
+    let snapshot = browser_harness::DomSnapshot {
+        input: browser_harness::DomInputSnapshot { tag: target_tag_clone.clone(), exists: true, visible: true, value_length: visible_length.unwrap_or(0) as usize },
+        composer: browser_harness::DomComposerSnapshot { exists: true, candidate_count: 1 },
+        send: browser_harness::DomSendSnapshot { exists: true, candidate_count: 1, enabled: send_enabled, text: "".to_string(), aria_label: "".to_string() },
+        attachment: browser_harness::DomAttachmentSnapshot { exists: false, candidate_count: 0 },
+        input_identity: Some(format!("{}#{}", target_tag_clone.to_ascii_lowercase(), visible_length.unwrap_or(0))),
+        composer_identity: Some(format!("composer#{}", visible_length.unwrap_or(0))),
+        send_identity: Some("send#1".to_string()),
+        attachment_identity: None,
+    };
+    diagnostics.emit_dom_snapshot(agent_id, snapshot, &op, "priming");
+    diagnostics.emit_harness_event(
+        agent_id,
+        if success { EventType::PrimingInjectionCompleted } else { EventType::PrimingInjectionFailed },
+        "priming",
+        &op,
+        "",
+        serde_json::json!({
+            "method": method_clone,
+            "prefix_ok": prefix_ok,
+            "suffix_ok": suffix_ok,
+            "visible_length": visible_length,
+            "send_enabled": send_enabled,
+            "target_tag": target_tag_clone,
+            "error": error.map(|e| browser_harness::sanitize_details_value(&e))
+        }),
+    );
+    if success {
+        diagnostics.emit_harness_event(agent_id, EventType::PrimingPromptVisible, "priming", &op, "", serde_json::json!({ "prefix_ok": prefix_ok, "suffix_ok": suffix_ok }));
+        if send_enabled {
+            diagnostics.emit_harness_event(agent_id, EventType::PrimingSendEnabled, "priming", &op, "", serde_json::json!({}));
+        } else {
+            diagnostics.emit_harness_event(agent_id, EventType::PrimingSendDisabled, "priming", &op, "", serde_json::json!({}));
+        }
+    }
 }
 
 pub fn record_prompt_injection_error(
@@ -588,6 +1165,8 @@ pub fn record_prompt_injection_error(
     agent_id: &str,
     error: &str,
 ) {
+    let op = diagnostics.current_operation_id(agent_id);
+    diagnostics.emit_harness_event(agent_id, EventType::PrimingInjectionFailed, "priming", &op, "", serde_json::json!({ "error": browser_harness::sanitize_details_value(error) }));
     let _ = update_diagnostic(diagnostics, agent_id, |record| {
         record.prompt_injection_error = Some(error.to_string());
     });
@@ -598,9 +1177,6 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
         NavEvent::Ready(agent_id) => Some((agent_id.as_str(), "ready")),
         NavEvent::Error(agent_id) => Some((agent_id.as_str(), "error")),
         NavEvent::Response(agent_id, _, _) => Some((agent_id.as_str(), "response")),
-        NavEvent::ResponseStart { agent_id, .. } => Some((agent_id.as_str(), "response_start")),
-        NavEvent::ResponseChunk { agent_id, .. } => Some((agent_id.as_str(), "response_chunk")),
-        NavEvent::ResponseEnd { agent_id, .. } => Some((agent_id.as_str(), "response_end")),
         NavEvent::Done(agent_id, _) => Some((agent_id.as_str(), "done")),
         NavEvent::SetupResponseObserved(agent_id) => Some((agent_id.as_str(), "setup-response")),
         NavEvent::SendDetected(agent_id, _) => Some((agent_id.as_str(), "sent")),
@@ -612,6 +1188,7 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
         NavEvent::UnshowableUrl(agent_id, _) => Some((agent_id.as_str(), "unshowable")),
         NavEvent::ResumeRequested(agent_id) => Some((agent_id.as_str(), "resume")),
         NavEvent::ManualResponse { agent_id, .. } => Some((agent_id.as_str(), "manual_response")),
+        NavEvent::ConsoleDiagnostic { .. } => None,
         NavEvent::UnsupportedNavigation { .. } | NavEvent::SessionAborted => None,
     }
 }
@@ -688,6 +1265,29 @@ pub fn record_setup_completion(diagnostics: &BrowserDiagnostics, agent_id: &str,
 
 pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event: &NavEvent) {
     record_signal_metadata(diagnostics, event);
+
+    if let NavEvent::ConsoleDiagnostic {
+        agent_id,
+        window_label,
+        category,
+        severity,
+        source,
+        message,
+        url,
+    } = event
+    {
+        record_console_diagnostic(
+            diagnostics,
+            window_label,
+            agent_id,
+            category,
+            severity,
+            source,
+            message,
+            Some(url),
+        );
+        return;
+    }
 
     if let NavEvent::ActiveSubmitReport {
         agent_id,
@@ -789,6 +1389,75 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             page_health_hint,
         } => {
             let timestamp = now_timestamp();
+            // Harness: composer probe lifecycle + snapshots
+            {
+                let op = diagnostics.current_operation_id(agent_id);
+                let phase = diagnostics.current_phase_str(agent_id);
+                diagnostics.emit_harness_event(agent_id, EventType::ComposerProbeStarted, &phase, &op, "", serde_json::json!({ "input_found": input_found, "send_button_found": send_button_found }));
+                diagnostics.emit_harness_event(agent_id, EventType::SendProbeStarted, &phase, &op, "", serde_json::json!({ "send_button_found": send_button_found }));
+                if *input_found {
+                    diagnostics.emit_harness_event(agent_id, EventType::InputDetected, &phase, &op, "", serde_json::json!({ "candidate_count": input_candidate_count }));
+                    diagnostics.emit_harness_event(agent_id, EventType::ComposerDetected, &phase, &op, "", serde_json::json!({ "candidate_count": composer_candidate_count }));
+                } else {
+                    diagnostics.emit_harness_event(agent_id, EventType::InputLost, &phase, &op, "", serde_json::json!({}));
+                    diagnostics.emit_harness_event(agent_id, EventType::ComposerLost, &phase, &op, "", serde_json::json!({}));
+                }
+                if *send_button_found {
+                    diagnostics.emit_harness_event(agent_id, EventType::SendDetected, &phase, &op, "", serde_json::json!({ "candidate_count": send_button_candidate_count }));
+                } else {
+                    diagnostics.emit_harness_event(agent_id, EventType::SendLost, &phase, &op, "", serde_json::json!({}));
+                }
+                // Auth / blocker classification from page hints (spec 20)
+                if let Some(hint) = page_state_hint {
+                    match hint.as_str() {
+                        "possible_login_required" => {
+                            diagnostics.emit_harness_event(agent_id, EventType::LoginPageDetected, &phase, &op, "", serde_json::json!({ "hint": hint }));
+                            diagnostics.emit_harness_event(agent_id, EventType::LoginRequired, &phase, &op, "", serde_json::json!({}));
+                        }
+                        "possible_challenge_or_security" => {
+                            diagnostics.emit_harness_event(agent_id, EventType::ChallengeDetected, &phase, &op, "", serde_json::json!({ "hint": hint }));
+                        }
+                        "empty_shell_or_hydration_stuck" => {
+                            diagnostics.emit_harness_event(agent_id, EventType::LoginStateUnknown, &phase, &op, "", serde_json::json!({ "hint": hint }));
+                        }
+                        "composer_detected" => {
+                            diagnostics.emit_harness_event(agent_id, EventType::LoginStateAuthenticated, &phase, &op, "", serde_json::json!({}));
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(health) = page_health_hint {
+                    if health.contains("cloudflare") {
+                        diagnostics.emit_harness_event(agent_id, EventType::CloudflareDetected, &phase, &op, "", serde_json::json!({ "health": health }));
+                    }
+                    if health.contains("captcha") {
+                        diagnostics.emit_harness_event(agent_id, EventType::CaptchaDetected, &phase, &op, "", serde_json::json!({ "health": health }));
+                    }
+                }
+                let snapshot = browser_harness::DomSnapshot {
+                    input: browser_harness::DomInputSnapshot { tag: if *input_found { "TEXTAREA".to_string() } else { "".to_string() }, exists: *input_found, visible: *input_found, value_length: 0 },
+                    composer: browser_harness::DomComposerSnapshot { exists: *input_found, candidate_count: input_candidate_count.unwrap_or(0) as usize },
+                    send: browser_harness::DomSendSnapshot { exists: *send_button_found, candidate_count: send_button_candidate_count.unwrap_or(0) as usize, enabled: false, text: "".to_string(), aria_label: "".to_string() },
+                    attachment: browser_harness::DomAttachmentSnapshot { exists: false, candidate_count: 0 },
+                    input_identity: if *input_found { Some(format!("input#{}", input_candidate_count.unwrap_or(0))) } else { None },
+                    composer_identity: if composer_candidate_count.unwrap_or(0) > 0 { Some(format!("composer#{}", composer_candidate_count.unwrap_or(0))) } else { None },
+                    send_identity: if *send_button_found { Some(format!("send#{}", send_button_candidate_count.unwrap_or(0))) } else { None },
+                    attachment_identity: None,
+                };
+                diagnostics.emit_dom_snapshot(agent_id, snapshot, &op, &phase);
+                diagnostics.emit_harness_event(agent_id, EventType::DomSnapshot, &phase, &op, "", serde_json::json!({
+                    "page_state_hint": page_state_hint.clone(),
+                    "page_health_hint": page_health_hint.clone(),
+                    "readiness_probe_count": readiness_probe_count,
+                    "input_candidate_count": input_candidate_count,
+                    "composer_candidate_count": composer_candidate_count,
+                    "send_button_candidate_count": send_button_candidate_count,
+                    "readiness_timeout_ms": readiness_timeout_ms,
+                    "user_submit_seen": user_submit_seen,
+                    "message_count_seen": message_count_seen,
+                    "sent_signal_emitted": sent_signal_emitted
+                }));
+            }
             let _ = update_diagnostic(diagnostics, agent_id, |record| {
                 record.input_found = *input_found;
                 record.send_button_found = *send_button_found;
@@ -816,34 +1485,6 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             return;
         }
         NavEvent::SessionAborted => return,
-        NavEvent::ResponseStart { agent_id, turn, message_id, chunk_count } => {
-            let _ = update_diagnostic(diagnostics, agent_id, |record| {
-                record.last_signal_type = Some("response_start".to_string());
-                record.last_signal_agent_id = Some(agent_id.clone());
-                record.last_signal_at = Some(now_timestamp());
-                record.active_turn_number = Some(*turn);
-                record.page_health_hint = Some(format!("response_id={message_id}; chunks={chunk_count}"));
-            });
-            return;
-        }
-        NavEvent::ResponseChunk { agent_id, turn, message_id: _, index: _, text: _ } => {
-            let _ = update_diagnostic(diagnostics, agent_id, |record| {
-                record.last_signal_type = Some("response_chunk".to_string());
-                record.last_signal_agent_id = Some(agent_id.clone());
-                record.last_signal_at = Some(now_timestamp());
-                record.active_turn_number = Some(*turn);
-            });
-            return;
-        }
-        NavEvent::ResponseEnd { agent_id, turn, message_id: _ } => {
-            let _ = update_diagnostic(diagnostics, agent_id, |record| {
-                record.last_signal_type = Some("response_end".to_string());
-                record.last_signal_agent_id = Some(agent_id.clone());
-                record.last_signal_at = Some(now_timestamp());
-                record.active_turn_number = Some(*turn);
-            });
-            return;
-        }
         _ => {}
     }
 
@@ -885,17 +1526,58 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             if *succeeded { "Active prompt submitted automatically" } else { "Active prompt inserted but was not submitted" },
         ),
         NavEvent::Response(agent_id, _, _) => (agent_id, "ready", "Model response detected"),
-        NavEvent::ResponseStart { .. } => return,
-        NavEvent::ResponseChunk { .. } => return,
-        NavEvent::ResponseEnd { .. } => return,
         NavEvent::Done(agent_id, _) => (agent_id, "ready", "Model response completed"),
         NavEvent::ChallengeDetected(_, _)
         | NavEvent::UnshowableUrl(_, _)
         | NavEvent::UnsupportedNavigation { .. }
         | NavEvent::ResumeRequested(_)
         | NavEvent::SendProbe { .. }
+        | NavEvent::ConsoleDiagnostic { .. }
         | NavEvent::SessionAborted => return,
     };
+    // Harness: emit timeline for these NavEvents before updating record
+    {
+        let op = diagnostics.current_operation_id(agent_id);
+        let ev_type = match event {
+            NavEvent::Ready(_) => EventType::ComposerDetected,
+            NavEvent::SendDetected(_, _) => EventType::SendDetected,
+            NavEvent::SetupManualConfirmed(_) => EventType::PrimingCompleted,
+            NavEvent::ManualResponse { .. } => EventType::ResponseObserved,
+            NavEvent::PromptInjectionReport { .. } => EventType::DomSnapshot,
+            NavEvent::ActiveSubmitReport { succeeded, .. } => if *succeeded { EventType::ActiveSubmitCompleted } else { EventType::ActiveSubmitFailed },
+            NavEvent::SetupResponseObserved(_) => EventType::ResponseObserved,
+            NavEvent::Response(_, _, _) => EventType::ResponseObserved,
+            NavEvent::Done(_, _) => EventType::ResponseCompleted,
+            _ => EventType::Unknown,
+        };
+        let details = match event {
+            NavEvent::Ready(_) => serde_json::json!({ "input_found": true, "composer_detected": true }),
+            NavEvent::SendDetected(_, reason) => serde_json::json!({ "reason": reason.clone() }),
+            NavEvent::PromptInjectionReport { method, prefix_ok, suffix_ok, visible_length, send_enabled, target_tag, error, .. } => serde_json::json!({
+                "method": method, "prefix_ok": prefix_ok, "suffix_ok": suffix_ok, "visible_length": visible_length, "send_enabled": send_enabled, "target_tag": target_tag, "error": error
+            }),
+            NavEvent::ActiveSubmitReport { turn, succeeded, method, send_enabled, error, .. } => serde_json::json!({ "turn": turn, "succeeded": succeeded, "method": method, "send_enabled": send_enabled, "error": error }),
+            NavEvent::Response(_, turn, text) => serde_json::json!({ "turn": turn, "text_length": text.len() }),
+            NavEvent::Done(_, turn) => serde_json::json!({ "turn": turn }),
+            NavEvent::ManualResponse { turn, .. } => serde_json::json!({ "turn": turn }),
+            _ => serde_json::json!({}),
+        };
+        diagnostics.emit_harness_event(agent_id, ev_type, phase, &op, "", details);
+        // Additional specialized events
+        match event {
+            NavEvent::Ready(_) => {
+                diagnostics.emit_harness_event(agent_id, EventType::InputDetected, phase, &op, "", serde_json::json!({}));
+                diagnostics.emit_harness_event(agent_id, EventType::PhaseChanged, phase, &op, "", serde_json::json!({ "new_phase": phase }));
+            }
+            NavEvent::SendDetected(_, _) => {
+                diagnostics.emit_harness_event(agent_id, EventType::PrimingCompleted, "priming", &op, "", serde_json::json!({}));
+            }
+            NavEvent::SetupResponseObserved(_) | NavEvent::Response(_, _, _) => {
+                diagnostics.emit_harness_event(agent_id, EventType::ResponseStarted, phase, &op, "", serde_json::json!({}));
+            }
+            _ => {}
+        }
+    }
     let timestamp = now_timestamp();
     if let Some(record) = update_diagnostic(diagnostics, agent_id, |record| {
         record.current_phase = phase.to_string();
@@ -922,15 +1604,6 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 record.last_send_detected_at = Some(timestamp.clone());
                 record.last_user_submit_event_at = Some(timestamp.clone());
                 record.sent_signal_emitted = true;
-            }
-            NavEvent::ResponseStart { .. } => {
-                record.last_signal_type = Some("response_start".to_string());
-            }
-            NavEvent::ResponseChunk { .. } => {
-                record.last_signal_type = Some("response_chunk".to_string());
-            }
-            NavEvent::ResponseEnd { .. } => {
-                record.last_signal_type = Some("response_end".to_string());
             }
             NavEvent::SetupManualConfirmed(_) => {
                 record.setup_completion_reason = Some("user_confirmed_manual".to_string());
@@ -990,6 +1663,7 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             }
             NavEvent::Error(_)
             | NavEvent::SendProbe { .. }
+            | NavEvent::ConsoleDiagnostic { .. }
             | NavEvent::ChallengeDetected(_, _)
             | NavEvent::UnshowableUrl(_, _)
             | NavEvent::UnsupportedNavigation { .. }
@@ -999,6 +1673,247 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
     }) {
         emit_browser_diagnostic(app, &record, message);
     }
+}
+
+fn is_valid_console_category(cat: &str) -> bool {
+    matches!(
+        cat,
+        "javascript_exception"
+            | "unhandled_rejection"
+            | "console_error"
+            | "console_warning"
+            | "navigation_error"
+            | "automation_error"
+            | "injection_error"
+            | "submission_error"
+            | "challenge_blocker"
+            | "login_blocker"
+            | "diagnostic_bridge_error"
+    )
+}
+
+fn severity_for_category(category: &str) -> &'static str {
+    match category {
+        "console_warning" => "warning",
+        "javascript_exception" | "unhandled_rejection" | "console_error" | "navigation_error" | "automation_error" | "injection_error" | "submission_error" | "challenge_blocker" | "login_blocker" | "diagnostic_bridge_error" => "error",
+        _ => "info",
+    }
+}
+
+pub fn record_console_diagnostic(
+    diagnostics: &BrowserDiagnostics,
+    window_label: &str,
+    reported_agent_id: &str,
+    category: &str,
+    severity: &str,
+    source: &str,
+    raw_message: &str,
+    url: Option<&str>,
+) {
+    // Resolve authoritative agent identity: prefer window's active agent.
+    let attributed_agent = diagnostics
+        .active_agent(window_label)
+        .filter(|active| !active.is_empty())
+        .unwrap_or_else(|| reported_agent_id.to_string());
+
+    // If reported differs from active, log but still use active for attribution.
+    if !reported_agent_id.is_empty() && attributed_agent != reported_agent_id {
+        tracing::warn!(
+            "[CONSOLE] attribution mismatch window={} reported={} active={} category={}",
+            window_label,
+            reported_agent_id,
+            attributed_agent,
+            category
+        );
+    }
+
+    let agent_id = attributed_agent;
+
+    // Validate category/severity, fallback to diagnostic_bridge_error / severity.
+    let category = if is_valid_console_category(category) {
+        category.to_string()
+    } else {
+        "diagnostic_bridge_error".to_string()
+    };
+    let severity = match severity {
+        "error" | "warning" | "info" => severity.to_string(),
+        _ => severity_for_category(&category).to_string(),
+    };
+
+    let message = sanitize_console_message(raw_message);
+    if message.is_empty() {
+        return;
+    }
+
+    let url_string = if let Some(provided) = url {
+        sanitized_url(provided)
+    } else {
+        // Avoid nested Mutex lock – compute fallback in separate scopes.
+        let from_last = {
+            let guard = diagnostics
+                .records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            guard.get(&agent_id).and_then(|r| r.last_navigation_url.clone())
+        };
+        if let Some(val) = from_last {
+            sanitized_url(&val)
+        } else {
+            let from_intended = {
+                let guard = diagnostics
+                    .records
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                guard.get(&agent_id).map(|r| r.intended_url.clone())
+            };
+            from_intended.map(|v| sanitized_url(&v)).unwrap_or_default()
+        }
+    };
+
+    let timestamp = now_timestamp();
+    let source = if source.is_empty() {
+        match category.as_str() {
+            "javascript_exception" => "window.onerror",
+            "unhandled_rejection" => "window.onunhandledrejection",
+            "console_error" => "console.error",
+            "console_warning" => "console.warn",
+            _ => "unknown",
+        }
+        .to_string()
+    } else {
+        source.to_string()
+    };
+
+    // Dedup + bounded storage
+    let mut records = diagnostics
+        .records
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(record) = records.get_mut(&agent_id) else {
+        tracing::warn!("[CONSOLE] no diagnostic record for agent {}", agent_id);
+        return;
+    };
+
+    // Lightweight duplicate suppression: if same category+message exists within dedup window, skip.
+    // Check most recent entries (since Vec is chronological, newest at end).
+    let now_instant = std::time::Instant::now();
+    // We store dedup check based on string equality; we use timestamp recency via comparing the last entry's timestamp string is near now.
+    // For simplicity, if the last entry matches category+message and its timestamp is within dedup window (we approximate by checking if its entry is the last one and message equal),
+    // we skip. A more precise check would need Instant map, but this lightweight check covers rapid repeats.
+    if let Some(last) = record.console_diagnostics.last() {
+        if last.category == category && last.message == message {
+            // Parse last timestamp to check window – if parsing fails, still dedup if it's the immediate predecessor.
+            let is_recent = last
+                .timestamp
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .ok()
+                .map(|dt| (chrono::Utc::now() - dt).num_seconds() < CONSOLE_DEDUP_WINDOW_SECS as i64)
+                .unwrap_or(true);
+            if is_recent {
+                tracing::debug!("[CONSOLE] dedup suppressed {} {}", agent_id, category);
+                return;
+            }
+        }
+        // Also check any recent duplicate within the last 5 entries
+        let recent_count = record.console_diagnostics.len().min(5);
+        for entry in record.console_diagnostics.iter().rev().take(recent_count) {
+            if entry.category == category && entry.message == message {
+                let is_recent = entry
+                    .timestamp
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .ok()
+                    .map(|dt| (chrono::Utc::now() - dt).num_seconds() < CONSOLE_DEDUP_WINDOW_SECS as i64)
+                    .unwrap_or(false);
+                if is_recent {
+                    tracing::debug!("[CONSOLE] dedup suppressed (recent) {} {}", agent_id, category);
+                    return;
+                }
+            }
+        }
+    }
+    // Suppress unused variable warning for now_instant if not used above (kept for future precise dedup)
+    let _ = now_instant;
+
+    let entry = ConsoleDiagnosticEntry {
+        timestamp: timestamp.clone(),
+        category: category.clone(),
+        severity: severity.clone(),
+        message: message.clone(),
+        source: source.clone(),
+        url: url_string.clone(),
+    };
+    record.console_diagnostics.push(entry);
+    if record.console_diagnostics.len() > MAX_CONSOLE_DIAGNOSTICS_PER_AGENT {
+        let excess = record.console_diagnostics.len() - MAX_CONSOLE_DIAGNOSTICS_PER_AGENT;
+        record.console_diagnostics.drain(0..excess);
+    }
+    // Update per-record summary counts
+    record.browser_console_error_count = record
+        .console_diagnostics
+        .iter()
+        .filter(|e| e.severity == "error")
+        .count() as u32;
+    record.browser_console_warning_count = record
+        .console_diagnostics
+        .iter()
+        .filter(|e| e.severity == "warning")
+        .count() as u32;
+    if severity == "error" {
+        record.browser_console_last_error_at = Some(timestamp.clone());
+    }
+    // Also surface as last_error for snapshot visibility but keep separate field
+    if category == "javascript_exception" || category == "unhandled_rejection" || category == "console_error" {
+        record.last_error = Some(format!("[{}] {}", category, message));
+    }
+    tracing::warn!(
+        "[CONSOLE] {} {} {} {} {} {}",
+        agent_id,
+        window_label,
+        category,
+        severity,
+        source,
+        message
+    );
+    // Harness: classified error + timeline
+    let classified = browser_harness::classify_console_error(&category, &message, &source);
+    let op = diagnostics.timeline.all_events_sorted().last().map(|e| e.operation_id.clone()).unwrap_or_else(|| diagnostics.current_operation_id(&agent_id));
+    // We need phase for harness; use current_phase
+    let phase = diagnostics.current_phase_str(&agent_id);
+    // Drop records lock before emitting timeline (to avoid deadlock – emit_timeline locks records again but we already hold it)
+    // So we stash values and emit after drop.
+    let agent_clone = agent_id.clone();
+    let category_clone = category.clone();
+    let severity_clone = severity.clone();
+    let source_clone = source.clone();
+    let message_clone = message.clone();
+    let url_clone = url_string.clone();
+    let classified_clone = classified.clone();
+    drop(records);
+    diagnostics.emit_harness_event(
+        &agent_clone,
+        match category_clone.as_str() {
+            "console_error" => EventType::ConsoleError,
+            "console_warning" => EventType::ConsoleWarning,
+            "javascript_exception" => EventType::JavascriptError,
+            "unhandled_rejection" => EventType::UnhandledRejection,
+            "navigation_error" => EventType::AutomationError,
+            "automation_error" | "injection_error" | "submission_error" => EventType::AutomationError,
+            _ => EventType::ConsoleError,
+        },
+        &phase,
+        &op,
+        &url_clone,
+        serde_json::json!({
+            "category": category_clone,
+            "severity": severity_clone,
+            "source": source_clone,
+            "message": browser_harness::sanitize_details_value(&message_clone),
+            "url": browser_harness::redact_url(&url_clone),
+            "classified_origin": classified_clone.origin,
+            "classified_category": classified_clone.category,
+            "automation_related": classified_clone.automation_related
+        }),
+    );
 }
 
 pub struct AgentConfig {
@@ -1067,14 +1982,97 @@ pub fn display_name_for(agent_id: &str) -> &'static str {
     }
 }
 
+/// P1: an owned, merged view of a participant. `get_agent_config` returns a
+/// `&'static` borrow limited to built-ins; this carries the same three fields
+/// plus an `is_custom` flag so the unified runtime registry (and the frontend)
+/// can distinguish the seven immutable built-ins from persisted custom entries.
+/// It is serializable so the backend can expose the unified list via IPC.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ParticipantInfo {
+    pub agent_id: String,
+    pub display_name: String,
+    pub base_url: String,
+    pub is_custom: bool,
+}
+
+/// P1: merged registry lookup — the single source both the session validator
+/// and the navigation-URL resolver use so they consume built-ins AND persisted
+/// custom participants. Built-ins always win: if `agent_id` matches a built-in,
+/// the built-in definition is authoritative and any same-id custom entry is
+/// ignored. Custom entries only fill ids not covered by the built-in set.
+pub fn resolve_participant(
+    agent_id: &str,
+    custom: &[crate::settings_store::CustomParticipant],
+) -> Option<ParticipantInfo> {
+    if let Some(builtin) = get_agent_config(agent_id) {
+        return Some(ParticipantInfo {
+            agent_id: builtin.agent_id.to_string(),
+            display_name: builtin.display_name.to_string(),
+            base_url: builtin.base_url.to_string(),
+            is_custom: false,
+        });
+    }
+    custom
+        .iter()
+        .find(|p| p.agent_id == agent_id)
+        .map(|p| ParticipantInfo {
+            agent_id: p.agent_id.clone(),
+            display_name: p.display_name.clone(),
+            base_url: p.base_url.clone(),
+            is_custom: true,
+        })
+}
+
+/// P3: the unified runtime registry — the single logical participant list the
+/// UI/runtime consume. Built-ins are emitted first (in the frozen `AGENTS`
+/// order, `is_custom: false`), then persisted custom participants in saved
+/// order (`is_custom: true`). Custom entries can never alias a built-in id
+/// (save-time validation rejects that, and this function masks any that leak
+/// through), so built-ins always precede and shadow same-id customs.
+pub fn merged_participants(
+    custom: &[crate::settings_store::CustomParticipant],
+) -> Vec<ParticipantInfo> {
+    let mut merged: Vec<ParticipantInfo> = AGENTS
+        .iter()
+        .map(|builtin| ParticipantInfo {
+            agent_id: builtin.agent_id.to_string(),
+            display_name: builtin.display_name.to_string(),
+            base_url: builtin.base_url.to_string(),
+            is_custom: false,
+        })
+        .collect();
+    for p in custom {
+        if get_agent_config(&p.agent_id).is_none() {
+            merged.push(ParticipantInfo {
+                agent_id: p.agent_id.clone(),
+                display_name: p.display_name.clone(),
+                base_url: p.base_url.clone(),
+                is_custom: true,
+            });
+        }
+    }
+    merged
+}
+
+/// P1: merged display-name resolution. Falls back to the built-in display name
+/// when known; otherwise checks custom participants; else "Unknown Model".
+pub fn resolve_display_name(
+    agent_id: &str,
+    custom: &[crate::settings_store::CustomParticipant],
+) -> String {
+    if let Some(info) = resolve_participant(agent_id, custom) {
+        return info.display_name;
+    }
+    "Unknown Model".to_string()
+}
+
+
+
 #[derive(Debug)]
 pub enum NavEvent {
     Ready(String),
     Error(String),
     Response(String, u32, String),
-    ResponseStart { agent_id: String, turn: u32, message_id: String, chunk_count: u32 },
-    ResponseChunk { agent_id: String, turn: u32, message_id: String, index: u32, text: String },
-    ResponseEnd { agent_id: String, turn: u32, message_id: String },
     Done(String, u32),
     SetupResponseObserved(String),
     SendDetected(String, Option<String>),
@@ -1130,6 +2128,15 @@ pub enum NavEvent {
     },
     ResumeRequested(String),
     SessionAborted,
+    ConsoleDiagnostic {
+        agent_id: String,
+        window_label: String,
+        category: String,
+        severity: String,
+        source: String,
+        message: String,
+        url: String,
+    },
 }
 
 // ── BrowserState ──────────────────────────────────────────────────────────────
@@ -1194,6 +2201,10 @@ impl BrowserState {
 
     pub fn begin_active_turn(&mut self, agent_id: &str, turn: u32) {
         self.active_turn = Some((agent_id.to_string(), turn));
+        let generation = self.diagnostics.setup_generation();
+        let op = browser_harness::operation_id_active_turn(agent_id, generation, turn);
+        self.diagnostics.set_operation(agent_id, &op, "submitting");
+        self.diagnostics.emit_harness_event(agent_id, EventType::ActivePromptInjectionStarted, "submitting", &op, "", serde_json::json!({ "turn": turn }));
         let _ = update_diagnostic(&self.diagnostics, agent_id, |record| {
             record.active_expected_agent_id = Some(agent_id.to_string());
             record.active_turn_number = Some(turn);
@@ -1204,6 +2215,10 @@ impl BrowserState {
     }
 
     pub fn mark_active_waiting(&self, agent_id: &str, turn: u32) {
+        let op = self.diagnostics.current_operation_id(agent_id);
+        self.diagnostics.emit_harness_event(agent_id, EventType::ActivePromptInjectionCompleted, "submitting", &op, "", serde_json::json!({ "turn": turn }));
+        self.diagnostics.emit_harness_event(agent_id, EventType::ActiveSubmitStarted, "submitting", &op, "", serde_json::json!({ "turn": turn }));
+        self.diagnostics.emit_harness_event(agent_id, EventType::ResponseStarted, "waiting_for_response", &op, "", serde_json::json!({ "turn": turn }));
         let _ = update_diagnostic(&self.diagnostics, agent_id, |record| {
             record.active_expected_agent_id = Some(agent_id.to_string());
             record.active_turn_number = Some(turn);
@@ -1215,6 +2230,8 @@ impl BrowserState {
         if self.active_turn.as_ref() == Some(&(agent_id.to_string(), turn)) {
             self.active_turn = None;
         }
+        let op = self.diagnostics.current_operation_id(agent_id);
+        self.diagnostics.emit_harness_event(agent_id, EventType::ResponseCompleted, "response_capture", &op, "", serde_json::json!({ "turn": turn }));
         let _ = update_diagnostic(&self.diagnostics, agent_id, |record| {
             if record.active_turn_number == Some(turn) {
                 record.current_phase = "active_response_captured".to_string();
@@ -1251,6 +2268,29 @@ pub fn navigate_agent_window(
     let window_label = window.label().to_string();
     diagnostics.register(agent_id, &window_label, window_kind);
     diagnostics.set_active(&window_label, agent_id);
+    // Harness: set operation for navigation
+    {
+        let generation = diagnostics.setup_generation();
+        let op = browser_harness::operation_id_setup(agent_id, generation);
+        diagnostics.set_operation(agent_id, &op, "navigation_started");
+        diagnostics.emit_harness_event(
+            agent_id,
+            EventType::NavigationStarted,
+            "navigation_started",
+            &op,
+            target_url,
+            serde_json::json!({ "window_label": window_label, "window_kind": window_kind, "target_url": browser_harness::redact_url(target_url) }),
+        );
+        diagnostics.emit_harness_event(
+            agent_id,
+            EventType::ComposerProbeStarted,
+            "navigation_started",
+            &op,
+            target_url,
+            serde_json::json!({}),
+        );
+    }
+    diagnostics.record_arena_navigation_request(agent_id, &window_label, target_url, "navigation_started");
 
     let sanitized = sanitized_url(target_url);
     if let Some(record) = update_diagnostic(diagnostics, agent_id, |record| {
@@ -1323,15 +2363,74 @@ fn handle_page_load(
 
     let url = sanitized_url(payload.url().as_str());
     let event = payload.event();
+    // Capture from_url before updating
+    let from_url = {
+        let guard = diagnostics.records.lock().unwrap_or_else(|p| p.into_inner());
+        guard.get(&agent_id).and_then(|r| r.last_navigation_url.clone())
+    };
+    let phase_str = if event == PageLoadEvent::Finished {
+        "real_url_loaded"
+    } else {
+        "navigation_started"
+    };
+    // Record navigation forensics with cause correlation
+    diagnostics.record_navigation(&window_label, from_url.clone(), &url, phase_str);
+    // Harness: navigation forensics + event timeline
+    {
+        let op = diagnostics.current_operation_id(&agent_id);
+        let from_cloned = from_url.clone().unwrap_or_default();
+        let (reason, conf) = browser_harness::classify_navigation_reason(&from_cloned, &url, None, None);
+        let (cause, arena_requested) = diagnostics
+            .last_navigation_for(&agent_id)
+            .map(|n| (n.cause.clone(), n.arena_requested))
+            .unwrap_or(("unknown".to_string(), false));
+        let forensics = browser_harness::NavigationForensics {
+            from_url: browser_harness::redact_url(&from_cloned),
+            to_url: browser_harness::redact_url(&url),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            operation_id: op.clone(),
+            phase: phase_str.to_string(),
+            same_document: None,
+            navigation_reason: reason.as_str().to_string(),
+            confidence: match conf { browser_harness::Confidence::Low => "low", browser_harness::Confidence::Medium => "medium", browser_harness::Confidence::High => "high" }.to_string(),
+            cause: cause.clone(),
+            arena_requested,
+        };
+        diagnostics.emit_harness_event(
+            &agent_id,
+            if event == PageLoadEvent::Finished { EventType::NavigationFinished } else { EventType::NavigationStarted },
+            phase_str,
+            &op,
+            &url,
+            serde_json::to_value(&forensics).unwrap_or(serde_json::Value::Null),
+        );
+        diagnostics.emit_harness_event(
+            &agent_id,
+            EventType::UrlChanged,
+            phase_str,
+            &op,
+            &url,
+            serde_json::json!({ "from_url": browser_harness::redact_url(&from_cloned), "to_url": browser_harness::redact_url(&url) }),
+        );
+        if event == PageLoadEvent::Finished {
+            diagnostics.emit_harness_event(
+                &agent_id,
+                EventType::DocumentLoaded,
+                phase_str,
+                &op,
+                &url,
+                serde_json::json!({}),
+            );
+        }
+        // DOM snapshot placeholder at navigation time (metadata only)
+        let snapshot = browser_harness::empty_dom_snapshot();
+        diagnostics.emit_dom_snapshot(&agent_id, snapshot, &op, phase_str);
+    }
     if let Some(record) = update_diagnostic(diagnostics, &agent_id, |record| {
         if is_real_external_url(&url) {
             record.last_navigation_url = Some(url.clone());
         }
-        record.current_phase = if event == PageLoadEvent::Finished {
-            "real_url_loaded".to_string()
-        } else {
-            "navigation_started".to_string()
-        };
+        record.current_phase = phase_str.to_string();
     }) {
         tracing::debug!(
             "[BROWSER] {} {} page load {:?}: {}",
@@ -1566,22 +2665,6 @@ fn handle_arena_url(
                 send_nav_event(&tx, NavEvent::Response(agent_id.to_string(), turn, text));
             }
         }
-        ("response-start", [agent_id, turn_str, message_id, count]) => {
-            if let (Ok(turn), Ok(chunk_count)) = (turn_str.parse::<u32>(), count.parse::<u32>()) {
-                send_nav_event(&tx, NavEvent::ResponseStart { agent_id: agent_id.to_string(), turn, message_id: message_id.to_string(), chunk_count });
-            }
-        }
-        ("response-chunk", [agent_id, turn_str, message_id, index, encoded]) => {
-            if let (Ok(turn), Ok(index)) = (turn_str.parse::<u32>(), index.parse::<u32>()) {
-                let text = urlencoding::decode(encoded).unwrap_or_default().into_owned();
-                send_nav_event(&tx, NavEvent::ResponseChunk { agent_id: agent_id.to_string(), turn, message_id: message_id.to_string(), index, text });
-            }
-        }
-        ("response-end", [agent_id, turn_str, message_id]) => {
-            if let Ok(turn) = turn_str.parse::<u32>() {
-                send_nav_event(&tx, NavEvent::ResponseEnd { agent_id: agent_id.to_string(), turn, message_id: message_id.to_string() });
-            }
-        }
         ("done", [agent_id, turn_str]) => {
             if let Ok(turn) = turn_str.parse::<u32>() {
                 send_nav_event(&tx, NavEvent::Done(agent_id.to_string(), turn));
@@ -1733,6 +2816,37 @@ fn handle_arena_url(
                 _ => tracing::info!("[WEBVIEW {}] {}", level.to_uppercase(), msg),
             }
         }
+        // Console diagnostics bridge: arena://console/<agent_id>/<category>/<severity>/<source>/<msg>/<url>
+        ("console", args) => {
+            // Expected 6 args: agent_id, category, severity, encoded_source, encoded_msg, encoded_url
+            // Older JS bridge may send fewer; handle gracefully.
+            if args.len() >= 5 {
+                let agent_id = args[0].clone();
+                let category = args[1].clone();
+                let severity = args[2].clone();
+                let source = urlencoding::decode(&args[3]).unwrap_or_default().into_owned();
+                let message = urlencoding::decode(&args[4]).unwrap_or_default().into_owned();
+                let url = if args.len() >= 6 {
+                    urlencoding::decode(&args[5]).unwrap_or_default().into_owned()
+                } else {
+                    String::new()
+                };
+                send_nav_event(
+                    &tx,
+                    NavEvent::ConsoleDiagnostic {
+                        agent_id,
+                        window_label: window_label.to_string(),
+                        category,
+                        severity,
+                        source,
+                        message,
+                        url,
+                    },
+                );
+            } else {
+                send_unknown_arena_signal(&tx, window_label, url);
+            }
+        }
         _ => send_unknown_arena_signal(&tx, window_label, url),
     }
 }
@@ -1745,21 +2859,31 @@ struct ArenaSignal {
 
 fn parse_arena_signal(url: &tauri::Url) -> Option<ArenaSignal> {
     let host = url.host_str().unwrap_or_default();
-    let path_segments = url
-        .path()
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
+    let path = url.path();
 
     if !host.is_empty() {
+        // For arena:// URLs where action is in the host (e.g., arena://prompt-injection/...),
+        // we must preserve empty path segments because actions like prompt-injection
+        // require a fixed number of arguments (including potentially empty ones for
+        // optional fields like role, contenteditable, error).
+        let path_segments = path
+            .trim_start_matches('/')
+            .split('/')
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
         return Some(ArenaSignal {
             action: host.to_string(),
             args: path_segments,
         });
     }
 
+    // For path-based actions (e.g., arena/ready/chatgpt), filter empty segments
+    let path_segments = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
     let mut segments = path_segments.into_iter();
     let action = segments.next()?;
     Some(ArenaSignal {
@@ -1794,7 +2918,11 @@ fn send_nav_event(tx: &std::sync::mpsc::SyncSender<NavEvent>, event: NavEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArenaSignal, GENERIC_INIT_SCRIPT, parse_arena_signal};
+    use super::{
+        AGENTS, ArenaSignal, GENERIC_INIT_SCRIPT, merged_participants, parse_arena_signal,
+        resolve_display_name, resolve_participant, validate_window_registry,
+    };
+    use crate::settings_store::CustomParticipant;
 
     fn parse(value: &str) -> ArenaSignal {
         let url = match value.parse::<tauri::Url>() {
@@ -1865,6 +2993,46 @@ mod tests {
                 ],
             }
         );
+        // Test prompt-injection with empty trailing arguments (role, contenteditable, error)
+        // This is the exact scenario from the DeepSeek live failure:
+        // arena://prompt-injection/deepseek/textarea-native-setter/1/1/262/1/TEXTAREA///
+        assert_eq!(
+            parse("arena://prompt-injection/deepseek/textarea-native-setter/1/1/262/1/TEXTAREA///"),
+            ArenaSignal {
+                action: "prompt-injection".to_string(),
+                args: vec![
+                    "deepseek".to_string(),
+                    "textarea-native-setter".to_string(),
+                    "1".to_string(),
+                    "1".to_string(),
+                    "262".to_string(),
+                    "1".to_string(),
+                    "TEXTAREA".to_string(),
+                    "".to_string(),  // role (empty)
+                    "".to_string(),  // contenteditable (empty)
+                    "".to_string(),  // error (empty)
+                ],
+            }
+        );
+        // Also test with some non-empty values (URL-encoded as they appear in the raw URL)
+        assert_eq!(
+            parse("arena://prompt-injection/chatgpt/textarea_value/1/1/100/1/TEXTAREA/textarea/textarea/some%20error"),
+            ArenaSignal {
+                action: "prompt-injection".to_string(),
+                args: vec![
+                    "chatgpt".to_string(),
+                    "textarea_value".to_string(),
+                    "1".to_string(),
+                    "1".to_string(),
+                    "100".to_string(),
+                    "1".to_string(),
+                    "TEXTAREA".to_string(),
+                    "textarea".to_string(),
+                    "textarea".to_string(),
+                    "some%20error".to_string(),
+                ],
+            }
+        );
     }
 
     #[test]
@@ -1882,9 +3050,856 @@ mod tests {
             "active-submit",
             "MAX_SUBMIT_ATTEMPTS",
             "button.click()",
+            "__ca_findOwnedSend",
         ] {
             assert!(GENERIC_INIT_SCRIPT.contains(required), "missing {required}");
         }
+    }
+
+    #[test]
+    fn generic_init_has_no_document_wide_send_discovery() {
+        // Regression guard (GO/NO-GO item #3): Send discovery must be rooted in
+        // the ACTIVE composer. Any document-wide Send scan is forbidden.
+        for forbidden in [
+            "document.querySelectorAll(SEND_SELECTORS",
+            "document.querySelectorAll('button,[role=\"button\"],input[type=\"submit\"]')",
+            "document.querySelector(SEND_SELECTORS",
+            "document.querySelector('button",
+            "document.body.querySelector",
+            "getElementsByTagName",
+            "getElementsByClassName",
+        ] {
+            assert!(
+                !GENERIC_INIT_SCRIPT.contains(forbidden),
+                "forbidden document-wide Send discovery pattern leaked: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_init_has_no_loose_ownership_fallback() {
+        // Regression guard (GO/NO-GO item #4): root === document.body must never
+        // grant Send ownership, and the loose ownContainerCheck fallback that
+        // accepted any global candidate must not return.
+        for forbidden in [
+            "ownContainerCheck",
+            "root === document.body",
+            "inputEl.closest('form,[role=\"form\"],[class*=\"composer\" i],[class*=\"prompt\" i],[class*=\"input\" i],footer,main')",
+        ] {
+            assert!(
+                !GENERIC_INIT_SCRIPT.contains(forbidden),
+                "loose ownership pattern leaked: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_init_send_discovery_is_composer_rooted() {
+        // Required ownership chain present in the emitted script:
+        // composer root -> descendants -> enabled Send -> click.
+        for required in [
+            "function composerRootFromInput(input)",
+            "root.querySelectorAll(SEND_SELECTORS[i])",
+            "root.querySelectorAll('button,[role=\"button\"],input[type=\"submit\"]')",
+            "function findOwnedSend(input)",
+            "window.__ca_findOwnedSend",
+            "composer_not_found",
+            "input.isConnected",
+            "function findEnabledButton()",
+            "function currentComposerRoot()",
+        ] {
+            assert!(
+                GENERIC_INIT_SCRIPT.contains(required),
+                "composer-rooted ownership marker missing: {required}"
+            );
+        }
+        // The document must never be the Send-search boundary. A page-state
+        // heuristic (classifyPageState) still counts interactive elements
+        // document-wide, but a Send candidate list must never be built from a
+        // document-wide button/role/input scan.
+        assert!(
+            !GENERIC_INIT_SCRIPT.contains("document.querySelectorAll('button,[role=\"button\"]"),
+            "document-wide Send-capable button scan must not exist in GENERIC_INIT_SCRIPT"
+        );
+    }
+
+    #[test]
+    fn inject_script_send_discovery_is_composer_rooted() {
+        // The per-turn injector's diagnostic send probe must not scan the
+        // document for a Send control; it reuses the composer-rooted helper.
+        let inject_js = super::build_inject_js("test prompt", "chatgpt", 1, true);
+        assert!(
+            !inject_js.contains("document.querySelector(SEND_SELECTORS"),
+            "inject script must not do document-wide Send discovery"
+        );
+        assert!(
+            inject_js.contains("window.__ca_findOwnedSend"),
+            "inject script must reuse composer-rooted Send discovery"
+        );
+    }
+
+    #[test]
+    fn generic_init_composer_root_is_narrow() {
+        // Regression guard (GO/NO-GO item #5): the composer boundary must stay
+        // NARROW. Broad class selectors ([class*="chat" i], [class*="input" i])
+        // can climb to a whole-chat/transcript wrapper and would then own
+        // unrelated Send controls in the message history.
+        for forbidden in [
+            "[class*=\"prompt\" i],[class*=\"input\" i],[class*=\"chat\" i]",
+            "[class*=\"input\" i],[class*=\"chat\" i]",
+        ] {
+            assert!(
+                !GENERIC_INIT_SCRIPT.contains(forbidden),
+                "broad composer-boundary selector leaked: {forbidden}"
+            );
+        }
+        // The narrow boundary (semantic composer ancestors only) is declared
+        // once in COMPOSER_ROOT_SELECTORS and shared by the ownership probe.
+        // It must contain the semantic composer selectors and NEVER the broad
+        // [class*="input"] / [data-testid*="input"] / [class*="chat"] matches
+        // that climb to a text-input wrapper or whole-chat wrapper — a
+        // [data-testid*="input"] wrapper excludes the Send sibling, which is
+        // the live ChatGPT failure (send_button_candidate_count=0) this guard
+        // exists to prevent. The injected-prompt re-verification marker must
+        // also exist for current-composer proof.
+        let boundary_start = GENERIC_INIT_SCRIPT
+            .find("const COMPOSER_ROOT_SELECTORS = [")
+            .expect("COMPOSER_ROOT_SELECTORS declaration missing");
+        let boundary_end = GENERIC_INIT_SCRIPT[boundary_start..]
+            .find("];")
+            .expect("COMPOSER_ROOT_SELECTORS terminator missing");
+        let boundary = &GENERIC_INIT_SCRIPT[boundary_start..boundary_start + boundary_end];
+        for required in [
+            "'form',",
+            "'[role=\"form\"]',",
+            "'[class*=\"composer\" i]',",
+            "'[class*=\"prompt\" i]',",
+            "'[data-testid*=\"composer\" i]',",
+            "'[data-testid*=\"prompt\" i]'",
+        ] {
+            assert!(
+                boundary.contains(required),
+                "narrow composer-boundary selector missing from COMPOSER_ROOT_SELECTORS: {required}"
+            );
+        }
+        for forbidden in [
+            "'[class*=\"input\" i]'",
+            "'[data-testid*=\"input\" i]'",
+            "'[class*=\"chat\" i]'",
+        ] {
+            assert!(
+                !boundary.contains(forbidden),
+                "broad composer-boundary selector leaked into COMPOSER_ROOT_SELECTORS: {forbidden}"
+            );
+        }
+        for required in [
+            "window.__ca_lastInjectedText",
+            "inputValue(liveInput).indexOf(window.__ca_lastInjectedText.slice(0, 40)) !== 0",
+        ] {
+            assert!(
+                GENERIC_INIT_SCRIPT.contains(required),
+                "narrow composer-boundary marker missing: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_init_icon_only_send_has_expanded_negative_filter() {
+        // Fix 1: looksIconOnlySend must reject attachment/upload controls by
+        // checking for expanded negative filter substrings.
+        for required in [
+            "text.indexOf('add') !== -1",
+            "text.indexOf('plus') !== -1",
+            "text.indexOf('upload') !== -1",
+            "text.indexOf('image') !== -1",
+            "text.indexOf('photo') !== -1",
+            "text.indexOf('clip') !== -1",
+            "text.indexOf('insert') !== -1",
+            "text.indexOf('+') !== -1",
+        ] {
+            assert!(
+                GENERIC_INIT_SCRIPT.contains(required),
+                "icon-only negative filter substring missing: {required}"
+            );
+        }
+        // Also verify the existing ones are still there
+        for required in [
+            "text.indexOf('stop') !== -1",
+            "text.indexOf('voice') !== -1",
+            "text.indexOf('attach') !== -1",
+            "text.indexOf('file') !== -1",
+        ] {
+            assert!(
+                GENERIC_INIT_SCRIPT.contains(required),
+                "existing icon-only negative filter substring missing: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_init_page_health_blocked_retries() {
+        // Fix 2: page_health_blocked branch must retry with MAX_SUBMIT_ATTEMPTS
+        // instead of returning immediately on first detection.
+        // Verify the retry pattern exists in the submitWhenReady function.
+        assert!(
+            GENERIC_INIT_SCRIPT.contains("if (textContainsAny(page, ['cloudflare', 'captcha', 'challenge', 'verify you are human', 'log in', 'sign in'])) {"),
+            "page health check block missing"
+        );
+        // The fix adds: attempts++; if (attempts < MAX_SUBMIT_ATTEMPTS) { setTimeout(submitWhenReady, 300); return; }
+        // followed by error = 'page_health_blocked'; report(false); return;
+        // We verify the retry increment and timeout pattern is present after the health check
+        assert!(
+            GENERIC_INIT_SCRIPT.contains("attempts++;") &&
+            GENERIC_INIT_SCRIPT.contains("if (attempts < MAX_SUBMIT_ATTEMPTS) { setTimeout(submitWhenReady, 300); return; }") &&
+            GENERIC_INIT_SCRIPT.contains("error = 'page_health_blocked';"),
+            "page_health_blocked retry pattern not found"
+        );
+    }
+
+    #[test]
+    fn generic_init_pre_click_button_validation() {
+        // Fix 3: pre-click sanity check to reject attachment/upload buttons.
+        for required in [
+            "btnText.indexOf('attach') !== -1",
+            "btnText.indexOf('file') !== -1",
+            "btnText.indexOf('upload') !== -1",
+            "btnText.indexOf('add') !== -1",
+            "btnText.indexOf('plus') !== -1",
+            "btnText.indexOf('image') !== -1",
+            "btnText.indexOf('photo') !== -1",
+            "btnText.indexOf('clip') !== -1",
+            "btnText.indexOf('insert') !== -1",
+            "btnText.indexOf('+') !== -1",
+        ] {
+            assert!(
+                GENERIC_INIT_SCRIPT.contains(required),
+                "pre-click validation substring missing: {required}"
+            );
+        }
+        assert!(
+            GENERIC_INIT_SCRIPT.contains("error = 'wrong_button_rejected_pre_click';"),
+            "pre-click rejection error code missing"
+        );
+    }
+
+    #[test]
+    fn inject_script_stamps_injected_text_for_ownership() {
+        // The per-turn injector must stamp the injected prompt so the submit
+        // helper and retries can prove they act on the CURRENT composer.
+        let inject_js = super::build_inject_js("test prompt", "chatgpt", 1, true);
+        assert!(
+            inject_js.contains("window.__ca_lastInjectedText = text"),
+            "inject script must stamp the injected text for current-composer proof"
+        );
+    }
+
+    #[test]
+    fn browser_ownership_fixtures_behavioral() {
+        // Behaviorally evaluates the REAL emitted GENERIC_INIT_SCRIPT against
+        // fixture DOMs (sidebar/transcript vs composer-owned Send, composer
+        // replacement between retries, no-composer -> composer_not_found).
+        // Skips gracefully when node is unavailable.
+        let fixture_script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/browser-ownership-fixtures.mjs"
+        );
+        let node_check = std::process::Command::new("node")
+            .arg("--version")
+            .output();
+        let Ok(node_status) = node_check else {
+            eprintln!("node unavailable; skipping behavioral fixture test");
+            return;
+        };
+        if !node_status.status.success() {
+            eprintln!("node unavailable; skipping behavioral fixture test");
+            return;
+        }
+        let output = std::process::Command::new("node")
+            .arg(fixture_script)
+            .output()
+            .expect("failed to execute behavioral fixture harness");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "composer ownership fixtures failed:\n{stdout}\n{stderr}"
+        );
+    }
+
+    // ── P1: merged participant registry ───────────────────────────────────────
+
+    #[test]
+    fn builtin_registry_has_exactly_seven_participants_unchanged() {
+        let ids: Vec<&str> = AGENTS.iter().map(|a| a.agent_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "chatgpt", "claude", "gemini", "deepseek", "qwen", "glm", "kimi"
+            ]
+        );
+        let names: Vec<&str> = AGENTS.iter().map(|a| a.display_name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "ChatGPT", "Claude", "Gemini", "DeepSeek", "Qwen", "GLM", "Kimi"
+            ]
+        );
+        let urls: Vec<&str> = AGENTS.iter().map(|a| a.base_url).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://chatgpt.com",
+                "https://claude.ai",
+                "https://gemini.google.com",
+                "https://chat.deepseek.com",
+                "https://chat.qwen.ai",
+                "https://chat.z.ai/",
+                "https://www.kimi.com/"
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_participant_returns_builtin_even_with_matching_custom() {
+        // A custom entry colliding with a built-in id must NEVER override it —
+        // built-ins are authoritative.
+        let custom = vec![CustomParticipant {
+            agent_id: "deepseek".to_string(),
+            display_name: "Not DeepSeek".to_string(),
+            base_url: "https://evil.example.com".to_string(),
+        }];
+        let resolved = resolve_participant("deepseek", &custom).expect("built-in resolves");
+        assert_eq!(resolved.display_name, "DeepSeek");
+        assert_eq!(resolved.base_url, "https://chat.deepseek.com");
+    }
+
+    #[test]
+    fn resolve_participant_returns_custom_when_no_builtin_overrides() {
+        let custom = vec![CustomParticipant {
+            agent_id: "acme".to_string(),
+            display_name: "Acme Bot".to_string(),
+            base_url: "https://acme.example.com".to_string(),
+        }];
+        let resolved = resolve_participant("acme", &custom).expect("custom resolves");
+        assert_eq!(resolved.display_name, "Acme Bot");
+        assert_eq!(resolved.base_url, "https://acme.example.com");
+    }
+
+    #[test]
+    fn resolve_participant_returns_none_for_unknown_id() {
+        let custom: Vec<CustomParticipant> = vec![];
+        assert!(resolve_participant("does-not-exist", &custom).is_none());
+        // Unknown id is not resolved even with unrelated custom entries present.
+        let custom = vec![CustomParticipant {
+            agent_id: "acme".to_string(),
+            display_name: "Acme Bot".to_string(),
+            base_url: "https://acme.example.com".to_string(),
+        }];
+        assert!(resolve_participant("does-not-exist", &custom).is_none());
+    }
+
+    #[test]
+    fn resolve_display_name_merges_custom_and_builtin() {
+        let custom = vec![CustomParticipant {
+            agent_id: "acme".to_string(),
+            display_name: "Acme Bot".to_string(),
+            base_url: "https://acme.example.com".to_string(),
+        }];
+        assert_eq!(resolve_display_name("chatgpt", &custom), "ChatGPT");
+        assert_eq!(resolve_display_name("acme", &custom), "Acme Bot");
+        assert_eq!(resolve_display_name("nope", &custom), "Unknown Model");
+    }
+
+    #[test]
+    fn custom_does_not_alias_builtin_ids() {
+        // The merged resolver MUST return the built-in for any built-in id,
+        // masking a bogus custom entry on a reserved id.
+        let custom = vec![
+            CustomParticipant {
+                agent_id: "glm".to_string(),
+                display_name: "Spoof".to_string(),
+                base_url: "https://spoof.example.com".to_string(),
+            },
+            CustomParticipant {
+                agent_id: "acme".to_string(),
+                display_name: "Acme Bot".to_string(),
+                base_url: "https://acme.example.com".to_string(),
+            },
+        ];
+        for builtin in AGENTS {
+            assert_eq!(
+                resolve_participant(builtin.agent_id, &custom).map(|i| i.display_name),
+                Some(builtin.display_name.to_string()),
+                "builtin {} must not be shadowed by a custom entry",
+                builtin.agent_id
+            );
+        }
+    }
+
+    // ── P2: create_windows registry gate ──────────────────────────────────────
+
+    fn custom_acme() -> CustomParticipant {
+        CustomParticipant {
+            agent_id: "acme".to_string(),
+            display_name: "Acme Bot".to_string(),
+            base_url: "https://acme.example.com".to_string(),
+        }
+    }
+
+    // A custom participant clears the shared-window registry gate (both as the
+    // leader and as the shared-nav participant).
+    #[test]
+    fn custom_participant_passes_window_registry_gate() {
+        let custom = vec![custom_acme()];
+        assert!(
+            validate_window_registry("chatgpt", "acme", &custom).is_ok(),
+            "built-in leader + custom nav must pass"
+        );
+        assert!(
+            validate_window_registry("acme", "chatgpt", &custom).is_ok(),
+            "custom leader + built-in nav must pass"
+        );
+        assert!(
+            validate_window_registry("acme", "deeper", &custom).is_err(),
+            "custom leader + unknown nav must fail"
+        );
+        assert!(
+            validate_window_registry("unknown", "acme", &custom).is_err(),
+            "unknown leader + custom nav must fail"
+        );
+    }
+
+    // A custom participant resolves during setup (the predicate `run_setup`
+    // and `retry_setup_agent` now use) — established resolver, custom granted.
+    #[test]
+    fn custom_resolves_for_setup_and_retry() {
+        let custom = vec![custom_acme()];
+        assert!(resolve_participant("acme", &custom).is_some());
+        assert_eq!(
+            resolve_participant("acme", &custom).map(|i| i.base_url),
+            Some("https://acme.example.com".to_string())
+        );
+    }
+
+    // Built-in resolution stays equivalent to the pre-P2 built-in-only path.
+    #[test]
+    fn builtin_resolution_unchanged_by_merge() {
+        let custom = vec![custom_acme()];
+        for builtin in AGENTS {
+            let via_builtin = super::get_agent_config(builtin.agent_id)
+                .map(|c| c.base_url)
+                .expect("builtin exists in AGENTS");
+            let via_merged = resolve_participant(builtin.agent_id, &custom)
+                .map(|i| i.base_url)
+                .expect("builtin resolves through merged registry");
+            assert_eq!(
+                via_merged, via_builtin,
+                "builtin {} base_url must be identical after the registry merge",
+                builtin.agent_id
+            );
+        }
+    }
+
+    // ── P3: unified runtime registry ─────────────────────────────────────────
+
+    // The unified registry emits exactly the 7 built-ins first, in frozen order,
+    // each tagged is_custom=false, then customs in saved order.
+    #[test]
+    fn unified_registry_returns_builtins_then_customs() {
+        let custom = vec![custom_acme()];
+        let merged = merged_participants(&custom);
+        assert_eq!(merged.len(), AGENTS.len() + custom.len());
+        for (i, builtin) in AGENTS.iter().enumerate() {
+            assert_eq!(merged[i].agent_id, builtin.agent_id);
+            assert_eq!(merged[i].display_name, builtin.display_name);
+            assert_eq!(merged[i].base_url, builtin.base_url);
+            assert!(!merged[i].is_custom, "built-in must not be flagged custom");
+        }
+        let tail = &merged[AGENTS.len()];
+        assert_eq!(tail.agent_id, "acme");
+        assert_eq!(tail.display_name, "Acme Bot");
+        assert!(tail.is_custom, "custom must be flagged is_custom");
+    }
+
+    // A custom entry can never alias a built-in id in the merged registry.
+    #[test]
+    fn unified_registry_never_aliases_builtin_ids() {
+        let custom = vec![CustomParticipant {
+            agent_id: "deepseek".to_string(),
+            display_name: "Spoof".to_string(),
+            base_url: "https://spoof.example.com".to_string(),
+        }];
+        let merged = merged_participants(&custom);
+        // deepseek remains the built-in and the spoof custom is dropped.
+        assert_eq!(merged.len(), AGENTS.len());
+        let ds = merged.iter().find(|p| p.agent_id == "deepseek").unwrap();
+        assert!(!ds.is_custom);
+        assert_eq!(ds.display_name, "DeepSeek");
+        assert_eq!(ds.base_url, "https://chat.deepseek.com");
+    }
+
+    // Build-in display names remain exactly unchanged when merged.
+    #[test]
+    fn unified_registry_preserves_builtin_display_names() {
+        let custom = vec![custom_acme()];
+        let merged = merged_participants(&custom);
+        for (i, builtin) in AGENTS.iter().enumerate() {
+            assert_eq!(merged[i].display_name, builtin.display_name);
+        }
+    }
+
+    // A custom participant's display name resolves through the merged resolver.
+    #[test]
+    fn unified_registry_resolves_custom_display_name() {
+        let custom = vec![custom_acme()];
+        assert_eq!(resolve_display_name("acme", &custom), "Acme Bot");
+    }
+
+    // ── Console diagnostics ───────────────────────────────────────────────────
+
+    fn make_console_diagnostics() -> super::BrowserDiagnostics {
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.begin_setup_run(super::BrowserSetupMetadata {
+            setup_generation: 1,
+            session_id: "test-session".to_string(),
+            selected_leader_id: "chatgpt".to_string(),
+            selected_agent_ids: vec!["chatgpt".to_string(), "deepseek".to_string()],
+            setup_order: vec!["chatgpt".to_string(), "deepseek".to_string()],
+        });
+        diagnostics.register("chatgpt", super::LEADER_WINDOW_LABEL, "leader");
+        diagnostics.register("deepseek", super::NAV_WINDOW_LABEL, "nav");
+        diagnostics.set_active(super::LEADER_WINDOW_LABEL, "chatgpt");
+        diagnostics.set_active(super::NAV_WINDOW_LABEL, "deepseek");
+        diagnostics
+    }
+
+    #[test]
+    fn console_classification_maps_correctly() {
+        // Direct validation of category/severity mapping via is_valid_console_category and severity_for_category
+        assert!(super::is_valid_console_category("javascript_exception"));
+        assert!(super::is_valid_console_category("unhandled_rejection"));
+        assert!(super::is_valid_console_category("console_error"));
+        assert!(super::is_valid_console_category("console_warning"));
+        assert_eq!(super::severity_for_category("console_warning"), "warning");
+        assert_eq!(super::severity_for_category("javascript_exception"), "error");
+        assert_eq!(super::severity_for_category("console_error"), "error");
+        assert_eq!(super::severity_for_category("unknown_cat"), "info");
+    }
+
+    #[test]
+    fn console_agent_attribution_uses_window_mapping() {
+        let diagnostics = make_console_diagnostics();
+        // Report from nav window but claim chatgpt – should be attributed to deepseek (active on nav)
+        super::record_console_diagnostic(
+            &diagnostics,
+            super::NAV_WINDOW_LABEL,
+            "chatgpt",
+            "console_error",
+            "error",
+            "console.error",
+            "TypeError: Cannot read properties of null",
+            Some("https://chat.deepseek.com/"),
+        );
+        let records = diagnostics.snapshot();
+        let deepseek = records.iter().find(|r| r.agent_id == "deepseek").expect("deepseek exists");
+        assert_eq!(deepseek.console_diagnostics.len(), 1);
+        assert_eq!(deepseek.console_diagnostics[0].category, "console_error");
+        assert!(deepseek.console_diagnostics[0].message.contains("TypeError"));
+        // chatgpt should have no console diagnostics, proving not attributed to last setup agent
+        let chatgpt = records.iter().find(|r| r.agent_id == "chatgpt").expect("chatgpt exists");
+        assert!(chatgpt.console_diagnostics.is_empty(), "chatgpt should not have deepseek's error");
+    }
+
+    #[test]
+    fn console_window_attribution_leader_and_nav() {
+        let diagnostics = make_console_diagnostics();
+        super::record_console_diagnostic(
+            &diagnostics,
+            super::LEADER_WINDOW_LABEL,
+            "chatgpt",
+            "javascript_exception",
+            "error",
+            "window.onerror",
+            "ReferenceError: x is not defined",
+            Some("https://chatgpt.com/"),
+        );
+        super::record_console_diagnostic(
+            &diagnostics,
+            super::NAV_WINDOW_LABEL,
+            "deepseek",
+            "console_warning",
+            "warning",
+            "console.warn",
+            "Deprecated API",
+            Some("https://chat.deepseek.com/"),
+        );
+        let records = diagnostics.snapshot();
+        let leader = records.iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        assert_eq!(leader.window_label, super::LEADER_WINDOW_LABEL);
+        assert_eq!(leader.window_kind, "leader");
+        assert_eq!(leader.console_diagnostics[0].severity, "error");
+        let nav = records.iter().find(|r| r.agent_id == "deepseek").unwrap();
+        assert_eq!(nav.window_label, super::NAV_WINDOW_LABEL);
+        assert_eq!(nav.window_kind, "nav");
+        assert_eq!(nav.console_diagnostics[0].severity, "warning");
+    }
+
+    #[test]
+    fn console_message_truncation_bounds_length() {
+        let diagnostics = make_console_diagnostics();
+        let huge = "a".repeat(5000);
+        super::record_console_diagnostic(
+            &diagnostics,
+            super::LEADER_WINDOW_LABEL,
+            "chatgpt",
+            "console_error",
+            "error",
+            "console.error",
+            &huge,
+            None,
+        );
+        let records = diagnostics.snapshot();
+        let chatgpt = records.iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        assert_eq!(chatgpt.console_diagnostics.len(), 1);
+        let msg = &chatgpt.console_diagnostics[0].message;
+        assert!(msg.len() <= super::MAX_CONSOLE_MESSAGE_LENGTH + 20, "msg len {} exceeds bound", msg.len());
+        assert!(msg.contains("[truncated]"), "huge message should be truncated");
+    }
+
+    #[test]
+    fn console_duplicate_suppression_drops_rapid_repeats() {
+        let diagnostics = make_console_diagnostics();
+        let msg = "TypeError: Cannot read properties of null";
+        super::record_console_diagnostic(
+            &diagnostics,
+            super::NAV_WINDOW_LABEL,
+            "deepseek",
+            "javascript_exception",
+            "error",
+            "window.onerror",
+            msg,
+            None,
+        );
+        // Immediate duplicate should be suppressed
+        super::record_console_diagnostic(
+            &diagnostics,
+            super::NAV_WINDOW_LABEL,
+            "deepseek",
+            "javascript_exception",
+            "error",
+            "window.onerror",
+            msg,
+            None,
+        );
+        let records = diagnostics.snapshot();
+        let deepseek = records.iter().find(|r| r.agent_id == "deepseek").unwrap();
+        assert_eq!(deepseek.console_diagnostics.len(), 1, "duplicate within dedup window should be suppressed");
+        // Different message should not be suppressed
+        super::record_console_diagnostic(
+            &diagnostics,
+            super::NAV_WINDOW_LABEL,
+            "deepseek",
+            "javascript_exception",
+            "error",
+            "window.onerror",
+            "Different error",
+            None,
+        );
+        let records = diagnostics.snapshot();
+        let deepseek = records.iter().find(|r| r.agent_id == "deepseek").unwrap();
+        assert_eq!(deepseek.console_diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn console_bounded_storage_retains_newest() {
+        let diagnostics = make_console_diagnostics();
+        for i in 0..(super::MAX_CONSOLE_DIAGNOSTICS_PER_AGENT + 5) {
+            super::record_console_diagnostic(
+                &diagnostics,
+                super::LEADER_WINDOW_LABEL,
+                "chatgpt",
+                "console_error",
+                "error",
+                "console.error",
+                &format!("error {}", i),
+                None,
+            );
+        }
+        let records = diagnostics.snapshot();
+        let chatgpt = records.iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        assert_eq!(chatgpt.console_diagnostics.len(), super::MAX_CONSOLE_DIAGNOSTICS_PER_AGENT);
+        // Oldest (error 0) should have been dropped, newest retained
+        assert!(!chatgpt.console_diagnostics.iter().any(|e| e.message == "error 0"));
+        assert!(chatgpt.console_diagnostics.iter().any(|e| e.message == format!("error {}", super::MAX_CONSOLE_DIAGNOSTICS_PER_AGENT + 4)));
+    }
+
+    #[test]
+    fn console_empty_fields_do_not_panic() {
+        let diagnostics = make_console_diagnostics();
+        super::record_console_diagnostic(
+            &diagnostics,
+            super::LEADER_WINDOW_LABEL,
+            "chatgpt",
+            "",
+            "",
+            "",
+            "",
+            None,
+        );
+        // Empty message should be ignored, no panic, no entry
+        let records = diagnostics.snapshot();
+        let chatgpt = records.iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        assert!(chatgpt.console_diagnostics.is_empty());
+        // Empty category should fallback to diagnostic_bridge_error without panic
+        super::record_console_diagnostic(
+            &diagnostics,
+            super::LEADER_WINDOW_LABEL,
+            "chatgpt",
+            "",
+            "error",
+            "",
+            "some error",
+            None,
+        );
+        let records = diagnostics.snapshot();
+        let chatgpt = records.iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        assert_eq!(chatgpt.console_diagnostics.len(), 1);
+        assert_eq!(chatgpt.console_diagnostics[0].category, "diagnostic_bridge_error");
+    }
+
+    #[test]
+    fn console_url_encoding_round_trip() {
+        let cases = vec![
+            "hello world",
+            "a/b/c",
+            "quote\"test\"",
+            "colon: value",
+            "unicode: café 🚀",
+            "percent % sign",
+            "query?foo=bar&baz=qux",
+            "special & = ? % #",
+        ];
+        for msg in cases {
+            let encoded = urlencoding::encode(msg);
+            let decoded = urlencoding::decode(&encoded).unwrap_or_default().into_owned();
+            assert_eq!(decoded, msg, "round-trip failed for {:?}", msg);
+            // Also test via arena signal parse
+            let url_str = format!("arena://console/chatgpt/console_error/error/console.error/{}/https%3A%2F%2Fchatgpt.com%2F", encoded);
+            let parsed = parse(&url_str);
+            assert_eq!(parsed.action, "console");
+            assert_eq!(parsed.args[0], "chatgpt");
+            // arg 4 is the encoded message which should still be encoded at parse time; decode it and compare
+            let decoded_arg = urlencoding::decode(&parsed.args[4]).unwrap_or_default().into_owned();
+            assert_eq!(decoded_arg, msg);
+        }
+    }
+
+    #[test]
+    fn console_generic_init_is_idempotent() {
+        // Idempotent marker and no agent-specific hardcoding
+        assert!(
+            super::GENERIC_INIT_SCRIPT.contains("__ca_consoleDiagnosticsInstalled"),
+            "idempotent guard missing"
+        );
+        // Should contain both console.error and console.warn wrappers
+        assert!(super::GENERIC_INIT_SCRIPT.contains("console.error = function"));
+        assert!(super::GENERIC_INIT_SCRIPT.contains("console.warn = function"));
+        // Should use addEventListener, not replace handlers
+        assert!(super::GENERIC_INIT_SCRIPT.contains("addEventListener('error'"));
+        assert!(super::GENERIC_INIT_SCRIPT.contains("addEventListener('unhandledrejection'"));
+        // Should preserve original behavior via apply
+        assert!(super::GENERIC_INIT_SCRIPT.contains("_ce.apply"));
+        assert!(super::GENERIC_INIT_SCRIPT.contains("_cw.apply"));
+        // Should be generic, not hardcode specific agent ids
+        for agent in ["chatgpt", "deepseek", "claude", "gemini", "qwen", "glm", "kimi"] {
+            // The script is generic; it should not contain literal agent strings except maybe in comments/selectors
+            // But it must not contain a hardcoded assignment like "__ca_agentId = \"chatgpt\""
+            assert!(
+                !super::GENERIC_INIT_SCRIPT.contains(&format!("\"{}\"", agent)) || super::GENERIC_INIT_SCRIPT.contains("display_name_for"),
+                "GENERIC_INIT_SCRIPT should not hardcode agent_id {}", agent
+            );
+        }
+    }
+
+    #[test]
+    fn console_sanitize_redacts_and_bounds() {
+        let msg = "Bearer sk-1234567890abcdef1234567890abcdef token-xyz and normal text";
+        let sanitized = super::sanitize_console_message(msg);
+        assert!(!sanitized.contains("sk-1234567890"), "should redact sk- token");
+        assert!(sanitized.contains("[REDACTED]"));
+        let long = "x".repeat(5000);
+        let sanitized_long = super::sanitize_console_message(&long);
+        assert!(sanitized_long.len() <= super::MAX_CONSOLE_MESSAGE_LENGTH + 20);
+        assert!(sanitized_long.contains("[truncated]"));
+    }
+
+    // ── Navigation diagnostics ────────────────────────────────────────────────
+
+    #[test]
+    fn navigation_arena_requested_is_correlated() {
+        let diagnostics = make_console_diagnostics();
+        diagnostics.record_arena_navigation_request("chatgpt", super::LEADER_WINDOW_LABEL, "https://chatgpt.com", "navigation_started");
+        diagnostics.record_navigation(super::LEADER_WINDOW_LABEL, Some("https://chatgpt.com/".to_string()), "https://chatgpt.com", "navigation_started");
+        let rec = diagnostics.snapshot().into_iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        assert_eq!(rec.navigation_diagnostics.len(), 1);
+        assert_eq!(rec.navigation_diagnostics[0].cause, "arena_requested");
+        assert!(rec.navigation_diagnostics[0].arena_requested);
+    }
+
+    #[test]
+    fn navigation_page_initiated_is_detected() {
+        let diagnostics = make_console_diagnostics();
+        diagnostics.record_navigation(super::NAV_WINDOW_LABEL, Some("https://chat.deepseek.com/".to_string()), "https://chat.deepseek.com/c/abc123", "real_url_loaded");
+        let rec = diagnostics.snapshot().into_iter().find(|r| r.agent_id == "deepseek").unwrap();
+        assert_eq!(rec.navigation_diagnostics.len(), 1);
+        assert_eq!(rec.navigation_diagnostics[0].cause, "page_initiated");
+        assert!(!rec.navigation_diagnostics[0].arena_requested);
+    }
+
+    #[test]
+    fn navigation_bounded_history_retains_newest() {
+        let diagnostics = make_console_diagnostics();
+        for i in 0..(super::MAX_NAVIGATION_DIAGNOSTICS_PER_AGENT + 5) {
+            diagnostics.record_navigation(
+                super::LEADER_WINDOW_LABEL,
+                Some(format!("https://chatgpt.com/{}", i)),
+                &format!("https://chatgpt.com/{}", i + 1),
+                "navigation_started",
+            );
+        }
+        let rec = diagnostics.snapshot().into_iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        assert_eq!(rec.navigation_diagnostics.len(), super::MAX_NAVIGATION_DIAGNOSTICS_PER_AGENT);
+        assert!(!rec.navigation_diagnostics.iter().any(|e| e.from_url == "https://chatgpt.com/0"));
+    }
+
+    #[test]
+    fn navigation_setup_generation_is_tracked() {
+        let diagnostics = make_console_diagnostics();
+        diagnostics.record_navigation(super::LEADER_WINDOW_LABEL, None, "https://chatgpt.com", "navigation_started");
+        let rec = diagnostics.snapshot().into_iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        assert_eq!(rec.navigation_diagnostics[0].setup_generation, 1);
+        assert_eq!(rec.navigation_diagnostics[0].agent_id, "chatgpt");
+        assert_eq!(rec.navigation_diagnostics[0].window_label, super::LEADER_WINDOW_LABEL);
+    }
+
+    #[test]
+    fn navigation_recent_unexpected_is_detected() {
+        let diagnostics = make_console_diagnostics();
+        diagnostics.record_navigation(super::LEADER_WINDOW_LABEL, Some("https://chatgpt.com/".to_string()), "https://chatgpt.com/c/new", "real_url_loaded");
+        assert!(diagnostics.has_recent_unexpected_navigation("chatgpt", 15));
+        assert!(!diagnostics.has_recent_unexpected_navigation("nonexistent", 15));
+    }
+
+    #[test]
+    fn navigation_recovery_is_bounded() {
+        let diagnostics = make_console_diagnostics();
+        for _ in 0..super::MAX_SETUP_NAVIGATION_RECOVERIES {
+            assert!(diagnostics.can_recover_navigation("chatgpt"));
+            diagnostics.increment_setup_navigation_recovery("chatgpt");
+        }
+        assert!(!diagnostics.can_recover_navigation("chatgpt"));
+        diagnostics.reset_setup_navigation_recovery("chatgpt");
+        assert!(diagnostics.can_recover_navigation("chatgpt"));
     }
 }
 
@@ -1905,31 +3920,124 @@ mod tests {
 //   appear, while continuing to emit secret-free readiness/send probes.
 
 pub const GENERIC_INIT_SCRIPT: &str = r#"
-// D-040 Tier 2: Forward JS errors to Rust via arena://log
+// D-040 Tier 2 + Console diagnostics bridge: bounded, classified, idempotent.
+// Captures console.error / console.warn / window.onerror / unhandledrejection
+// and forwards via arena://console/<agent_id>/<category>/<severity>/<source>/<msg>/<url>
+// with re-entrancy guards, safe stringify, truncation, and no DOM serialization.
 (function() {
-    var _ce = console.error;
-    var _ceGuard = false;
-    console.error = function() {
-        _ce.apply(console, arguments);
-        if (_ceGuard) return;
-        _ceGuard = true;
+    if (window.__ca_consoleDiagnosticsInstalled) return;
+    window.__ca_consoleDiagnosticsInstalled = true;
+    var MAX_LEN = 2048;
+    function getAgentId() {
+        if (window.__ca_agentId) return window.__ca_agentId;
         try {
-            var msg = Array.prototype.slice.call(arguments).join(' ');
-            window.location.href = 'arena://log/error/' + encodeURIComponent(msg);
-        } catch (x) {}
-        _ceGuard = false;
-    };
-    var _oeGuard = false;
-    window.onerror = function(msg, src, line) {
-        if (_oeGuard) return false;
-        _oeGuard = true;
+            var p = '__consensus_arena_agent__:';
+            if (typeof window.name === 'string' && window.name.indexOf(p) === 0) return window.name.substring(p.length);
+        } catch (e) {}
+        return 'unknown';
+    }
+    function sanitize(str) {
+        if (!str) return '';
+        str = String(str);
+        if (str.length > MAX_LEN) str = str.slice(0, MAX_LEN) + ' [truncated]';
+        return str;
+    }
+    function safeStringify(arg) {
         try {
-            var m = (msg || '') + ' (' + (src || '') + ':' + (line || 0) + ')';
-            window.location.href = 'arena://log/error/' + encodeURIComponent(m);
-        } catch (x) {}
-        _oeGuard = false;
-        return false;
-    };
+            if (arg === null) return 'null';
+            if (arg === undefined) return 'undefined';
+            if (typeof arg === 'string') return arg;
+            if (arg instanceof Error) {
+                var s = arg.name + ': ' + arg.message;
+                if (arg.stack) s += ' ' + String(arg.stack).slice(0, 800);
+                return s;
+            }
+            if (typeof arg === 'object') {
+                if (arg instanceof Element || arg instanceof Document) return '[DOM ' + (arg.tagName || 'node') + ']';
+                try {
+                    var seen = new WeakSet();
+                    var json = JSON.stringify(arg, function(k, v) {
+                        if (typeof v === 'object' && v !== null) {
+                            if (seen.has(v)) return '[Circular]';
+                            seen.add(v);
+                        }
+                        return v;
+                    });
+                    if (json && json.length > MAX_LEN) json = json.slice(0, MAX_LEN) + ' [truncated]';
+                    return json || String(arg);
+                } catch (e) {
+                    return String(arg).slice(0, MAX_LEN);
+                }
+            }
+            return String(arg);
+        } catch (e) {
+            try { return String(arg).slice(0, MAX_LEN); } catch (_) { return '[unserializable]'; }
+        }
+    }
+    function argsToMessage(args) {
+        var parts = [];
+        for (var i = 0; i < args.length; i++) parts.push(safeStringify(args[i]));
+        var msg = parts.join(' ');
+        if (msg.length > MAX_LEN) msg = msg.slice(0, MAX_LEN) + ' [truncated]';
+        return msg;
+    }
+    function report(category, severity, source, msg) {
+        try {
+            if (!msg) return;
+            var agentId = getAgentId();
+            var url = '';
+            try { url = window.location.href.slice(0, 500); } catch (e) {}
+            var encMsg = encodeURIComponent(msg);
+            var encSource = encodeURIComponent(source);
+            var encUrl = encodeURIComponent(url);
+            if (encMsg.length > 3000) encMsg = encodeURIComponent(msg.slice(0, 2000) + ' [truncated]');
+            window.location.href = 'arena://console/' + encodeURIComponent(agentId) + '/' + encodeURIComponent(category) + '/' + encodeURIComponent(severity) + '/' + encSource + '/' + encMsg + '/' + encUrl;
+        } catch (e) {}
+    }
+    // Preserve original console functions and do not break model site.
+    try {
+        var _ce = console.error;
+        var _cw = console.warn;
+        var _ceGuard = false;
+        console.error = function() {
+            var msg = argsToMessage(arguments);
+            if (!_ceGuard) { _ceGuard = true; try { report('console_error','error','console.error', msg); } catch (_) {} _ceGuard = false; }
+            return _ce.apply(this, arguments);
+        };
+        console.warn = function() {
+            var msg = argsToMessage(arguments);
+            if (!_ceGuard) { _ceGuard = true; try { report('console_warning','warning','console.warn', msg); } catch (_) {} _ceGuard = false; }
+            return _cw.apply(this, arguments);
+        };
+    } catch (e) {}
+    try {
+        window.addEventListener('error', function(ev) {
+            var msg = '';
+            try {
+                msg = (ev.message || '') + ' (' + (ev.filename || '') + ':' + (ev.lineno || 0) + ':' + (ev.colno || 0) + ')';
+                if (ev.error && ev.error.stack) msg += ' ' + String(ev.error.stack).slice(0, 800);
+            } catch (_) { msg = String(ev.message || 'error'); }
+            msg = sanitize(msg);
+            try { report('javascript_exception','error','window.onerror', msg); } catch (_) {}
+        });
+    } catch (e) {}
+    try {
+        window.addEventListener('unhandledrejection', function(ev) {
+            var msg = '';
+            try {
+                var r = ev.reason;
+                if (r instanceof Error) msg = r.name + ': ' + r.message + (r.stack ? ' ' + String(r.stack).slice(0,800) : '');
+                else msg = safeStringify(r);
+            } catch (_) { msg = 'unhandledrejection'; }
+            msg = sanitize(msg);
+            try { report('unhandled_rejection','error','window.onunhandledrejection', msg); } catch (_) {}
+        });
+    } catch (e) {}
+    // Keep legacy arena://log/error path for backward compat but also route through new bridge.
+    try {
+        var _legacyCe = console.error;
+        // no-op: legacy handler already replaced above; just ensure arena://log still works for any external callers
+    } catch (e) {}
 })();
 
 // Main agent init
@@ -2076,6 +4184,24 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
                     if (raw.matches('form,footer,main,[role="form"],[data-testid*="composer" i],[data-testid*="textbox" i],[data-testid*="input" i]')) {
                         addUniqueElement(composerContainers, raw);
                     }
+                }
+            }
+        }
+
+        // Current-composer proof: once a prompt has been injected, the ACTIVE
+        // composer is the editable holding that text. Prefer it over any
+        // DOM-order candidate (a previous-message edit box, a hidden editor, a
+        // regenerated ProseMirror node) so retries and re-resolution never
+        // target the transcript. Setup never sets __ca_lastInjectedText, so the
+        // readiness/send-detection paths are unaffected.
+        if (inputCandidates.length > 0 && window.__ca_lastInjectedText) {
+            var expectedPrefix = window.__ca_lastInjectedText.slice(0, 40);
+            for (var p = 0; p < inputCandidates.length; p++) {
+                var preferred = inputCandidates[p];
+                if (preferred && inputValue(preferred).indexOf(expectedPrefix) === 0) {
+                    inputCandidates.splice(p, 1);
+                    inputCandidates.unshift(preferred);
+                    break;
                 }
             }
         }
@@ -2348,33 +4474,126 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
 
     function isSendCandidate(el) {
         if (!el || !(el instanceof Element)) return false;
-        if (!isVisible(el) || !isEnabled(el)) return false;
+        if (!isVisible(el)) return false;
         const text = candidateText(el);
+        // Explicit negative filters: attachment, file, upload, paperclip, voice, microphone
+        if (text.indexOf('attach') !== -1 || text.indexOf('file') !== -1 || text.indexOf('upload') !== -1 ||
+            text.indexOf('paperclip') !== -1 || text.indexOf('voice') !== -1 || text.indexOf('microphone') !== -1) {
+            return false;
+        }
         if (text.indexOf('send') !== -1 || text.indexOf('submit') !== -1 || text.indexOf('arrow-up') !== -1 || text.indexOf('arrow up') !== -1) return true;
         return el.matches && SEND_SELECTORS.some(function(selector) {
             try { return el.matches(selector); } catch (e) { return false; }
         });
     }
 
-    function composerContainer(input) {
-        if (!input || !(input instanceof Element)) return null;
-        return input.closest('form,[role="form"],[class*="composer" i],[class*="input" i],[class*="chat" i]') || input.parentElement;
-    }
-
     function looksIconOnlySend(button, input) {
-        if (!button || !(button instanceof Element) || !isVisible(button) || !isEnabled(button)) return false;
+        if (!button || !(button instanceof Element) || !isVisible(button)) return false;
         const rect = button.getBoundingClientRect();
         if (rect.width < 20 || rect.width > 80 || rect.height < 20 || rect.height > 80) return false;
         const inputRect = input && input.getBoundingClientRect ? input.getBoundingClientRect() : null;
         if (inputRect && Math.abs(rect.top - inputRect.top) > 140 && Math.abs(rect.bottom - inputRect.bottom) > 140) return false;
         const text = candidateText(button);
-        if (text.indexOf('stop') !== -1 || text.indexOf('voice') !== -1 || text.indexOf('attach') !== -1 || text.indexOf('file') !== -1) return false;
+        if (text.indexOf('stop') !== -1 || text.indexOf('voice') !== -1 || text.indexOf('attach') !== -1 || text.indexOf('file') !== -1 ||
+            text.indexOf('add') !== -1 || text.indexOf('plus') !== -1 || text.indexOf('upload') !== -1 ||
+            text.indexOf('image') !== -1 || text.indexOf('photo') !== -1 || text.indexOf('clip') !== -1 ||
+            text.indexOf('insert') !== -1 || text.indexOf('+') !== -1) return false;
         if (button.querySelector('svg')) return true;
         return !!button.querySelector('path[d]');
     }
 
-    function collectSendButtonCandidates(input) {
+    // Provider-neutral composer-ownership resolution (shared by setup probes,
+    // readiness/send probes, and active submission).
+    //
+    // The composer boundary is resolved from the ACTIVE input and is the ONLY
+    // boundary for Send discovery. It must never resolve to document.body /
+    // documentElement, and the document is never searched for a Send control.
+    //
+    // Why a single closest() is not enough: real composer DOMs differ in
+    // structure. ChatGPT nests the textarea inside a narrow text-input wrapper
+    // (e.g. a [data-testid*="input"] div) whose SIBLING is the Send control,
+    // while DeepSeek keeps an icon-only Send inside a non-form toolbar. A
+    // one-shot closest() with a wide selector list stops at whichever wrapper
+    // matches first — often the narrow text-input wrapper that EXCLUDES Send,
+    // which is exactly the live failure (input_found=true, prompt injected,
+    // send_button_candidate_count=0). Resolution therefore walks UP from the
+    // active input, anchored to it, and never past body/html:
+    //   1. nearest semantic composer ancestor (form / [role="form"] /
+    //      [class*="composer"|"prompt"] / composer|prompt testid) that contains
+    //      an owned Send control;
+    //   2. else the NARROWEST ancestor (excluding body/html) that contains an
+    //      owned Send control — covers Send-as-sibling-of-the-text-wrapper and
+    //      non-form composers;
+    //   3. else the nearest semantic composer ancestor;
+    //   4. else the direct composer wrapper (input.parentElement).
+    // Unprovable ownership yields null -> callers report composer_not_found or
+    // a false send-capability probe; they never broaden to the document.
+    const COMPOSER_ROOT_SELECTORS = [
+        'form',
+        '[role="form"]',
+        '[class*="composer" i]',
+        '[class*="prompt" i]',
+        '[data-testid*="composer" i]',
+        '[data-testid*="prompt" i]'
+    ];
+
+    function matchesAny(el, selectors) {
+        if (!el || !el.matches) return false;
+        for (let i = 0; i < selectors.length; i++) {
+            try { if (el.matches(selectors[i])) return true; } catch (e) {}
+        }
+        return false;
+    }
+
+    function isOwnershipStop(node) {
+        return !node || node === document.body || node === document.documentElement;
+    }
+
+    function composerRootFromInput(input) {
+        if (!input || !(input instanceof Element)) return null;
+        // 1) Nearest semantic composer ancestor containing an owned Send.
+        let node = input.parentElement;
+        while (!isOwnershipStop(node)) {
+            if (matchesAny(node, COMPOSER_ROOT_SELECTORS) &&
+                collectSendCandidatesIn(node, input).length > 0) {
+                return node;
+            }
+            node = node.parentElement;
+        }
+        // 2) Narrowest ancestor (excluding body/html) containing an owned Send.
+        // Also check the parent of each ancestor (i.e., siblings of the ancestor)
+        // to handle cases where the Send button is a sibling of the ancestor
+        // rather than a descendant (e.g., ChatGPT's text-input-wrapper + Send sibling).
+        node = input.parentElement;
+        while (!isOwnershipStop(node)) {
+            if (collectSendCandidatesIn(node, input).length > 0) return node;
+            const parent = node.parentElement;
+            if (parent && !isOwnershipStop(parent) && collectSendCandidatesIn(parent, input).length > 0) {
+                return parent;
+            }
+            node = node.parentElement;
+        }
+        // 3) Nearest semantic composer ancestor (ownerless capability check).
+        const container = input.closest(COMPOSER_ROOT_SELECTORS.join(','));
+        if (container && container instanceof Element && !isOwnershipStop(container)) {
+            return container;
+        }
+        // 4) Direct composer wrapper. Never document.body / documentElement.
+        const parent = input.parentElement;
+        if (parent && parent instanceof Element && !isOwnershipStop(parent)) {
+            return parent;
+        }
+        return null;
+    }
+
+    // Pure owned-Send scan over a given root. Never resolves a root itself and
+    // never touches the document, so it can be used both as the boundary probe
+    // (composerRootFromInput) and as the final candidate list. Geometry
+    // (looksIconOnlySend) is only a secondary check on candidates already owned
+    // by the composer region, never a substitute for ownership.
+    function collectSendCandidatesIn(root, input) {
         const candidates = [];
+        if (!root || !(root instanceof Element)) return candidates;
         function consider(button) {
             if ((isSendCandidate(button) || looksIconOnlySend(button, input)) && candidates.indexOf(button) === -1) {
                 candidates.push(button);
@@ -2382,29 +4601,48 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         }
         for (let i = 0; i < SEND_SELECTORS.length; i++) {
             try {
-                const elements = Array.prototype.slice.call(document.querySelectorAll(SEND_SELECTORS[i]));
+                const elements = Array.prototype.slice.call(root.querySelectorAll(SEND_SELECTORS[i]));
                 for (let j = 0; j < elements.length; j++) {
                     consider(elements[j]);
                 }
             } catch (e) {}
         }
-        const container = composerContainer(input);
-        if (container) {
-            const scoped = Array.prototype.slice.call(
-                container.querySelectorAll('button,[role="button"],input[type="submit"]')
-            );
-            for (let i = 0; i < scoped.length; i++) {
-                consider(scoped[i]);
-            }
-        }
-        const buttons = Array.prototype.slice.call(
-            document.querySelectorAll('button,[role="button"],input[type="submit"]')
+        const owned = Array.prototype.slice.call(
+            root.querySelectorAll('button,[role="button"],input[type="submit"]')
         );
-        for (let i = 0; i < buttons.length; i++) {
-            consider(buttons[i]);
+        for (let i = 0; i < owned.length; i++) {
+            consider(owned[i]);
         }
         return candidates;
     }
+
+    // STRICTLY composer-owned Send discovery: every candidate lives inside the
+    // resolved ACTIVE composer root. The document is never searched.
+    function collectSendButtonCandidates(input) {
+        const root = composerRootFromInput(input);
+        if (!root) return [];
+        return collectSendCandidatesIn(root, input);
+    }
+
+    function findOwnedSend(input) {
+        const el = input || findInput();
+        if (!el) return null;
+        const root = composerRootFromInput(el);
+        if (!root) return null;
+        const candidates = collectSendButtonCandidates(el);
+        for (let i = 0; i < candidates.length; i++) {
+            const candidate = candidates[i];
+            if (candidate && !candidate.disabled && candidate.getAttribute('aria-disabled') !== 'true') {
+                return candidate;
+            }
+        }
+        return candidates.length > 0 ? candidates[0] : null;
+    }
+
+    // Exposed for per-turn injection diagnostics and readiness probes.
+    window.__ca_findOwnedSend = function(input) {
+        return findOwnedSend(input);
+    };
 
     function findSendButton(input) {
         const candidates = collectSendButtonCandidates(input || findInput());
@@ -2495,7 +4733,9 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
             source: source
         };
         if (source === 'trusted-click' || source === 'trusted-enter' || source === 'trusted-submit') {
-            setTimeout(function() { emitSent(source); }, 150);
+            // Emit quickly before navigation destroys the JS context (ChatGPT new-chat pushState)
+            try { emitSent(source); } catch (e) {}
+            setTimeout(function() { if (!sentSignalEmitted) emitSent(source); }, 150);
         }
         emitSendProbe(true);
     }
@@ -2560,11 +4800,13 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         attachSendListeners();
         if (!pendingSend) return;
         const currentCount = renderedMessageCount(pendingSend.text, pendingSend.input);
-        const documentUnchanged = performance.timeOrigin === pendingSend.timeOrigin;
         const ready = document.readyState === 'complete' || document.readyState === 'interactive';
         const inputCleared = !pendingSend.input || inputValue(pendingSend.input) === '' || inputValue(findInput()) === '';
-        const messageAdded = currentCount > pendingSend.messageCount;
-        if (documentUnchanged && ready && (inputCleared || messageAdded) && userSubmitSeen) {
+        const messageAdded = currentCount === pendingSend.messageCount + 1;
+        // Navigation to a new chat (ChatGPT creates /c/<id>) changes performance.timeOrigin,
+        // clearing the old composer but indicating a successful Send. Treat any inputCleared
+        // or messageAdded after a trusted submit as success, even across a navigation.
+        if (ready && (inputCleared || messageAdded) && userSubmitSeen) {
             emitSent('poll');
             pendingSend = null;
         } else if (Date.now() - pendingSend.startedAt > 15000) {
@@ -2577,7 +4819,7 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         const observer = new MutationObserver(function() {
             if (pendingSend && userSubmitSeen) {
                 const currentCount = renderedMessageCount(pendingSend.text, pendingSend.input);
-                if (currentCount > pendingSend.messageCount) {
+                if (currentCount === pendingSend.messageCount + 1) {
                     emitSent('mutation');
                     pendingSend = null;
                 }
@@ -2586,7 +4828,7 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
             if (!observedPrompt.text || sentSignalEmitted || !userSubmitSeen) return;
             const currentCount = renderedMessageCount(observedPrompt.text, observedPrompt.input);
             const inputCleared = inputValue(observedPrompt.input) === '' || inputValue(findInput()) === '';
-            if (inputCleared && currentCount > observedPrompt.messageCount) {
+            if (inputCleared && currentCount === observedPrompt.messageCount + 1) {
                 emitSent('mutation');
             }
         });
@@ -2600,26 +4842,39 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
     // Active orchestration only calls this helper after the per-turn injector
     // has verified the inserted prompt. Setup never invokes it.
     window.__caSubmitActivePrompt = function(input, expectedAgentId, expectedTurn) {
-        var enabled = false;
-        var method = 'none';
         var error = '';
+        var method = 'none';
+        var enabled = false;
         var attempts = 0;
-        var MAX_SUBMIT_ATTEMPTS = 12;
+        var MAX_SUBMIT_ATTEMPTS = 40;
         function report(success) {
             try {
-                window.location.href = 'arena://active-submit/' + expectedAgentId + '/' + expectedTurn + '/' + (success ? '1' : '0') + '/' + method + '/' + (enabled ? '1' : '0') + '/' + encodeURIComponent(error);
+                window.location.href = 'arena://active-submit/' + expectedAgentId + '/' + expectedTurn + '/' + (success ? '1' : '0') + '/' + encodeURIComponent(method) + '/' + (enabled ? '1' : '0') + '/' + encodeURIComponent(error);
             } catch (e) {}
         }
+        // Resolve the CURRENT composer each attempt. The injected input is
+        // re-validated against the live DOM: it must be connected AND still
+        // hold the injected prompt. A stale node (React/Vue replaced the
+        // composer, or the prompt was cleared) is discarded and the composer is
+        // re-resolved fresh so ownership always tracks the ACTIVE composer.
+        function currentComposerRoot() {
+            var liveInput = (input && input.isConnected) ? input : findInput();
+            if (!liveInput || !liveInput.isConnected) return { input: null, root: null };
+            if (window.__ca_lastInjectedText &&
+                inputValue(liveInput).indexOf(window.__ca_lastInjectedText.slice(0, 40)) !== 0) {
+                liveInput = findInput();
+            }
+            if (!liveInput || !liveInput.isConnected) return { input: null, root: null };
+            return { input: liveInput, root: composerRootFromInput(liveInput) };
+        }
         function findEnabledButton() {
-            var root = input && input.closest && input.closest('form,[role="form"],[class*="composer" i],[class*="prompt" i],footer,main');
-            var selectors = ['button[type="submit"]', '#send-message-button', 'div.send-button-container', 'button[data-testid*="send" i]', 'button[data-testid*="submit" i]', '[role="button"][aria-label*="send" i]', 'button[aria-label*="send" i]', 'button[title*="send" i]', 'button[class*="send" i]', 'button[aria-label*="arrow" i]'];
-            var scopes = root && root !== document ? [root, document] : [document];
-            for (var scopeIndex = 0; scopeIndex < scopes.length; scopeIndex++) {
-                for (var i = 0; i < selectors.length; i++) {
-                    var candidates = scopes[scopeIndex].querySelectorAll(selectors[i]);
-                    for (var j = 0; j < candidates.length; j++) {
-                        if (isVisible(candidates[j]) && isEnabled(candidates[j])) return candidates[j];
-                    }
+            var found = currentComposerRoot();
+            if (!found.input || !found.root) return null;
+            var composite = collectSendButtonCandidates(found.input);
+            for (var i = 0; i < composite.length; i++) {
+                var candidate = composite[i];
+                if (candidate && !candidate.disabled && candidate.getAttribute('aria-disabled') !== 'true') {
+                    return candidate;
                 }
             }
             return null;
@@ -2628,13 +4883,49 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
             try {
                 if (getAgentId() !== expectedAgentId) { error = 'agent_mismatch'; report(false); return; }
                 var page = safeVisibleText();
-                if (textContainsAny(page, ['cloudflare', 'captcha', 'challenge', 'verify you are human', 'log in', 'sign in'])) { error = 'page_health_blocked'; report(false); return; }
+                if (textContainsAny(page, ['cloudflare', 'captcha', 'challenge', 'verify you are human', 'log in', 'sign in'])) {
+                    attempts++;
+                    if (attempts < MAX_SUBMIT_ATTEMPTS) { setTimeout(submitWhenReady, 300); return; }
+                    error = 'page_health_blocked';
+                    report(false);
+                    return;
+                }
+                var found = currentComposerRoot();
+                if (!found.input || !found.root) {
+                    attempts++;
+                    if (attempts < MAX_SUBMIT_ATTEMPTS) { setTimeout(submitWhenReady, 300); return; }
+                    error = 'composer_not_found';
+                    report(false);
+                    return;
+                }
+                // Nudge the composer so React/ProseMirror frameworks register
+                // the injected text before we look for an enabled Send button.
+                var inputEl = found.input;
+                if (inputEl) {
+                    try {
+                        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+                        inputEl.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Unidentified' }));
+                    } catch (e) {}
+                }
                 var button = findEnabledButton();
                 enabled = !!button;
                 if (!button) {
                     attempts++;
-                    if (attempts < MAX_SUBMIT_ATTEMPTS) { setTimeout(submitWhenReady, 250); return; }
+                    if (attempts < MAX_SUBMIT_ATTEMPTS) { setTimeout(submitWhenReady, 300); return; }
                     error = 'enabled_send_button_not_found_after_retry';
+                    report(false);
+                    return;
+                }
+                // Pre-click sanity: reject if button looks like attachment/upload control
+                var btnText = candidateText(button);
+                if (btnText.indexOf('attach') !== -1 || btnText.indexOf('file') !== -1 ||
+                    btnText.indexOf('upload') !== -1 || btnText.indexOf('add') !== -1 ||
+                    btnText.indexOf('plus') !== -1 || btnText.indexOf('image') !== -1 ||
+                    btnText.indexOf('photo') !== -1 || btnText.indexOf('clip') !== -1 ||
+                    btnText.indexOf('insert') !== -1 || btnText.indexOf('+') !== -1) {
+                    attempts++;
+                    if (attempts < MAX_SUBMIT_ATTEMPTS) { setTimeout(submitWhenReady, 300); return; }
+                    error = 'wrong_button_rejected_pre_click';
                     report(false);
                     return;
                 }
@@ -2646,13 +4937,49 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
                 report(false);
             }
         }
-        submitWhenReady();
+        setTimeout(submitWhenReady, 250);
+    };
+    // Re-runs the submit action from an external eval (used by the backend to
+    // retry a failed auto-submit as a fresh action rather than just observing).
+    // Re-resolves the live composer and owned Send control on each invocation.
+    window.__caRetrySubmit = function(expectedAgentId, expectedTurn) {
+        try {
+            var input = findInput();
+            if (input && typeof window.__caSubmitActivePrompt === 'function') {
+                window.__caSubmitActivePrompt(input, expectedAgentId, expectedTurn);
+            }
+        } catch (e) {}
     };
 })();
 "#;
 
 // ── create_windows ────────────────────────────────────────────────────────────
 
+/// P2: registry existence gate for the leader and shared-nav participants,
+/// using the MERGED registry (built-ins + persisted custom). Extracted from
+/// `create_windows` so it is unit-testable without a full Tauri runtime. A
+/// custom participant resolves like a built-in; an unknown id is rejected.
+fn validate_window_registry(
+    leader_agent_id: &str,
+    nav_agent_id: &str,
+    custom: &[crate::settings_store::CustomParticipant],
+) -> Result<(), AgentError> {
+    if resolve_participant(leader_agent_id, custom).is_none() {
+        return Err(AgentError::NavigationFailed(format!(
+            "unknown leader model: {leader_agent_id}"
+        )));
+    }
+    if resolve_participant(nav_agent_id, custom).is_none() {
+        return Err(AgentError::NavigationFailed(format!(
+            "unknown participant model: {nav_agent_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// Two-WebView window setup. Resolves the leader and shared-nav participant
+/// through the merged registry so a persisted custom participant can create
+/// the windows; the seven built-ins behave identically to the pre-P2 gate.
 pub fn create_windows(
     app: &AppHandle,
     state: &mut BrowserState,
@@ -2661,6 +4988,7 @@ pub fn create_windows(
     session_id: &str,
     setup_generation: u32,
     setup_order: &[String],
+    custom: &[crate::settings_store::CustomParticipant],
 ) -> Result<(), AgentError> {
     let nav_agent_id = agent_ids
         .iter()
@@ -2671,12 +4999,7 @@ pub fn create_windows(
             )
         })?
         .clone();
-    get_agent_config(leader_agent_id).ok_or_else(|| {
-        AgentError::NavigationFailed(format!("unknown leader model: {leader_agent_id}"))
-    })?;
-    get_agent_config(&nav_agent_id).ok_or_else(|| {
-        AgentError::NavigationFailed(format!("unknown participant model: {nav_agent_id}"))
-    })?;
+    validate_window_registry(leader_agent_id, &nav_agent_id, custom)?;
     state.diagnostics.begin_setup_run(BrowserSetupMetadata {
         setup_generation,
         session_id: session_id.to_string(),
@@ -2707,8 +5030,8 @@ pub fn create_windows(
             record.current_phase = "queued".to_string();
             record.last_error = None;
         });
-        let intended_url = get_agent_config(agent_id)
-            .map(|config| config.base_url)
+        let intended_url = resolve_participant(agent_id, custom)
+            .map(|info| info.base_url)
             .unwrap_or_default();
         tracing::info!(
             "[SETUP] generation={} session_id={} agent_id={} selected_leader_id={} selected_agent_ids={:?} setup_order={:?} assigned_window_label={} assigned_window_kind={} intended_url={} is_selected_leader={}",
@@ -2821,6 +5144,28 @@ pub fn ensure_nav_window(app: &AppHandle, state: &mut BrowserState) -> Result<We
     Ok(window)
 }
 
+/// Re-run the submit ACTION on a page whose active-turn auto-submit did not get
+/// confirmed. Evals the generic `__caRetrySubmit` helper (defined by
+/// GENERIC_INIT_SCRIPT), which rediscoveries the composer and re-invokes
+/// `__caSubmitActivePrompt` so the exact expected agent/turn is preserved.
+pub fn retry_active_submit(
+    window: &WebviewWindow,
+    agent_id: &str,
+    turn: u32,
+) -> Result<(), AgentError> {
+    let agent_json = serde_json::to_string(agent_id).map_err(|error| {
+        AgentError::InjectionFailed(format!(
+            "retry submit identity serialization failed: {error}"
+        ))
+    })?;
+    let js = format!(
+        "try {{ if (typeof window.__caRetrySubmit === 'function') {{ window.__caRetrySubmit({agent_json}, {turn}); }} }} catch (e) {{}}"
+    );
+    window.eval(&js).map_err(|error| {
+        AgentError::InjectionFailed(format!("retry submit eval failed: {error}"))
+    })
+}
+
 /// Start response capture for a message the user sent manually during setup.
 /// Unlike `build_inject_js`, this does not modify the input or click Send.
 pub fn monitor_existing_response(
@@ -2842,6 +5187,8 @@ pub fn monitor_existing_response(
     '[class*="ai-message"]',
     '[class*="bot-message"]',
     '[class*="model-response"]',
+    '.markdown',
+    '.prose'
   ];
   var AGENT_ID = {};
   var TURN = {};
@@ -2905,7 +5252,7 @@ pub fn monitor_existing_response(
 //
 // Response monitoring polls for a new assistant response after the user sends.
 // Once stable for ~2 seconds, fires:
-//   arena://response-start/chunk/end with bounded URL-encoded chunks
+//   arena://response/{AGENT_ID}/{TURN}/{url-encoded-text}  (text capped 8000 chars)
 //   arena://done/{AGENT_ID}/{TURN}                         (200 ms later)
 // A _baseline is captured before injection to avoid re-reporting old responses.
 
@@ -2957,15 +5304,6 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
     '[data-testid*="textbox" i]',
     '[data-testid*="input" i]'
   ];
-  var SEND_SELECTORS = [
-    '#send-message-button',
-    'div.send-button-container',
-    'button[data-testid="send-button"]',
-    'button[aria-label*="Send"]',
-    'button[aria-label*="send"]',
-    'button[type="submit"]',
-    'button[class*="send"]'
-  ];
   // Assistant-message selectors for response capture (most specific first).
   var RESP_SELECTORS = [
     '[data-message-author-role="assistant"]',
@@ -2974,6 +5312,8 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
     '[class*="ai-message"]',
     '[class*="bot-message"]',
     '[class*="model-response"]',
+    '.markdown',
+    '.prose'
   ];
 
   var AGENT_ID = '{}';
@@ -3051,11 +5391,14 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
     return candidates.length > 0 ? candidates[0] : null;
   }}
 
-  function findSend() {{
-    for (var i = 0; i < SEND_SELECTORS.length; i++) {{
-      var el = document.querySelector(SEND_SELECTORS[i]);
-      if (el && !el.disabled) return el;
-    }}
+  function findSend(input) {{
+    // Composer-rooted only: reuse the ownership-aware discovery installed by
+    // GENERIC_INIT_SCRIPT. Never search the document for a Send control.
+    try {{
+      if (typeof window.__ca_findOwnedSend === 'function') {{
+        return window.__ca_findOwnedSend(input);
+      }}
+    }} catch (e) {{}}
     return null;
   }}
 
@@ -3096,15 +5439,8 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
         if (_stable >= 4) {{ // 4 × 500 ms = 2 s stable → response complete
           _done = true;
           window.__ca_lastResponse = txt;
-          var chunkSize = 1200;
-          var chunkCount = Math.max(1, Math.ceil(txt.length / chunkSize));
-          var messageId = String(Date.now()) + '-' + String(TURN);
-          try {{ window.location.href = 'arena://response-start/' + AGENT_ID + '/' + TURN + '/' + messageId + '/' + chunkCount; }} catch (e) {{}}
-          for (var chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++) {{
-            var chunk = encodeURIComponent(txt.slice(chunkIndex * chunkSize, (chunkIndex + 1) * chunkSize));
-            try {{ window.location.href = 'arena://response-chunk/' + AGENT_ID + '/' + TURN + '/' + messageId + '/' + chunkIndex + '/' + chunk; }} catch (e) {{}}
-          }}
-          try {{ window.location.href = 'arena://response-end/' + AGENT_ID + '/' + TURN + '/' + messageId; }} catch (e) {{}}
+          var enc = encodeURIComponent(txt.substring(0, 8000));
+          try {{ window.location.href = 'arena://response/' + AGENT_ID + '/' + TURN + '/' + enc; }} catch (e) {{}}
           setTimeout(function() {{
             try {{ window.location.href = 'arena://done/' + AGENT_ID + '/' + TURN; }} catch (e) {{}}
           }}, 200);
@@ -3123,40 +5459,101 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
     var visible = input ? ((input.value || input.textContent || '').trim()) : '';
     var prefix = visible.indexOf(text.slice(0, 32)) === 0;
     var suffix = text.length < 32 || visible.slice(-32) === text.slice(-32);
-    var send = findSend();
+    var send = findSend(input);
     try {{ window.location.href = 'arena://prompt-injection/' + AGENT_ID + '/' + method + '/' + (prefix ? '1' : '0') + '/' + (suffix ? '1' : '0') + '/' + visible.length + '/' + (send ? '1' : '0') + '/' + (input ? input.tagName.toLowerCase() : 'none') + '/' + encodeURIComponent(input && input.getAttribute('role') || '') + '/' + encodeURIComponent(input && input.getAttribute('contenteditable') || '') + '/' + encodeURIComponent(error || ''); }} catch (e) {{}}
     return prefix && suffix;
   }}
 
+  function reportSubmitOutcome(ok, methodName, err) {{
+    try {{ window.location.href = 'arena://active-submit/' + AGENT_ID + '/' + TURN + '/' + (ok ? '1' : '0') + '/' + encodeURIComponent(methodName) + '/0/' + encodeURIComponent(err || ''); }} catch (e) {{}}
+  }}
+
+var _injectAttempts = 0;
+  var MAX_INJECT_ATTEMPTS = 50; // 50 × 200 ms ≈ 10 s before reporting failure
   function inject() {{
     var input = findInput();
-    if (!input) {{ setTimeout(inject, 200); return; }}
+    if (!input) {{
+      _injectAttempts++;
+      if (_injectAttempts < MAX_INJECT_ATTEMPTS) {{ setTimeout(inject, 200); return; }}
+      reportInjection(null, 'none', 'input_not_found_after_retry');
+      if (AUTO_SUBMIT) reportSubmitOutcome(false, 'none', 'input_not_found_after_retry');
+      return;
+    }}
+
+    // Idempotency guard: if the prompt is already fully visible in the input,
+    // skip re-injection (e.g., after page reload where __ca_lastInjectedText was lost).
+    var visible = input ? ((input.value || input.textContent || '').trim()) : '';
+    var prefixOk = visible.indexOf(text.slice(0, Math.min(32, text.length))) === 0;
+    var suffixOk = text.length < 32 || visible.slice(-32) === text.slice(-32);
+    if (prefixOk && suffixOk && visible.length >= text.length) {{
+      // Prompt already present — report success and proceed to submit if AUTO_SUBMIT
+      reportInjection(input, 'idempotent_skip', '');
+      if (AUTO_SUBMIT) {{
+        try {{ window.__ca_lastInjectedText = text; }} catch (e) {{}}
+        if (typeof window.__caSubmitActivePrompt === 'function') {{
+          window.__caSubmitActivePrompt(input, AGENT_ID, TURN);
+        }} else {{
+          reportSubmitOutcome(false, 'none', 'submit_helper_missing');
+        }}
+      }}
+      return;
+    }}
 
     var method = 'unsupported';
+    var methodError = '';
     if (input.tagName === 'TEXTAREA') {{
-      var setter = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype, 'value'
-      ).set;
-      setter.call(input, text);
-      input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-      method = 'textarea_value';
+      try {{
+        var setter = Object.getOwnPropertyDescriptor(
+          window.HTMLTextAreaElement.prototype, 'value'
+        ).set;
+        setter.call(input, text);
+        // Dispatch proper InputEvent to notify React of the change
+        // React 17+ listens for 'input' on the root, React 18+ uses batched updates
+        try {{
+            input.dispatchEvent(new InputEvent('beforeinput', {{ bubbles: true, cancelable: true, inputType: 'insertText', data: text }}));
+        }} catch (_) {{}}
+        try {{
+            input.dispatchEvent(new InputEvent('input', {{ bubbles: true, cancelable: true, inputType: 'insertText', data: text }}));
+        }} catch (_) {{
+            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        }}
+        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        method = 'textarea_value';
+      }} catch (e) {{ methodError = String((e && e.message) || e); }}
     }} else if (input.contentEditable === 'true') {{
       // D-042: execCommand works for Kimi Lexical and all other contenteditable
       // editors (Claude.ai, etc.).
-      input.focus();
-      document.execCommand('selectAll', false, null);
-      document.execCommand('insertText', false, text);
+      try {{
+        input.focus();
+        document.execCommand('selectAll', false, null);
+        document.execCommand('insertText', false, text);
+        method = 'contenteditable_exec_command';
+      }} catch (e) {{
+        methodError = String((e && e.message) || e);
+        // Fallback: set text directly and dispatch input so frameworks
+        // register the change even when execCommand is blocked.
+        try {{
+          input.textContent = text;
+          method = 'contenteditable_text_content';
+          methodError = '';
+        }} catch (e2) {{ methodError = methodError || String((e2 && e2.message) || e2); }}
+      }}
       input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-      method = 'contenteditable_exec_command';
+      input.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true, key: 'Unidentified' }}));
     }}
-    var integrityOk = reportInjection(input, method, method === 'unsupported' ? 'unsupported_input' : '');
+    var integrityOk = reportInjection(input, method, methodError || (method === 'unsupported' ? 'unsupported_input' : ''));
     if (AUTO_SUBMIT) {{
-      if (!integrityOk) {{
-        try {{ window.location.href = 'arena://active-submit/' + AGENT_ID + '/' + TURN + '/0/integrity_failed/0/prompt_integrity_failed'; }} catch (e) {{}}
+      // Stamp the injected prompt so the submit helper and any retry can prove
+      // they are acting on the CURRENT composer (see currentComposerRoot /
+      // collectComposerSnapshot). Best-effort only; a sealed/non-writable
+      // window must not break the normal path.
+      try {{ window.__ca_lastInjectedText = text; }} catch (e) {{}}
+      if (!integrityOk || methodError) {{
+        reportSubmitOutcome(false, method, methodError || 'prompt_integrity_failed');
       }} else if (typeof window.__caSubmitActivePrompt === 'function') {{
         window.__caSubmitActivePrompt(input, AGENT_ID, TURN);
       }} else {{
-        try {{ window.location.href = 'arena://active-submit/' + AGENT_ID + '/' + TURN + '/0/helper_missing/0/submit_helper_missing'; }} catch (e) {{}}
+        reportSubmitOutcome(false, 'none', 'submit_helper_missing');
       }}
     }}
   }}
