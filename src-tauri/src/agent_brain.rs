@@ -92,7 +92,17 @@ struct ChatResponseMessage {
     content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrainSource {
+    Primary,
+    Fallback,
+}
+
 impl AgentBrain {
+    pub fn model_name(&self) -> &str { &self.model }
+    pub fn fallback_model_name(&self) -> Option<&str> { self.fallback_model.as_deref() }
+
     pub fn new(
         api_key: String,
         base_url: String,
@@ -151,6 +161,17 @@ impl AgentBrain {
         context: &str,
         memory_context: Option<&str>,
     ) -> Result<AgentDecision, AgentError> {
+        self.decide_with_source(leader_response, context, memory_context)
+            .await
+            .map(|(decision, _source)| decision)
+    }
+
+    pub async fn decide_with_source(
+        &self,
+        leader_response: &str,
+        context: &str,
+        memory_context: Option<&str>,
+    ) -> Result<(AgentDecision, BrainSource), AgentError> {
         let user_content = format!(
             "Leader response:\n{}\n\nContext:\n{}",
             leader_response, context
@@ -167,10 +188,11 @@ impl AgentBrain {
                 &self.model,
                 &effective_system_prompt,
                 &user_content,
+                "primary",
             )
             .await
         {
-            Ok(decision) => Ok(decision),
+            Ok(decision) => Ok((decision, BrainSource::Primary)),
 
             // D-038: on failure, retry once with the fallback config if present.
             Err(primary_err) => {
@@ -199,8 +221,10 @@ impl AgentBrain {
                             fb_model,
                             &effective_system_prompt,
                             &user_content,
+                            "fallback",
                         )
                         .await
+                        .map(|decision| (decision, BrainSource::Fallback))
                         // On fallback failure, surface the original error.
                         .map_err(|_| primary_err)
                     }
@@ -223,7 +247,16 @@ impl AgentBrain {
         prompt
     }
 
-    /// Shared HTTP call + parse logic used by both primary and fallback paths.
+    /// Shared HTTP call + parse logic used by the primary and fallback paths.
+    /// `source_label` is "primary" or "fallback" so the telemetry can say which
+    /// configured brain served/produced each request. (A secondary brain is a
+    /// separate AgentBrain instance selected by the response router; from this
+    /// module's point of view its requests are "primary".)
+    ///
+    /// Telemetry at this choke point (Phase A5) records request start/completion,
+    /// HTTP status category, latency, source, and the parsed decision action.
+    /// It NEVER logs API keys, Authorization headers, full prompts, or full
+    /// response bodies.
     async fn call_api_with(
         &self,
         client: &Client,
@@ -232,7 +265,10 @@ impl AgentBrain {
         model: &str,
         system_prompt: &str,
         user_content: &str,
+        source_label: &str,
     ) -> Result<AgentDecision, AgentError> {
+        let started = std::time::Instant::now();
+
         let request = ChatRequest {
             model: model.to_string(),
             messages: vec![
@@ -250,58 +286,201 @@ impl AgentBrain {
 
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-        let response = client
+        tracing::debug!(
+            "[BRAIN] request started source={} endpoint={}",
+            source_label,
+            redact_endpoint(&url)
+        );
+
+        let response = match client
             .post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
             .json(&request)
             .send()
             .await
-            .map_err(|e| {
-                AgentError::NetworkError(format!("Agent brain request failed: {}", e))
-            })?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                let category = network_error_category(&e);
+                tracing::warn!(
+                    "[BRAIN] request failed source={} category={} latency_ms={} error={}",
+                    source_label,
+                    category,
+                    started.elapsed().as_millis(),
+                    redact_network_error(&e),
+                );
+                return Err(AgentError::NetworkError(format!(
+                    "Agent brain request failed ({category}): {}",
+                    redact_network_error(&e)
+                )));
+            }
+        };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+        let status = response.status();
+        if !status.is_success() {
+            let category = http_status_category(status.as_u16());
+            let redacted = match category {
+                "authentication" => "authentication failed".to_string(),
+                _ if status.as_u16() == 410 => {
+                    "model reached end of life (HTTP 410 Gone)".to_string()
+                }
+                "rate_limit" => "rate limited".to_string(),
+                _ => {
+                    format!("HTTP {} {} ", status.as_u16(), status.canonical_reason().unwrap_or("")).trim().to_string()
+                }
+            };
+            tracing::warn!(
+                "[BRAIN] request completed source={} status={} category={} latency_ms={}",
+                source_label,
+                status.as_u16(),
+                category,
+                started.elapsed().as_millis(),
+            );
             return Err(AgentError::NetworkError(format!(
-                "Agent brain API error {}: {}",
-                status, body
+                "Agent brain API error ({}): {}",
+                category, redacted
             )));
         }
 
-        let chat_response: ChatResponse = response.json().await.map_err(|e| {
-            AgentError::NetworkError(format!("Failed to parse agent brain response: {}", e))
-        })?;
+        // HTTP 200 here — record completion before downstream parsing.
+        tracing::debug!(
+            "[BRAIN] request completed source={} status=200 category=success latency_ms={}",
+            source_label,
+            started.elapsed().as_millis(),
+        );
 
-        let content = chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| {
-                AgentError::NetworkError("Agent brain returned empty response".to_string())
-            })?;
+        let chat_response: ChatResponse = match response.json().await {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                let detail = redact_network_error(&e);
+                tracing::warn!(
+                    "[BRAIN] malformed response source={} category=malformed_response latency_ms={} error={}",
+                    source_label,
+                    started.elapsed().as_millis(),
+                    detail
+                );
+                return Err(AgentError::NetworkError(format!(
+                    "Failed to parse agent brain response: {}",
+                    detail
+                )));
+            }
+        };
 
-        // D-040 [BRAIN] raw response (truncated to 400 chars for log readability)
-        tracing::debug!("[BRAIN] raw ({}) {:.400}", url, content);
+        let content = match chat_response.choices.into_iter().next() {
+            Some(choice) => choice.message.content,
+            None => {
+                tracing::warn!(
+                    "[BRAIN] empty response source={} category=malformed_response latency_ms={}",
+                    source_label,
+                    started.elapsed().as_millis(),
+                );
+                return Err(AgentError::NetworkError(
+                    "Agent brain returned empty response".to_string(),
+                ));
+            }
+        };
 
-        let clean = extract_json_object(&content).ok_or_else(|| {
-            AgentError::NetworkError("Agent brain response contained no complete JSON object".to_string())
-        })?;
+        let clean = match extract_json_object(&content) {
+            Some(clean) => clean,
+            None => {
+                tracing::warn!(
+                    "[BRAIN] no JSON object source={} category=malformed_response latency_ms={}",
+                    source_label,
+                    started.elapsed().as_millis(),
+                );
+                return Err(AgentError::NetworkError(
+                    "Agent brain response contained no complete JSON object".to_string(),
+                ));
+            }
+        };
 
-        let decision = serde_json::from_str::<AgentDecision>(clean).map_err(|e| {
-            AgentError::NetworkError(format!(
-                "Failed to parse agent decision JSON: {} ({} bytes, redacted)",
-                e,
-                clean.len()
-            ))
-        })?;
+        let decision = match serde_json::from_str::<AgentDecision>(clean) {
+            Ok(decision) => decision,
+            Err(e) => {
+                tracing::warn!(
+                    "[BRAIN] invalid decision JSON source={} category=invalid_decision latency_ms={} bytes={}",
+                    source_label,
+                    started.elapsed().as_millis(),
+                    clean.len(),
+                );
+                return Err(AgentError::NetworkError(format!(
+                    "Failed to parse agent decision JSON: {} ({} bytes, redacted)",
+                    e,
+                    clean.len()
+                )));
+            }
+        };
 
-        // D-040 [BRAIN] parsed decision
-        tracing::debug!("[BRAIN] parsed {:?}", decision);
+        // D-040 [BRAIN] parsed decision + Phase A5 observability.
+        tracing::debug!(
+            "[BRAIN] decision source={} action={} latency_ms={} {:?}",
+            source_label,
+            decision_action(&decision),
+            started.elapsed().as_millis(),
+            decision,
+        );
 
         Ok(decision)
+    }
+}
+
+/// Short, secret-free label for a successful decision's action variant.
+fn decision_action(decision: &AgentDecision) -> &'static str {
+    match decision {
+        AgentDecision::Route { .. } => "route",
+        AgentDecision::Blueprint { .. } => "blueprint",
+        AgentDecision::Continue => "continue",
+        AgentDecision::Complete => "complete",
+        AgentDecision::RouteCompare { .. } => "route_compare",
+        AgentDecision::AskUser { .. } => "ask_user",
+    }
+}
+
+/// Redacts a chat-completions endpoint for logging — the host/path are not
+/// sensitive, but this keeps any query string or token fragment out of logs.
+fn redact_endpoint(url: &str) -> String {
+    url.split('?').next().unwrap_or(url).to_string()
+}
+
+/// Classifies a reqwest Transport error into a secret-free category.
+fn network_error_category(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect_error"
+    } else if error.is_request() {
+        "request_error"
+    } else {
+        "network_error"
+    }
+}
+
+/// Hides transient request-local details (URL, address) from network errors.
+/// The returned string never includes a URL or a header.
+fn redact_network_error(error: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    if error.is_timeout() {
+        "request timed out".to_string()
+    } else {
+        error
+            .source()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "request failed".to_string())
+    }
+}
+
+/// Classifies an HTTP status code into a secret-free telemetry category.
+fn http_status_category(status: u16) -> &'static str {
+    match status {
+        200..=299 => "success",
+        401 | 403 => "authentication",
+        404 => "not_found",
+        410 => "gone",
+        429 => "rate_limit",
+        500..=599 => "server_error",
+        _ if (400..=499).contains(&status) => "client_error",
+        _ => "unexpected",
     }
 }
 

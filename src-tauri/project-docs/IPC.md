@@ -153,34 +153,76 @@ invoke('get_diagnostic_snapshot')
 // blueprint.db presence, session_active, brain configuration booleans,
 // memory health summary, and command timestamp. Never includes keys, prompts,
 // cookies, transcripts, model responses, or project brief content.
-// Also includes leader_window_exists, nav_window_exists, and
-// browser_diagnostics. Each browser record contains agent_id, display_name,
-// setup_generation, session_id, selected_leader_id, selected_agent_ids,
-// setup_order, intended_url, window_label, window_kind,
-// assigned_window_label, assigned_window_kind, is_selected_leader,
-// created_at, last_navigation_url, last_ready_at, last_send_detected_at,
-// last_response_at, last_error, and current_phase. It also contains
-// last_blocker, last_blocker_url_redacted, last_challenge_detected_at,
-// resume_attempt_count, last_resume_at, input_found, send_button_found,
-// last_send_probe_at, last_user_submit_event_at, last_message_count_seen,
-// sent_signal_emitted, expected_agent_id, last_signal_agent_id,
-// last_signal_type, last_signal_at, stale_signal_count,
-// response_observed_before_send, response_observed_after_injection,
-// setup_completion_reason, prompt_injected_at, prompt_injection_error,
-// readiness_timeout_ms, readiness_probe_count, input_candidate_count,
-// composer_candidate_count, page_state_hint, page_health_hint,
-// active_expected_agent_id, active_turn_number, last_active_prompt_injected_at,
-// last_active_response_at, active_auto_submit_attempted,
-// active_auto_submit_succeeded, active_auto_submit_method,
-// active_send_button_enabled_before_submit, active_submit_error, and
-// active_submit_at. These active-submit diagnostics never include prompt or
-// response text.
+ // Also includes leader_window_exists, nav_window_exists,
+ // browser_console_error_count, browser_console_warning_count,
+ // browser_console_last_error_at, browser_timeline, browser_timeline_dropped,
+ // browser_timeline_count, and browser_diagnostics. Each browser
+ // record contains agent_id, display_name, setup_generation, session_id,
+ // selected_leader_id, selected_agent_ids, setup_order, intended_url,
+ // window_label, window_kind, assigned_window_label, assigned_window_kind,
+ // is_selected_leader, created_at, last_navigation_url, last_ready_at,
+ // last_send_detected_at, last_response_at, last_error, and current_phase.
+ // It also contains last_blocker, last_blocker_url_redacted,
+ // last_challenge_detected_at, resume_attempt_count, last_resume_at,
+ // input_found, send_button_found, last_send_probe_at,
+ // last_user_submit_event_at, last_message_count_seen,
+ // sent_signal_emitted, expected_agent_id, last_signal_agent_id,
+ // last_signal_type, last_signal_at, stale_signal_count,
+ // response_observed_before_send, response_observed_after_injection,
+ // setup_completion_reason, prompt_injected_at, prompt_injection_error,
+ // readiness_timeout_ms, readiness_probe_count, input_candidate_count,
+ // composer_candidate_count, page_state_hint, page_health_hint,
+ // active_expected_agent_id, active_turn_number, last_active_prompt_injected_at,
+ // last_active_response_at, active_auto_submit_attempted,
+ // active_auto_submit_succeeded, active_auto_submit_method,
+ // active_send_button_enabled_before_submit, active_submit_error, and
+ // active_submit_at. These active-submit diagnostics never include prompt or
+ // response text. Each record also contains console_diagnostics: an array
+ // of { timestamp, category, severity, message, source, url } with
+ // category = javascript_exception | unhandled_rejection | console_error |
+ // console_warning | navigation_error | automation_error | injection_error |
+ // submission_error | challenge_blocker | login_blocker | diagnostic_bridge_error,
+ // severity = error | warning | info, source = window.onerror |
+ // window.onunhandledrejection | console.error | console.warn, and
+ // per-agent counters browser_console_error_count,
+ // browser_console_warning_count, browser_console_last_error_at.
+ // Each record also contains navigation_diagnostics: an array of
+ // { timestamp, agent_id, window_label, window_kind, from_url, to_url, phase,
+ //   setup_generation, cause, arena_requested } with cause = arena_requested |
+ //   page_initiated | unknown, plus setup_navigation_recovery_count and
+ //   last_navigation (same shape). Navigation history is bounded to 10 per agent.
+//Top-level snapshot also aggregates browser_console_error_count,
+ // browser_console_warning_count, browser_console_last_error_at across all agents,
+ // plus browser_timeline (sorted BrowserEvent[] with timestamp, session_id, agent_id,
+ // display_name, window_label, window_kind, setup_generation, phase, operation_id,
+ // event_type, url, details, expected_agent_id; details never contains prompt/response),
+ // browser_timeline_dropped (map agent_id→dropped_count) and browser_timeline_count.
 // current_phase is queued | creating |
-// loading | ready | waiting_user_send | consulting |
-// captcha_or_challenge | navigation_error | unshowable_url | error |
-// unknown. last_blocker is none | captcha_or_challenge | unsupported_url |
-// navigation_error | timeout. URLs are redacted; no keys, prompts, cookies,
-// tokens, or model responses are included.
+ // loading | ready | waiting_user_send | consulting |
+ // captcha_or_challenge | navigation_error | unshowable_url | error |
+ // unknown. last_blocker is none | captcha_or_challenge | unsupported_url |
+ // navigation_error | timeout. URLs and console messages are redacted;
+ // no keys, prompts, cookies, tokens, or model responses are included.
+
+invoke('get_browser_timeline')
+// Returns: Promise<string> (JSON array of BrowserEvent — parse it)
+// BrowserEvent shape: { timestamp, session_id, agent_id, display_name, window_label, window_kind, setup_generation, phase, operation_id, event_type, url, details, expected_agent_id }
+// Sorted chronological, bounded 500 per agent, details never contains prompt/response.
+
+invoke('get_browser_reliability_report')
+// Returns: Promise<string> (plain markdown string — do NOT JSON.parse)
+// Evidence-based report per model: timeline, navigation, console, DOM, priming/submission, diagnosis.
+
+invoke('export_browser_diagnostics')
+// Returns: Promise<string> (JSON: {export_dir, report, events, browser_diagnostics, navigation_history, console_errors})
+// Writes bundle to app_data_dir/diagnostics_export_YYYYMMDD_HHMMSS/ containing
+// BROWSER_RELIABILITY_REPORT.md, events.json, browser-diagnostics.json, navigation-history.json, console-errors.json
+// All files are secret-free and redacted.
+
+invoke('run_single_model_diagnostic', { agent_id: string })
+// Returns: Promise<string> (JSON: {agent_id, display_name, base_url, operation_id, probe, timeline_dropped, note})
+// Dev-only probe for one model (chatgpt|claude|gemini|deepseek|qwen|glm|kimi). Reuses the shared nav WebView, never creates a third window.
+// Refused while a session is active. Probes create/navigate, readiness, login state, composer/input/send/attachment, injection capability, navigation stability.
 ```
 
 ### Data Retrieval

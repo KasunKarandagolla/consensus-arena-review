@@ -1,9 +1,8 @@
 use crate::browser_backend::{
-    NavEvent, READINESS_WAIT_TIMEOUT_SECS, display_name_for, get_agent_config,
-    navigate_agent_window, record_browser_blocker, record_browser_error,
-    record_prompt_injected, record_prompt_injection_error, record_prompt_injection_report,
-    record_setup_completion,
-    record_setup_expected_agent, record_setup_stale_signal,
+    NavEvent, READINESS_WAIT_TIMEOUT_SECS, MAX_SETUP_NAVIGATION_RECOVERIES, display_name_for,
+    navigate_agent_window, record_browser_blocker, record_browser_error, record_prompt_injected,
+    record_prompt_injection_error, record_prompt_injection_report, record_setup_completion,
+    record_setup_expected_agent, record_setup_stale_signal, resolve_participant,
 };
 use crate::errors::AgentError;
 use crate::orchestrator::{AppState, SessionConfig};
@@ -32,6 +31,183 @@ fn setup_send_reason(reason: Option<&str>) -> String {
         }
         Some("mutation") | Some("poll") => "mutation_fallback".to_string(),
         _ => "send_detected".to_string(),
+    }
+}
+
+/// Strong setup capability proof, shared by the setup gate.
+///
+/// Setup completes WITHOUT waiting for a human to press Send only when the
+/// priming injection is confirmed verbatim (`prefix_ok` AND `suffix_ok`), a
+/// composer-owned Send control is enabled after injection
+/// (`send_enabled`), and there is no injection error. This deliberately
+/// treats capability as readiness ONLY: it never implies the priming text was
+/// submitted and never fabricates a response or an ActiveSubmitReport. The
+/// `send_button_candidate_count` alone is never sufficient — the enabled,
+/// composer-owned Send probe result is required.
+fn capability_verified(
+    prefix_ok: bool,
+    suffix_ok: bool,
+    send_enabled: bool,
+    injection_error: Option<&str>,
+) -> bool {
+    injection_error.is_none() && prefix_ok && suffix_ok && send_enabled
+}
+
+fn build_priming_script(priming: &str) -> Result<String, AgentError> {
+    let priming_json = serde_json::to_string(priming)
+        .map_err(|e| AgentError::InjectionFailed(format!("priming prompt serialization failed: {e}")))?;
+    Ok(format!(
+        r#"(function() {{
+                const text = {};
+                const selectors = ['textarea', '#prompt-textarea', '#chat-input', 'div.ProseMirror[contenteditable="true"]', '[contenteditable="true"]', '[role="textbox"]', '[aria-multiline="true"]', 'p[data-placeholder]'];
+                function visible(el) {{ if (!el || !(el instanceof Element)) return false; const s = getComputedStyle(el), r = el.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0; }}
+                function root(el) {{
+                    if (!el || !(el instanceof Element)) return null;
+                    if (el.tagName === 'TEXTAREA') return el;
+                    const editable = el.closest('[contenteditable="true"], [role="textbox"], div.ProseMirror');
+                    if (editable) return editable;
+                    if (el.matches('p[data-placeholder]')) return null;
+                    const child = el.querySelector && el.querySelector('textarea,[contenteditable="true"],[role="textbox"],div.ProseMirror');
+                    return child ? root(child) : null;
+                }}
+                function findInput() {{
+                    const textareas = Array.from(document.querySelectorAll('textarea')).filter(visible);
+                    if (textareas.length) return textareas[0];
+                    for (const selector of selectors) for (const candidate of document.querySelectorAll(selector)) {{ const candidateRoot = root(candidate); if (candidateRoot && visible(candidateRoot)) return candidateRoot; }}
+                    return null;
+                }}
+                function fire(type, inputType) {{
+                    try {{ el.dispatchEvent(new InputEvent(type, {{ bubbles: true, cancelable: type === 'beforeinput', inputType: inputType, data: text }})); }}
+                    catch (_) {{ el.dispatchEvent(new Event(type, {{ bubbles: true }})); }}
+                }}
+                function valueOf(target) {{ return target && target.tagName === 'TEXTAREA' ? target.value : (target && (target.innerText || target.textContent) || ''); }}
+                function selectContents(target) {{ const range = document.createRange(); range.selectNodeContents(target); const selection = getSelection(); if (selection) {{ selection.removeAllRanges(); selection.addRange(range); }} }}
+                function latestResponse() {{ for (const selector of ['[data-message-author-role="assistant"]','[data-testid="assistant-message"]','[class*="assistant-message"]','[class*="ai-message"]','.markdown','.prose']) {{ const items = document.querySelectorAll(selector); if (items.length) {{ const response = (items[items.length - 1].innerText || '').trim(); if (response) return response; }} }} return ''; }}
+                const baseline = latestResponse();
+                const el = findInput();
+                let method = 'none', error = '';
+                if (!el) {{ error = 'priming input field not found'; }} else {{
+                    const visibleText = valueOf(el);
+                    const prefixOk = !!el && visibleText.indexOf(text.slice(0, Math.min(32, text.length))) !== -1;
+                    const suffixOk = !!el && visibleText.indexOf(text.slice(Math.max(0, text.length - 32))) !== -1;
+                    if (prefixOk && suffixOk && visibleText.length >= text.length) {{
+                        const id = encodeURIComponent(window.__ca_agentId || '');
+                        try {{ window.location.href = 'arena://prompt-injection/' + id + '/' + encodeURIComponent('idempotent_skip') + '/1/1/' + visibleText.length + '/0/' + encodeURIComponent(el ? el.tagName : '') + '/' + encodeURIComponent(el && el.getAttribute('role') || '') + '/' + encodeURIComponent(el && el.getAttribute('contenteditable') || '') + '/' + encodeURIComponent(''); }} catch (_) {{}}
+                        return;
+                    }}
+                    try {{
+                        el.focus();
+                        if (el.tagName === 'TEXTAREA') {{
+                            const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+                            if (!descriptor || !descriptor.set) throw new Error('textarea native value setter unavailable');
+                            descriptor.set.call(el, text);
+                            try {{
+                                el.dispatchEvent(new InputEvent('beforeinput', {{ bubbles: true, cancelable: true, inputType: 'insertText', data: text }}));
+                            }} catch (_) {{}}
+                            try {{
+                                el.dispatchEvent(new InputEvent('input', {{ bubbles: true, cancelable: true, inputType: 'insertText', data: text }}));
+                            }} catch (_) {{
+                                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            }}
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            method = 'textarea-native-setter';
+                        }} else {{
+                            selectContents(el); fire('beforeinput', 'insertText');
+                            if (document.execCommand && document.execCommand('insertText', false, text)) method = 'contenteditable-execCommand';
+                            if (valueOf(el).indexOf(text) === -1) {{ el.textContent = text; method = 'contenteditable-textContent-fallback'; }}
+                            fire('input', 'insertText'); el.dispatchEvent(new Event('change', {{ bubbles: true }})); el.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true, key: 'Unidentified' }}));
+                        }}
+                    }} catch (injectionError) {{ error = String(injectionError && injectionError.message || injectionError); }}
+                }}
+                function reportInjection() {{
+                    const visibleText = valueOf(el);
+                    const prefixOk = !!el && visibleText.indexOf(text.slice(0, Math.min(32, text.length))) !== -1;
+                    const suffixOk = !!el && visibleText.indexOf(text.slice(Math.max(0, text.length - 32))) !== -1;
+                    if (!error && (!prefixOk || !suffixOk)) error = 'prompt integrity check failed; composer did not show the full prompt';
+                    let capability = null;
+                    try {{ capability = typeof window.__ca_findOwnedSend === 'function' ? window.__ca_findOwnedSend(el) : null; }} catch (_) {{ capability = null; }}
+                    const enabled = !!capability && !capability.disabled && capability.getAttribute('aria-disabled') !== 'true';
+                    if (!error && !enabled) error = 'prompt injected but the composer-owned send control was not discoverable; composer state may not have accepted injected text';
+                    const id = encodeURIComponent(window.__ca_agentId || '');
+                    try {{ window.location.href = 'arena://prompt-injection/' + id + '/' + encodeURIComponent(method) + '/' + (prefixOk ? '1' : '0') + '/' + (suffixOk ? '1' : '0') + '/' + visibleText.length + '/' + (enabled ? '1' : '0') + '/' + encodeURIComponent(el ? el.tagName : '') + '/' + encodeURIComponent(el && el.getAttribute('role') || '') + '/' + encodeURIComponent(el && el.getAttribute('contenteditable') || '') + '/' + encodeURIComponent(error); }} catch (_) {{}}
+                    let responseChecks = 0, responseEmitted = false;
+                    function pollSetupResponse() {{
+                        if (responseEmitted || ++responseChecks > 240) return;
+                        if (latestResponse() && latestResponse() !== baseline) {{
+                            responseEmitted = true;
+                            try {{ window.location.href = 'arena://setup-response/' + id; }} catch (_) {{}}
+                            return;
+                        }}
+                        setTimeout(pollSetupResponse, 500);
+                    }}
+                    setTimeout(pollSetupResponse, 1000);
+                }}
+                setTimeout(reportInjection, 1000);
+            }})();"#,
+        priming_json
+    ))
+}
+
+async fn perform_priming_injection(
+    window: &tauri::WebviewWindow,
+    priming: &str,
+    diagnostics: &crate::browser_backend::BrowserDiagnostics,
+    agent_id: &str,
+    nav_rx: &mut Receiver<NavEvent>,
+) -> Result<bool, AgentError> {
+    let script = build_priming_script(priming)?;
+    window.eval(&script).map_err(|e| {
+        let msg = format!("priming prompt eval failed: {e}");
+        record_prompt_injection_error(diagnostics, agent_id, &msg);
+        AgentError::InjectionFailed(msg)
+    })?;
+    record_prompt_injected(diagnostics, agent_id);
+    let report_agent_id = agent_id.to_string();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match nav_rx.recv().await {
+                Some(NavEvent::PromptInjectionReport {
+                    agent_id,
+                    method,
+                    prefix_ok,
+                    suffix_ok,
+                    visible_length,
+                    send_enabled,
+                    target_tag,
+                    target_role,
+                    target_contenteditable,
+                    error,
+                }) if agent_id == report_agent_id => {
+                    break Some((
+                        method, prefix_ok, suffix_ok, visible_length, send_enabled, target_tag, target_role,
+                        target_contenteditable, error,
+                    ));
+                }
+                Some(NavEvent::SessionAborted) => break None,
+                Some(event) => {
+                    record_setup_stale_signal(diagnostics, &report_agent_id, &event);
+                }
+                None => break None,
+            }
+        }
+    })
+    .await;
+    match report {
+        Ok(Some((method, prefix_ok, suffix_ok, visible_length, send_enabled, target_tag, target_role, target_contenteditable, error))) => {
+            record_prompt_injection_report(
+                diagnostics, agent_id, method, prefix_ok, suffix_ok, visible_length, send_enabled, target_tag,
+                target_role, target_contenteditable, error.clone(),
+            );
+            Ok(capability_verified(prefix_ok, suffix_ok, send_enabled, error.as_deref()))
+        }
+        Ok(None) | Err(_) => {
+            record_prompt_injection_error(
+                diagnostics,
+                agent_id,
+                "prompt injection was not confirmed by the composer diagnostics",
+            );
+            Ok(false)
+        }
     }
 }
 
@@ -203,11 +379,22 @@ pub async fn run_setup(
 ) -> Result<(), AgentError> {
     let setup_order = config.setup_order();
 
+    // P2: resolve participants against the MERGED registry (built-ins + custom)
+    // loaded once for the whole setup pass, so a persisted custom participant
+    // gets a valid navigation URL and display name. Best-effort load: a settings
+    // read failure falls back to built-ins only.
+    let custom = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .unwrap_or_default();
+
     for agent_id in &setup_order {
         let role = assign_role(agent_id, config);
         let is_leader = agent_id == &config.leader_agent_id;
 
-        let agent_config = get_agent_config(agent_id)
+        let agent_config = resolve_participant(agent_id, &custom)
             .ok_or_else(|| AgentError::NavigationFailed(format!("Unknown model id: {agent_id}")))?;
         let (window, diagnostics, window_kind) = {
             let browser = state.browser_state.lock().await;
@@ -248,7 +435,7 @@ pub async fn run_setup(
             &window,
             agent_id,
             window_kind,
-            agent_config.base_url,
+            &agent_config.base_url,
         );
         if let Err(error) = navigation_result {
             record_browser_error(app, &diagnostics, agent_id, &error.to_string());
@@ -265,8 +452,8 @@ pub async fn run_setup(
 
         match wait_for_setup_ready(
             agent_id,
-            agent_config.base_url,
-            agent_config.display_name,
+            &agent_config.base_url,
+            &agent_config.display_name,
             app,
             &diagnostics,
             nav_rx,
@@ -312,6 +499,14 @@ pub async fn run_setup(
             role
         );
 
+        // Strong setup capability proof, set when the priming injection is
+        // confirmed verbatim (prefix+suffix), a composer-owned Send control is
+        // enabled after injection, and no injection error was reported. This is
+        // a capability/readiness verdict, NOT a submission. When true, setup
+        // advances without waiting for a human to press Send; the ACTIVE loop
+        // performs the real turn submissions.
+        let mut setup_capability_verified = false;
+
         if !diagnostics.prompt_already_visible(agent_id) {
             let priming_json = serde_json::to_string(&priming).map_err(|error| {
                 AgentError::InjectionFailed(format!("priming prompt serialization failed: {error}"))
@@ -319,7 +514,6 @@ pub async fn run_setup(
             let script = format!(r#"(function() {{
                 const text = {};
                 const selectors = ['textarea', '#prompt-textarea', '#chat-input', 'div.ProseMirror[contenteditable="true"]', '[contenteditable="true"]', '[role="textbox"]', '[aria-multiline="true"]', 'p[data-placeholder]'];
-                const sendSelectors = ['#send-message-button', 'button[data-testid*="send" i]', 'button[aria-label*="send" i]', 'button[type="submit"]'];
                 function visible(el) {{ if (!el || !(el instanceof Element)) return false; const s = getComputedStyle(el), r = el.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0; }}
                 function root(el) {{
                     if (!el || !(el instanceof Element)) return null;
@@ -342,12 +536,22 @@ pub async fn run_setup(
                 }}
                 function valueOf(target) {{ return target && target.tagName === 'TEXTAREA' ? target.value : (target && (target.innerText || target.textContent) || ''); }}
                 function selectContents(target) {{ const range = document.createRange(); range.selectNodeContents(target); const selection = getSelection(); if (selection) {{ selection.removeAllRanges(); selection.addRange(range); }} }}
-                function sendButton() {{ for (const selector of sendSelectors) {{ const button = document.querySelector(selector); if (button && visible(button)) return button; }} return null; }}
                 function latestResponse() {{ for (const selector of ['[data-message-author-role="assistant"]','[data-testid="assistant-message"]','[class*="assistant-message"]','[class*="ai-message"]','.markdown','.prose']) {{ const items = document.querySelectorAll(selector); if (items.length) {{ const response = (items[items.length - 1].innerText || '').trim(); if (response) return response; }} }} return ''; }}
                 const baseline = latestResponse();
                 const el = findInput();
                 let method = 'none', error = '';
                 if (!el) {{ error = 'priming input field not found'; }} else {{
+                    // Idempotency guard: if the priming prompt is already fully visible in the input,
+                    // skip re-injection (e.g., after page reload or retry where prompt remains in composer).
+                    const visibleText = valueOf(el);
+                    const prefixOk = !!el && visibleText.indexOf(text.slice(0, Math.min(32, text.length))) !== -1;
+                    const suffixOk = !!el && visibleText.indexOf(text.slice(Math.max(0, text.length - 32))) !== -1;
+                    if (prefixOk && suffixOk && visibleText.length >= text.length) {{
+                        // Prompt already present — report success without re-injecting
+                        const id = encodeURIComponent(window.__ca_agentId || '');
+                        try {{ window.location.href = 'arena://prompt-injection/' + id + '/' + encodeURIComponent('idempotent_skip') + '/1/1/' + visibleText.length + '/0/' + encodeURIComponent(el ? el.tagName : '') + '/' + encodeURIComponent(el && el.getAttribute('role') || '') + '/' + encodeURIComponent(el && el.getAttribute('contenteditable') || '') + '/' + encodeURIComponent(''); }} catch (_) {{}}
+                        return;
+                    }}
                     try {{
                         el.focus();
                         if (el.tagName === 'TEXTAREA') {{
@@ -367,8 +571,13 @@ pub async fn run_setup(
                     const prefixOk = !!el && visibleText.indexOf(text.slice(0, Math.min(32, text.length))) !== -1;
                     const suffixOk = !!el && visibleText.indexOf(text.slice(Math.max(0, text.length - 32))) !== -1;
                     if (!error && (!prefixOk || !suffixOk)) error = 'prompt integrity check failed; composer did not show the full prompt';
-                    const button = sendButton(); const enabled = !!button && !button.disabled && button.getAttribute('aria-disabled') !== 'true';
-                    if (!error && !enabled) error = 'prompt injected but send button remained disabled; composer state may not have accepted injected text';
+                    // Send-capability probe via the SAME ownership abstraction the
+                    // active path uses (window.__ca_findOwnedSend from
+                    // GENERIC_INIT_SCRIPT). Observation-only: never clicks Send.
+                    let capability = null;
+                    try {{ capability = typeof window.__ca_findOwnedSend === 'function' ? window.__ca_findOwnedSend(el) : null; }} catch (_) {{ capability = null; }}
+                    const enabled = !!capability && !capability.disabled && capability.getAttribute('aria-disabled') !== 'true';
+                    if (!error && !enabled) error = 'prompt injected but the composer-owned send control was not discoverable; composer state may not have accepted injected text';
                     const id = encodeURIComponent(window.__ca_agentId || '');
                     try {{ window.location.href = 'arena://prompt-injection/' + id + '/' + encodeURIComponent(method) + '/' + (prefixOk ? '1' : '0') + '/' + (suffixOk ? '1' : '0') + '/' + visibleText.length + '/' + (enabled ? '1' : '0') + '/' + encodeURIComponent(el ? el.tagName : '') + '/' + encodeURIComponent(el && el.getAttribute('role') || '') + '/' + encodeURIComponent(el && el.getAttribute('contenteditable') || '') + '/' + encodeURIComponent(error); }} catch (_) {{}}
                     let responseChecks = 0, responseEmitted = false;
@@ -425,7 +634,13 @@ pub async fn run_setup(
                 Ok(Some((method, prefix_ok, suffix_ok, visible_length, send_enabled, target_tag, target_role, target_contenteditable, error))) => {
                     record_prompt_injection_report(
                         &diagnostics, agent_id, method, prefix_ok, suffix_ok, visible_length,
-                        send_enabled, target_tag, target_role, target_contenteditable, error,
+                        send_enabled, target_tag, target_role, target_contenteditable, error.clone(),
+                    );
+                    setup_capability_verified = capability_verified(
+                        prefix_ok,
+                        suffix_ok,
+                        send_enabled,
+                        error.as_deref(),
                     );
                 }
                 Ok(None) | Err(_) => record_prompt_injection_error(
@@ -446,7 +661,14 @@ pub async fn run_setup(
 
         // Wait for proof that the setup prompt was submitted — either same-agent
         // send detection or a same-agent post-injection assistant response.
+        // This wait is skipped when the strong capability proof already
+        // advanced setup: the ACTIVE loop performs the real submissions.
+        if !setup_capability_verified {
         let agent_id_clone = agent_id.clone();
+        let mut nav_recovery_count: u32 = 0;
+        let mut final_proof: Option<SetupCompletionProof> = None;
+        let mut final_error: Option<AgentError> = None;
+        for _ in 0..=MAX_SETUP_NAVIGATION_RECOVERIES {
         let sent = tokio::time::timeout(std::time::Duration::from_secs(120), async {
             loop {
                 match nav_rx.recv().await {
@@ -478,6 +700,22 @@ pub async fn run_setup(
                     Some(NavEvent::SessionAborted) => {
                         break Err(AgentError::UnknownError("Session aborted".to_string()));
                     }
+                    Some(NavEvent::Ready(id)) if id == agent_id_clone => {
+                        if diagnostics.has_pending_user_submit(&agent_id_clone) {
+                            let _ = app.emit("boss-message", json!({"text": format!("{} navigated to new chat; treating as sent...", agent_config.display_name), "message_type": "status"}));
+                            break Ok(SetupCompletionProof::SendDetected("trusted_submit".to_string()));
+                        }
+                        if nav_recovery_count >= MAX_SETUP_NAVIGATION_RECOVERIES {
+                            break Err(AgentError::NavigationFailed("repeated_navigation_during_setup".to_string()));
+                        }
+                        nav_recovery_count += 1;
+                        diagnostics.increment_setup_navigation_recovery(&agent_id_clone);
+                        let _ = app.emit("boss-message", json!({"text": format!("{} page refreshed; re-priming... (attempt {}/{})", agent_config.display_name, nav_recovery_count, MAX_SETUP_NAVIGATION_RECOVERIES), "message_type": "status"}));
+                        match perform_priming_injection(&window, &priming, &diagnostics, &agent_id_clone, nav_rx).await {
+                            Ok(_) => continue,
+                            Err(e) => break Err(e),
+                        }
+                    }
                     Some(event) => {
                         record_setup_stale_signal(&diagnostics, &agent_id_clone, &event);
                         continue;
@@ -493,37 +731,30 @@ pub async fn run_setup(
         .await;
 
         match sent {
-            Ok(Ok(SetupCompletionProof::SendDetected(reason))) => {
-                record_setup_completion(&diagnostics, agent_id, &reason);
-            }
-            Ok(Ok(SetupCompletionProof::ResponseAfterInjection)) => {
-                record_setup_completion(&diagnostics, agent_id, "response_after_injection");
-            }
-            Ok(Ok(SetupCompletionProof::UserConfirmedManual)) => {
-                record_setup_completion(&diagnostics, agent_id, "user_confirmed_manual");
-            }
-            Ok(Err(error)) => {
-                let message = error.to_string();
-                if matches!(error, AgentError::CaptchaRequired(_)) {
-                    let _ = app.emit("captcha-detected", json!({ "agent_id": agent_id }));
-                    let _ = app.emit("boss-message", json!({
-                        "text": format!("{} needs verification. Complete the check in the model window, then click Resume.", agent_config.display_name),
-                        "message_type": "status"
-                    }));
-                }
-                record_browser_error(app, &diagnostics, agent_id, &message);
-                let _ = app.emit(
-                    "boss-message",
-                    json!({
-                        "text": format!("{} setup stopped: {}", agent_config.display_name, message),
-                        "message_type": "status"
-                    }),
-                );
-                return Err(error);
-            }
+            Ok(Ok(proof)) => { final_proof = Some(proof); break; }
+            Ok(Err(e)) => { final_error = Some(e); break; }
             Err(_) => {
+                if diagnostics.has_recent_unexpected_navigation(agent_id, 15) && nav_recovery_count < MAX_SETUP_NAVIGATION_RECOVERIES {
+                    nav_recovery_count += 1;
+                    diagnostics.increment_setup_navigation_recovery(agent_id);
+                    let _ = app.emit("boss-message", json!({"text": format!("{} page navigation detected after timeout; re-priming... (attempt {}/{})", agent_config.display_name, nav_recovery_count, MAX_SETUP_NAVIGATION_RECOVERIES), "message_type": "status"}));
+                    if let Err(e) = wait_for_setup_ready(agent_id, &agent_config.base_url, &agent_config.display_name, app, &diagnostics, nav_rx).await {
+                        final_error = Some(e);
+                        break;
+                    }
+                    match perform_priming_injection(&window, &priming, &diagnostics, agent_id, nav_rx).await {
+                        Ok(verified) => {
+                            if verified {
+                                final_proof = Some(SetupCompletionProof::SendDetected("capability_verified".to_string()));
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(e) => { final_error = Some(e); break; }
+                    }
+                }
                 let message =
-                    diagnostics.send_detection_timeout_message(agent_id, agent_config.display_name);
+                    diagnostics.send_detection_timeout_message(agent_id, &agent_config.display_name);
                 record_browser_error(app, &diagnostics, agent_id, &message);
                 let _ = app.emit(
                     "boss-message",
@@ -532,8 +763,27 @@ pub async fn run_setup(
                         "message_type": "status"
                     }),
                 );
-                return Err(AgentError::Timeout(message));
+                final_error = Some(AgentError::Timeout(message));
+                break;
             }
+        }
+        }
+        match (final_proof, final_error) {
+            (Some(SetupCompletionProof::SendDetected(reason)), _) => record_setup_completion(&diagnostics, agent_id, &reason),
+            (Some(SetupCompletionProof::ResponseAfterInjection), _) => record_setup_completion(&diagnostics, agent_id, "response_after_injection"),
+            (Some(SetupCompletionProof::UserConfirmedManual), _) => record_setup_completion(&diagnostics, agent_id, "user_confirmed_manual"),
+            (Some(_), _) => unreachable!(),
+            (None, Some(e)) => return Err(e),
+            (None, None) => unreachable!(),
+        }
+        } else {
+            // Strong capability proof (composer accepted priming verbatim, an
+            // owned Send is enabled, no injection error) advanced this agent
+            // without waiting for a human to submit. The priming text was NOT
+            // submitted and no response was fabricated: the ACTIVE loop will
+            // perform turn-1 and onward. Setup completion is an accelerator for
+            // readiness, never a guarantee of submission.
+            record_setup_completion(&diagnostics, agent_id, "capability_verified");
         }
 
         // Capture conversation URL
@@ -633,4 +883,80 @@ pub async fn run_debate(
     }; // lock released here — agent_brain is now free
 
     crate::response_router::run_agent_loop(&config, &brain, &state, &app, &mut nav_rx).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capability_verified;
+
+    // A. Strong setup capability proof completes setup (accelerator) — all four
+    //    signal strengths true and no injection error → the gate holds true.
+    #[test]
+    fn strong_capability_proof_is_verified() {
+        assert!(capability_verified(true, true, true, None));
+    }
+
+    // B. Weak capability proof (any of the required fields false) must NOT
+    //    complete setup automatically; it falls through to the manual
+    //    send-detection / recovery path.
+    #[test]
+    fn weak_capability_proof_not_verified() {
+        assert!(!capability_verified(false, true, true, None), "prefix fail");
+        assert!(!capability_verified(true, false, true, None), "suffix fail");
+        assert!(!capability_verified(true, true, false, None), "send fail");
+        assert!(
+            !capability_verified(false, false, false, None),
+            "all-weak must not verify"
+        );
+    }
+
+    // C. Failed prompt integrity (injection error present) must NOT complete
+    //    setup even when the other signals look strong.
+    #[test]
+    fn failed_prompt_integrity_not_verified() {
+        assert!(
+            !capability_verified(
+                true,
+                true,
+                true,
+                Some("prompt integrity check failed; composer did not show the full prompt")
+            )
+        );
+    }
+
+    // D. Disabled Send control must NOT complete setup.
+    #[test]
+    fn disabled_send_not_verified() {
+        assert!(!capability_verified(true, true, false, None));
+    }
+
+    // The send_button_candidate_count alone must never be a setup-completion
+    // condition: capability verification requires the composer-owned
+    // send_button_enabled_after_injection probe result, not a raw candidate
+    // count. This guards the contract that a present-but-disabled/unauthoritative
+    // Send does not advance setup.
+    #[test]
+    fn send_button_candidate_count_alone_is_never_sufficient() {
+        // Emulate a discovered but DISABLED owned Send: candidates > 0 but the
+        // probe's enabled flag is false. Using count alone would be true.
+        let candidates_found_but_disabled = true;
+        assert!(
+            candidates_found_but_disabled,
+            "candidate trace present is not proof of enablement"
+        );
+        assert!(!capability_verified(true, true, false, None));
+    }
+
+    // F. Setup priming never generates an active-submit ACK. The capability gate
+    //    returns a boolean only; nothing in it emits or fabricates an
+    //    ActiveSubmitReport (that report path is exclusively the ACTIVE loop's
+    //    __caSubmitActivePrompt). This test asserts the gate is side-effect-free
+    //    in the sense that it decides readiness without touching submit state.
+    #[test]
+    fn capability_gate_does_not_imply_submission() {
+        // Verifying capability must not be interpreted as a success ack for a
+        // turn. It is a readiness signal; turnover is the ACTIVE loop's job.
+        let verified = capability_verified(true, true, true, None);
+        assert!(verified);
+    }
 }

@@ -3,9 +3,10 @@ use std::sync::atomic::Ordering;
 
 use crate::agent_brain::AgentBrain;
 use crate::browser_backend::{
-    NavEvent, create_windows, get_agent_config, navigate_agent_window, record_nav_event,
-    record_setup_completion,
+    NavEvent, create_windows, ensure_nav_window, get_agent_config, navigate_agent_window, record_nav_event,
+    record_setup_completion, resolve_participant,
 };
+use crate::settings_store::CustomParticipant;
 use crate::context_manager::ContextManager;
 use crate::errors::AgentError;
 use crate::orchestrator::{AppState, OrchestratorStatus, SessionConfig, SessionType};
@@ -76,7 +77,16 @@ fn validate_brain_fields(base_url: &str, model: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_session_agents(agent_ids: &[String], leader_agent_id: &str) -> Result<(), String> {
+/// P1: session participants are validated against the MERGED registry (the
+/// seven built-ins plus any persisted custom participants). Built-in ids are
+/// authoritative; a custom entry colliding with a built-in id would be
+/// re-validated at save time, so here the merged resolver simply returns the
+/// built-in.
+fn validate_session_agents(
+    agent_ids: &[String],
+    leader_agent_id: &str,
+    custom: &[CustomParticipant],
+) -> Result<(), String> {
     if agent_ids.len() < 2 {
         return Err("Select at least two participants.".to_string());
     }
@@ -86,7 +96,7 @@ fn validate_session_agents(agent_ids: &[String], leader_agent_id: &str) -> Resul
         if !seen.insert(agent_id.clone()) {
             return Err(format!("Duplicate participant selected: {agent_id}"));
         }
-        if get_agent_config(agent_id).is_none() {
+        if resolve_participant(agent_id, custom).is_none() {
             return Err(format!("Unknown participant selected: {agent_id}"));
         }
     }
@@ -111,7 +121,13 @@ pub async fn start_session(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    validate_session_agents(&agent_ids, &leader_agent_id)?;
+    let custom = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .map_err(|e| settings_command_error("Failed to read custom participants", e))?;
+    validate_session_agents(&agent_ids, &leader_agent_id, &custom)?;
 
     // IMP-3: Concurrency guard — prevent two sessions from running simultaneously.
     // compare_exchange(false → true): if already true, return error immediately.
@@ -225,6 +241,7 @@ pub async fn start_session(
             &config.session_id,
             setup_generation,
             &setup_order,
+            &custom,
         ) {
             state.session_active.store(false, Ordering::SeqCst);
             {
@@ -283,6 +300,7 @@ pub async fn start_session(
     let mem_clone = state.memory_store.clone();
     let memory_health = state.last_memory_health.clone();
     let setup_generation_clone = state.setup_generation.clone();
+    let active_brain_clone = state.active_brain.clone();
 
     tokio::spawn(async move {
         let state_ref = AppState {
@@ -303,6 +321,7 @@ pub async fn start_session(
             memory_store: mem_clone,
             last_memory_health: memory_health,
             setup_generation: setup_generation_clone,
+            active_brain: active_brain_clone,
         };
 
         let mut nav_rx = tokio_rx;
@@ -579,7 +598,16 @@ pub async fn retry_setup_agent(
     if !config.agent_ids.iter().any(|id| id == &agent_id) {
         return Err("Agent is not part of the active setup".to_string());
     }
-    let agent = get_agent_config(&agent_id).ok_or_else(|| "Unknown setup agent".to_string())?;
+    // P2: resolve through the MERGED registry so a persisted custom participant
+    // can be retried. Unknown ids keep the same rejection as before.
+    let custom = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .unwrap_or_default();
+    let agent = resolve_participant(&agent_id, &custom)
+        .ok_or_else(|| "Unknown setup agent".to_string())?;
     let (window, diagnostics, window_kind, nav_tx) = {
         let browser = state.browser_state.lock().await;
         let is_leader = agent_id == config.leader_agent_id;
@@ -587,8 +615,15 @@ pub async fn retry_setup_agent(
             .ok_or_else(|| "Model window is not available".to_string())?;
         (window, browser.diagnostics.clone(), if is_leader { "leader" } else { "nav" }, browser.nav_tx.clone())
     };
-    navigate_agent_window(&app, &diagnostics, &window, &agent_id, window_kind, agent.base_url)
-        .map_err(|error| error.to_string())?;
+    navigate_agent_window(
+        &app,
+        &diagnostics,
+        &window,
+        &agent_id,
+        window_kind,
+        &agent.base_url,
+    )
+    .map_err(|error| error.to_string())?;
     nav_tx.try_send(NavEvent::ResumeRequested(agent_id))
         .map_err(|error| format!("Could not request setup retry: {error}"))?;
     Ok(())
@@ -840,6 +875,104 @@ pub async fn get_fallback_brain_config(
     serde_json::to_string(&config).map_err(|e| e.to_string())
 }
 
+/// P1: return the persisted custom participants as a JSON array string.
+/// Follows the IPC.json-string convention (callers JSON.parse the result).
+#[tauri::command]
+pub async fn get_custom_participants(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let participants = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .map_err(|e| settings_command_error("Failed to read custom participants", e))?;
+    serde_json::to_string(&participants).map_err(|e| e.to_string())
+}
+
+/// P3: return the UNIFIED participant registry (the seven immutable built-ins
+/// in frozen order followed by persisted custom participants) as a JSON array
+/// string, each entry tagged with `is_custom`. This is the single logical
+/// participant list the frontend iterates for participant/leader selection,
+/// connected accounts, sidebar model dots, and name resolution. Returns a
+/// JSON string per the project's convention (callers JSON.parse the result).
+#[tauri::command]
+pub async fn get_participants(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let custom = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .map_err(|e| settings_command_error("Failed to read custom participants", e))?;
+    serde_json::to_string(&crate::browser_backend::merged_participants(&custom))
+        .map_err(|e| e.to_string())
+}
+
+/// P1: validate a single proposed custom participant. Built-in ids are
+/// reserved; ids must be unique and URLs must be absolute HTTP(S).
+fn validate_custom_participant(
+    index: usize,
+    participant: &CustomParticipant,
+    reserved: &HashSet<String>,
+) -> Result<(), String> {
+    let label = format!("Custom participant {}", index + 1);
+    let id = participant.agent_id.trim();
+    if id.is_empty() || id.chars().any(|c| c.is_whitespace()) {
+        return Err(settings_command_error(
+            &label,
+            "agent_id is required and must not contain whitespace",
+        ));
+    }
+    let name = participant.display_name.trim();
+    if name.is_empty() {
+        return Err(settings_command_error(&label, "display_name is required"));
+    }
+    let base_url = participant.base_url.trim();
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|e| settings_command_error(&label, format!("base_url is invalid: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(settings_command_error(
+            &label,
+            "base_url must be an absolute http:// or https:// URL",
+        ));
+    }
+    // Built-in ids are always reserved; a custom save can never shadow or
+    // redefine one (e.g. agent_id "deepseek" is refused at save time).
+    if get_agent_config(id).is_some() {
+        return Err(settings_command_error(
+            &label,
+            format!("agent_id '{id}' is reserved — it collides with a built-in participant"),
+        ));
+    }
+    if reserved.contains(id) {
+        return Err(settings_command_error(
+            &label,
+            format!("agent_id '{id}' is duplicated within the custom participant list"),
+        ));
+    }
+    Ok(())
+}
+
+/// P1: persist the custom-participant list. Passing an empty list clears all
+/// custom participants. Built-in ids may never be overridden.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_custom_participants(
+    participants: Vec<CustomParticipant>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let mut reserved: HashSet<String> = HashSet::new();
+    for (index, participant) in participants.iter().enumerate() {
+        validate_custom_participant(index, participant, &reserved)?;
+        reserved.insert(participant.agent_id.trim().to_string());
+    }
+
+    let mut store = state.settings_store.lock().await;
+    store
+        .save_custom_participants(&participants)
+        .map_err(|e| settings_command_error("Failed to save custom participants", e))?;
+    Ok(())
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn save_prompt_template(
     template_name: String,
@@ -900,6 +1033,13 @@ struct DiagnosticSnapshot {
     leader_window_exists: bool,
     nav_window_exists: bool,
     browser_diagnostics: Vec<crate::browser_backend::BrowserDiagnosticRecord>,
+    browser_console_error_count: usize,
+    browser_console_warning_count: usize,
+    browser_console_last_error_at: Option<String>,
+    // Harness extensions (spec 15)
+    browser_timeline: Vec<crate::browser_harness::BrowserEvent>,
+    browser_timeline_dropped: std::collections::HashMap<String, usize>,
+    browser_timeline_count: usize,
     command_timestamp: String,
 }
 
@@ -946,10 +1086,33 @@ pub async fn get_diagnostic_snapshot(
     .await
     .map_err(|e| settings_command_error("Failed to read memory health", e))?;
 
-    let browser_diagnostics = {
+    let (browser_diagnostics, browser_timeline, browser_timeline_dropped, browser_timeline_count) = {
         let browser = state.browser_state.lock().await;
-        browser.diagnostics.snapshot()
+        let diag = browser.diagnostics.snapshot();
+        let tl = browser.diagnostics.timeline.all_events_sorted();
+        let mut dropped: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for r in &diag {
+            let d = browser.diagnostics.timeline.events_dropped(&r.agent_id);
+            if d > 0 {
+                dropped.insert(r.agent_id.clone(), d);
+            }
+        }
+        let count = browser.diagnostics.timeline.total_events();
+        (diag, tl, dropped, count)
     };
+    // Top-level console summary derived from per-agent vectors.
+    let browser_console_error_count = browser_diagnostics
+        .iter()
+        .map(|r| r.browser_console_error_count as usize)
+        .sum();
+    let browser_console_warning_count = browser_diagnostics
+        .iter()
+        .map(|r| r.browser_console_warning_count as usize)
+        .sum();
+    let browser_console_last_error_at = browser_diagnostics
+        .iter()
+        .filter_map(|r| r.browser_console_last_error_at.clone())
+        .max();
 
     let snapshot = DiagnosticSnapshot {
         app_data_dir: app_data_dir.to_string_lossy().into_owned(),
@@ -969,11 +1132,162 @@ pub async fn get_diagnostic_snapshot(
             .get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL)
             .is_some(),
         browser_diagnostics,
+        browser_console_error_count,
+        browser_console_warning_count,
+        browser_console_last_error_at,
+        browser_timeline,
+        browser_timeline_dropped,
+        browser_timeline_count,
         command_timestamp: chrono::Utc::now().to_rfc3339(),
     };
 
     serde_json::to_string(&snapshot)
         .map_err(|e| settings_command_error("Failed to serialize diagnostic snapshot", e))
+}
+
+/// Harness: return chronological timeline events as JSON string (spec 3-15)
+#[tauri::command]
+pub async fn get_browser_timeline(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let browser = state.browser_state.lock().await;
+    let events = browser.diagnostics.timeline.all_events_sorted();
+    serde_json::to_string(&events).map_err(|e| e.to_string())
+}
+
+/// Harness: human-readable reliability report markdown (spec 16)
+#[tauri::command]
+pub async fn get_browser_reliability_report(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let (timeline, diagnostics) = {
+        let browser = state.browser_state.lock().await;
+        (browser.diagnostics.timeline.clone(), browser.diagnostics.snapshot())
+    };
+    let md = crate::browser_harness::generate_reliability_report_markdown(&timeline, &diagnostics);
+    Ok(md)
+}
+
+/// Harness: export bundle (spec 18) – writes BROWSER_RELIABILITY_REPORT.md + JSON files to app_data_dir/exports
+#[tauri::command]
+pub async fn export_browser_diagnostics(state: tauri::State<'_, AppState>, app: AppHandle) -> Result<String, String> {
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let export_dir = app_data_dir.join(format!("diagnostics_export_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S")));
+    std::fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
+    let (timeline, diagnostics, browser_diagnostics) = {
+        let browser = state.browser_state.lock().await;
+        (
+            browser.diagnostics.timeline.all_events_sorted(),
+            browser.diagnostics.snapshot(),
+            browser.diagnostics.snapshot(),
+        )
+    };
+    // events.json
+    let events_path = export_dir.join("events.json");
+    std::fs::write(&events_path, serde_json::to_string_pretty(&timeline).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    // browser-diagnostics.json
+    let diag_path = export_dir.join("browser-diagnostics.json");
+    std::fs::write(&diag_path, serde_json::to_string_pretty(&browser_diagnostics).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    // navigation-history.json
+    let nav: Vec<_> = browser_diagnostics.iter().flat_map(|r| r.navigation_diagnostics.clone()).collect();
+    let nav_path = export_dir.join("navigation-history.json");
+    std::fs::write(&nav_path, serde_json::to_string_pretty(&nav).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    // console-errors.json
+    let console: Vec<_> = browser_diagnostics.iter().flat_map(|r| r.console_diagnostics.clone()).collect();
+    let console_path = export_dir.join("console-errors.json");
+    std::fs::write(&console_path, serde_json::to_string_pretty(&console).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    // BROWSER_RELIABILITY_REPORT.md
+    let timeline_obj = {
+        let browser = state.browser_state.lock().await;
+        browser.diagnostics.timeline.clone()
+    };
+    let report = crate::browser_harness::generate_reliability_report_markdown(&timeline_obj, &diagnostics);
+    let report_path = export_dir.join("BROWSER_RELIABILITY_REPORT.md");
+    std::fs::write(&report_path, &report).map_err(|e| e.to_string())?;
+    let result = serde_json::json!({
+        "export_dir": export_dir.to_string_lossy(),
+        "report": report_path.to_string_lossy(),
+        "events": events_path.to_string_lossy(),
+        "browser_diagnostics": diag_path.to_string_lossy(),
+        "navigation_history": nav_path.to_string_lossy(),
+        "console_errors": console_path.to_string_lossy(),
+    });
+    Ok(serde_json::to_string(&result).map_err(|e| e.to_string())?)
+}
+
+/// Dev-only single-model diagnostic (spec 19) – probe one agent without full arena loop
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_single_model_diagnostic(
+    agent_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    if state.session_active.load(Ordering::SeqCst) {
+        return Err("Cannot run single-model diagnostic while a session is active. Stop the session first.".to_string());
+    }
+    let custom = state.settings_store.lock().await.get_custom_participants().map_err(|e| e.to_string())?;
+    let participant = crate::browser_backend::resolve_participant(&agent_id, &custom).ok_or_else(|| format!("Unknown participant: {agent_id}"))?;
+    let window = {
+        let mut browser = state.browser_state.lock().await;
+        match browser.nav_window.clone() {
+            Some(w) => w,
+            None => {
+                if let Some(existing) = app.get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL) {
+                    browser.nav_window = Some(existing.clone());
+                    existing
+                } else {
+                    crate::browser_backend::ensure_nav_window(&app, &mut browser).map_err(|e| e.to_string())?
+                }
+            }
+        }
+    };
+    let diagnostics = {
+        let browser = state.browser_state.lock().await;
+        browser.diagnostics.clone()
+    };
+    let generation = diagnostics.setup_generation();
+    let op = crate::browser_harness::operation_id_diagnostic_single(&agent_id, generation);
+    diagnostics.set_operation(&agent_id, &op, "diagnostic");
+    diagnostics.emit_harness_event(&agent_id, crate::browser_harness::EventType::WindowCreated, "diagnostic", &op, &participant.base_url, serde_json::json!({ "single_model": true }));
+
+    // Navigate
+    crate::browser_backend::navigate_agent_window(&app, &diagnostics, &window, &agent_id, "nav", &participant.base_url).map_err(|e| e.to_string())?;
+
+    // Wait briefly for readiness probe (non-blocking, harness captures regardless)
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(15);
+    let probe_snapshot = loop {
+        if start.elapsed() > timeout {
+            break serde_json::json!({ "timed_out": true, "elapsed_ms": start.elapsed().as_millis() });
+        }
+        // Check diagnostics for composer detection
+        let diag = diagnostics.snapshot().into_iter().find(|r| r.agent_id == agent_id);
+        if let Some(r) = diag {
+            if r.input_found || r.send_button_found || r.last_ready_at.is_some() {
+                break serde_json::json!({
+                    "input_found": r.input_found,
+                    "send_button_found": r.send_button_found,
+                    "composer_candidate_count": r.composer_candidate_count,
+                    "input_candidate_count": r.input_candidate_count,
+                    "send_button_candidate_count": r.send_button_candidate_count,
+                    "page_state_hint": r.page_state_hint,
+                    "page_health_hint": r.page_health_hint,
+                    "last_navigation_url": r.last_navigation_url,
+                    "elapsed_ms": start.elapsed().as_millis()
+                });
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    };
+
+    diagnostics.emit_harness_event(&agent_id, crate::browser_harness::EventType::DomSnapshot, "diagnostic", &op, &participant.base_url, probe_snapshot.clone());
+
+    let result = serde_json::json!({
+        "agent_id": agent_id,
+        "display_name": participant.display_name,
+        "base_url": participant.base_url,
+        "operation_id": op,
+        "probe": probe_snapshot,
+        "timeline_dropped": diagnostics.timeline.events_dropped(&agent_id),
+        "note": "Diagnostic probe is dev-only and does not run the full arena loop; check timeline for detailed events"
+    });
+    Ok(serde_json::to_string(&result).map_err(|e| e.to_string())?)
 }
 
 #[tauri::command]
@@ -1354,6 +1668,66 @@ pub async fn recover_session(
     Ok(())
 }
 
+// ── Launch Connected Account (reuses 2-WebView, no third window) ───────────
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn launch_connected_account(
+    agent_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if state.session_active.load(Ordering::SeqCst) {
+        return Err("Cannot launch a model window while a session is active. Stop the session first.".to_string());
+    }
+    let custom = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .map_err(|e| format!("Failed to read custom participants: {e}"))?;
+    let participant = resolve_participant(&agent_id, &custom)
+        .ok_or_else(|| format!("Unknown participant: {agent_id}"))?;
+
+    // Ensure nav window exists (creates one if no session has ever created windows).
+    // This never creates a third window; it reuses the shared nav WebView.
+    let window = {
+        let mut browser = state.browser_state.lock().await;
+        match browser.nav_window.clone() {
+            Some(w) => w,
+            None => {
+                // Try to get from app if BrowserState lost it but window still exists
+                if let Some(existing) = app.get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL) {
+                    browser.nav_window = Some(existing.clone());
+                    existing
+                } else {
+                    // Create nav window anew via ensure helper
+                    ensure_nav_window(&app, &mut browser)
+                        .map_err(|e| format!("Failed to create model window: {e}"))?
+                }
+            }
+        }
+    };
+
+    let diagnostics = {
+        let browser = state.browser_state.lock().await;
+        browser.diagnostics.clone()
+    };
+
+    navigate_agent_window(&app, &diagnostics, &window, &agent_id, "nav", &participant.base_url)
+        .map_err(|e| e.to_string())?;
+
+    // Make window visible so user can interact (login/inspect)
+    let _ = window.show();
+    let _ = window.set_focus();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_brain_status(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let status = state.active_brain.lock().await.clone();
+    serde_json::to_string(&status).map_err(|e| e.to_string())
+}
+
 // ── Phase 1 memory ───────────────────────────────────────────────────────────
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1570,4 +1944,89 @@ pub async fn restore_memory(
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings_store::CustomParticipant;
+
+    fn participant(agent_id: &str, name: &str, url: &str) -> CustomParticipant {
+        CustomParticipant {
+            agent_id: agent_id.to_string(),
+            display_name: name.to_string(),
+            base_url: url.to_string(),
+        }
+    }
+
+    // P1: a custom participant may never reserve a built-in id.
+    #[test]
+    fn custom_save_rejects_builtin_id_collision() {
+        let mut reserved = HashSet::new();
+        let err = validate_custom_participant(
+            0,
+            &participant("deepseek", "Spoof", "https://spoof.example.com"),
+            &reserved,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("reserved"),
+            "expected a reserved-id error, got: {err}"
+        );
+        reserved.insert("deepseek".to_string());
+    }
+
+    // P1: duplicate ids within the same custom list are rejected.
+    #[test]
+    fn custom_save_rejects_duplicate_ids() {
+        let mut reserved = HashSet::new();
+        reserved.insert("acme".to_string());
+        let err = validate_custom_participant(
+            1,
+            &participant("acme", "Acme", "https://acme.example.com"),
+            &reserved,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("duplicated"),
+            "expected a duplicate-id error, got: {err}"
+        );
+    }
+
+    // P1: a valid absolute-URL custom id passes validation.
+    #[test]
+    fn custom_save_accepts_valid_participant() {
+        let reserved = HashSet::new();
+        let result = validate_custom_participant(
+            0,
+            &participant("acme", "Acme Bot", "https://acme.example.com"),
+            &reserved,
+        );
+        assert!(result.is_ok(), "valid participant rejected: {result:?}");
+    }
+
+    // P1: session validation consumes the MERGED registry (built-in + custom).
+    #[test]
+    fn session_validation_accepts_merged_custom_participant() {
+        let custom = vec![participant(
+            "acme",
+            "Acme Bot",
+            "https://acme.example.com",
+        )];
+        let ids = vec!["chatgpt".to_string(), "acme".to_string()];
+        let result = validate_session_agents(&ids, "chatgpt", &custom);
+        assert!(result.is_ok(), "merged validation failed: {result:?}");
+    }
+
+    // P1: session validation still rejects a truly unknown id.
+    #[test]
+    fn session_validation_rejects_unknown_participant() {
+        let custom: Vec<CustomParticipant> = vec![];
+        let ids = vec!["chatgpt".to_string(), "does-not-exist".to_string()];
+        let result = validate_session_agents(&ids, "chatgpt", &custom);
+        assert!(
+            result.is_err(),
+            "unknown participant should be rejected"
+        );
+    }
 }

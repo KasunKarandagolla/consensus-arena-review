@@ -88,6 +88,34 @@ impl Orchestrator {
     }
 }
 
+// ── Active Brain Status (for Topbar "Powered by..." indicator) ─────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveBrainKind {
+    Primary,
+    Fallback,
+    Secondary,
+    Unavailable,
+    Unknown,
+}
+
+impl Default for ActiveBrainKind {
+    fn default() -> Self { ActiveBrainKind::Unknown }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveBrainStatus {
+    pub kind: ActiveBrainKind,
+    pub model: String,
+}
+
+impl Default for ActiveBrainStatus {
+    fn default() -> Self {
+        Self { kind: ActiveBrainKind::Unknown, model: String::new() }
+    }
+}
+
 // ── AppState ──────────────────────────────────────────────────────────────────
 
 pub struct AppState {
@@ -134,6 +162,7 @@ pub struct AppState {
     pub memory_store: Arc<std::sync::Mutex<MemoryStore>>,
     pub last_memory_health: MemoryHealth,
     pub setup_generation: Arc<AtomicU32>,
+    pub active_brain: Arc<Mutex<ActiveBrainStatus>>,
 }
 
 impl AppState {
@@ -203,6 +232,7 @@ impl AppState {
             memory_store: Arc::new(std::sync::Mutex::new(memory_store)),
             last_memory_health,
             setup_generation: Arc::new(AtomicU32::new(0)),
+            active_brain: Arc::new(Mutex::new(ActiveBrainStatus::default())),
         }
     }
 }

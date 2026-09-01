@@ -10,6 +10,7 @@ import {
   LifeBuoy,
   Moon,
   Palette,
+  Plus,
   Route,
   Settings2,
   Sun,
@@ -20,9 +21,9 @@ import {
   buildCommandErrorMessage,
   safeInvoke as invoke,
 } from '@/lib/tauri'
-import { AGENT_DISPLAY_NAMES, AGENT_IDS } from '@/lib/agents'
+import { refreshParticipants } from '@/lib/agents'
+import { useAppStore, type Participant } from '@/stores/useAppStore'
 import { applyTheme, loadStoredTheme, storeTheme, type Theme } from '@/lib/theme'
-import { useAppStore } from '@/stores/useAppStore'
 import MemoryPanel from '@/panels/MemoryPanel'
 
 interface Brain { [key: string]: string; api_key: string; base_url: string; model: string; system_prompt: string }
@@ -100,7 +101,49 @@ interface DiagnosticSnapshot {
     send_button_candidate_count: number | null
     page_state_hint: string | null
     page_health_hint: string | null
+    console_diagnostics: Array<{
+      timestamp: string
+      category: string
+      severity: string
+      message: string
+      source: string
+      url: string
+    }>
+    browser_console_error_count: number
+    browser_console_warning_count: number
+    browser_console_last_error_at: string | null
+    navigation_diagnostics: Array<{
+      timestamp: string
+      agent_id: string
+      window_label: string
+      window_kind: string
+      from_url: string
+      to_url: string
+      phase: string
+      setup_generation: number
+      cause: string
+      arena_requested: boolean
+    }>
+    setup_navigation_recovery_count: number
+    last_navigation: {
+      timestamp: string
+      agent_id: string
+      window_label: string
+      window_kind: string
+      from_url: string
+      to_url: string
+      phase: string
+      setup_generation: number
+      cause: string
+      arena_requested: boolean
+    } | null
   }>
+  browser_console_error_count: number
+  browser_console_warning_count: number
+  browser_console_last_error_at: string | null
+  browser_timeline?: unknown[]
+  browser_timeline_dropped?: Record<string, number>
+  browser_timeline_count?: number
   command_timestamp: string
 }
 
@@ -143,6 +186,9 @@ export default function SettingsPanel({ open, onClose }: Props) {
   const addToast = useAppStore((state) => state.addToast)
   const setupBrief = useAppStore((state) => state.setupBrief)
   const selectedSessionId = useAppStore((state) => state.selectedSessionId)
+  const participants = useAppStore((state) => state.participants)
+  const setParticipants = useAppStore((state) => state.setParticipants)
+  const sessionStatus = useAppStore((state) => state.sessionStatus)
   const [brain, setBrain] = useState<Brain>(emptyBrain)
   const [fallback, setFallback] = useState<Fallback>({ api_key: '', base_url: '', model: '' })
   const [secondary, setSecondary] = useState<Brain>(emptyBrain)
@@ -155,6 +201,15 @@ export default function SettingsPanel({ open, onClose }: Props) {
   const [busy, setBusy] = useState('')
   const [lastSettingsError, setLastSettingsError] = useState<LastSettingsError | null>(null)
   const [diagnosticSnapshot, setDiagnosticSnapshot] = useState<DiagnosticSnapshot | null>(null)
+  const [reliabilityReport, setReliabilityReport] = useState<string | null>(null)
+  const [timelinePreview, setTimelinePreview] = useState<unknown[] | null>(null)
+  const [exportResult, setExportResult] = useState<string | null>(null)
+  const [singleDiagnosticAgent, setSingleDiagnosticAgent] = useState<string>('chatgpt')
+  const [singleDiagnosticResult, setSingleDiagnosticResult] = useState<string | null>(null)
+  const [customDraft, setCustomDraft] = useState<Participant | null>(null)
+  const [customError, setCustomError] = useState('')
+  const [customBusy, setCustomBusy] = useState('')
+  const [launchBusy, setLaunchBusy] = useState('')
 
   const load = useCallback(async () => {
     const results = await Promise.allSettled([
@@ -164,6 +219,7 @@ export default function SettingsPanel({ open, onClose }: Props) {
       invoke<string>('get_prompt_template', { template_name: 'leader_priming' }),
       invoke<string>('get_prompt_template', { template_name: 'participant_priming' }),
       invoke<string>('get_agent_health'),
+      invoke<string>('get_participants'),
     ])
     if (results[0].status === 'fulfilled') try { setBrain(JSON.parse(results[0].value) as Brain) } catch (error) { console.error(error) }
     if (results[1].status === 'fulfilled') try { setFallback(JSON.parse(results[1].value) as Fallback) } catch (error) { console.error(error) }
@@ -171,8 +227,12 @@ export default function SettingsPanel({ open, onClose }: Props) {
     if (results[3].status === 'fulfilled') setLeaderPrompt(results[3].value)
     if (results[4].status === 'fulfilled') setParticipantPrompt(results[4].value)
     if (results[5].status === 'fulfilled') try { setHealth(JSON.parse(results[5].value) as Record<string, Health>) } catch (error) { console.error(error) }
+    if (results[6].status === 'fulfilled') try {
+      const merged = JSON.parse(results[6].value) as Participant[]
+      if (Array.isArray(merged) && merged.length > 0) setParticipants(merged)
+    } catch (error) { console.error(error) }
     setTheme(loadStoredTheme())
-  }, [])
+  }, [setParticipants])
 
   useEffect(() => { if (open) void load() }, [load, open])
 
@@ -249,12 +309,136 @@ export default function SettingsPanel({ open, onClose }: Props) {
     }
   }
 
+  async function showReliabilityReport() {
+    setBusy('reliability')
+    try {
+      const raw = await invoke<string>('get_browser_reliability_report')
+      setReliabilityReport(raw)
+    } catch (error) {
+      reportError('diagnostics', 'get_browser_reliability_report', error)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function showTimeline() {
+    setBusy('timeline')
+    try {
+      const raw = await invoke<string>('get_browser_timeline')
+      const arr = JSON.parse(raw) as unknown[]
+      setTimelinePreview(arr.slice(-50))
+    } catch (error) {
+      reportError('diagnostics', 'get_browser_timeline', error)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function exportDiagnostics() {
+    setBusy('export')
+    try {
+      const raw = await invoke<string>('export_browser_diagnostics')
+      setExportResult(raw)
+      addToast('Browser diagnostics exported')
+    } catch (error) {
+      reportError('diagnostics', 'export_browser_diagnostics', error)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function runSingleDiagnostic() {
+    setBusy('single-diagnostic')
+    try {
+      const raw = await invoke<string>('run_single_model_diagnostic', { agent_id: singleDiagnosticAgent })
+      setSingleDiagnosticResult(raw)
+      addToast(`Single-model diagnostic completed for ${singleDiagnosticAgent}`)
+    } catch (error) {
+      reportError('diagnostics', 'run_single_model_diagnostic', error)
+    } finally {
+      setBusy('')
+    }
+  }
+
   async function copyText(text: string, successMessage: string) {
     try {
       await navigator.clipboard.writeText(text)
       addToast(successMessage)
     } catch {
       addToast('Could not copy; select the text manually')
+    }
+  }
+
+  // ── Custom AI CRUD ──────────────────────────────────────────────────────────
+  // Custom participants are stored backend-side as a JSON array. The save
+  // command validates ids/URLs and rejects built-in collisions, so we keep the
+  // shared client-side checks light (non-empty display name + absolute http(s)
+  // URL) and let the backend give authoritative validation errors.
+
+  function beginAddCustom() {
+    setCustomError('')
+    setCustomDraft({ agent_id: '', display_name: '', base_url: '', is_custom: true })
+  }
+
+  function beginEditCustom(p: Participant) {
+    setCustomError('')
+    setCustomDraft({ ...p })
+  }
+
+  async function saveCustom(draft: Participant): Promise<boolean> {
+    const display = draft.display_name.trim()
+    const url = draft.base_url.trim()
+    if (!display) { setCustomError('Display name is required.'); return false }
+    if (!/^https?:\/\/.+/i.test(url)) { setCustomError('Chat URL must be an absolute http:// or https:// URL.'); return false }
+
+    // Derive a unique id from display name + same-host suffix to avoid
+    // collisions; explicit agent_id is not exposed to the user.
+    let id = draft.agent_id.trim()
+    if (!id) {
+      const key = display.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'custom'
+      id = key
+      let n = 1
+      const existing = participants.map((p) => p.agent_id)
+      while (existing.includes(id)) { id = `${key}-${n++}` }
+    }
+
+    const current: Participant[] = participants.filter((p) => p.is_custom)
+    const updated = current.map((p) => (p.agent_id === draft.agent_id && draft.agent_id ? { ...p, display_name: display, base_url: url } : p))
+    if (!updated.some((p) => p.agent_id === id)) {
+      updated.push({ agent_id: id, display_name: display, base_url: url, is_custom: true })
+    }
+
+    setCustomBusy('save')
+    try {
+      await invoke('save_custom_participants', { participants: updated })
+      setCustomError('')
+      setCustomDraft(null)
+      setParticipants(await refreshParticipants())
+      addToast('Custom AI saved')
+      return true
+    } catch (error) {
+      const message = buildCommandErrorMessage('save_custom_participants', error)
+      console.error(message)
+      setCustomError(message)
+      return false
+    } finally {
+      setCustomBusy('')
+    }
+  }
+
+  async function deleteCustom(p: Participant) {
+    if (!confirm(`Remove "${p.display_name}" from the panel? This only removes the custom participant; session data is untouched.`)) return
+    setCustomBusy(p.agent_id)
+    try {
+      const updated = participants.filter((x) => x.is_custom && x.agent_id !== p.agent_id)
+      await invoke('save_custom_participants', { participants: updated })
+      if (customDraft?.agent_id === p.agent_id) setCustomDraft(null)
+      setParticipants(await refreshParticipants())
+      addToast('Custom AI removed')
+    } catch (error) {
+      reportError('custom', 'save_custom_participants', error)
+    } finally {
+      setCustomBusy('')
     }
   }
 
@@ -271,7 +455,48 @@ export default function SettingsPanel({ open, onClose }: Props) {
       <div className="sp-hd"><h3><Settings2 size={17} />Settings</h3><button className="ic-btn" onClick={onClose}><X size={17} /></button></div>
       <div className="sp-body">
         <Section icon={<Wifi size={12} />} title="Connected accounts">
-          {AGENT_IDS.map((id) => { const on = health[id]?.is_available; return <div className="cr" key={id}><span className={`cdot ${on ? 'on' : 'off'}`} /><span className="cr-n">{AGENT_DISPLAY_NAMES[id]}</span><button className="cr-btn" disabled title="Account login is managed in each model WebView">{on ? 'Available' : 'Not checked'}</button></div> })}
+          {participants.map((p) => {
+            const on = health[p.agent_id]?.is_available
+            const isActiveSession = sessionStatus === 'running' || sessionStatus === 'priming' || sessionStatus === 'setup' || sessionStatus === 'requirements' || sessionStatus === 'paused'
+            async function launch() {
+              if (isActiveSession) { addToast('Cannot launch while a session is active. Stop the session first.', 5000); return }
+              setLaunchBusy(p.agent_id)
+              try {
+                await invoke('launch_connected_account', { agent_id: p.agent_id })
+                addToast(`Opened ${p.display_name} window — complete login/inspection there.`)
+              } catch (error) {
+                reportError('launch', 'launch_connected_account', error)
+              } finally { setLaunchBusy('') }
+            }
+            return <div className="cr" key={p.agent_id}><span className={`cdot ${on ? 'on' : 'off'}`} /><span className="cr-n">{p.display_name}</span><span className="cr-btns" style={{ display: 'inline-flex', gap: 6, marginLeft: 'auto' }}><button className="cr-btn" onClick={() => void launch()} disabled={launchBusy === p.agent_id || isActiveSession} title={isActiveSession ? 'Stop the active session before launching a model window (reuses the shared WebView)' : `Open ${p.display_name} in the app window for login/inspection`}>{launchBusy === p.agent_id ? 'Opening…' : 'Launch'}</button><button className="cr-btn" disabled title={p.is_custom ? 'Custom AI — log in manually in its window' : 'Account login is managed in each model WebView'}>{on ? 'Available' : 'Not checked'}</button></span></div>
+          })}
+        </Section>
+        <Section icon={<Plus size={14} />} title="Custom AI">
+          {participants.filter((p) => p.is_custom).map((p) => (
+            <div className="cr" key={p.agent_id}>
+              <span className="cdot custom" />
+              <span className="cr-n">{p.display_name}</span>
+              <span className="cr-u" title={p.base_url}>{p.agent_id}</span>
+              <button className="cr-btn" onClick={() => beginEditCustom(p)}>Edit</button>
+              <button className="cr-btn cr-del" onClick={() => void deleteCustom(p)} disabled={customBusy === p.agent_id}>Delete</button>
+            </div>
+          ))}
+          {participants.filter((p) => p.is_custom).length === 0 && (
+            <div className="sif" style={{ color: 'var(--t2)', fontSize: 12.5 }}>No custom AI added yet. Add a chat service by its URL.</div>
+          )}
+          {customDraft ? (
+            <div className="sif">
+              <input className="si2" placeholder="Display name" value={customDraft.display_name} onChange={(e) => setCustomDraft({ ...customDraft, display_name: e.target.value })} />
+              <input className="si2" placeholder="Chat URL (https://…)" value={customDraft.base_url} onChange={(e) => setCustomDraft({ ...customDraft, base_url: e.target.value })} />
+              {customError && <div className="form-error">{customError}</div>}
+              <div className="sact">
+                <button className="sv-btn" disabled={customBusy === 'save'} onClick={() => void saveCustom(customDraft)}>{customBusy === 'save' ? 'Saving…' : 'Save'}</button>
+                <button className="sv-btn" onClick={() => { setCustomDraft(null); setCustomError('') }}>Cancel</button>
+              </div>
+            </div>
+          ) : (
+            <button className="sv-btn" onClick={beginAddCustom}><Plus size={13} /> Add custom AI</button>
+          )}
         </Section>
         <Section icon={<Cpu size={12} />} title="Agent brain">
           <div className="sif"><input className="si2" placeholder="API base URL" value={brain.base_url} onChange={(event) => setBrain({ ...brain, base_url: event.target.value })} /><input className="si2" type="password" placeholder="API key" value={brain.api_key} onChange={(event) => setBrain({ ...brain, api_key: event.target.value })} /><input className="si2" placeholder="Model name" value={brain.model} onChange={(event) => setBrain({ ...brain, model: event.target.value })} /><textarea className="si2" placeholder="System prompt..." value={brain.system_prompt} onChange={(event) => setBrain({ ...brain, system_prompt: event.target.value })} /></div>
@@ -301,13 +526,41 @@ export default function SettingsPanel({ open, onClose }: Props) {
         </Section>
         <MemoryPanel projectBrief={projectBrief} />
         <Section icon={<Activity size={12} />} title="Diagnostics">
-          <p style={{ fontSize: 11.5, lineHeight: 1.5, color: 'var(--t3)', marginBottom: 9 }}>Shows database, configuration, and browser-window loading state. Keys, prompts, project content, cookies, and model responses are excluded.</p>
-          <button className="sv-btn" disabled={busy === 'diagnostics'} onClick={() => void showDiagnosticSnapshot()}>{busy === 'diagnostics' ? 'Loading…' : 'Show Diagnostic Snapshot'}</button>
+          <p style={{ fontSize: 11.5, lineHeight: 1.5, color: 'var(--t3)', marginBottom: 9 }}>Shows database, configuration, and browser-window loading state. Keys, prompts, project content, cookies, and model responses are excluded. Harness also captures timeline, navigation forensics, DOM snapshots, and classified console errors.</p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
+            <button className="sv-btn" disabled={busy === 'diagnostics'} onClick={() => void showDiagnosticSnapshot()}>{busy === 'diagnostics' ? 'Loading…' : 'Show Diagnostic Snapshot'}</button>
+            <button className="sv-btn" disabled={busy === 'reliability'} onClick={() => void showReliabilityReport()}>{busy === 'reliability' ? 'Loading…' : 'Reliability Report'}</button>
+            <button className="sv-btn" disabled={busy === 'timeline'} onClick={() => void showTimeline()}>{busy === 'timeline' ? 'Loading…' : 'Timeline (last 50)'}</button>
+            <button className="sv-btn" disabled={busy === 'export'} onClick={() => void exportDiagnostics()}>{busy === 'export' ? 'Exporting…' : 'Export Diagnostics Bundle'}</button>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+            <select className="si2" value={singleDiagnosticAgent} onChange={(e) => setSingleDiagnosticAgent(e.target.value)} style={{ flex: 1 }}>
+              {participants.map((p) => <option key={p.agent_id} value={p.agent_id}>{p.display_name}</option>)}
+            </select>
+            <button className="sv-btn" disabled={busy === 'single-diagnostic'} onClick={() => void runSingleDiagnostic()}>{busy === 'single-diagnostic' ? 'Probing…' : 'Probe Single Model'}</button>
+          </div>
           <ErrorDetails error={lastSettingsError} kinds={['diagnostics']} onCopy={(text) => void copyText(text, 'Error details copied')} />
           {diagnosticSnapshot && <details style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
-            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>Diagnostic snapshot</summary>
+            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>Diagnostic snapshot (incl. harness timeline)</summary>
             <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{JSON.stringify(diagnosticSnapshot, null, 2)}</pre>
             <button className="sv-btn" style={{ marginTop: 8 }} onClick={() => void copyText(JSON.stringify(diagnosticSnapshot, null, 2), 'Diagnostic snapshot copied')}><ClipboardCopy size={12} /> Copy snapshot</button>
+          </details>}
+          {reliabilityReport && <details open style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
+            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>BROWSER_RELIABILITY_REPORT.md</summary>
+            <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{reliabilityReport}</pre>
+            <button className="sv-btn" style={{ marginTop: 8 }} onClick={() => void copyText(reliabilityReport!, 'Reliability report copied')}><ClipboardCopy size={12} /> Copy report</button>
+          </details>}
+          {timelinePreview && <details style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
+            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>Timeline (last 50 events)</summary>
+            <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{JSON.stringify(timelinePreview, null, 2)}</pre>
+          </details>}
+          {exportResult && <details style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
+            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>Export bundle</summary>
+            <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{(() => { try { return JSON.stringify(JSON.parse(exportResult), null, 2) } catch { return exportResult } })()}</pre>
+          </details>}
+          {singleDiagnosticResult && <details style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
+            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>Single-model probe result</summary>
+            <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{(() => { try { return JSON.stringify(JSON.parse(singleDiagnosticResult), null, 2) } catch { return singleDiagnosticResult } })()}</pre>
           </details>}
         </Section>
         <Section icon={<Palette size={12} />} title="Appearance"><div className="th-g">{([{ t: 'blue', label: 'Blue', icon: <Droplets size={13} /> }, { t: 'light', label: 'Light', icon: <Sun size={13} /> }, { t: 'dark', label: 'Dark', icon: <Moon size={13} /> }] as const).map((item) => <button className={`th-b${theme === item.t ? ' on' : ''}`} onClick={() => choose(item.t)} key={item.t}>{item.icon}{item.label}</button>)}</div></Section>
