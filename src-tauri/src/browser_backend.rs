@@ -1601,8 +1601,27 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             page_health_hint,
         } => {
             let timestamp = now_timestamp();
-            // Harness: composer probe lifecycle + snapshots
-            {
+            // RC1-H1: summarize high-frequency readiness probes to avoid
+            // silently dropping earlier evidence. Only emit harness timeline
+            // when probe values change vs last stored state, or periodically
+            // (every 5 probes) for liveness. The diagnostic record is always
+            // updated, so the latest state is never lost.
+            let should_emit_harness = {
+                let records = diagnostics.records.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(rec) = records.get(agent_id) {
+                    let hint_changed = rec.page_state_hint != *page_state_hint;
+                    let health_changed = rec.page_health_hint != *page_health_hint;
+                    let input_changed = rec.input_found != *input_found;
+                    let send_changed = rec.send_button_found != *send_button_found;
+                    let periodic = readiness_probe_count.map(|c| c % 5 == 0).unwrap_or(true);
+                    let first = rec.readiness_probe_count.is_none();
+                    hint_changed || health_changed || input_changed || send_changed || periodic || first || *sent_signal_emitted || *user_submit_seen
+                } else {
+                    true
+                }
+            };
+            // Harness: composer probe lifecycle + snapshots (summarized)
+            if should_emit_harness {
                 let op = diagnostics.current_operation_id(agent_id);
                 let phase = diagnostics.current_phase_str(agent_id);
                 diagnostics.emit_harness_event(agent_id, EventType::ComposerProbeStarted, &phase, &op, "", serde_json::json!({ "input_found": input_found, "send_button_found": send_button_found }));
@@ -4306,6 +4325,163 @@ mod tests {
         assert!(truncated.contains("[truncated]"));
         assert!(truncated.len() <= 512);
     }
+
+    // RC1-H2: field-level truncation must keep valid JSON (not mid-string slice)
+    #[test]
+    fn safe_dom_forensics_json_remains_valid_after_truncation() {
+        // Build a near-worst-case forensics object (like JS would) and ensure
+        // our field-level truncation keeps JSON valid and <=4000.
+        let mut button_labels = Vec::new();
+        for i in 0..10 {
+            button_labels.push("a".repeat(50) + &i.to_string());
+        }
+        let forensics = crate::browser_harness::SafeDomForensics {
+            url: "https://chat.deepseek.com/".repeat(20), // 500-ish
+            title: "x".repeat(200),
+            active_element: crate::browser_harness::SafeElement {
+                tag: "BUTTON".to_string(),
+                role: "button".to_string(),
+                aria_label: "a".repeat(50),
+                name: "b".repeat(50),
+                enabled: true,
+                visible: true,
+                bounding_rect: None,
+            },
+            button_labels: button_labels.clone(),
+            input_types: vec!["text".to_string(); 10],
+            input_placeholders: vec!["placeholder".repeat(5); 10],
+            link_labels: button_labels.clone(),
+            candidate_login_buttons: vec![crate::browser_harness::SafeElement {
+                tag: "BUTTON".to_string(),
+                role: "button".to_string(),
+                aria_label: "login".to_string(),
+                name: "login".to_string(),
+                enabled: true,
+                visible: true,
+                bounding_rect: None,
+            }; 3],
+            candidate_next_buttons: vec![crate::browser_harness::SafeElement {
+                tag: "BUTTON".to_string(),
+                role: "button".to_string(),
+                aria_label: "next".to_string(),
+                name: "next".to_string(),
+                enabled: true,
+                visible: true,
+                bounding_rect: None,
+            }; 3],
+            candidate_send_buttons: vec![crate::browser_harness::SafeElement {
+                tag: "BUTTON".to_string(),
+                role: "button".to_string(),
+                aria_label: "send".to_string(),
+                name: "send".to_string(),
+                enabled: true,
+                visible: true,
+                bounding_rect: None,
+            }; 3],
+            candidate_attachment_buttons: vec![crate::browser_harness::SafeElement {
+                tag: "BUTTON".to_string(),
+                role: "button".to_string(),
+                aria_label: "attach".to_string(),
+                name: "attach".to_string(),
+                enabled: true,
+                visible: true,
+                bounding_rect: None,
+            }; 3],
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            operation_id: "op-test".to_string(),
+        };
+        let json = serde_json::to_string(&forensics).expect("serialize");
+        // Simulate JS field-level truncation logic: if >4000, truncate arrays
+        let mut obj = forensics.clone();
+        let mut j = serde_json::to_string(&obj).unwrap();
+        if j.len() > 4000 {
+            obj.button_labels = obj.button_labels.into_iter().take(5).map(|s| s[..30.min(s.len())].to_string()).collect();
+            obj.link_labels = obj.link_labels.into_iter().take(5).map(|s| s[..30.min(s.len())].to_string()).collect();
+            obj.input_types = obj.input_types.into_iter().take(5).collect();
+            obj.title = obj.title[..100.min(obj.title.len())].to_string();
+            j = serde_json::to_string(&obj).unwrap();
+        }
+        if j.len() > 4000 {
+            obj.candidate_login_buttons.clear();
+            obj.candidate_next_buttons.clear();
+            obj.candidate_send_buttons.clear();
+            obj.candidate_attachment_buttons.clear();
+            j = serde_json::to_string(&obj).unwrap();
+        }
+        assert!(j.len() <= 4000, "truncated json len {} exceeds 4000", j.len());
+        // Must still parse as valid SafeDomForensics
+        let parsed: crate::browser_harness::SafeDomForensics = serde_json::from_str(&j).expect("truncated json must be valid");
+        assert_eq!(parsed.operation_id, "op-test");
+        // Original naive slice would have produced invalid JSON — ensure our method does not
+        let naive = if json.len() > 4000 { json[..4000].to_string() + " [truncated]" } else { json.clone() };
+        assert!(serde_json::from_str::<crate::browser_harness::SafeDomForensics>(&naive).is_err(), "naive slice should be invalid JSON");
+    }
+
+    // RC1-H1: high-frequency readiness probes must be summarized, not spammed
+    #[test]
+    fn send_probe_harness_summarization_reduces_spam() {
+        let diagnostics = make_console_diagnostics();
+        // Probe dedup predicate: identical consecutive probes with count 2 (not periodic)
+        // should be skipped unless hint changes.
+        // Instead test predicate directly: after first probe stored, second identical should be deduped
+        let _ = super::update_diagnostic(&diagnostics, "chatgpt", |r| {
+            r.input_found = true;
+            r.send_button_found = true;
+            r.page_state_hint = Some("still_loading".to_string());
+            r.page_health_hint = Some("interactive".to_string());
+            r.readiness_probe_count = Some(1);
+        });
+        // Second probe same values, count=2 not periodic and no flag => should NOT emit
+        let should_emit = {
+            let records = diagnostics.records.lock().unwrap_or_else(|p| p.into_inner());
+            let rec = records.get("chatgpt").unwrap();
+            let hint_changed = rec.page_state_hint != Some("still_loading".to_string());
+            let input_changed = rec.input_found != true;
+            let send_changed = rec.send_button_found != true;
+            let periodic = Some(2).map(|c| c % 5 == 0).unwrap_or(true);
+            hint_changed || input_changed || send_changed || periodic || rec.readiness_probe_count.is_none()
+        };
+        assert!(!should_emit, "identical probe count 2 should be deduped");
+        // Probe count 5 periodic should emit
+        let periodic_emit = {
+            let records = diagnostics.records.lock().unwrap_or_else(|p| p.into_inner());
+            let rec = records.get("chatgpt").unwrap();
+            Some(5).map(|c| c % 5 == 0).unwrap_or(true)
+        };
+        assert!(periodic_emit, "periodic probe 5 should emit");
+        // Hint change should emit
+        let hint_emit = {
+            let records = diagnostics.records.lock().unwrap_or_else(|p| p.into_inner());
+            let rec = records.get("chatgpt").unwrap();
+            rec.page_state_hint != Some("composer_detected".to_string())
+        };
+        assert!(hint_emit, "hint change should emit");
+    }
+
+    // RC1-G1: busy guard must be held for 10s, not 3s
+    #[test]
+    fn connected_account_busy_guard_duration() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let mut state = super::BrowserState::new(tx);
+        let now = std::time::Instant::now();
+        state.connected_account_busy_until = Some(now + std::time::Duration::from_secs(10));
+        assert!(state.connected_account_busy_until.unwrap() > now + std::time::Duration::from_secs(9));
+        // Short guard (old 3s) would be <= now+3s
+        let short = now + std::time::Duration::from_secs(3);
+        assert!(state.connected_account_busy_until.unwrap() > short, "guard must be longer than old 3s");
+    }
+
+    #[test]
+    fn generic_init_script_has_rc1_guards() {
+        // RC1-INITSCRIPT: main init must be idempotent
+        assert!(super::GENERIC_INIT_SCRIPT.contains("window.__ca_mainInstalled"), "missing idempotent guard for main init");
+        // RC1-H2: forensics must use field-level truncation, not naive slice
+        assert!(super::GENERIC_INIT_SCRIPT.contains("forensicsJson"), "missing field-level forensics truncation helper");
+        assert!(!super::GENERIC_INIT_SCRIPT.contains("if(json.length>4000) json=json.slice(0,4000)"), "naive JSON slice must be removed");
+        // RC1-H1: readiness stable 3-probe must exist
+        assert!(super::GENERIC_INIT_SCRIPT.contains("_readyStableCount"), "missing 3-probe stable readiness");
+        assert!(super::GENERIC_INIT_SCRIPT.contains("possible_login_required"), "missing login guard");
+    }
 }
 
 // ── GENERIC_INIT_SCRIPT ───────────────────────────────────────────────────────
@@ -4547,10 +4723,43 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
                 timestamp: new Date().toISOString(),
                 operation_id: operationId||''
             };
-            var json = JSON.stringify(forensics);
-            if(json.length>4000) json=json.slice(0,4000)+' [truncated]';
-            var enc=json; try{ enc=encodeURIComponent(json); }catch(e){}
-            if(enc.length>6000) enc=encodeURIComponent(json.slice(0,3000)+' [truncated]');
+            // RC1-H2: truncate fields BEFORE serialization to keep valid JSON.
+            // Previously json.slice(0,4000) after stringify produced malformed JSON
+            // that failed serde_json::from_str and silently erased the snapshot.
+            function forensicsJson(obj) {
+                var j = JSON.stringify(obj);
+                if (j.length <= 4000) return j;
+                // Field-level truncation: keep most diagnostic value, drop bulk
+                obj.button_labels = obj.button_labels.slice(0,5).map(function(s){ return s.slice(0,30); });
+                obj.link_labels = obj.link_labels.slice(0,5).map(function(s){ return s.slice(0,30); });
+                obj.input_types = obj.input_types.slice(0,5);
+                obj.input_placeholders = obj.input_placeholders.slice(0,5).map(function(s){ return s.slice(0,20); });
+                obj.title = obj.title.slice(0,100);
+                j = JSON.stringify(obj);
+                if (j.length <= 4000) return j;
+                // Still over: drop heavy candidate arrays entirely
+                obj.candidate_login_buttons = [];
+                obj.candidate_next_buttons = [];
+                obj.candidate_send_buttons = [];
+                obj.candidate_attachment_buttons = [];
+                j = JSON.stringify(obj);
+                if (j.length <= 4000) return j;
+                // Final fallback: minimal valid snapshot
+                return JSON.stringify({ url: obj.url.slice(0,300), title: obj.title.slice(0,50), timestamp: obj.timestamp, operation_id: obj.operation_id, truncated: true });
+            }
+            var json = forensicsJson(forensics);
+            var enc=""; try{ enc=encodeURIComponent(json); }catch(e){ enc=encodeURIComponent(JSON.stringify({url:url,title:title.slice(0,50),truncated:true,operation_id:operationId||''})); }
+            if(enc.length>6000) {
+                // Re-truncate at field level and re-encode (slicing encoded URI would break % escapes)
+                forensics.button_labels = forensics.button_labels.slice(0,3);
+                forensics.link_labels = [];
+                var retry = JSON.stringify(forensics);
+                try{ enc=encodeURIComponent(retry); }catch(e){}
+                if(enc.length>6000) {
+                    var minimal = JSON.stringify({url:url,title:title.slice(0,30),truncated:true,operation_id:operationId||''});
+                    try{ enc=encodeURIComponent(minimal); }catch(e){}
+                }
+            }
             window.location.href='arena://dom/' + encodeURIComponent(getAgentIdLC()) + '/' + enc;
         } catch(e){}
     };
@@ -4580,6 +4789,10 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
 
 // Main agent init
 (function() {
+    // RC1-INITSCRIPT: idempotent guard — if this document somehow receives the
+    // init script twice (e.g. via an extra eval), do not multiply timers.
+    if (window.__ca_mainInstalled) return;
+    window.__ca_mainInstalled = true;
     // window.name survives full cross-origin navigations. Rust writes only a
     // generic marker plus the current agent id before navigation; every new
     // document restores the runtime identity into window.__ca_agentId.

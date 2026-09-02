@@ -378,7 +378,7 @@ async fn wait_for_setup_ready(
                     Ok(Ok(())) => continue,
                     Ok(Err(error)) => return Err(error),
                     Err(_) => {
-                        let message = "timeout waiting for verification resume".to_string();
+                        let message = "timeout waiting for verification resume (600s)".to_string();
                         record_browser_blocker(
                             app,
                             diagnostics,
@@ -389,7 +389,12 @@ async fn wait_for_setup_ready(
                             "Verification resume timed out",
                             Some(&message),
                         );
-                        return Err(AgentError::Timeout(message));
+                        // RC1-A4: expose as CaptchaRequired (Permanent) so callers can
+                        // distinguish challenge-expiry from a normal Timeout. Matches
+                        // active-turn wait_for_response challenge expiry semantics.
+                        return Err(AgentError::CaptchaRequired(format!(
+                            "{display_name} blocked by verification challenge: timeout waiting for resume (600s)"
+                        )));
                     }
                 }
             }

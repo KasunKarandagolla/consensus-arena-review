@@ -1766,12 +1766,14 @@ pub async fn launch_connected_account(
                 );
             }
         }
-        // Reserve the window for this navigation (3 s). `navigate_agent_window`
-        // will update the diagnostic phase to `navigation_started`/`creating`,
-        // but the expiry guard is the authoritative lock for the race window
-        // before that phase is visible.
+        // RC1-G1: extend reservation to cover the full navigation critical
+        // interval. The previous 3s guard was too short: a slow WebKitGTK
+        // load (up to 15s) could still be in flight when a second click
+        // arrives at 5s and yanks the same WebView between models. 10s
+        // covers the window-repoint race; the post-navigate extension (below)
+        // covers the page-load tail.
         browser.connected_account_busy_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
     }
 
     // Ensure nav window exists (creates one if no session has ever created windows).
@@ -1807,13 +1809,15 @@ pub async fn launch_connected_account(
     let nav_result =
         navigate_agent_window(&app, &diagnostics, &window, &agent_id, "nav", &participant.base_url)
             .map_err(|e| e.to_string());
-    // Release the short busy guard after the navigation request is issued;
-    // extend it slightly so a second immediate click still coalesces.
+    // RC1-G1: keep guard through the page-load tail so a second
+    // immediate click at 11s does not steal the window while the first
+    // navigation is still hydrating. Cleared on failure so a genuine
+    // retry is not blocked.
     {
         let mut browser = state.browser_state.lock().await;
         if nav_result.is_ok() {
             browser.connected_account_busy_until =
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
         } else {
             browser.connected_account_busy_until = None;
         }

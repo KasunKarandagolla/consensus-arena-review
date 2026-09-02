@@ -39,6 +39,16 @@ const MAX_RETRIES: u32 = 3;
 const BACKOFF_BASE_SECS: u64 = 2;
 const MAX_UNCLASSIFIED_CONTINUES: u32 = 1;
 
+/// RC1-F3: total retry accounting — the outer `inject_and_wait_with_retry`
+/// loop (MAX_RETRIES=3 → up to 4 attempts) and the inner
+/// `confirm_active_submit` loop (MAX_SUBMIT_ACTION_RETRIES=3 → up to 4
+/// submit acks per outer attempt) are intentionally separate budgets:
+/// outer = turn-level navigation/injection/response, inner = action-level
+/// submit confirmation. Worst-case per participant turn = 4 outer × 4 inner
+/// = 16 submit actions + 4 navigates, all bounded and capped at 60 s
+/// backoff per outer retry. No retry path is unbounded or infinite; empty-
+/// shell failures bypass both via `should_retry_after_failure`.
+
 /// W1-C: distinguish Category 1 (transient/navigation) vs Category 2
 /// (empty-shell/readiness). Empty-shell failures are page readiness
 /// failures where the document loaded but hydration never produced a
@@ -463,8 +473,11 @@ pub async fn run_agent_loop(
         "Consensus Arena active turn 1 (session {}).\n\nProject brief:\n{}\n\nConstraints: work as the panel leader, keep the first draft practical and concise, and identify decisions or questions worth consulting another model on. Produce the first short proposal/blueprint draft now. Do not answer only CONSENSUS on this active turn. Respond now with the requested draft/proposal.",
         config.session_id, config.project_brief
     );
-    let early_turn1 = inject_active_prompt(
-        leader_window,
+    // RC1-A2: leader injection is intentionally fatal — no participant fallback.
+    // Make error semantics explicit: record diagnostic + boss-message before
+    // propagating, so an injection failure does not silently crash.
+    let early_turn1 = match inject_active_prompt(
+        leader_window.clone(),
         &leader_id,
         &first_prompt,
         1,
@@ -472,7 +485,25 @@ pub async fn run_agent_loop(
         app,
         nav_rx,
     )
-    .await?;
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let diagnostics = {
+                let browser = state.browser_state.lock().await;
+                browser.diagnostics.clone()
+            };
+            crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
+            let _ = app.emit(
+                "boss-message",
+                serde_json::json!({
+                    "text": format!("Leader window injection failed (turn 1): {e}"),
+                    "message_type": "status"
+                }),
+            );
+            return Err(e);
+        }
+    };
     let mut next_leader_turn: u32 = 2;
     let mut early_leader_response: Option<String> = early_turn1;
 
@@ -901,7 +932,8 @@ pub async fn run_agent_loop(
                     iteration,
                     return_prompt.len()
                 );
-                early_leader_response = inject_active_prompt(
+                // RC1-A2: explicit fatal semantics for leader
+                early_leader_response = match inject_active_prompt(
                     leader_window,
                     &leader_id,
                     &return_prompt,
@@ -910,7 +942,25 @@ pub async fn run_agent_loop(
                     app,
                     nav_rx,
                 )
-                .await?;
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let diagnostics = {
+                            let browser = state.browser_state.lock().await;
+                            browser.diagnostics.clone()
+                        };
+                        crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
+                        let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Leader window injection failed (Route return turn {next_leader_turn}): {e}"),
+                                "message_type": "status"
+                            }),
+                        );
+                        return Err(e);
+                    }
+                };
                 next_leader_turn = next_leader_turn.saturating_add(1);
             }
 
@@ -1079,7 +1129,8 @@ pub async fn run_agent_loop(
                     iteration,
                     combined_msg.len()
                 );
-                early_leader_response = inject_active_prompt(
+                // RC1-A2: explicit fatal for leader
+                early_leader_response = match inject_active_prompt(
                     leader_window,
                     &leader_id,
                     &combined_msg,
@@ -1088,7 +1139,25 @@ pub async fn run_agent_loop(
                     app,
                     nav_rx,
                 )
-                .await?;
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let diagnostics = {
+                            let browser = state.browser_state.lock().await;
+                            browser.diagnostics.clone()
+                        };
+                        crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
+                        let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Leader window injection failed (RouteCompare turn {next_leader_turn}): {e}"),
+                                "message_type": "status"
+                            }),
+                        );
+                        return Err(e);
+                    }
+                };
                 next_leader_turn = next_leader_turn.saturating_add(1);
             }
 
@@ -1195,7 +1264,8 @@ pub async fn run_agent_loop(
                 let ack =
                     "Section recorded. Please continue with the next section or signal completion.";
                 tracing::debug!("[INJECT] Blueprint ack → {} turn={}", leader_id, iteration);
-                early_leader_response = inject_active_prompt(
+                // RC1-A2: explicit fatal for leader
+                early_leader_response = match inject_active_prompt(
                     leader_window,
                     &leader_id,
                     ack,
@@ -1204,7 +1274,25 @@ pub async fn run_agent_loop(
                     app,
                     nav_rx,
                 )
-                .await?;
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let diagnostics = {
+                            let browser = state.browser_state.lock().await;
+                            browser.diagnostics.clone()
+                        };
+                        crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
+                        let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Leader window injection failed (Blueprint ack turn {next_leader_turn}): {e}"),
+                                "message_type": "status"
+                            }),
+                        );
+                        return Err(e);
+                    }
+                };
                 next_leader_turn = next_leader_turn.saturating_add(1);
             }
 
@@ -1228,7 +1316,8 @@ pub async fn run_agent_loop(
                 tracing::debug!("[LOCK] released browser_state for Continue");
 
                 tracing::debug!("[INJECT] Continue → {} turn={}", leader_id, iteration);
-                early_leader_response = inject_active_prompt(
+                // RC1-A2: explicit fatal for leader
+                early_leader_response = match inject_active_prompt(
                     leader_window,
                     &leader_id,
                     "Please continue.",
@@ -1237,7 +1326,25 @@ pub async fn run_agent_loop(
                     app,
                     nav_rx,
                 )
-                .await?;
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let diagnostics = {
+                            let browser = state.browser_state.lock().await;
+                            browser.diagnostics.clone()
+                        };
+                        crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
+                        let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Leader window injection failed (Continue turn {next_leader_turn}): {e}"),
+                                "message_type": "status"
+                            }),
+                        );
+                        return Err(e);
+                    }
+                };
                 next_leader_turn = next_leader_turn.saturating_add(1);
             }
 
@@ -1363,7 +1470,8 @@ pub async fn run_agent_loop(
                     iteration,
                     context_prompt.len()
                 );
-                early_leader_response = inject_active_prompt(
+                // RC1-A2: explicit fatal for leader
+                early_leader_response = match inject_active_prompt(
                     leader_window,
                     &leader_id,
                     &context_prompt,
@@ -1372,7 +1480,25 @@ pub async fn run_agent_loop(
                     app,
                     nav_rx,
                 )
-                .await?;
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let diagnostics = {
+                            let browser = state.browser_state.lock().await;
+                            browser.diagnostics.clone()
+                        };
+                        crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
+                        let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Leader window injection failed (AskUser turn {next_leader_turn}): {e}"),
+                                "message_type": "status"
+                            }),
+                        );
+                        return Err(e);
+                    }
+                };
                 next_leader_turn = next_leader_turn.saturating_add(1);
             }
 
