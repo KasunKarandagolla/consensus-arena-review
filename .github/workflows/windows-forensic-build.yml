@@ -55,6 +55,9 @@ jobs:
       - name: Frontend install
         run: npm ci
 
+      - name: Tauri CLI version
+        run: npx tauri --version
+
       - name: Frontend build
         run: npm run build
 
