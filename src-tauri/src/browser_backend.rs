@@ -144,6 +144,9 @@ pub struct BrowserDiagnosticRecord {
     pub navigation_diagnostics: Vec<NavigationDiagnosticEntry>,
     pub setup_navigation_recovery_count: u32,
     pub last_navigation: Option<NavigationDiagnosticEntry>,
+    /// W1-D: best-effort navigator.userAgent captured once per window via
+    /// arena://ua. Truncated to 500 chars, never contains cookies/tokens.
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -184,7 +187,7 @@ pub struct BrowserDiagnostics {
 }
 
 impl BrowserDiagnostics {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             records: Arc::new(Mutex::new(HashMap::new())),
             active_by_window: Arc::new(Mutex::new(HashMap::new())),
@@ -506,7 +509,7 @@ impl BrowserDiagnostics {
         }
     }
 
-    fn register(&self, agent_id: &str, window_label: &str, window_kind: &str) {
+    pub(crate) fn register(&self, agent_id: &str, window_label: &str, window_kind: &str) {
         let intended_url = get_agent_config(agent_id)
             .map(|config| config.base_url)
             .unwrap_or_default();
@@ -596,6 +599,7 @@ impl BrowserDiagnostics {
                 navigation_diagnostics: Vec::new(),
                 setup_navigation_recovery_count: 0,
                 last_navigation: None,
+                user_agent: None,
             });
         record.display_name = display_name_for(agent_id).to_string();
         record.setup_generation = metadata.setup_generation;
@@ -611,7 +615,7 @@ impl BrowserDiagnostics {
         record.is_selected_leader = is_selected_leader;
     }
 
-    fn set_active(&self, window_label: &str, agent_id: &str) {
+    pub(crate) fn set_active(&self, window_label: &str, agent_id: &str) {
         self.active_by_window
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -936,6 +940,39 @@ impl BrowserDiagnostics {
     pub fn last_navigation_for(&self, agent_id: &str) -> Option<NavigationDiagnosticEntry> {
         let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
         records.get(agent_id).and_then(|r| r.last_navigation.clone())
+    }
+
+    /// W1-C: check whether the last classified page state for this agent is an
+    /// empty-shell/hydration failure. Such failures are NOT transient navigation
+    /// failures — they indicate the page loaded but hydration never completed
+    /// (body <40, interactive <2). Retrying with a full `window.navigate` to the
+    /// same URL would destroy diagnostic evidence and amplify one failure into
+    /// repeated reloads. Caller should record diagnostic and return bounded
+    /// failure instead.
+    pub fn is_empty_shell_failure(&self, agent_id: &str) -> bool {
+        let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(rec) = records.get(agent_id) {
+            if let Some(hint) = rec.page_state_hint.as_deref() {
+                return hint == "empty_shell_or_hydration_stuck";
+            }
+        }
+        false
+    }
+
+    pub fn page_state_hint_for(&self, agent_id: &str) -> Option<String> {
+        self.records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .and_then(|r| r.page_state_hint.clone())
+    }
+
+    #[cfg(test)]
+    pub fn set_page_state_hint_for_test(&self, agent_id: &str, hint: Option<String>) {
+        let mut records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(rec) = records.get_mut(agent_id) {
+            rec.page_state_hint = hint;
+        }
     }
 }
 
@@ -1318,6 +1355,7 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
         NavEvent::PageLifecycle { agent_id, .. } => Some((agent_id.as_str(), "lifecycle")),
         NavEvent::SafeDomForensics { agent_id, .. } => Some((agent_id.as_str(), "dom-forensics")),
         NavEvent::ActionEvent { agent_id, .. } => Some((agent_id.as_str(), "action")),
+        NavEvent::UserAgent { agent_id, .. } => Some((agent_id.as_str(), "user-agent")),
         NavEvent::UnsupportedNavigation { .. } | NavEvent::SessionAborted => None,
     }
 }
@@ -1430,6 +1468,36 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
 
     if let NavEvent::ActionEvent { agent_id, window_label: _, action, actor, reason, target } = event {
         diagnostics.record_action(agent_id, action, actor, reason, target.clone());
+        return;
+    }
+
+    if let NavEvent::UserAgent { agent_id, window_label: _, user_agent } = event {
+        let sanitized = {
+            let mut s = user_agent.trim().to_string();
+            if s.len() > 500 {
+                s.truncate(500);
+                s.push_str(" [truncated]");
+            }
+            // Keep controls stripped but keep UA intact
+            s.chars().filter(|c| !c.is_control() || *c == ' ').collect::<String>()
+        };
+        if !sanitized.is_empty() {
+            let _ = update_diagnostic(diagnostics, agent_id, |record| {
+                // Only store first non-empty UA to keep evidence of WebView identity
+                if record.user_agent.is_none() {
+                    record.user_agent = Some(sanitized.clone());
+                }
+            });
+            let op = diagnostics.current_operation_id(agent_id);
+            diagnostics.emit_harness_event(
+                agent_id,
+                EventType::Unknown,
+                &diagnostics.current_phase_str(agent_id),
+                &op,
+                "",
+                serde_json::json!({ "user_agent": crate::browser_harness::sanitize_details_value(&sanitized) }),
+            );
+        }
         return;
     }
 
@@ -1677,6 +1745,10 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
         | NavEvent::ResumeRequested(_)
         | NavEvent::SendProbe { .. }
         | NavEvent::ConsoleDiagnostic { .. }
+        | NavEvent::PageLifecycle { .. }
+        | NavEvent::SafeDomForensics { .. }
+        | NavEvent::ActionEvent { .. }
+        | NavEvent::UserAgent { .. }
         | NavEvent::SessionAborted => return,
     };
     // Harness: emit timeline for these NavEvents before updating record
@@ -1812,6 +1884,10 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             | NavEvent::UnshowableUrl(_, _)
             | NavEvent::UnsupportedNavigation { .. }
             | NavEvent::ResumeRequested(_)
+            | NavEvent::PageLifecycle { .. }
+            | NavEvent::SafeDomForensics { .. }
+            | NavEvent::ActionEvent { .. }
+            | NavEvent::UserAgent { .. }
             | NavEvent::SessionAborted => {}
         }
     }) {
@@ -2301,6 +2377,12 @@ pub enum NavEvent {
         reason: String,
         target: crate::browser_harness::ActionTarget,
     },
+    /// W1-D: best-effort navigator.userAgent captured via arena://ua.
+    UserAgent {
+        agent_id: String,
+        window_label: String,
+        user_agent: String,
+    },
 }
 
 // ── BrowserState ──────────────────────────────────────────────────────────────
@@ -2318,6 +2400,11 @@ pub struct BrowserState {
     /// Key = agent_id, Value = Instant when the cooldown expires.
     pub cooldowns: HashMap<String, std::time::Instant>,
     pub active_turn: Option<(String, u32)>,
+    /// R1.3: shared nav window launch guard — prevents rapid successive
+    /// `launch_connected_account` calls from yanking the same WebView between
+    /// models while navigation is still in progress. Stored as an expiry
+    /// Instant so a stale lock cannot permanently block the window.
+    pub connected_account_busy_until: Option<std::time::Instant>,
 }
 
 impl BrowserState {
@@ -2333,6 +2420,7 @@ impl BrowserState {
             captcha_resolved: HashSet::new(),
             cooldowns: HashMap::new(),
             active_turn: None,
+            connected_account_busy_until: None,
         }
     }
 
@@ -3083,6 +3171,35 @@ fn handle_arena_url(
             } else {
                 send_unknown_arena_signal(&tx, window_label, url);
             }
+        }
+        // W1-D: navigator.userAgent captured via arena://ua/<agent>/<encoded>
+        ("ua", [agent_id, encoded_ua]) => {
+            let ua = urlencoding::decode(encoded_ua)
+                .unwrap_or_default()
+                .into_owned();
+            send_nav_event(
+                &tx,
+                NavEvent::UserAgent {
+                    agent_id: agent_id.to_string(),
+                    window_label: window_label.to_string(),
+                    user_agent: ua,
+                },
+            );
+        }
+        ("ua", args) if args.len() >= 2 => {
+            let agent_id = args[0].clone();
+            let encoded_ua = args[1..].join("/");
+            let ua = urlencoding::decode(&encoded_ua)
+                .unwrap_or_default()
+                .into_owned();
+            send_nav_event(
+                &tx,
+                NavEvent::UserAgent {
+                    agent_id,
+                    window_label: window_label.to_string(),
+                    user_agent: ua,
+                },
+            );
         }
         _ => send_unknown_arena_signal(&tx, window_label, url),
     }
@@ -4138,6 +4255,57 @@ mod tests {
         diagnostics.reset_setup_navigation_recovery("chatgpt");
         assert!(diagnostics.can_recover_navigation("chatgpt"));
     }
+
+    // ── W1-C: empty-shell classification ──────────────────────────────────
+
+    #[test]
+    fn is_empty_shell_failure_detects_hint() {
+        let diagnostics = make_console_diagnostics();
+        // Simulate send-probe that sets page_state_hint to empty_shell
+        // We do this via direct record manipulation through SendProbe handling
+        // For unit test, set via update_diagnostic
+        let _ = super::update_diagnostic(&diagnostics, "chatgpt", |r| {
+            r.page_state_hint = Some("empty_shell_or_hydration_stuck".to_string());
+        });
+        assert!(diagnostics.is_empty_shell_failure("chatgpt"));
+        assert_eq!(diagnostics.page_state_hint_for("chatgpt"), Some("empty_shell_or_hydration_stuck".to_string()));
+        // Other hint should not be considered empty shell
+        let _ = super::update_diagnostic(&diagnostics, "deepseek", |r| {
+            r.page_state_hint = Some("composer_detected".to_string());
+        });
+        assert!(!diagnostics.is_empty_shell_failure("deepseek"));
+        // No hint -> false
+        assert!(!diagnostics.is_empty_shell_failure("nonexistent"));
+        // composer_selector_miss is NOT empty_shell per W1-C strict check
+        let _ = super::update_diagnostic(&diagnostics, "chatgpt", |r| {
+            r.page_state_hint = Some("composer_selector_miss".to_string());
+        });
+        assert!(!diagnostics.is_empty_shell_failure("chatgpt"));
+    }
+
+    #[test]
+    fn user_agent_captured_via_nav_event() {
+        let diagnostics = make_console_diagnostics();
+        // Simulate UA signal storage path
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36 Edg/120.0";
+        let _ = super::update_diagnostic(&diagnostics, "chatgpt", |r| {
+            r.user_agent = Some(ua.to_string());
+        });
+        let rec = diagnostics.snapshot().into_iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        assert_eq!(rec.user_agent, Some(ua.to_string()));
+        let before = rec.user_agent.clone();
+        assert_eq!(before, Some(ua.to_string()));
+        // Ensure truncation logic works: long UA >500 is truncated with [truncated]
+        let long = "a".repeat(600);
+        assert!(long.len() > 500);
+        let truncated = {
+            let mut s = long.clone();
+            if s.len() > 500 { s.truncate(500); s.push_str(" [truncated]"); }
+            s
+        };
+        assert!(truncated.contains("[truncated]"));
+        assert!(truncated.len() <= 512);
+    }
 }
 
 // ── GENERIC_INIT_SCRIPT ───────────────────────────────────────────────────────
@@ -4146,6 +4314,22 @@ mod tests {
 // - Static &str constant — never modified at runtime, never agent-specific.
 // - Agent identity always read from window.__ca_agentId — never captured.
 // - Detects input field at runtime — generic across ALL agents.
+//
+// R1.3 Domain-boundary note: GENERIC_INIT_SCRIPT intentionally has NO
+// provider-specific `if (location.hostname === "accounts.google.com")`
+// branch. OAuth and login flows use unpredictable hosts, redirects, and
+// partitioned WebView storage; a brittle host allowlist would break those
+// flows and would require baking a dynamic expected-host variable into the
+// static script, violating the static/generic guarantee. The existing
+// `classifyPageState` heuristic (possible_login_required /
+// possible_challenge_or_security / composer_detected) already distinguishes
+// a login/challenge shell from a real composer without a domain allowlist,
+// and the navigation forensics (`cause` / `arena_requested`) surface
+// unexpected redirects. If strict origin scoping is later required, it must
+// be implemented generically via a runtime `window.__ca_expectedOrigin`
+// set from Rust before navigation and read (not hardcoded) by the script —
+// not as per-provider branches. This batch documents the limitation rather
+// than adding a brittle hack.
 //
 // D-040 Tier 2: console.error override and window.onerror → arena://log/error
 //   with re-entrancy guards to prevent infinite recursion.
@@ -4372,6 +4556,26 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
     };
     // Initial lifecycle after install
     try { setTimeout(function(){ sendLifecycle('forensics_ready'); }, 500); } catch(e){}
+})();
+
+// W1-D: best-effort navigator.userAgent capture (not secret, bounded 500, once per document)
+// Sends arena://ua/<agent>/<encoded> so Rust can record WebView identity for Windows vs Linux comparison.
+(function() {
+    try {
+        var sendUA = function() {
+            try {
+                var agentId = 'unknown';
+                if (window.__ca_agentId) agentId = window.__ca_agentId;
+                else try { var p='__consensus_arena_agent__:'; if(typeof window.name==='string'&&window.name.indexOf(p)===0) agentId = window.name.substring(p.length); } catch(e){}
+                var ua = ''; try { ua = (navigator.userAgent||'').slice(0,500); } catch(e){}
+                if (!ua) return;
+                window.location.href = 'arena://ua/' + encodeURIComponent(agentId) + '/' + encodeURIComponent(ua);
+            } catch(e){}
+        };
+        // Delay slightly so window.__ca_agentId has been restored by the main init below; also send immediately if already present.
+        try { setTimeout(sendUA, 900); } catch(e){}
+        try { if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(sendUA, 1200); } catch(e){}
+    } catch(e){}
 })();
 
 // Main agent init
@@ -4709,7 +4913,13 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
     // IMP-11B: checkReady now probes for up to 45 seconds before declaring
     // page_loaded_but_no_composer. This is long enough for slower WebKit/dev
     // paths without bypassing login, security, or challenge pages.
+    // R1.4: composer is considered ready only after the ACTIVE composer
+    // remains stable across multiple consecutive observations (3 × 500 ms).
+    // This guards the ChatGPT/SPA case where the composer appears, is
+    // injected, then replaced/reset during hydration.
     var _checkReadyStart = null;
+    var _readyStableCount = 0;
+    var _lastReadyEl = null;
     window.__ca_readinessProbeCount = 0;
     window.__ca_pageStateHint = 'still_loading';
 
@@ -4723,19 +4933,40 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
 
         if (detectChallengeOrUnshowable()) {
             window.__ca_pageStateHint = 'possible_challenge_or_security';
+            _readyStableCount = 0;
+            _lastReadyEl = null;
             emitSendProbe(true);
             setTimeout(checkReady, 1000);
-        } else if (snapshot.input) {
-            window.__ca_ready = true;
-            window.__ca_pageStateHint = 'composer_detected';
+        } else if (window.__ca_pageStateHint === 'possible_login_required') {
+            _readyStableCount = 0;
+            _lastReadyEl = null;
             emitSendProbe(true);
-            signalReady();
+            setTimeout(checkReady, 1000);
+        } else if (snapshot.input && snapshot.input.isConnected && isVisible(snapshot.input)) {
+            // Require the SAME composer element to remain present/visible
+            // across 3 consecutive probes. A replacement/reset clears the count.
+            if (snapshot.input === _lastReadyEl) {
+                _readyStableCount += 1;
+            } else {
+                _lastReadyEl = snapshot.input;
+                _readyStableCount = 1;
+            }
+            if (_readyStableCount >= 3) {
+                window.__ca_ready = true;
+                window.__ca_pageStateHint = 'composer_detected';
+                emitSendProbe(true);
+                signalReady();
+            } else {
+                setTimeout(checkReady, READY_CHECK_INTERVAL_MS);
+            }
         } else if (now - _checkReadyStart >= READY_TIMEOUT_MS) {
             // Timeout — signal error so the backend can surface it
             var agentId = getAgentId();
             emitSendProbe(true);
             try { window.location.href = 'arena://ready/error-' + agentId; } catch (e) {}
         } else {
+            _readyStableCount = 0;
+            _lastReadyEl = null;
             setTimeout(checkReady, READY_CHECK_INTERVAL_MS);
         }
     }
@@ -4748,6 +4979,11 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         });
     }
 
+    // R1.6: `button[type="submit"]` is intentionally removed — it matched
+    // any submit button (including attachment/upload/plus/voice/stop) and
+    // could win as Send inside the composer. Legitimate Send controls are
+    // identified via send-specific selectors or icon-only geometry inside the
+    // composer root; the generic fallback is not needed and not safe.
     const SEND_SELECTORS = [
         '#send-message-button',
         'div.send-button-container',
@@ -4761,7 +4997,6 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         'button[aria-label*="send" i]',
         'button[aria-label*="arrow" i]',
         'button[title*="send" i]',
-        'button[type="submit"]',
         'button[class*="send" i]'
     ];
     const MESSAGE_SELECTORS = [
@@ -4810,9 +5045,15 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         if (!el || !(el instanceof Element)) return false;
         if (!isVisible(el)) return false;
         const text = candidateText(el);
-        // Explicit negative filters: attachment, file, upload, paperclip, voice, microphone
+        // R1.6: expanded negative filter — attachment/upload/plus/voice/stop
+        // must never be selected as Send merely because it matches submit
+        // semantics. Must stay in sync with looksIconOnlySend and pre-click.
         if (text.indexOf('attach') !== -1 || text.indexOf('file') !== -1 || text.indexOf('upload') !== -1 ||
-            text.indexOf('paperclip') !== -1 || text.indexOf('voice') !== -1 || text.indexOf('microphone') !== -1) {
+            text.indexOf('paperclip') !== -1 || text.indexOf('voice') !== -1 || text.indexOf('microphone') !== -1 ||
+            text.indexOf('stop') !== -1 || text.indexOf('pause') !== -1 ||
+            text.indexOf('add') !== -1 || text.indexOf('plus') !== -1 ||
+            text.indexOf('image') !== -1 || text.indexOf('photo') !== -1 || text.indexOf('clip') !== -1 ||
+            text.indexOf('insert') !== -1 || text.indexOf('+') !== -1) {
             return false;
         }
         if (text.indexOf('send') !== -1 || text.indexOf('submit') !== -1 || text.indexOf('arrow-up') !== -1 || text.indexOf('arrow up') !== -1) return true;

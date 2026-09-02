@@ -1047,6 +1047,11 @@ struct DiagnosticSnapshot {
     action_records: Vec<crate::browser_harness::ActionRecord>,
     // Recent failures + auth hints
     recent_failures: Vec<serde_json::Value>,
+    // W1-D: minimal Windows WebView2 environment
+    webview_version: Option<String>,
+    os: String,
+    arch: String,
+    tauri_version: String,
     command_timestamp: String,
 }
 
@@ -1126,6 +1131,9 @@ pub async fn get_diagnostic_snapshot(
         .filter_map(|r| r.browser_console_last_error_at.clone())
         .max();
 
+    // W1-D: WebView version via Tauri/Wry (no new dep). On Windows this is
+    // the Edge WebView2 runtime version; on Linux it is WebKitGTK version.
+    let webview_version = tauri::webview_version().ok();
     let snapshot = DiagnosticSnapshot {
         app_data_dir: app_data_dir.to_string_lossy().into_owned(),
         settings_db_exists: app_data_dir.join("settings.db").is_file(),
@@ -1155,6 +1163,10 @@ pub async fn get_diagnostic_snapshot(
         safe_dom_snapshots,
         action_records,
         recent_failures,
+        webview_version,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        tauri_version: env!("CARGO_PKG_VERSION").to_string(),
         command_timestamp: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -1740,6 +1752,28 @@ pub async fn launch_connected_account(
     let participant = resolve_participant(&agent_id, &custom)
         .ok_or_else(|| format!("Unknown participant: {agent_id}"))?;
 
+    // R1.3: shared-window busy guard — prevents rapid successive launches
+    // from yanking the same WebView between models while navigation is still
+    // in flight. Uses the existing BrowserState lock so frontend and backend
+    // stay synchronized; not a frontend-only flag.
+    {
+        let mut browser = state.browser_state.lock().await;
+        if let Some(until) = browser.connected_account_busy_until {
+            if std::time::Instant::now() < until {
+                return Err(
+                    "A model window launch is already in progress. Wait a moment and try again."
+                        .to_string(),
+                );
+            }
+        }
+        // Reserve the window for this navigation (3 s). `navigate_agent_window`
+        // will update the diagnostic phase to `navigation_started`/`creating`,
+        // but the expiry guard is the authoritative lock for the race window
+        // before that phase is visible.
+        browser.connected_account_busy_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+    }
+
     // Ensure nav window exists (creates one if no session has ever created windows).
     // This never creates a third window; it reuses the shared nav WebView.
     let window = {
@@ -1765,12 +1799,45 @@ pub async fn launch_connected_account(
         browser.diagnostics.clone()
     };
 
-    navigate_agent_window(&app, &diagnostics, &window, &agent_id, "nav", &participant.base_url)
-        .map_err(|e| e.to_string())?;
+    // R1.3: navigation STARTED is the honest signal — the page is not yet
+    // ready when this command returns. `navigate_agent_window` records the
+    // diagnostic phase `navigation_started` and the `browser-diagnostic`
+    // event drives the frontend's "window loading …" / "checking for a
+    // composer" status. We deliberately do NOT imply the target page is ready.
+    let nav_result =
+        navigate_agent_window(&app, &diagnostics, &window, &agent_id, "nav", &participant.base_url)
+            .map_err(|e| e.to_string());
+    // Release the short busy guard after the navigation request is issued;
+    // extend it slightly so a second immediate click still coalesces.
+    {
+        let mut browser = state.browser_state.lock().await;
+        if nav_result.is_ok() {
+            browser.connected_account_busy_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        } else {
+            browser.connected_account_busy_until = None;
+        }
+    }
+    nav_result?;
 
-    // Make window visible so user can interact (login/inspect)
+    // `navigate_agent_window` already shows/focuses the window after issuing
+    // the navigation request. The extra show/focus here is idempotent and
+    // guarantees the window is visible even if it was previously hidden.
     let _ = window.show();
     let _ = window.set_focus();
+    // Notify via boss-message so the frontend status line reflects STARTED
+    // rather than READY. The `browser-diagnostic` loading phase is the
+    // authoritative progress signal; this is the immediate acknowledgment.
+    let _ = app.emit(
+        "boss-message",
+        serde_json::json!({
+            "text": format!(
+                "Navigation started for {} — window loading {}. Complete any login there if prompted.",
+                participant.display_name, participant.base_url
+            ),
+            "message_type": "status"
+        }),
+    );
     Ok(())
 }
 

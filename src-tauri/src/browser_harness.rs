@@ -1456,6 +1456,7 @@ mod tests {
             navigation_diagnostics: vec![],
             setup_navigation_recovery_count: 0,
             last_navigation: None,
+            user_agent: None,
         };
         let md = generate_reliability_report_markdown(&tl, &[diag]);
         assert!(md.contains("ChatGPT"));

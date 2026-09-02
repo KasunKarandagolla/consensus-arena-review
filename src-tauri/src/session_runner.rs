@@ -84,7 +84,7 @@ fn build_priming_script(priming: &str) -> Result<String, AgentError> {
                 function selectContents(target) {{ const range = document.createRange(); range.selectNodeContents(target); const selection = getSelection(); if (selection) {{ selection.removeAllRanges(); selection.addRange(range); }} }}
                 function latestResponse() {{ for (const selector of ['[data-message-author-role="assistant"]','[data-testid="assistant-message"]','[class*="assistant-message"]','[class*="ai-message"]','.markdown','.prose']) {{ const items = document.querySelectorAll(selector); if (items.length) {{ const response = (items[items.length - 1].innerText || '').trim(); if (response) return response; }} }} return ''; }}
                 const baseline = latestResponse();
-                const el = findInput();
+                let el = findInput();
                 let method = 'none', error = '';
                 if (!el) {{ error = 'priming input field not found'; }} else {{
                     const visibleText = valueOf(el);
@@ -119,7 +119,11 @@ fn build_priming_script(priming: &str) -> Result<String, AgentError> {
                         }}
                     }} catch (injectionError) {{ error = String(injectionError && injectionError.message || injectionError); }}
                 }}
-                function reportInjection() {{
+                // R1.5: bounded stability window — verify injected text remains
+                // present after the initial report window and re-inject once if
+                // wiped by an in-place SPA rerender. No permanent timer.
+                let _stabilityRetry = 0;
+                function doReport() {{
                     const visibleText = valueOf(el);
                     const prefixOk = !!el && visibleText.indexOf(text.slice(0, Math.min(32, text.length))) !== -1;
                     const suffixOk = !!el && visibleText.indexOf(text.slice(Math.max(0, text.length - 32))) !== -1;
@@ -142,7 +146,47 @@ fn build_priming_script(priming: &str) -> Result<String, AgentError> {
                     }}
                     setTimeout(pollSetupResponse, 1000);
                 }}
-                setTimeout(reportInjection, 1000);
+                function checkStabilityAndReport() {{
+                    const visibleText = valueOf(el);
+                    const prefixOk = !!el && visibleText.indexOf(text.slice(0, Math.min(32, text.length))) !== -1;
+                    const suffixOk = !!el && visibleText.indexOf(text.slice(Math.max(0, text.length - 32))) !== -1;
+                    const stillPresent = prefixOk && suffixOk && visibleText.length >= text.length;
+                    const elValid = el && el.isConnected && visible(el);
+                    if ((!stillPresent || !elValid) && _stabilityRetry < 1) {{
+                        _stabilityRetry++;
+                        // Re-resolve composer after rerender and retry injection once
+                        const fresh = findInput();
+                        if (fresh && fresh.isConnected && visible(fresh)) {{
+                            el = fresh;
+                            error = '';
+                            try {{
+                                el.focus();
+                                if (el.tagName === 'TEXTAREA') {{
+                                    const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+                                    if (!descriptor || !descriptor.set) throw new Error('textarea native value setter unavailable');
+                                    descriptor.set.call(el, text);
+                                    try {{ el.dispatchEvent(new InputEvent('beforeinput', {{ bubbles: true, cancelable: true, inputType: 'insertText', data: text }})); }} catch (_) {{}}
+                                    try {{ el.dispatchEvent(new InputEvent('input', {{ bubbles: true, cancelable: true, inputType: 'insertText', data: text }})); }} catch (_) {{ el.dispatchEvent(new Event('input', {{ bubbles: true }})); }}
+                                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    method = 'textarea-native-setter-retry';
+                                }} else {{
+                                    selectContents(el); fire('beforeinput', 'insertText');
+                                    if (document.execCommand && document.execCommand('insertText', false, text)) method = 'contenteditable-execCommand-retry';
+                                    if (valueOf(el).indexOf(text) === -1) {{ el.textContent = text; method = 'contenteditable-textContent-fallback-retry'; }}
+                                    fire('input', 'insertText'); el.dispatchEvent(new Event('change', {{ bubbles: true }})); el.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true, key: 'Unidentified' }}));
+                                }}
+                            }} catch (e) {{ error = String(e && e.message || e); }}
+                            setTimeout(checkStabilityAndReport, 700);
+                            return;
+                        }} else {{
+                            error = error || 'prompt wiped by page rerender and composer not recoverable';
+                        }}
+                    }} else if (!stillPresent || !elValid) {{
+                        error = error || 'prompt wiped by page rerender after injection';
+                    }}
+                    doReport();
+                }}
+                setTimeout(checkStabilityAndReport, 1000);
             }})();"#,
         priming_json
     ))
@@ -538,7 +582,7 @@ pub async fn run_setup(
                 function selectContents(target) {{ const range = document.createRange(); range.selectNodeContents(target); const selection = getSelection(); if (selection) {{ selection.removeAllRanges(); selection.addRange(range); }} }}
                 function latestResponse() {{ for (const selector of ['[data-message-author-role="assistant"]','[data-testid="assistant-message"]','[class*="assistant-message"]','[class*="ai-message"]','.markdown','.prose']) {{ const items = document.querySelectorAll(selector); if (items.length) {{ const response = (items[items.length - 1].innerText || '').trim(); if (response) return response; }} }} return ''; }}
                 const baseline = latestResponse();
-                const el = findInput();
+                let el = findInput();
                 let method = 'none', error = '';
                 if (!el) {{ error = 'priming input field not found'; }} else {{
                     // Idempotency guard: if the priming prompt is already fully visible in the input,
@@ -566,14 +610,13 @@ pub async fn run_setup(
                         }}
                     }} catch (injectionError) {{ error = String(injectionError && injectionError.message || injectionError); }}
                 }}
-                function reportInjection() {{
+                // R1.5: bounded stability — verify injected text remains after rerender window
+                let _stabilityRetry = 0;
+                function doReport() {{
                     const visibleText = valueOf(el);
                     const prefixOk = !!el && visibleText.indexOf(text.slice(0, Math.min(32, text.length))) !== -1;
                     const suffixOk = !!el && visibleText.indexOf(text.slice(Math.max(0, text.length - 32))) !== -1;
                     if (!error && (!prefixOk || !suffixOk)) error = 'prompt integrity check failed; composer did not show the full prompt';
-                    // Send-capability probe via the SAME ownership abstraction the
-                    // active path uses (window.__ca_findOwnedSend from
-                    // GENERIC_INIT_SCRIPT). Observation-only: never clicks Send.
                     let capability = null;
                     try {{ capability = typeof window.__ca_findOwnedSend === 'function' ? window.__ca_findOwnedSend(el) : null; }} catch (_) {{ capability = null; }}
                     const enabled = !!capability && !capability.disabled && capability.getAttribute('aria-disabled') !== 'true';
@@ -592,7 +635,46 @@ pub async fn run_setup(
                     }}
                     setTimeout(pollSetupResponse, 1000);
                 }}
-                setTimeout(reportInjection, 300);
+                function checkStabilityAndReport() {{
+                    const visibleText = valueOf(el);
+                    const prefixOk = !!el && visibleText.indexOf(text.slice(0, Math.min(32, text.length))) !== -1;
+                    const suffixOk = !!el && visibleText.indexOf(text.slice(Math.max(0, text.length - 32))) !== -1;
+                    const stillPresent = prefixOk && suffixOk && visibleText.length >= text.length;
+                    const elValid = el && el.isConnected && visible(el);
+                    if ((!stillPresent || !elValid) && _stabilityRetry < 1) {{
+                        _stabilityRetry++;
+                        const fresh = findInput();
+                        if (fresh && fresh.isConnected && visible(fresh)) {{
+                            el = fresh;
+                            error = '';
+                            try {{
+                                el.focus();
+                                if (el.tagName === 'TEXTAREA') {{
+                                    const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+                                    if (!descriptor || !descriptor.set) throw new Error('textarea native value setter unavailable');
+                                    descriptor.set.call(el, text);
+                                    try {{ el.dispatchEvent(new InputEvent('beforeinput', {{ bubbles: true, cancelable: true, inputType: 'insertText', data: text }})); }} catch (_) {{}}
+                                    try {{ el.dispatchEvent(new InputEvent('input', {{ bubbles: true, cancelable: true, inputType: 'insertText', data: text }})); }} catch (_) {{ el.dispatchEvent(new Event('input', {{ bubbles: true }})); }}
+                                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    method = 'textarea-native-setter-retry';
+                                }} else {{
+                                    selectContents(el); fire('beforeinput', 'insertText');
+                                    if (document.execCommand && document.execCommand('insertText', false, text)) method = 'contenteditable-execCommand-retry';
+                                    if (valueOf(el).indexOf(text) === -1) {{ el.textContent = text; method = 'contenteditable-textContent-fallback-retry'; }}
+                                    fire('input', 'insertText'); el.dispatchEvent(new Event('change', {{ bubbles: true }})); el.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true, key: 'Unidentified' }}));
+                                }}
+                            }} catch (e) {{ error = String(e && e.message || e); }}
+                            setTimeout(checkStabilityAndReport, 700);
+                            return;
+                        }} else {{
+                            error = error || 'prompt wiped by page rerender and composer not recoverable';
+                        }}
+                    }} else if (!stillPresent || !elValid) {{
+                        error = error || 'prompt wiped by page rerender after injection';
+                    }}
+                    doReport();
+                }}
+                setTimeout(checkStabilityAndReport, 300);
             }})();"#, priming_json);
             if let Err(error) = window.eval(&script) {
                 let message = format!("priming prompt eval failed: {error}");
@@ -786,62 +868,98 @@ pub async fn run_setup(
             record_setup_completion(&diagnostics, agent_id, "capability_verified");
         }
 
-        // Capture conversation URL
-        let conversation_url = window.url().map(|url| url.to_string()).map_err(|error| {
-            let message = format!("failed to read current conversation URL: {error}");
-            record_browser_error(app, &diagnostics, agent_id, &message);
-            AgentError::NavigationFailed(message)
-        })?;
-
-        // Save URL to vault.
-        //
-        // Task 9 (HIGH-5/HIGH-6): session_vault is now Arc<std::sync::Mutex<_>>
-        // (see orchestrator.rs) instead of Arc<tokio::sync::Mutex<_>>, so the
-        // synchronous rusqlite write happens inside db_helpers::run_blocking —
-        // off the async runtime thread, with retry/backoff on transient
-        // failure — instead of directly on it via `.lock().await`.
-        //
-        // Best-effort, same as before this change: a vault write failure does
-        // not abort setup. Previously swallowed silently via `.ok()`; now
-        // logged via tracing::warn! so a persistent failure is at least
-        // visible in the log file, without changing the non-fatal behaviour.
-        {
-            let vault = state.session_vault.clone();
-            let session_id = config.session_id.clone();
-            let agent_id_owned = agent_id.clone();
-            let url_owned = conversation_url.clone();
-            if let Err(e) = crate::db_helpers::run_blocking(move || {
-                let mut guard = vault.lock().map_err(|_| {
-                    AgentError::DatabaseError("session vault lock poisoned".to_string())
-                })?;
-                guard.save_conversation_url(&session_id, &agent_id_owned, &url_owned)
-            })
-            .await
+        // R1.7: do NOT save a fake conversation URL for a participant that
+        // was advanced via capability_verified without a real Send. A
+        // participant conversation URL must represent a real conversation
+        // (trusted SendDetected / submit / response / manual confirmation),
+        // not the base URL captured before any message was created. For the
+        // leader, capability_verified is safe because the leader window is
+        // persistent and never re-navigated via the saved URL; for a
+        // non-leader, saving base_url would pretend a conversation exists and
+        // would later be returned to the shared nav window as if it were a
+        // real chat URL. The router already falls back to the validated
+        // base_url when no conversation URL is stored, so skipping the save
+        // preserves the invariant without fabricating a URL.
+        let is_leader_for_url = is_leader;
+        if setup_capability_verified && !is_leader_for_url {
+            // No real conversation was created — do not persist base_url.
             {
-                tracing::warn!(
-                    "[VAULT] Failed to save conversation URL for {}: {}",
-                    agent_id,
-                    e
-                );
+                let mut browser = state.browser_state.lock().await;
+                browser
+                    .conversation_urls
+                    .insert(agent_id.clone(), None);
             }
-        }
+            tracing::info!(
+                "[SETUP] capability_verified for participant {} — not saving fake conversation URL (will use base_url on first route)",
+                agent_id
+            );
+            app.emit(
+                "setup-agent-complete",
+                json!({
+                    "agent_id": agent_id,
+                    "conversation_url": ""
+                }),
+            )
+            .ok();
+        } else {
+            // Genuine proof (SendDetected / response / manual / leader capability)
+            // — capture and persist the current URL.
+            let conversation_url = window.url().map(|url| url.to_string()).map_err(|error| {
+                let message = format!("failed to read current conversation URL: {error}");
+                record_browser_error(app, &diagnostics, agent_id, &message);
+                AgentError::NavigationFailed(message)
+            })?;
 
-        // Save URL to browser state
-        {
-            let mut browser = state.browser_state.lock().await;
-            browser
-                .conversation_urls
-                .insert(agent_id.clone(), Some(conversation_url.clone()));
-        }
+            // Save URL to vault.
+            //
+            // Task 9 (HIGH-5/HIGH-6): session_vault is now Arc<std::sync::Mutex<_>>
+            // (see orchestrator.rs) instead of Arc<tokio::sync::Mutex<_>>, so the
+            // synchronous rusqlite write happens inside db_helpers::run_blocking —
+            // off the async runtime thread, with retry/backoff on transient
+            // failure — instead of directly on it via `.lock().await`.
+            //
+            // Best-effort, same as before this change: a vault write failure does
+            // not abort setup. Previously swallowed silently via `.ok()`; now
+            // logged via tracing::warn! so a persistent failure is at least
+            // visible in the log file, without changing the non-fatal behaviour.
+            {
+                let vault = state.session_vault.clone();
+                let session_id = config.session_id.clone();
+                let agent_id_owned = agent_id.clone();
+                let url_owned = conversation_url.clone();
+                if let Err(e) = crate::db_helpers::run_blocking(move || {
+                    let mut guard = vault.lock().map_err(|_| {
+                        AgentError::DatabaseError("session vault lock poisoned".to_string())
+                    })?;
+                    guard.save_conversation_url(&session_id, &agent_id_owned, &url_owned)
+                })
+                .await
+                {
+                    tracing::warn!(
+                        "[VAULT] Failed to save conversation URL for {}: {}",
+                        agent_id,
+                        e
+                    );
+                }
+            }
 
-        app.emit(
-            "setup-agent-complete",
-            json!({
-                "agent_id": agent_id,
-                "conversation_url": conversation_url
-            }),
-        )
-        .ok();
+            // Save URL to browser state
+            {
+                let mut browser = state.browser_state.lock().await;
+                browser
+                    .conversation_urls
+                    .insert(agent_id.clone(), Some(conversation_url.clone()));
+            }
+
+            app.emit(
+                "setup-agent-complete",
+                json!({
+                    "agent_id": agent_id,
+                    "conversation_url": conversation_url
+                }),
+            )
+            .ok();
+        }
     }
 
     // Setup monitors observe priming only. Active turn 1 establishes its own

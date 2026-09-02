@@ -124,7 +124,7 @@ interface DiagnosticSnapshot {
       cause: string
       arena_requested: boolean
     }>
-    setup_navigation_recovery_count: number
+     setup_navigation_recovery_count: number
     last_navigation: {
       timestamp: string
       agent_id: string
@@ -137,6 +137,7 @@ interface DiagnosticSnapshot {
       cause: string
       arena_requested: boolean
     } | null
+    user_agent?: string | null
   }>
   browser_console_error_count: number
   browser_console_warning_count: number
@@ -144,6 +145,11 @@ interface DiagnosticSnapshot {
   browser_timeline?: unknown[]
   browser_timeline_dropped?: Record<string, number>
   browser_timeline_count?: number
+  // W1-D: minimal Windows WebView2 diagnostics (all optional for backwards compat)
+  webview_version?: string | null
+  os?: string
+  arch?: string
+  tauri_version?: string
   command_timestamp: string
 }
 
@@ -458,17 +464,19 @@ export default function SettingsPanel({ open, onClose }: Props) {
           {participants.map((p) => {
             const on = health[p.agent_id]?.is_available
             const isActiveSession = sessionStatus === 'running' || sessionStatus === 'priming' || sessionStatus === 'setup' || sessionStatus === 'requirements' || sessionStatus === 'paused'
+            const anyLaunchBusy = launchBusy !== ''
             async function launch() {
               if (isActiveSession) { addToast('Cannot launch while a session is active. Stop the session first.', 5000); return }
+              if (anyLaunchBusy) { addToast('A model window launch is already in progress — wait a moment.', 3000); return }
               setLaunchBusy(p.agent_id)
               try {
                 await invoke('launch_connected_account', { agent_id: p.agent_id })
-                addToast(`Opened ${p.display_name} window — complete login/inspection there.`)
+                addToast(`Navigation started for ${p.display_name} — window loading. Complete any login there if prompted.`)
               } catch (error) {
                 reportError('launch', 'launch_connected_account', error)
               } finally { setLaunchBusy('') }
             }
-            return <div className="cr" key={p.agent_id}><span className={`cdot ${on ? 'on' : 'off'}`} /><span className="cr-n">{p.display_name}</span><span className="cr-btns" style={{ display: 'inline-flex', gap: 6, marginLeft: 'auto' }}><button className="cr-btn" onClick={() => void launch()} disabled={launchBusy === p.agent_id || isActiveSession} title={isActiveSession ? 'Stop the active session before launching a model window (reuses the shared WebView)' : `Open ${p.display_name} in the app window for login/inspection`}>{launchBusy === p.agent_id ? 'Opening…' : 'Launch'}</button><button className="cr-btn" disabled title={p.is_custom ? 'Custom AI — log in manually in its window' : 'Account login is managed in each model WebView'}>{on ? 'Available' : 'Not checked'}</button></span></div>
+            return <div className="cr" key={p.agent_id}><span className={`cdot ${on ? 'on' : 'off'}`} /><span className="cr-n">{p.display_name}</span><span className="cr-btns" style={{ display: 'inline-flex', gap: 6, marginLeft: 'auto' }}><button className="cr-btn" onClick={() => void launch()} disabled={anyLaunchBusy || isActiveSession} title={isActiveSession ? 'Stop the active session before launching a model window (reuses the shared WebView)' : anyLaunchBusy ? 'Another model window is launching — wait a moment' : `Open ${p.display_name} in the app window for login/inspection (navigation will start, not imply ready)`}>{launchBusy === p.agent_id ? 'Opening…' : anyLaunchBusy ? 'Busy…' : 'Launch'}</button><button className="cr-btn" disabled title={p.is_custom ? 'Custom AI — log in manually in its window' : 'Account login is managed in each model WebView'}>{on ? 'Available' : 'Not checked'}</button></span></div>
           })}
         </Section>
         <Section icon={<Plus size={14} />} title="Custom AI">
