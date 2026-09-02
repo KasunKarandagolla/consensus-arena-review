@@ -61,6 +61,24 @@ jobs:
       - name: Frontend build
         run: npm run build
 
+      - name: Ensure Windows icon exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "src-tauri/icons/icon.ico")) {
+            Write-Host "icon.ico missing — generating for Windows resource (CI-only, not source)"
+            if (Test-Path "src-tauri/icons/icon.png") {
+              npx tauri icon src-tauri/icons/icon.png 2>&1 | Out-Null
+            }
+            if (-not (Test-Path "src-tauri/icons/icon.ico")) {
+              Write-Host "Fallback: copying icon.png to icon.ico"
+              Copy-Item "src-tauri/icons/icon.png" "src-tauri/icons/icon.ico" -Force -ErrorAction SilentlyContinue
+            }
+            Get-ChildItem src-tauri/icons/ | Format-List
+          } else {
+            Write-Host "icon.ico already exists"
+            Get-ChildItem src-tauri/icons/ | Format-List
+          }
+
       - name: Rust check
         working-directory: src-tauri
         run: cargo check
