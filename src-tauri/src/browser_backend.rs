@@ -1677,6 +1677,9 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
         | NavEvent::ResumeRequested(_)
         | NavEvent::SendProbe { .. }
         | NavEvent::ConsoleDiagnostic { .. }
+        | NavEvent::PageLifecycle { .. }
+        | NavEvent::SafeDomForensics { .. }
+        | NavEvent::ActionEvent { .. }
         | NavEvent::SessionAborted => return,
     };
     // Harness: emit timeline for these NavEvents before updating record
@@ -1812,6 +1815,9 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             | NavEvent::UnshowableUrl(_, _)
             | NavEvent::UnsupportedNavigation { .. }
             | NavEvent::ResumeRequested(_)
+            | NavEvent::PageLifecycle { .. }
+            | NavEvent::SafeDomForensics { .. }
+            | NavEvent::ActionEvent { .. }
             | NavEvent::SessionAborted => {}
         }
     }) {
