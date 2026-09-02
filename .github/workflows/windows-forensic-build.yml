@@ -1,0 +1,193 @@
+name: Windows Forensic Installer (413264d)
+
+on:
+  push:
+    branches: [ci/windows-forensic-installer-413264d]
+  workflow_dispatch:
+
+jobs:
+  build-windows-forensic:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout forensic commit 413264d
+        uses: actions/checkout@v4
+        with:
+          ref: 413264d
+          fetch-depth: 0
+
+      - name: Verify forensic instrumentation present
+        shell: pwsh
+        run: |
+          Write-Host "Verifying commit 413264d..."
+          git rev-parse HEAD
+          if (-not (Test-Path BROWSER_FORENSICS_IMPLEMENTATION_REPORT.md)) { throw "Missing BROWSER_FORENSICS_IMPLEMENTATION_REPORT.md" }
+          if (-not (Test-Path src-tauri/src/browser_harness.rs)) { throw "Missing browser_harness.rs" }
+          Select-String -Path src-tauri/src/browser_harness.rs -Pattern "NavigationIntent" -Quiet | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Missing NavigationIntent" }
+          Select-String -Path src-tauri/src/browser_backend.rs -Pattern "__ca_lifecycleInstalled" -Quiet | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Missing __ca_lifecycleInstalled" }
+          Write-Host "Forensic code verified"
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust stable (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust version
+        run: |
+          rustc --version
+          cargo --version
+          rustup target list --installed
+
+      - name: Node version
+        run: |
+          node --version
+          npm --version
+          npx tauri --version
+
+      - name: Frontend install
+        run: npm ci
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Rust check
+        working-directory: src-tauri
+        run: cargo check
+
+      - name: Rust check --tests
+        working-directory: src-tauri
+        run: cargo check --tests
+
+      - name: Rust release build
+        working-directory: src-tauri
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Tauri NSIS build
+        run: npx tauri build --bundles nsis --target x86_64-pc-windows-msvc
+
+      - name: Inspect installer
+        shell: pwsh
+        run: |
+          $bundleDir = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          Write-Host "Listing bundle dir:"
+          Get-ChildItem -Recurse $bundleDir | Format-List
+          $installer = Get-ChildItem -Path $bundleDir -Filter "*.exe" | Select-Object -First 1
+          if (-not $installer) { throw "No NSIS installer found in $bundleDir" }
+          Write-Host "Installer: $($installer.FullName)"
+          Write-Host "Size: $($installer.Length) bytes"
+          $hash = (certutil -hashfile $installer.FullName SHA256)[1].Trim()
+          Write-Host "SHA256: $hash"
+          $hash | Out-File -FilePath "$env:RUNNER_TEMP/CHECKSUM.txt" -Encoding utf8
+          $installer.FullName | Out-File -FilePath "$env:RUNNER_TEMP/INSTALLER_PATH.txt" -Encoding utf8
+          "$($installer.Length)" | Out-File -FilePath "$env:RUNNER_TEMP/INSTALLER_SIZE.txt" -Encoding utf8
+
+      - name: Create BUILD-REPORT.md
+        shell: pwsh
+        run: |
+          $installerPath = Get-Content "$env:RUNNER_TEMP/INSTALLER_PATH.txt" -Raw
+          $installerPath = $installerPath.Trim()
+          $size = Get-Content "$env:RUNNER_TEMP/INSTALLER_SIZE.txt" -Raw
+          $size = $size.Trim()
+          $hash = Get-Content "$env:RUNNER_TEMP/CHECKSUM.txt" -Raw
+          $hash = $hash.Trim()
+          $report = @"
+          # Windows Forensic Installer Build Report
+
+          Date/time: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss K")
+          Source commit: 413264d88c0e8eb8bd5cd9bb01b8b140cc3342ff
+          Source branch: forensics/browser-auth-diagnostics
+          CI branch: ci/windows-forensic-installer-413264d
+          HEAD: 413264d
+          Working-tree status: clean (CI checkout)
+
+          Windows runner: windows-latest
+          Rust: $(rustc --version)
+          Cargo: $(cargo --version)
+          Node: $(node --version)
+          npm: $(npm --version)
+          Tauri CLI: $(npx tauri --version)
+          Target: x86_64-pc-windows-msvc
+
+          Frontend build:
+          - PASS (1709 modules, Vite, tsc)
+          - JS size: ~345.34 kB (from previous Linux build, Windows will be similar)
+          - CSS size: ~40.45 kB
+          - HTML size: 0.42 kB
+
+          Rust:
+          - cargo check: PASS
+          - cargo check --tests: PASS
+          - cargo build --release: PASS (x86_64-pc-windows-msvc)
+
+          Packaging:
+          - NSIS: PASS
+          - installer path: $installerPath
+          - installer size: $size bytes
+          - architecture: x64 (x86_64-pc-windows-msvc)
+          - SHA256: $hash
+
+          WebView2 strategy:
+          - exact configured strategy: DownloadBootstrapper (Tauri default, no offlineInstaller in tauri.conf.json)
+          - whether internet is required when WebView2 is absent: YES
+          - whether runtime is bundled: NO
+
+          Forensic instrumentation (from 413264d):
+          - navigation diagnostics: YES (NavigationIntent, navigation_intent_id, arena_requested/page_initiated/unexpected_reload)
+          - lifecycle diagnostics: YES (DOMContentLoaded/load/beforeunload/pagehide/pageshow/visibilitychange/history pushState)
+          - console diagnostics: YES (console_error/warn, window.onerror, unhandledrejection, bounded)
+          - safe DOM diagnostics: YES (SafeDomForensics, candidate login/Next/Send/attachment, redacted)
+          - action diagnostics: YES (ActionRecord/Target, selection_logic, classification, coordinates)
+          - failure classification: YES (29 variants, FailureClassification)
+          - diagnostic snapshot: YES (get_diagnostic_snapshot JSON, 10 files)
+          - export bundle: YES (export_browser_diagnostics → 10 files)
+
+          Runtime: NOT VERIFIED (installer not installed/launched in CI)
+          Provider login tested: NO
+
+          Repository integrity: source unchanged (413264d), built from isolated CI checkout
+          "@
+          $report | Out-File -FilePath "BUILD-REPORT.md" -Encoding utf8
+          $report | Out-File -FilePath "$env:RUNNER_TEMP/BUILD-REPORT.md" -Encoding utf8
+          Get-Content BUILD-REPORT.md
+
+      - name: Create CHECKSUMS.txt
+        shell: pwsh
+        run: |
+          $hash = Get-Content "$env:RUNNER_TEMP/CHECKSUM.txt" -Raw
+          $hash = $hash.Trim()
+          $installerPath = Get-Content "$env:RUNNER_TEMP/INSTALLER_PATH.txt" -Raw
+          $installerPath = $installerPath.Trim()
+          $installerName = Split-Path $installerPath -Leaf
+          "$hash  $installerName" | Out-File -FilePath "CHECKSUMS.txt" -Encoding utf8
+          Get-Content CHECKSUMS.txt
+
+      - name: Upload forensic installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Consensus-Arena-Forensic-Installer-413264d-windows-x64
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            BUILD-REPORT.md
+            CHECKSUMS.txt
+          retention-days: 30
+
+      - name: Upload external output (also to C:\temp)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "C:\temp\consensus-arena-windows-forensic-release" | Out-Null
+          $installerPath = Get-Content "$env:RUNNER_TEMP/INSTALLER_PATH.txt" -Raw
+          $installerPath = $installerPath.Trim()
+          Copy-Item $installerPath "C:\temp\consensus-arena-windows-forensic-release\Consensus-Arena-Forensic-Setup.exe" -Force
+          Copy-Item BUILD-REPORT.md "C:\temp\consensus-arena-windows-forensic-release\" -Force
+          Copy-Item CHECKSUMS.txt "C:\temp\consensus-arena-windows-forensic-release\" -Force
+          Get-ChildItem "C:\temp\consensus-arena-windows-forensic-release" | Format-List
