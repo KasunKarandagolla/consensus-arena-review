@@ -195,6 +195,7 @@ export default function SettingsPanel({ open, onClose }: Props) {
   const participants = useAppStore((state) => state.participants)
   const setParticipants = useAppStore((state) => state.setParticipants)
   const sessionStatus = useAppStore((state) => state.sessionStatus)
+  const isDraftSession = useAppStore((state) => state.isDraftSession)
   const [brain, setBrain] = useState<Brain>(emptyBrain)
   const [fallback, setFallback] = useState<Fallback>({ api_key: '', base_url: '', model: '' })
   const [secondary, setSecondary] = useState<Brain>(emptyBrain)
@@ -207,11 +208,7 @@ export default function SettingsPanel({ open, onClose }: Props) {
   const [busy, setBusy] = useState('')
   const [lastSettingsError, setLastSettingsError] = useState<LastSettingsError | null>(null)
   const [diagnosticSnapshot, setDiagnosticSnapshot] = useState<DiagnosticSnapshot | null>(null)
-  const [reliabilityReport, setReliabilityReport] = useState<string | null>(null)
-  const [timelinePreview, setTimelinePreview] = useState<unknown[] | null>(null)
-  const [exportResult, setExportResult] = useState<string | null>(null)
-  const [singleDiagnosticAgent, setSingleDiagnosticAgent] = useState<string>('chatgpt')
-  const [singleDiagnosticResult, setSingleDiagnosticResult] = useState<string | null>(null)
+  const [maintenanceMode, setMaintenanceMode] = useState(false)
   const [customDraft, setCustomDraft] = useState<Participant | null>(null)
   const [customError, setCustomError] = useState('')
   const [customBusy, setCustomBusy] = useState('')
@@ -226,6 +223,7 @@ export default function SettingsPanel({ open, onClose }: Props) {
       invoke<string>('get_prompt_template', { template_name: 'participant_priming' }),
       invoke<string>('get_agent_health'),
       invoke<string>('get_participants'),
+      invoke<string>('get_maintenance_mode'),
     ])
     if (results[0].status === 'fulfilled') try { setBrain(JSON.parse(results[0].value) as Brain) } catch (error) { console.error(error) }
     if (results[1].status === 'fulfilled') try { setFallback(JSON.parse(results[1].value) as Fallback) } catch (error) { console.error(error) }
@@ -237,6 +235,7 @@ export default function SettingsPanel({ open, onClose }: Props) {
       const merged = JSON.parse(results[6].value) as Participant[]
       if (Array.isArray(merged) && merged.length > 0) setParticipants(merged)
     } catch (error) { console.error(error) }
+    if (results[7].status === 'fulfilled') try { setMaintenanceMode(JSON.parse(results[7].value) as boolean) } catch { setMaintenanceMode(results[7].value === 'true') }
     setTheme(loadStoredTheme())
   }, [setParticipants])
 
@@ -302,7 +301,27 @@ export default function SettingsPanel({ open, onClose }: Props) {
     await save('project-context', 'save_project_config', { project_brief: projectBrief, content: projectContext }, 'Project Context saved')
   }
 
+  async function toggleMaintenanceMode() {
+    const next = !maintenanceMode
+    setBusy('maintenance')
+    try {
+      await invoke('set_maintenance_mode', { enabled: next })
+      setMaintenanceMode(next)
+      setLastSettingsError((current) => current?.kind === 'maintenance' ? null : current)
+      addToast(next ? 'Maintenance mode enabled' : 'Maintenance mode disabled')
+      if (!next) setDiagnosticSnapshot(null)
+    } catch (error) {
+      reportError('maintenance', 'set_maintenance_mode', error)
+    } finally {
+      setBusy('')
+    }
+  }
+
   async function showDiagnosticSnapshot() {
+    if (!maintenanceMode) {
+      addToast('Enable Maintenance mode to capture diagnostics')
+      return
+    }
     setBusy('diagnostics')
     try {
       const raw = await invoke<string>('get_diagnostic_snapshot')
@@ -310,57 +329,6 @@ export default function SettingsPanel({ open, onClose }: Props) {
       setLastSettingsError((current) => current?.kind === 'diagnostics' ? null : current)
     } catch (error) {
       reportError('diagnostics', 'get_diagnostic_snapshot', error)
-    } finally {
-      setBusy('')
-    }
-  }
-
-  async function showReliabilityReport() {
-    setBusy('reliability')
-    try {
-      const raw = await invoke<string>('get_browser_reliability_report')
-      setReliabilityReport(raw)
-    } catch (error) {
-      reportError('diagnostics', 'get_browser_reliability_report', error)
-    } finally {
-      setBusy('')
-    }
-  }
-
-  async function showTimeline() {
-    setBusy('timeline')
-    try {
-      const raw = await invoke<string>('get_browser_timeline')
-      const arr = JSON.parse(raw) as unknown[]
-      setTimelinePreview(arr.slice(-50))
-    } catch (error) {
-      reportError('diagnostics', 'get_browser_timeline', error)
-    } finally {
-      setBusy('')
-    }
-  }
-
-  async function exportDiagnostics() {
-    setBusy('export')
-    try {
-      const raw = await invoke<string>('export_browser_diagnostics')
-      setExportResult(raw)
-      addToast('Browser diagnostics exported')
-    } catch (error) {
-      reportError('diagnostics', 'export_browser_diagnostics', error)
-    } finally {
-      setBusy('')
-    }
-  }
-
-  async function runSingleDiagnostic() {
-    setBusy('single-diagnostic')
-    try {
-      const raw = await invoke<string>('run_single_model_diagnostic', { agent_id: singleDiagnosticAgent })
-      setSingleDiagnosticResult(raw)
-      addToast(`Single-model diagnostic completed for ${singleDiagnosticAgent}`)
-    } catch (error) {
-      reportError('diagnostics', 'run_single_model_diagnostic', error)
     } finally {
       setBusy('')
     }
@@ -463,15 +431,17 @@ export default function SettingsPanel({ open, onClose }: Props) {
         <Section icon={<Wifi size={12} />} title="Connected accounts">
           {participants.map((p) => {
             const on = health[p.agent_id]?.is_available
-            const isActiveSession = sessionStatus === 'running' || sessionStatus === 'priming' || sessionStatus === 'setup' || sessionStatus === 'requirements' || sessionStatus === 'paused'
+            // §10-12: Draft Setup (New Session before Start) is NOT an active session — Settings/Connected Accounts remain accessible.
+            // Only the real backend-active lifecycle (post-start_session) counts as active. `isDraftSession` distinguishes the two.
+            const isActiveSession = !isDraftSession && (sessionStatus === 'running' || sessionStatus === 'priming' || sessionStatus === 'setup' || sessionStatus === 'requirements' || sessionStatus === 'paused')
             const anyLaunchBusy = launchBusy !== ''
             async function launch() {
               if (isActiveSession) { addToast('Cannot launch while a session is active. Stop the session first.', 5000); return }
-              if (anyLaunchBusy) { addToast('A model window launch is already in progress — wait a moment.', 3000); return }
+              if (anyLaunchBusy) { addToast('A model window launch is already in progress — wait about 30s.', 3000); return }
               setLaunchBusy(p.agent_id)
               try {
                 await invoke('launch_connected_account', { agent_id: p.agent_id })
-                addToast(`Navigation started for ${p.display_name} — window loading. Complete any login there if prompted.`)
+                addToast(`Navigation started for ${p.display_name} — window loading ${p.base_url}. Complete any login there if prompted.`)
               } catch (error) {
                 reportError('launch', 'launch_connected_account', error)
               } finally { setLaunchBusy('') }
@@ -534,41 +504,33 @@ export default function SettingsPanel({ open, onClose }: Props) {
         </Section>
         <MemoryPanel projectBrief={projectBrief} />
         <Section icon={<Activity size={12} />} title="Diagnostics">
-          <p style={{ fontSize: 11.5, lineHeight: 1.5, color: 'var(--t3)', marginBottom: 9 }}>Shows database, configuration, and browser-window loading state. Keys, prompts, project content, cookies, and model responses are excluded. Harness also captures timeline, navigation forensics, DOM snapshots, and classified console errors.</p>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
-            <button className="sv-btn" disabled={busy === 'diagnostics'} onClick={() => void showDiagnosticSnapshot()}>{busy === 'diagnostics' ? 'Loading…' : 'Show Diagnostic Snapshot'}</button>
-            <button className="sv-btn" disabled={busy === 'reliability'} onClick={() => void showReliabilityReport()}>{busy === 'reliability' ? 'Loading…' : 'Reliability Report'}</button>
-            <button className="sv-btn" disabled={busy === 'timeline'} onClick={() => void showTimeline()}>{busy === 'timeline' ? 'Loading…' : 'Timeline (last 50)'}</button>
-            <button className="sv-btn" disabled={busy === 'export'} onClick={() => void exportDiagnostics()}>{busy === 'export' ? 'Exporting…' : 'Export Diagnostics Bundle'}</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+            <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text)' }}>Maintenance mode</span>
+            <button
+              role="switch"
+              aria-checked={maintenanceMode}
+              aria-label="Maintenance mode"
+              className={`tgl ${maintenanceMode ? 'on' : ''}`}
+              style={{ flexShrink: 0 }}
+              disabled={busy === 'maintenance'}
+              onClick={() => void toggleMaintenanceMode()}
+            />
+            <span style={{ fontSize: 11.5, fontWeight: 500, color: maintenanceMode ? 'var(--accent)' : 'var(--t3)' }}>{maintenanceMode ? 'ON' : 'OFF'}</span>
           </div>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
-            <select className="si2" value={singleDiagnosticAgent} onChange={(e) => setSingleDiagnosticAgent(e.target.value)} style={{ flex: 1 }}>
-              {participants.map((p) => <option key={p.agent_id} value={p.agent_id}>{p.display_name}</option>)}
-            </select>
-            <button className="sv-btn" disabled={busy === 'single-diagnostic'} onClick={() => void runSingleDiagnostic()}>{busy === 'single-diagnostic' ? 'Probing…' : 'Probe Single Model'}</button>
-          </div>
-          <ErrorDetails error={lastSettingsError} kinds={['diagnostics']} onCopy={(text) => void copyText(text, 'Error details copied')} />
+          <button
+            className="sv-btn"
+            style={{ marginTop: 0 }}
+            disabled={busy === 'diagnostics' || !maintenanceMode}
+            title={maintenanceMode ? 'Capture diagnostic snapshot' : 'Enable Maintenance mode to capture diagnostics'}
+            onClick={() => void showDiagnosticSnapshot()}
+          >
+            {busy === 'diagnostics' ? 'Loading…' : 'Show Diagnostic Snapshot'}
+          </button>
+          <ErrorDetails error={lastSettingsError} kinds={['diagnostics', 'maintenance']} onCopy={(text) => void copyText(text, 'Error details copied')} />
           {diagnosticSnapshot && <details style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
             <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>Diagnostic snapshot (incl. harness timeline)</summary>
             <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{JSON.stringify(diagnosticSnapshot, null, 2)}</pre>
             <button className="sv-btn" style={{ marginTop: 8 }} onClick={() => void copyText(JSON.stringify(diagnosticSnapshot, null, 2), 'Diagnostic snapshot copied')}><ClipboardCopy size={12} /> Copy snapshot</button>
-          </details>}
-          {reliabilityReport && <details open style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
-            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>BROWSER_RELIABILITY_REPORT.md</summary>
-            <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{reliabilityReport}</pre>
-            <button className="sv-btn" style={{ marginTop: 8 }} onClick={() => void copyText(reliabilityReport!, 'Reliability report copied')}><ClipboardCopy size={12} /> Copy report</button>
-          </details>}
-          {timelinePreview && <details style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
-            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>Timeline (last 50 events)</summary>
-            <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{JSON.stringify(timelinePreview, null, 2)}</pre>
-          </details>}
-          {exportResult && <details style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
-            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>Export bundle</summary>
-            <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{(() => { try { return JSON.stringify(JSON.parse(exportResult), null, 2) } catch { return exportResult } })()}</pre>
-          </details>}
-          {singleDiagnosticResult && <details style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
-            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>Single-model probe result</summary>
-            <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{(() => { try { return JSON.stringify(JSON.parse(singleDiagnosticResult), null, 2) } catch { return singleDiagnosticResult } })()}</pre>
           </details>}
         </Section>
         <Section icon={<Palette size={12} />} title="Appearance"><div className="th-g">{([{ t: 'blue', label: 'Blue', icon: <Droplets size={13} /> }, { t: 'light', label: 'Light', icon: <Sun size={13} /> }, { t: 'dark', label: 'Dark', icon: <Moon size={13} /> }] as const).map((item) => <button className={`th-b${theme === item.t ? ' on' : ''}`} onClick={() => choose(item.t)} key={item.t}>{item.icon}{item.label}</button>)}</div></Section>

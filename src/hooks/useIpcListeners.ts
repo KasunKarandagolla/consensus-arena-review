@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { safeListen as listen } from '@/lib/tauri'
+import { safeListen as listen, safeInvoke as invoke } from '@/lib/tauri'
 import { displayName } from '@/lib/agents'
 import { useAppStore } from '@/stores/useAppStore'
 
@@ -37,6 +37,8 @@ export function useIpcListeners() {
         }
         store.setSessionStatus(status as Parameters<typeof store.setSessionStatus>[0])
         if (status === 'setup') {
+          // Backend-driven setup is active, not a draft — clear draft flag.
+          useAppStore.getState().setIsDraftSession(false)
           store.setSessionAgentIds(
             Array.isArray(setup_order)
               ? setup_order
@@ -55,7 +57,11 @@ export function useIpcListeners() {
           store.setCaptchaPending(null)
           store.setRateLimitPending(null)
         }
+        if (status === 'running' || status === 'paused' || status === 'requirements' || status === 'priming') {
+          useAppStore.getState().setIsDraftSession(false)
+        }
         if (status === 'ended' || status === 'complete' || status === 'idle') {
+          useAppStore.getState().setIsDraftSession(false)
           store.setSetupReadyAgentId(null)
           store.setActiveAgentId(null)
           if (status === 'ended' && useAppStore.getState().liveStatusText === 'Session complete') {
@@ -279,6 +285,83 @@ export function useIpcListeners() {
       cleanups.push(await listen('brain-status', (e) => {
         const { active, model } = e.payload as { active: string; model: string }
         store.setActiveBrain({ kind: active as import('@/stores/useAppStore').ActiveBrainKind, model: model || '' })
+      }))
+
+      // ── Hackathon ─────────────────────────────────────────────────────────
+      cleanups.push(await listen('hackathon-invitation-update', (e) => {
+        const payload = e.payload as { run_id: string; group_id: string; model_id: string; status: string; error?: string }
+        const run = useAppStore.getState().hackathonRun
+        if (!run || run.run_id !== payload.run_id) return
+        // Update participant status in store
+        const updated: typeof run = {
+          ...run,
+          groups: run.groups.map(g => {
+            if (g.group_id !== payload.group_id) return g
+            return {
+              ...g,
+              participants: g.participants.map(p => p.model_id === payload.model_id ? { ...p, status: payload.status as 'confirmed' | 'failed' | 'pending' } : p)
+            }
+          })
+        }
+        store.setHackathonRun(updated)
+        // Re-sort responders float top is handled by backend; here we could re-sort locally but rely on next group-status
+      }))
+
+      cleanups.push(await listen('hackathon-group-status', (e) => {
+        const { run_id } = e.payload as { run_id: string; group_id: string; status: string }
+        // Refetch full run state for accurate status
+        void invoke<string>('get_hackathon_run_state').then(raw => {
+          if (!raw || raw === 'null') return
+          try {
+            const next = JSON.parse(raw) as import('@/stores/useAppStore').HackathonRunSafe
+            if (next.run_id === run_id) store.setHackathonRun(next)
+          } catch {}
+        }).catch(()=>{})
+      }))
+
+      cleanups.push(await listen('hackathon-invitations-complete', (e) => {
+        const { run_id } = e.payload as { run_id: string }
+        void invoke<string>('get_hackathon_run_state').then(raw => {
+          if (!raw || raw === 'null') return
+          try {
+            const next = JSON.parse(raw) as import('@/stores/useAppStore').HackathonRunSafe
+            if (next.run_id === run_id) {
+              store.setHackathonRun(next)
+              store.addToast('Invitations complete — review live participants')
+            }
+          } catch {}
+        }).catch(()=>{})
+      }))
+
+      cleanups.push(await listen('hackathon-run-started', (e) => {
+        const { run_id } = e.payload as { run_id: string }
+        store.setLiveStatusText(`Hackathon run ${run_id.slice(0,8)} started…`)
+      }))
+
+      cleanups.push(await listen('hackathon-group-output', (e) => {
+        const { run_id, group_id, status } = e.payload as { run_id: string; group_id: string; group_name: string; status: string }
+        void invoke<string>('get_hackathon_run_state').then(raw => {
+          if (!raw || raw === 'null') return
+          try {
+            const next = JSON.parse(raw) as import('@/stores/useAppStore').HackathonRunSafe
+            if (next.run_id === run_id) store.setHackathonRun(next)
+          } catch {}
+        }).catch(()=>{})
+        store.setLiveStatusText(`Hackathon group ${group_id} ${status}`)
+      }))
+
+      cleanups.push(await listen('hackathon-complete', (e) => {
+        const { run_id, report } = e.payload as { run_id: string; report: string; group_count: number }
+        store.setLiveStatusText(`Hackathon complete — ${report.slice(0,60)}…`)
+        store.addToast(`Hackathon complete (${run_id.slice(0,8)})`)
+        // Store report as live status expanded? For now keep run
+        void invoke<string>('get_hackathon_run_state').then(raw => {
+          if (!raw || raw === 'null') return
+          try {
+            const next = JSON.parse(raw) as import('@/stores/useAppStore').HackathonRunSafe
+            if (next.run_id === run_id) store.setHackathonRun(next)
+          } catch {}
+        }).catch(()=>{})
       }))
 
       // session-complete

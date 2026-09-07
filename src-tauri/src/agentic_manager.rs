@@ -28,7 +28,12 @@ impl AgenticManager {
         }
     }
 
-    pub fn request_action(&mut self, action: ActionType, requested_by: String, reason: String) -> Result<(), AgentError> {
+    pub fn request_action(
+        &mut self,
+        action: ActionType,
+        requested_by: String,
+        reason: String,
+    ) -> Result<(), AgentError> {
         match action {
             ActionType::ReadFile => {
                 // Auto-approve reads within workspace
@@ -51,7 +56,9 @@ impl AgenticManager {
             self.pending_approvals.remove(index);
             Ok(())
         } else {
-            Err(AgentError::UnknownError("Invalid approval index".to_string()))
+            Err(AgentError::UnknownError(
+                "Invalid approval index".to_string(),
+            ))
         }
     }
 
@@ -60,7 +67,9 @@ impl AgenticManager {
             self.pending_approvals.remove(index);
             Ok(())
         } else {
-            Err(AgentError::UnknownError("Invalid rejection index".to_string()))
+            Err(AgentError::UnknownError(
+                "Invalid rejection index".to_string(),
+            ))
         }
     }
 }

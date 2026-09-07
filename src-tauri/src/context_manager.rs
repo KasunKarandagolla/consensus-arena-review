@@ -34,6 +34,7 @@ pub struct ContextManager {
     pub requirements_charter: Option<String>,
     pub session_type: SessionType,
     pub pending_user_input: Option<String>,
+    pub pending_user_session_id: Option<String>,
 }
 
 impl ContextManager {
@@ -44,10 +45,16 @@ impl ContextManager {
             requirements_charter: None,
             session_type,
             pending_user_input: None,
+            pending_user_session_id: None,
         }
     }
 
-    pub fn build_prompt_for_agent(&self, agent_id: &str, role: &str, current_question: &str) -> String {
+    pub fn build_prompt_for_agent(
+        &self,
+        agent_id: &str,
+        role: &str,
+        current_question: &str,
+    ) -> String {
         let mut prompt = String::new();
         prompt.push_str(&format!(
             "You are participating in a structured expert panel discussion.\nYour role is {}. Agent ID: {}.\n\n",
@@ -60,7 +67,10 @@ impl ContextManager {
         if !self.history.is_empty() {
             prompt.push_str("=== Expert Panel Discussion So Far ===\n");
             for record in self.get_history_for_prompt() {
-                prompt.push_str(&format!("{} ({}): {}\n\n", record.agent_id, record.role, record.response));
+                prompt.push_str(&format!(
+                    "{} ({}): {}\n\n",
+                    record.agent_id, record.role, record.response
+                ));
             }
             prompt.push_str("=== End of Discussion ===\n\n");
         }
@@ -70,7 +80,7 @@ impl ContextManager {
              - If you agree and have nothing to improve, respond with CONSENSUS on its own line.\n\
              - If you have a concern, include DISAGREES: [your reason].\n\
              - If you have a concrete improvement, include IMPROVES: [your change].\n\
-             - Be concise. Only respond when you have something new to add.\n"
+             - Be concise. Only respond when you have something new to add.\n",
         );
         prompt
     }
@@ -82,7 +92,10 @@ impl ContextManager {
         }
         let max_iter = self.history.iter().map(|r| r.iteration).max().unwrap_or(0);
         let cutoff = if max_iter >= 2 { max_iter - 1 } else { 0 };
-        self.history.iter().filter(|r| r.iteration >= cutoff).collect()
+        self.history
+            .iter()
+            .filter(|r| r.iteration >= cutoff)
+            .collect()
     }
 
     pub fn add_turn(&mut self, record: TurnRecord) {
@@ -95,10 +108,37 @@ impl ContextManager {
 
     pub fn set_pending_user_input(&mut self, input: String) {
         self.pending_user_input = Some(input);
+        self.pending_user_session_id = None;
+    }
+
+    pub fn set_pending_user_input_for_session(&mut self, input: String, session_id: String) {
+        self.pending_user_input = Some(input);
+        self.pending_user_session_id = Some(session_id);
     }
 
     pub fn take_pending_user_input(&mut self) -> Option<String> {
-        self.pending_user_input.take()
+        let v = self.pending_user_input.take();
+        self.pending_user_session_id = None;
+        v
+    }
+
+    pub fn take_pending_user_input_if_session(
+        &mut self,
+        current_session_id: &str,
+    ) -> Option<String> {
+        match &self.pending_user_session_id {
+            Some(sid) if sid == current_session_id => {
+                self.pending_user_session_id = None;
+                self.pending_user_input.take()
+            }
+            Some(_) => {
+                // Stale: discard message intended for different session
+                self.pending_user_input = None;
+                self.pending_user_session_id = None;
+                None
+            }
+            None => self.pending_user_input.take(),
+        }
     }
 
     pub fn detect_consensus_signal(&self, response: &str) -> ConsensusSignal {
@@ -107,11 +147,21 @@ impl ContextManager {
             return ConsensusSignal::Agrees;
         }
         if let Some(pos) = upper.find("IMPROVES:") {
-            let reason = response[pos + 9..].trim().lines().next().unwrap_or("").to_string();
+            let reason = response[pos + 9..]
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
             return ConsensusSignal::Improves(reason);
         }
         if let Some(pos) = upper.find("DISAGREES:") {
-            let reason = response[pos + 10..].trim().lines().next().unwrap_or("").to_string();
+            let reason = response[pos + 10..]
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
             return ConsensusSignal::Disagrees(reason);
         }
         ConsensusSignal::NoSignal
@@ -122,7 +172,11 @@ impl ContextManager {
             return false;
         }
         let max_iter = self.history.iter().map(|r| r.iteration).max().unwrap_or(0);
-        let last_iter: Vec<&TurnRecord> = self.history.iter().filter(|r| r.iteration == max_iter).collect();
+        let last_iter: Vec<&TurnRecord> = self
+            .history
+            .iter()
+            .filter(|r| r.iteration == max_iter)
+            .collect();
         for agent_id in agent_ids {
             match last_iter.iter().find(|r| &r.agent_id == agent_id) {
                 Some(r) => match &r.consensus_signal {
@@ -143,7 +197,13 @@ impl ContextManager {
         if max_iter < 2 {
             return false;
         }
-        let recent: Vec<&TurnRecord> = self.history.iter().filter(|r| r.iteration >= max_iter - 1).collect();
-        !recent.iter().any(|r| matches!(r.consensus_signal, ConsensusSignal::Improves(_)))
+        let recent: Vec<&TurnRecord> = self
+            .history
+            .iter()
+            .filter(|r| r.iteration >= max_iter - 1)
+            .collect();
+        !recent
+            .iter()
+            .any(|r| matches!(r.consensus_signal, ConsensusSignal::Improves(_)))
     }
 }

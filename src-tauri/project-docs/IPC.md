@@ -147,6 +147,14 @@ invoke('get_prompt_template', {
 // Returns: Promise<string>
 // NOTE: this one is a plain string, NOT JSON-wrapped — do not JSON.parse() it.
 
+invoke('get_maintenance_mode')
+// Returns: Promise<string>  (JSON-serialized boolean — parse it)
+
+invoke('set_maintenance_mode', {
+    enabled: boolean,
+})
+// Returns: Promise<void>
+
 invoke('get_diagnostic_snapshot')
 // Returns: Promise<string>  (JSON-serialized DiagnosticSnapshot — parse it)
 // Secret-free snapshot: app_data_dir, settings.db/memory.db/transcript.db/
@@ -250,6 +258,56 @@ invoke('get_agent_health')
 // Returns: Promise<string>  (JSON map of agent_id → ModelHealth — parse it)
 // ModelHealth shape: { agent_id, is_available, error_count, last_error }
 // Returns {} before any session has run.
+```
+
+### Hackathon Mode
+
+```typescript
+invoke('get_hackathon_config')
+// Returns: Promise<string>  (JSON-serialized HackathonConfigSafe — parse it)
+// HackathonConfigSafe shape: { groups: HackathonGroupSafe[], models: HackathonModelSafe[], max_questions_per_teammate: number|null, enabled: boolean }
+// HackathonGroupSafe: { id, name, model_ids: string[], selected: boolean }
+// HackathonModelSafe: { id, model_name, base_url, group_id } — api_key NEVER returned (redacted)
+// Call on SetupView mount and when opening the Hackathon mini-window
+
+invoke('save_hackathon_config', {
+    config: HackathonConfig,   // full config with api_key per model — backend preserves existing key if empty string sent
+})
+// Returns: Promise<void>
+// HackathonConfig shape: { groups: HackathonGroupConfig[], models: HackathonModelConfig[], max_questions_per_teammate: number|null, enabled: boolean }
+// HackathonGroupConfig: { id, name, model_ids: string[], selected: boolean }
+// HackathonModelConfig: { id, model_name, base_url, api_key, group_id }
+// Validates base_url is http(s), model_name non-empty, api_key non-empty (unless updating existing id with empty => keep prior), group membership consistent
+// Replaces persisted hackathon_config atomically
+
+invoke('get_hackathon_run_state')
+// Returns: Promise<string>  (JSON-serialized HackathonRunSafe|null — parse it; "null" if no run yet)
+// HackathonRunSafe shape: { run_id, task_brief, max_questions_per_teammate: number|null, groups: GroupRunSafe[], cancelled: boolean }
+// GroupRunSafe: { group_id, group_name, model_ids_ordered: string[], participants: ParticipantRunSafe[], leader_id: string|null, history_len: number, status: 'pending'|'running'|'completed'|'failed'|'locked', final_output: string|null }
+// ParticipantRunSafe: { model_id, model_name, base_url, group_id, status: 'pending'|'confirmed'|'failed', consultation_count: number }
+// Never includes api_key or model response histories beyond length
+
+invoke('send_hackathon_invitations')
+// Returns: Promise<string>  (JSON: { run_id: string } — parse it)
+// Concurrent fan-out health-check to every model in every selected group (timeout 15s per model, all in parallel).
+// Returns immediately with run_id; live updates flow via hackathon-invitation-update / hackathon-group-status / hackathon-invitations-complete events.
+// Responders float top preserving order; zero-responder groups become locked (selected becomes inactive in UI).
+// Rejected if an invitation/run is already in progress and not cancelled.
+
+invoke('run_hackathon', {
+    task_brief: string,        // verbatim project brief — same string for every group
+})
+// Returns: Promise<string>  (JSON: { run_id: string, report: string } — parse it)
+// Executes all non-locked groups concurrently, each with private history, leader fallback, per-teammate cap, safety cap 20 rounds.
+// Groups preserve history across leader fallback; zero-live groups produce "(No output — locked)" in report.
+// Fails if no confirmed participants (send invitations first) or if run was cancelled/superseded.
+// On success emits hackathon-group-output per group and hackathon-complete with combined report.
+// Combined report format: [Hackathon Group: <name>]\n<output>\n... === End Hackathon Results === — raw material for main leader, not auto-blueprint.
+
+invoke('cancel_hackathon_run')
+// Returns: Promise<void>
+// Sets cancellation flag for active run; running group loops check flag each iteration and stop gracefully.
+// Does not delete persisted HackathonConfig; a new send_hackathon_invitations creates a fresh run_id.
 ```
 
 ### Phase 1 Memory
@@ -562,6 +620,43 @@ listen('memory-health-warning', (event) => {
     // text: string
     // fts_needs_repair: boolean
 })
+
+### Hackathon
+
+```typescript
+listen('hackathon-run-started', (event) => {
+    const { run_id, task_brief, group_ids, max_questions, group_count } = event.payload
+    // Emitted when send_hackathon_invitations or run_hackathon begins
+})
+
+listen('hackathon-invitation-update', (event) => {
+    const { run_id, group_id, model_id, status, error } = event.payload
+    // status: 'confirmed' | 'failed'
+    // Live per-model health-check result; update UI row state immediately
+})
+
+listen('hackathon-group-status', (event) => {
+    const { run_id, group_id, status } = event.payload
+    // status: 'pending' | 'locked'
+    // Emitted after all invitations complete — zero-responder groups become locked
+})
+
+listen('hackathon-invitations-complete', (event) => {
+    const { run_id } = event.payload
+    // All invitation fan-out tasks finished; refresh get_hackathon_run_state for final sorted participants
+})
+
+listen('hackathon-group-output', (event) => {
+    const { run_id, group_id, group_name, status, final_output } = event.payload
+    // status: 'completed' | 'failed' | 'locked'
+    // Per-group completion during run_hackathon concurrency — groups complete at different times
+})
+
+listen('hackathon-complete', (event) => {
+    const { run_id, report, group_count } = event.payload
+    // Combined delimited report is raw material for main leader — do not auto-promote to blueprint
+})
+```
 ```
 
 ---

@@ -14,6 +14,7 @@ import CaptchaOverlay from '@/components/overlays/CaptchaOverlay'
 import RateLimitOverlay from '@/components/overlays/RateLimitOverlay'
 import Toast from '@/components/shared/Toast'
 import DebugPanel from '@/components/shared/DebugPanel'
+import HackathonMiniWindow from '@/components/hackathon/HackathonMiniWindow'
 
 export default function App() {
   useIpcListeners()
@@ -70,6 +71,7 @@ export default function App() {
       {askUserPending && <AskUserPopup />}
       {captchaPending && <CaptchaOverlay />}
       <RateLimitOverlay />
+      <HackathonMiniWindow />
       <Toast />
 
       {import.meta.env.DEV && <DebugPanel />}

@@ -54,13 +54,76 @@ export interface ActiveBrainStatus {
   model: string
 }
 
+// ── Hackathon types (frontend-safe) ────────────────────────────────────────────
+
+export interface HackathonModelSafe {
+  id: string
+  model_name: string
+  base_url: string
+  group_id: string
+}
+
+export interface HackathonGroupSafe {
+  id: string
+  name: string
+  model_ids: string[]
+  selected: boolean
+}
+
+export interface HackathonConfigSafe {
+  groups: HackathonGroupSafe[]
+  models: HackathonModelSafe[]
+  max_questions_per_teammate: number | null
+  enabled: boolean
+}
+
+export interface HackathonParticipantRunSafe {
+  model_id: string
+  model_name: string
+  base_url: string
+  group_id: string
+  status: 'pending' | 'confirmed' | 'failed'
+  consultation_count: number
+}
+
+export interface HackathonGroupRunSafe {
+  group_id: string
+  group_name: string
+  model_ids_ordered: string[]
+  participants: HackathonParticipantRunSafe[]
+  leader_id: string | null
+  history_len: number
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'locked'
+  final_output: string | null
+}
+
+export interface HackathonRunSafe {
+  run_id: string
+  task_brief: string
+  max_questions_per_teammate: number | null
+  groups: HackathonGroupRunSafe[]
+  cancelled: boolean
+}
+
 export interface AppStore {
   // P3: unified participant registry (built-ins + persisted custom)
   participants: Participant[]
   setParticipants: (participants: Participant[]) => void
 
+  // Hackathon
+  hackathonConfig: HackathonConfigSafe | null
+  hackathonRun: HackathonRunSafe | null
+  hackathonOpen: boolean
+  setHackathonConfig: (config: HackathonConfigSafe | null) => void
+  setHackathonRun: (run: HackathonRunSafe | null) => void
+  setHackathonOpen: (open: boolean) => void
+
   // Session state
   sessionStatus: 'idle' | 'setup' | 'priming' | 'requirements' | 'running' | 'paused' | 'complete' | 'ended'
+  // Draft vs active session (§10-12): New Session draft must not block Settings/Connected Accounts.
+  // `isDraftSession` true means Setup screen is showing but `start_session` has not yet succeeded.
+  // Backend `session_active` remains false in this state; Settings remains accessible.
+  isDraftSession: boolean
   setupProgress: string[]
   selectedSessionId: string | null
   recoveryState: RecoveryState | null
@@ -99,6 +162,7 @@ export interface AppStore {
 
   // Actions
   setSessionStatus: (status: AppStore['sessionStatus']) => void
+  setIsDraftSession: (isDraft: boolean) => void
   addSetupProgress: (agentId: string) => void
   clearSetupProgress: () => void
   setSelectedSessionId: (id: string | null) => void
@@ -143,11 +207,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
     { agent_id: 'deepseek', display_name: 'DeepSeek', base_url: 'https://chat.deepseek.com', is_custom: false },
     { agent_id: 'qwen', display_name: 'Qwen', base_url: 'https://chat.qwen.ai', is_custom: false },
     { agent_id: 'glm', display_name: 'GLM', base_url: 'https://chat.z.ai/', is_custom: false },
-    { agent_id: 'kimi', display_name: 'Kimi', base_url: 'https://www.kimi.com/', is_custom: false },
+    { agent_id: 'kimi', display_name: 'Kimi', base_url: 'https://kimi.ai/', is_custom: false },
   ],
   setParticipants: (participants) => set({ participants }),
 
   sessionStatus: 'idle',
+  isDraftSession: false,
   setupProgress: [],
   selectedSessionId: null,
   recoveryState: null,
@@ -169,8 +234,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
   agentBrainConfig: null,
   settingsOpen: false,
   sidebarCollapsed: false,
+  hackathonConfig: null,
+  hackathonRun: null,
+  hackathonOpen: false,
 
   setSessionStatus: (status) => set({ sessionStatus: status }),
+  setIsDraftSession: (isDraft) => set({ isDraftSession: isDraft }),
   addSetupProgress: (agentId) => set((s) => ({
     setupProgress: s.setupProgress.includes(agentId)
       ? s.setupProgress
@@ -201,6 +270,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     activeAgentId: null,
     activeTurnNumber: null,
     activeBrain: { kind: 'unknown', model: '' },
+    isDraftSession: false,
   }),
 
   upsertBlueprintSection: (section) => set((s) => {
@@ -237,4 +307,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setAgentBrainConfig: (config) => set({ agentBrainConfig: config }),
   setSettingsOpen: (open) => set({ settingsOpen: open }),
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
+  setHackathonConfig: (config) => set({ hackathonConfig: config }),
+  setHackathonRun: (run) => set({ hackathonRun: run }),
+  setHackathonOpen: (open) => set({ hackathonOpen: open }),
 }))

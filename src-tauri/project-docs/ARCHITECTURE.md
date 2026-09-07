@@ -56,7 +56,7 @@ Reads every leader response using its own AI intelligence and decides:
 No pattern matching. No rigid output format required from the leader.
 The brain reads natural language and acts.
 
-**AgentDecision enum — all 6 variants implemented, none pending:**
+**AgentDecision enum — all 7 variants implemented, none pending (beta-final 2026-09-07 — prompts hardened, Hackathon first-class, runtime authoritative):**
 ```rust
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -67,41 +67,35 @@ pub enum AgentDecision {
     Complete,
     RouteCompare { models: Vec<String>, prompt: String },
     AskUser { question: String, options: Vec<String>, allow_custom: bool },
+    Hackathon { task_brief: String },
 }
 ```
+*Three production prompt templates (`leader_priming.md`, `participant_priming.md`, `agent_system.md` at repo root) were reviewed and hardened 2026-09-07. `agent_system` lists exactly 7 actions with strict field contracts: `Continue` and `Complete` carry no extra fields, `Route` needs `target_model`+`prompt`, `RouteCompare` needs `models`+`prompt`, `Blueprint` needs `section_title`+`section_content`, `AskUser` needs `question`+`options`(2-4)+`allow_custom:true`, `Hackathon` needs `task_brief`(1-2000, must contain PROBLEM STATEMENT/CONSTRAINTS/REQUIRED REPORT STRUCTURE). Roster from runtime is authoritative; Continue never carries a prompt; malformed decisions fall back safely. No timeout or Kimi-domain change.*
 
 Note: `rename_all = "snake_case"` — an earlier version of this document
 said `"lowercase"`. This matters specifically for `RouteCompare` (→
 `"route_compare"`) and `AskUser` (→ `"ask_user"`), which need snake_case
 word-splitting behaviour, not simple lowercasing of an already-single word.
 
-**Default agent system prompt (stored in settings_store, fully customizable):**
+**Default agent system prompt (stored in settings_store, fully customizable, seeded from `agent_system.md` at repo root):**
 ```
 You are an orchestration agent managing an expert panel discussion.
 Your job is to read the leader's responses and decide what action to take next.
 
-You must respond in JSON with this structure:
+You must respond in JSON with this structure (example roster — runtime Context roster is authoritative):
 {
-  "action": "route" | "route_compare" | "blueprint" | "ask_user" | "continue" | "complete",
-  "target_model": "claude|chatgpt|gemini|deepseek|qwen|glm|kimi" (only if action is route),
-  "models": ["model1", "model2"] (only if action is route_compare),
+  "action": "route" | "route_compare" | "blueprint" | "ask_user" | "continue" | "complete" | "hackathon",
+  "target_model": "deepseek" (only if action is route — canonical ID, not display name),
+  "models": ["deepseek","claude"] (only if action is route_compare),
   "prompt": "exact prompt to inject" (only if action is route or route_compare),
   "section_title": "title" (only if action is blueprint),
   "section_content": "exact finalized text" (only if action is blueprint),
   "question": "short question for user" (only if action is ask_user),
-  "options": ["option1", "option2"] (only if action is ask_user, 2-4 items),
-  "allow_custom": false (only if action is ask_user)
+  "options": ["option1", "option2"] (only if action is ask_user, 2-4 panel-derived items),
+  "allow_custom": true (only if action is ask_user, always true),
+  "task_brief": "PROBLEM STATEMENT:\n...\nCONSTRAINTS:\n...\nREQUIRED REPORT STRUCTURE:\n..." (only if action is hackathon, 1-2000 chars)
 }
-
-Rules:
-- If the leader is asking for input from a specific participant, action is "route"
-- If the leader wants to compare responses from multiple participants, action is "route_compare"
-- If the leader has produced a finalized section ready for the blueprint, action is "blueprint"
-- If the session is genuinely ambiguous and user input would change the approach, action is "ask_user"
-- If the leader is still working and needs no routing, action is "continue"
-- If the leader signals the blueprint is complete, action is "complete"
-- Use ask_user sparingly — only when the answer materially changes direction
-- Always include "Your choice" as one of the ask_user options
+Strict contracts: Continue = {"action":"continue"} alone, no prompt; Complete = global blueprint done, not one section; Blueprint needs exact finalized content, not paraphrase; AskUser gate is product-vision only; Hackathon brief must contain all three labeled sections or will be rejected.
 ```
 
 ---
@@ -380,7 +374,7 @@ See FRONTEND.md for complete specification.
 | deepseek | DeepSeek    | https://chat.deepseek.com | textarea | |
 | qwen     | Qwen        | https://chat.qwen.ai | textarea | |
 | glm      | GLM         | https://chat.z.ai/ | textarea (#chat-input) | Implemented (D-036) |
-| kimi     | Kimi        | https://www.kimi.com/ | Lexical contenteditable | Implemented (D-042) |
+| kimi     | Kimi        | https://kimi.ai/ | Lexical contenteditable | Implemented (D-042) — canonical 2026-09-07 |
 
 All 7 models are fully implemented — none are pending. An earlier version
 of this table said "Pending D-036"/"Pending D-042" for GLM/Kimi

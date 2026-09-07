@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="blue">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Consensus Arena — Configure Hackathon</title>
+
+<style>@font-face{font-family:'Inter';src:url('../../../public/fonts/inter-variable.woff2') format('woff2');font-weight:100 900;font-display:swap;}@font-face{font-family:'JetBrains Mono';src:url('../../../public/fonts/jetbrains-mono-variable.woff2') format('woff2');font-weight:400 800;font-display:swap;}</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+
+:root{
+  --ease:cubic-bezier(0.16,1,0.3,1);
+  --spring:cubic-bezier(0.34,1.56,0.64,1);
+  --font:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+[data-theme="blue"]{
+  --bg:#F5F8FF; --bg2:#EEF3FF;
+  --bg-grad:radial-gradient(at 18% 0%, rgba(16,69,200,0.10) 0px, transparent 48%), radial-gradient(at 82% 100%, rgba(14,165,233,0.08) 0px, transparent 52%);
+  --surface:#FFFFFF; --surface-elev:#FFFFFF; --surface2:#EEF3FF;
+  --text:#0C1A3A; --t2:#4A6694; --t3:#8AA3C8; --t4:#C0D2EE;
+  --border:#D8E4F6; --border2:#C0D2EE;
+  --accent:#1045C8; --accent-h:#0D38A8; --accent-soft:#EBF0FF; --accent-mid:#B8CFFF; --accent-glow:rgba(16,69,200,0.22);
+  --accent-text-grad:linear-gradient(135deg,#1045C8 0%,#2563EB 52%,#0EA5E9 100%);
+  --green:#16A34A; --green-soft:rgba(22,163,74,0.12);
+  --red:#DC2626; --red-soft:rgba(220,38,38,0.10); --amber:#D97706; --amber-soft:rgba(217,119,6,0.12);
+  --overlay:rgba(10,25,70,0.5);
+  --sh-xs:0 1px 2px rgba(16,69,200,0.04);
+  --sh-sm:0 2px 4px rgba(16,69,200,0.04), 0 1px 2px rgba(0,0,0,0.03);
+  --sh:0 4px 12px rgba(16,69,200,0.08), 0 1px 3px rgba(0,0,0,0.04);
+  --sh-md:0 8px 24px rgba(16,69,200,0.11), 0 2px 6px rgba(0,0,0,0.04);
+  --sh-lg:0 24px 48px -12px rgba(16,69,200,0.22), 0 8px 16px -8px rgba(0,0,0,0.08);
+  --sh-xl:0 32px 64px -12px rgba(16,69,200,0.28);
+}
+[data-theme="light"]{
+  --bg:#FAFAFB; --bg2:#F4F4F6;
+  --bg-grad:radial-gradient(at 20% 0%, rgba(16,69,200,0.08) 0px, transparent 50%), radial-gradient(at 80% 100%, rgba(14,165,233,0.06) 0px, transparent 50%);
+  --surface:#FFFFFF; --surface-elev:#FFFFFF; --surface2:#F5F5F7;
+  --text:#0B0F1A; --t2:#475569; --t3:#94A3B8; --t4:#CBD5E1;
+  --border:#EAECEF; --border2:#D7DBE0;
+  --accent:#1045C8; --accent-h:#0D38A8; --accent-soft:#EBF0FF; --accent-mid:#B8CFFF; --accent-glow:rgba(16,69,200,0.22);
+  --accent-text-grad:linear-gradient(135deg,#1045C8 0%,#2563EB 52%,#0EA5E9 100%);
+  --green:#10B981; --green-soft:rgba(16,185,129,0.12);
+  --red:#EF4444; --red-soft:rgba(239,68,68,0.10); --amber:#F59E0B; --amber-soft:rgba(245,158,11,0.12);
+  --overlay:rgba(15,23,42,0.5);
+  --sh-xs:0 1px 2px rgba(15,23,42,0.04);
+  --sh-sm:0 2px 4px rgba(15,23,42,0.04), 0 1px 2px rgba(15,23,42,0.03);
+  --sh:0 4px 12px rgba(15,23,42,0.06), 0 1px 3px rgba(15,23,42,0.04);
+  --sh-md:0 8px 24px rgba(15,23,42,0.08), 0 2px 6px rgba(15,23,42,0.04);
+  --sh-lg:0 24px 48px -12px rgba(15,23,42,0.18), 0 8px 16px -8px rgba(15,23,42,0.08);
+  --sh-xl:0 32px 64px -12px rgba(15,23,42,0.25);
+}
+[data-theme="dark"]{
+  --bg:#07080D; --bg2:#0E1018;
+  --bg-grad:radial-gradient(at 20% 0%, rgba(74,127,255,0.18) 0px, transparent 50%), radial-gradient(at 80% 100%, rgba(14,165,233,0.10) 0px, transparent 50%);
+  --surface:#0F1219; --surface-elev:#14171F; --surface2:#0B0D14;
+  --text:#F1F5F9; --t2:#94A3B8; --t3:#64748B; --t4:#334155;
+  --border:rgba(255,255,255,0.06); --border2:rgba(255,255,255,0.1);
+  --accent:#818CF8; --accent-h:#A5B4FC; --accent-soft:rgba(129,140,248,0.1); --accent-mid:rgba(129,140,248,0.25); --accent-glow:rgba(129,140,248,0.35);
+  --accent-text-grad:linear-gradient(135deg,#4A7FFF 0%,#60A5FA 55%,#22D3EE 100%);
+  --green:#34D399; --green-soft:rgba(52,211,153,0.15);
+  --red:#F87171; --red-soft:rgba(248,113,113,0.12); --amber:#FBBF24; --amber-soft:rgba(251,191,36,0.12);
+  --overlay:rgba(0,0,0,0.72);
+  --sh-xs:0 1px 2px rgba(0,0,0,0.3);
+  --sh-sm:0 2px 4px rgba(0,0,0,0.25), 0 1px 2px rgba(0,0,0,0.2);
+  --sh:0 4px 12px rgba(0,0,0,0.3), 0 1px 3px rgba(0,0,0,0.2);
+  --sh-md:0 8px 24px rgba(0,0,0,0.4), 0 2px 6px rgba(0,0,0,0.25);
+  --sh-lg:0 24px 48px -12px rgba(0,0,0,0.6), 0 8px 16px -8px rgba(0,0,0,0.3);
+  --sh-xl:0 32px 64px -12px rgba(0,0,0,0.8);
+}
+
+body{
+  font-family:var(--font);background:var(--bg);background-image:var(--bg-grad);
+  background-attachment:fixed;color:var(--text);font-size:14px;line-height:1.5;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  font-feature-settings:'cv11','ss01','ss03';
+}
+button,input,textarea,select{font-family:var(--font);color:inherit}
+button{cursor:pointer;border:none;background:none}
+input,textarea,select{outline:none}
+::selection{background:var(--accent-soft);color:var(--accent)}
+
+#demo-bar{position:fixed;top:16px;right:16px;z-index:9999;display:flex;gap:6px;padding:6px;background:var(--surface);border:1px solid var(--border2);border-radius:10px;box-shadow:var(--sh-md)}
+#demo-bar button{padding:6px 12px;border-radius:7px;font-size:12px;font-weight:600;color:var(--t2);transition:all .15s ease}
+#demo-bar button.on{background:var(--accent);color:#fff}
+#demo-bar button:not(.on):hover{background:var(--bg2);color:var(--text)}
+#stage{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:32px 20px;background:var(--overlay);backdrop-filter:blur(3px)}
+
+/* ═══════════════════════════════════════════
+   MODAL SHELL — a real popup: fixed compact
+   width, proper elevation, header/toolbar/
+   footer structure instead of a floating page.
+═══════════════════════════════════════════ */
+.hk-modal{
+  width:100%;max-width:620px;
+  background:var(--surface-elev);
+  border:1px solid var(--border);
+  border-radius:18px;
+  box-shadow:var(--sh-xl);
+  display:flex;flex-direction:column;
+  overflow:hidden;
+  animation:hkIn .32s var(--ease);
+}
+@keyframes hkIn{from{opacity:0;transform:translateY(14px) scale(.97)}to{opacity:1;transform:none}}
+
+/* HEADER — icon, title, subtitle, close. Real
+   modal anatomy instead of a bare text label. */
+.hk-head{
+  display:flex;align-items:center;gap:11px;
+  padding:16px 18px;
+  border-bottom:1px solid var(--border);
+  flex-shrink:0;
+}
+.hk-head-icon{
+  width:32px;height:32px;border-radius:9px;
+  background:var(--surface2);
+  border:1px solid var(--border);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  box-shadow:var(--sh-xs);
+  overflow:hidden;
+}
+.hk-head-icon svg{width:16px;height:16px;color:#fff}
+.hk-head-icon img{
+  width:18px;height:18px;object-fit:contain;display:block;
+  /* Source glyph is solid black. Blue/Light themes want it to stay
+     black on the light surface2 background above — no filter needed.
+     Dark theme flips surface2 to a near-black tone, so the same source
+     PNG is inverted to render white instead of swapping in a second
+     embedded image. */
+  filter:none;
+}
+[data-theme="dark"] .hk-head-icon img{filter:invert(1)}
+.hk-head-txt{flex:1;min-width:0}
+.hk-head-txt h2{font-size:14.5px;font-weight:700;color:var(--text);letter-spacing:-.2px}
+.hk-head-txt p{font-size:11.5px;color:var(--t3);margin-top:1px}
+.hk-close{
+  width:26px;height:26px;border-radius:7px;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;color:var(--t3);
+  transition:all .15s ease;
+}
+.hk-close:hover{background:var(--bg2);color:var(--text)}
+.hk-close svg{width:14px;height:14px}
+
+/* TOOLBAR — the two add-actions live in a real
+   toolbar row anchored to the header, not
+   floating pills in open space. */
+.hk-toolbar{
+  display:flex;align-items:center;gap:8px;
+  padding:10px 18px;
+  background:var(--surface2);
+  border-bottom:1px solid var(--border);
+  flex-shrink:0;
+}
+.hk-toolbar-label{
+  font-size:10px;font-weight:700;color:var(--t3);
+  text-transform:uppercase;letter-spacing:.5px;margin-right:2px;
+}
+.hk-tbtn{
+  display:flex;align-items:center;gap:6px;
+  padding:6px 12px;border-radius:8px;
+  background:var(--surface);border:1px solid var(--border2);
+  font-size:12px;font-weight:600;color:var(--t2);
+  box-shadow:var(--sh-xs);
+  transition:all .15s var(--ease);
+}
+.hk-tbtn:hover{border-color:var(--accent-mid);color:var(--accent);background:var(--accent-soft);transform:translateY(-1px)}
+.hk-tbtn:active{transform:translateY(0)}
+.hk-tbtn svg{width:12.5px;height:12.5px}
+.hk-toolbar-spacer{flex:1}
+.hk-count-chip{
+  font-size:11px;font-weight:600;color:var(--t3);
+  background:var(--surface);border:1px solid var(--border);
+  padding:4px 10px;border-radius:20px;
+}
+
+/* BODY — compact columns */
+.hk-body{padding:14px 18px 16px;overflow-y:auto}
+.hk-columns{display:flex;gap:10px}
+.hk-col{
+  flex:1;min-width:0;
+  background:var(--surface2);
+  border:1px solid var(--border);
+  border-radius:12px;
+  display:flex;flex-direction:column;
+  overflow:hidden;
+  max-height:290px;
+  transition:box-shadow .2s ease,border-color .2s ease;
+}
+.hk-col:hover{border-color:var(--border2);box-shadow:var(--sh-xs)}
+.hk-col.degraded{opacity:.6}
+
+.hk-col-head{
+  display:flex;align-items:center;gap:7px;
+  padding:9px 10px;border-bottom:1px solid var(--border);
+  background:var(--surface);
+}
+.hk-check{
+  width:16px;height:16px;border-radius:5px;
+  border:1.5px solid var(--border2);background:var(--surface);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  transition:all .15s var(--spring);
+}
+.hk-check svg{width:10px;height:10px;color:#fff;opacity:0;transform:scale(.5);transition:all .12s ease}
+.hk-check.on{background:var(--accent);border-color:var(--accent)}
+.hk-check.on svg{opacity:1;transform:scale(1)}
+.hk-check.disabled{background:var(--bg2);border-color:var(--border);cursor:not-allowed}
+.hk-check:not(.disabled):hover{border-color:var(--accent-mid)}
+.hk-col-name{flex:1;font-size:12px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hk-col-name.muted{color:var(--t3)}
+.hk-col-status{
+  font-size:9.5px;font-weight:700;padding:2px 7px;border-radius:20px;
+  display:flex;align-items:center;gap:3px;white-space:nowrap;flex-shrink:0;
+}
+.hk-col-status .d{width:4px;height:4px;border-radius:50%;background:currentColor;flex-shrink:0}
+.hk-col-status.live{color:var(--green);background:var(--green-soft)}
+.hk-col-status.pending{color:var(--t3);background:var(--bg2)}
+.hk-col-status.dead{color:var(--red);background:var(--red-soft)}
+.hk-col-status .d.wait{animation:hkPulse 1.4s ease-in-out infinite}
+@keyframes hkPulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+.hk-col-body{flex:1;overflow-y:auto}
+.hk-col-body::-webkit-scrollbar{width:4px}
+.hk-col-body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+
+.hk-row{
+  display:flex;align-items:center;gap:6px;
+  padding:7px 9px;border-bottom:1px solid var(--border);
+  transition:background .2s ease;position:relative;
+}
+.hk-row:last-child{border-bottom:none}
+.hk-row.responded{background:var(--green-soft)}
+.hk-row.no-response{opacity:.5}
+.hk-row:hover .hk-row-hover{opacity:1}
+
+.hk-rank{
+  width:15px;height:15px;border-radius:4px;
+  background:var(--bg2);color:var(--t3);
+  display:flex;align-items:center;justify-content:center;
+  font-size:9px;font-weight:700;font-family:var(--mono);flex-shrink:0;
+}
+.hk-row.responded .hk-rank.pos1{background:var(--accent-text-grad);color:#fff}
+
+.hk-row-info{flex:1;min-width:0}
+.hk-row-name{font-size:11.5px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hk-leader-badge{
+  font-size:8px;font-weight:700;color:var(--accent);
+  background:var(--accent-soft);border:1px solid var(--accent-mid);
+  padding:0px 4px;border-radius:20px;letter-spacing:.2px;flex-shrink:0;
+}
+.hk-row-meta{font-size:9.5px;color:var(--t3);margin-top:0px;font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.hk-row-state{flex-shrink:0;display:flex}
+.hk-row-state svg{width:12px;height:12px}
+.hk-row-state.ok svg{color:var(--green)}
+.hk-row-state.dead svg{color:var(--t3)}
+.spin-sm{width:10px;height:10px;border:1.5px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Reorder + menu revealed on hover to keep rows clean at rest */
+.hk-row-hover{display:flex;align-items:center;gap:1px;opacity:0;transition:opacity .15s ease;flex-shrink:0}
+.hk-reorder{display:flex;flex-direction:column}
+.hk-arrow{width:14px;height:10px;display:flex;align-items:center;justify-content:center;color:var(--t3);border-radius:3px;transition:all .12s ease}
+.hk-arrow:hover{background:var(--bg2);color:var(--accent)}
+.hk-arrow svg{width:9px;height:9px}
+.hk-arrow.disabled{opacity:.2;pointer-events:none}
+.hk-more{width:17px;height:17px;border-radius:5px;display:flex;align-items:center;justify-content:center;color:var(--t3);flex-shrink:0;transition:all .12s ease}
+.hk-more:hover{background:var(--bg2);color:var(--text)}
+.hk-more svg{width:12px;height:12px}
+
+.hk-col-note{
+  padding:6px 9px;font-size:9.5px;color:var(--t3);
+  display:flex;align-items:center;gap:4px;
+  border-top:1px solid var(--border);background:var(--surface);
+}
+.hk-col-note svg{width:10px;height:10px;flex-shrink:0}
+.hk-col-note.warn{color:var(--red)}
+.hk-col-note.warn svg{color:var(--red)}
+
+/* Compact rounds control, inline, no separate collapsible section */
+.hk-rounds{
+  display:flex;align-items:center;gap:9px;
+  margin-top:12px;padding:9px 12px;
+  background:var(--surface2);border:1px solid var(--border);border-radius:10px;
+}
+.hk-rounds svg{width:13px;height:13px;color:var(--accent);flex-shrink:0}
+.hk-rounds-label{font-size:11.5px;font-weight:600;color:var(--text);flex:1}
+.hk-rounds-label span{display:block;font-size:10px;font-weight:400;color:var(--t3);margin-top:1px}
+select.fi.hk-select-inline{width:88px;flex-shrink:0}
+
+/* FOOTER — clear hierarchy: Cancel (quiet) /
+   Send Invitations (secondary, outlined) /
+   Go (primary, filled, largest, rightmost) */
+.hk-foot{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:13px 18px;border-top:1px solid var(--border);
+  background:var(--surface-elev);flex-shrink:0;
+}
+.hk-foot-left{font-size:11px;color:var(--t3)}
+.hk-foot-left b{color:var(--t2);font-weight:600}
+.hk-foot-actions{display:flex;gap:8px;align-items:center}
+.hk-btn-cancel{
+  padding:9px 14px;border-radius:9px;
+  color:var(--t3);font-size:12.5px;font-weight:600;
+  transition:all .15s ease;
+}
+.hk-btn-cancel:hover{color:var(--text);background:var(--bg2)}
+.hk-btn-invite{
+  display:flex;align-items:center;gap:6px;
+  padding:9px 15px;border-radius:9px;
+  background:var(--surface);border:1.5px solid var(--border2);
+  color:var(--text);font-size:12.5px;font-weight:600;
+  box-shadow:var(--sh-xs);
+  transition:all .15s var(--ease);
+}
+.hk-btn-invite:hover{border-color:var(--accent-mid);color:var(--accent);background:var(--accent-soft);transform:translateY(-1px)}
+.hk-btn-invite:active{transform:translateY(0)}
+.hk-btn-invite svg{width:13px;height:13px}
+.hk-btn-go{
+  display:flex;align-items:center;gap:7px;
+  padding:9px 20px;border-radius:9px;
+  background:var(--accent);color:#fff;
+  font-size:13px;font-weight:700;
+  box-shadow:0 3px 12px var(--accent-glow);
+  transition:all .18s var(--ease);
+}
+.hk-btn-go:hover{background:var(--accent-h);transform:translateY(-1.5px);box-shadow:0 6px 18px var(--accent-glow)}
+.hk-btn-go:active{transform:translateY(0)}
+.hk-btn-go svg{width:13px;height:13px}
+
+/* ═══════════════════════════════════════════
+   Small popups — Reg. Model / Reg. Team
+═══════════════════════════════════════════ */
+.hk-popup-layer{position:fixed;inset:0;z-index:200;pointer-events:none}
+.hk-popup-layer.open{pointer-events:auto}
+.hk-popup-bg{position:absolute;inset:0;background:var(--overlay);backdrop-filter:blur(4px);opacity:0;transition:opacity .2s ease}
+.hk-popup-layer.open .hk-popup-bg{opacity:1}
+.hk-popup{
+  position:absolute;top:50%;left:50%;transform:translate(-50%,-46%) scale(.96);
+  opacity:0;transition:all .2s var(--ease);width:100%;max-width:340px;
+  background:var(--surface-elev);border:1px solid var(--border);
+  border-radius:14px;box-shadow:var(--sh-xl);padding:18px;
+}
+.hk-popup-layer.open .hk-popup{transform:translate(-50%,-50%) scale(1);opacity:1}
+.hk-popup h3{font-size:14px;font-weight:700;color:var(--text);margin-bottom:12px}
+.hk-popup label{display:block;font-size:11px;font-weight:600;color:var(--t2);margin-bottom:4px;margin-top:10px}
+.hk-popup label:first-of-type{margin-top:0}
+.fi{
+  width:100%;padding:8px 10px;background:var(--surface);
+  border:1px solid var(--border2);border-radius:7px;
+  color:var(--text);font-size:12.5px;
+  transition:border-color .15s ease,box-shadow .15s ease;
+}
+.fi:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.fi::placeholder{color:var(--t3)}
+select.fi{
+  height:33px;cursor:pointer;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='11' viewBox='0 0 24 24' fill='none' stroke='%2394A3B8' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 9px center;padding-right:26px;appearance:none;
+}
+.hk-popup-actions{display:flex;gap:8px;margin-top:16px}
+.hk-popup-actions .hk-btn-g{flex:1;padding:9px;border-radius:8px;background:var(--surface);border:1px solid var(--border2);color:var(--t2);font-size:12.5px;font-weight:600;transition:all .15s ease}
+.hk-popup-actions .hk-btn-g:hover{background:var(--bg2);color:var(--text)}
+.hk-popup-actions .hk-btn-p{flex:1;padding:9px;border-radius:8px;background:var(--accent);color:#fff;font-size:12.5px;font-weight:700;box-shadow:0 3px 10px var(--accent-glow);transition:all .15s ease}
+.hk-popup-actions .hk-btn-p:hover{background:var(--accent-h);transform:translateY(-1px)}
+.hk-popup-close{position:absolute;top:12px;right:12px;width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;color:var(--t3);transition:all .15s ease}
+.hk-popup-close:hover{background:var(--bg2);color:var(--text)}
+.hk-popup-close svg{width:13px;height:13px}
+</style>
+</head>
+<body>
+
+<div id="demo-bar">
+  <button class="on" onclick="setTheme('blue',this)">Blue</button>
+  <button onclick="setTheme('light',this)">Light</button>
+  <button onclick="setTheme('dark',this)">Dark</button>
+</div>
+
+<div id="stage">
+  <div class="hk-modal">
+
+    <!-- HEADER -->
+    <div class="hk-head">
+      <div class="hk-head-icon"><img src="data:image/png;base64,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" alt="Hackathon"></div>
+      <div class="hk-head-txt">
+        <h2>Configure Hackathon</h2>
+        <p>Register models, form teams, confirm who's live</p>
+      </div>
+      <button class="hk-close"><i data-lucide="x"></i></button>
+    </div>
+
+    <!-- TOOLBAR -->
+    <div class="hk-toolbar">
+      <button class="hk-tbtn" onclick="openPopup('model')"><i data-lucide="cpu"></i>Add model</button>
+      <button class="hk-tbtn" onclick="openPopup('team')"><i data-lucide="folder-plus"></i>New team</button>
+      <div class="hk-toolbar-spacer"></div>
+      <div class="hk-count-chip">3 teams · 9 models</div>
+    </div>
+
+    <!-- BODY -->
+    <div class="hk-body">
+      <div class="hk-columns">
+
+        <!-- Team Falcon — healthy -->
+        <div class="hk-col">
+          <div class="hk-col-head">
+            <button class="hk-check on"><i data-lucide="check"></i></button>
+            <div class="hk-col-name">Falcon</div>
+            <div class="hk-col-status live"><span class="d"></span>3/4</div>
+          </div>
+          <div class="hk-col-body">
+            <div class="hk-row responded">
+              <div class="hk-rank pos1">1</div>
+              <div class="hk-row-info">
+                <div class="hk-row-name">llama-3.3-70b <span class="hk-leader-badge">Lead</span></div>
+                <div class="hk-row-meta">nvidia.com</div>
+              </div>
+              <div class="hk-row-state ok"><i data-lucide="check-circle-2"></i></div>
+              <div class="hk-row-hover">
+                <div class="hk-reorder">
+                  <button class="hk-arrow disabled"><i data-lucide="chevron-up"></i></button>
+                  <button class="hk-arrow"><i data-lucide="chevron-down"></i></button>
+                </div>
+                <button class="hk-more"><i data-lucide="more-vertical"></i></button>
+              </div>
+            </div>
+            <div class="hk-row responded">
+              <div class="hk-rank">2</div>
+              <div class="hk-row-info">
+                <div class="hk-row-name">qwen2.5-72b</div>
+                <div class="hk-row-meta">nvidia.com</div>
+              </div>
+              <div class="hk-row-state ok"><i data-lucide="check-circle-2"></i></div>
+              <div class="hk-row-hover">
+                <div class="hk-reorder">
+                  <button class="hk-arrow"><i data-lucide="chevron-up"></i></button>
+                  <button class="hk-arrow"><i data-lucide="chevron-down"></i></button>
+                </div>
+                <button class="hk-more"><i data-lucide="more-vertical"></i></button>
+              </div>
+            </div>
+            <div class="hk-row responded">
+              <div class="hk-rank">3</div>
+              <div class="hk-row-info">
+                <div class="hk-row-name">mixtral-8x22b</div>
+                <div class="hk-row-meta">nvidia.com</div>
+              </div>
+              <div class="hk-row-state ok"><i data-lucide="check-circle-2"></i></div>
+              <div class="hk-row-hover">
+                <div class="hk-reorder">
+                  <button class="hk-arrow"><i data-lucide="chevron-up"></i></button>
+                  <button class="hk-arrow"><i data-lucide="chevron-down"></i></button>
+                </div>
+                <button class="hk-more"><i data-lucide="more-vertical"></i></button>
+              </div>
+            </div>
+            <div class="hk-row no-response">
+              <div class="hk-rank">4</div>
+              <div class="hk-row-info">
+                <div class="hk-row-name">nemotron-340b</div>
+                <div class="hk-row-meta">nvidia.com</div>
+              </div>
+              <div class="hk-row-state dead"><i data-lucide="x-circle"></i></div>
+              <div class="hk-row-hover">
+                <div class="hk-reorder">
+                  <button class="hk-arrow"><i data-lucide="chevron-up"></i></button>
+                  <button class="hk-arrow disabled"><i data-lucide="chevron-down"></i></button>
+                </div>
+                <button class="hk-more"><i data-lucide="more-vertical"></i></button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Team Orbit — invitations in progress -->
+        <div class="hk-col">
+          <div class="hk-col-head">
+            <button class="hk-check on"><i data-lucide="check"></i></button>
+            <div class="hk-col-name">Orbit</div>
+            <div class="hk-col-status pending"><span class="d wait"></span>2/3</div>
+          </div>
+          <div class="hk-col-body">
+            <div class="hk-row">
+              <div class="hk-rank">1</div>
+              <div class="hk-row-info">
+                <div class="hk-row-name">deepseek-v3</div>
+                <div class="hk-row-meta">deepseek.com</div>
+              </div>
+              <div class="hk-row-state"><span class="spin-sm"></span></div>
+              <div class="hk-row-hover">
+                <div class="hk-reorder">
+                  <button class="hk-arrow disabled"><i data-lucide="chevron-up"></i></button>
+                  <button class="hk-arrow"><i data-lucide="chevron-down"></i></button>
+                </div>
+                <button class="hk-more"><i data-lucide="more-vertical"></i></button>
+              </div>
+            </div>
+            <div class="hk-row responded">
+              <div class="hk-rank">2</div>
+              <div class="hk-row-info">
+                <div class="hk-row-name">gemma-2-27b</div>
+                <div class="hk-row-meta">nvidia.com</div>
+              </div>
+              <div class="hk-row-state ok"><i data-lucide="check-circle-2"></i></div>
+              <div class="hk-row-hover">
+                <div class="hk-reorder">
+                  <button class="hk-arrow"><i data-lucide="chevron-up"></i></button>
+                  <button class="hk-arrow"><i data-lucide="chevron-down"></i></button>
+                </div>
+                <button class="hk-more"><i data-lucide="more-vertical"></i></button>
+              </div>
+            </div>
+            <div class="hk-row responded">
+              <div class="hk-rank">3</div>
+              <div class="hk-row-info">
+                <div class="hk-row-name">phi-4</div>
+                <div class="hk-row-meta">nvidia.com</div>
+              </div>
+              <div class="hk-row-state ok"><i data-lucide="check-circle-2"></i></div>
+              <div class="hk-row-hover">
+                <div class="hk-reorder">
+                  <button class="hk-arrow"><i data-lucide="chevron-up"></i></button>
+                  <button class="hk-arrow disabled"><i data-lucide="chevron-down"></i></button>
+                </div>
+                <button class="hk-more"><i data-lucide="more-vertical"></i></button>
+              </div>
+            </div>
+          </div>
+          <div class="hk-col-note"><i data-lucide="info"></i>Sorting live as replies land</div>
+        </div>
+
+        <!-- Team Vega — degraded -->
+        <div class="hk-col degraded">
+          <div class="hk-col-head">
+            <button class="hk-check disabled"></button>
+            <div class="hk-col-name muted">Vega</div>
+            <div class="hk-col-status dead"><span class="d"></span>0/2</div>
+          </div>
+          <div class="hk-col-body">
+            <div class="hk-row no-response">
+              <div class="hk-rank">1</div>
+              <div class="hk-row-info">
+                <div class="hk-row-name">codestral-25b</div>
+                <div class="hk-row-meta">mistral.ai</div>
+              </div>
+              <div class="hk-row-state dead"><i data-lucide="x-circle"></i></div>
+              <div class="hk-row-hover">
+                <div class="hk-reorder">
+                  <button class="hk-arrow disabled"><i data-lucide="chevron-up"></i></button>
+                  <button class="hk-arrow disabled"><i data-lucide="chevron-down"></i></button>
+                </div>
+                <button class="hk-more"><i data-lucide="more-vertical"></i></button>
+              </div>
+            </div>
+            <div class="hk-row no-response">
+              <div class="hk-rank">2</div>
+              <div class="hk-row-info">
+                <div class="hk-row-name">yi-large</div>
+                <div class="hk-row-meta">01.ai</div>
+              </div>
+              <div class="hk-row-state dead"><i data-lucide="x-circle"></i></div>
+              <div class="hk-row-hover">
+                <div class="hk-reorder">
+                  <button class="hk-arrow disabled"><i data-lucide="chevron-up"></i></button>
+                  <button class="hk-arrow disabled"><i data-lucide="chevron-down"></i></button>
+                </div>
+                <button class="hk-more"><i data-lucide="more-vertical"></i></button>
+              </div>
+            </div>
+          </div>
+          <div class="hk-col-note warn"><i data-lucide="alert-triangle"></i>Locked — no responders</div>
+        </div>
+
+      </div>
+
+      <!-- Rounds control — compact, inline -->
+      <div class="hk-rounds">
+        <i data-lucide="sliders-horizontal"></i>
+        <div class="hk-rounds-label">Max questions per teammate<span>Leader is exempt from this cap</span></div>
+        <select class="fi hk-select-inline">
+          <option>1</option>
+          <option selected>3</option>
+          <option>5</option>
+          <option>Unlimited</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- FOOTER -->
+    <div class="hk-foot">
+      <div class="hk-foot-left"><b>Vega</b> locked — no responders</div>
+      <div class="hk-foot-actions">
+        <button class="hk-btn-cancel">Cancel</button>
+        <button class="hk-btn-invite"><i data-lucide="send"></i>Send invitations</button>
+        <button class="hk-btn-go"><i data-lucide="arrow-right"></i>Go</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- POPUP — Add Model -->
+<div class="hk-popup-layer" id="popup-model">
+  <div class="hk-popup-bg" onclick="closePopup('model')"></div>
+  <div class="hk-popup">
+    <button class="hk-popup-close" onclick="closePopup('model')"><i data-lucide="x"></i></button>
+    <h3>Add a model</h3>
+    <label>Model name</label>
+    <input class="fi" placeholder="e.g. llama-3.3-70b" />
+    <label>Base URL</label>
+    <input class="fi" placeholder="https://integrate.api.nvidia.com/v1" />
+    <label>API key</label>
+    <input class="fi" type="password" placeholder="nvapi-••••••••" />
+    <label>Team</label>
+    <select class="fi">
+      <option>Falcon</option>
+      <option>Orbit</option>
+      <option>Vega</option>
+    </select>
+    <div class="hk-popup-actions">
+      <button class="hk-btn-g" onclick="closePopup('model')">Cancel</button>
+      <button class="hk-btn-p" onclick="closePopup('model')">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- POPUP — New Team -->
+<div class="hk-popup-layer" id="popup-team">
+  <div class="hk-popup-bg" onclick="closePopup('team')"></div>
+  <div class="hk-popup">
+    <button class="hk-popup-close" onclick="closePopup('team')"><i data-lucide="x"></i></button>
+    <h3>New team</h3>
+    <label>Team name</label>
+    <input class="fi" placeholder="e.g. Nova" />
+    <div class="hk-popup-actions">
+      <button class="hk-btn-g" onclick="closePopup('team')">Cancel</button>
+      <button class="hk-btn-p" onclick="closePopup('team')">Create</button>
+    </div>
+  </div>
+</div>
+
+<script>
+function setTheme(t,btn){
+  document.documentElement.setAttribute('data-theme',t);
+  document.querySelectorAll('#demo-bar button').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+}
+function openPopup(id){document.getElementById('popup-'+id).classList.add('open');lucide.createIcons();}
+function closePopup(id){document.getElementById('popup-'+id).classList.remove('open');}
+lucide.createIcons();
+</script>
+</body>
+</html>

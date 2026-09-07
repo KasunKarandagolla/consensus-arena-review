@@ -1,4 +1,6 @@
 # Rust build artifacts
+/src-tauri/target/
+**/target/
 src-tauri/target/
 
 # Node modules
@@ -6,8 +8,30 @@ node_modules/
 src/node_modules/
 
 # Build output
+/src/dist/
+/dist/
 src/dist/
 src/src/dist/
+
+# Tauri build artifacts
+/src-tauri/gen/
+/src-tauri/Cargo.lock.bak
+
+# Database files (session/settings/blueprint data — never track these)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+/src-tauri/logs/
+
+# OS/editor cruft
+*.swp
+.vscode/
+.idea/
 
 # TypeScript build info
 *.tsbuildinfo

@@ -1,7 +1,7 @@
 use crate::context_manager::TurnRecord;
 use crate::errors::AgentError;
 use crate::orchestrator::SessionConfig;
-use rusqlite::{params, Connection, Error as SqliteError};
+use rusqlite::{Connection, Error as SqliteError, params};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,8 +33,9 @@ impl TranscriptStore {
     }
 
     fn init_schema(&self) -> Result<(), AgentError> {
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 project_brief TEXT NOT NULL,
                 session_type TEXT NOT NULL,
@@ -52,8 +53,8 @@ impl TranscriptStore {
                 consensus_signal TEXT NOT NULL,
                 timestamp INTEGER NOT NULL
             );",
-        )
-        .map_err(AgentError::from)
+            )
+            .map_err(AgentError::from)
     }
 
     pub fn create_session(&mut self, config: &SessionConfig) -> Result<(), AgentError> {
@@ -97,7 +98,11 @@ impl TranscriptStore {
         Ok(())
     }
 
-    pub fn update_session_status(&mut self, session_id: &str, status: &str) -> Result<(), AgentError> {
+    pub fn update_session_status(
+        &mut self,
+        session_id: &str,
+        status: &str,
+    ) -> Result<(), AgentError> {
         self.conn.execute(
             "UPDATE sessions SET status = ?1 WHERE id = ?2",
             params![status, session_id],
@@ -115,13 +120,9 @@ impl TranscriptStore {
             let signal = if signal_str == "agrees" {
                 crate::context_manager::ConsensusSignal::Agrees
             } else if signal_str.starts_with("disagrees:") {
-                crate::context_manager::ConsensusSignal::Disagrees(
-                    signal_str[10..].to_string(),
-                )
+                crate::context_manager::ConsensusSignal::Disagrees(signal_str[10..].to_string())
             } else if signal_str.starts_with("improves:") {
-                crate::context_manager::ConsensusSignal::Improves(
-                    signal_str[9..].to_string(),
-                )
+                crate::context_manager::ConsensusSignal::Improves(signal_str[9..].to_string())
             } else {
                 crate::context_manager::ConsensusSignal::NoSignal
             };
@@ -220,10 +221,9 @@ impl TranscriptStore {
             "DELETE FROM turns WHERE session_id = ?1",
             params![session_id],
         )?;
-        let rows_affected = self.conn.execute(
-            "DELETE FROM sessions WHERE id = ?1",
-            params![session_id],
-        )?;
+        let rows_affected = self
+            .conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
         if rows_affected == 0 {
             return Err(AgentError::DatabaseError(format!(
                 "delete_session: no session found with id '{}'",

@@ -35,8 +35,8 @@ the Phase 1 memory system (D-058).**
   were never added to the registration list — see D-056 below; fixed)
 - 16 AppState fields (the prior 14 plus `memory_store` and
   `last_memory_health`)
-- AgentDecision enum has all 6 variants live: Route, Blueprint, Continue,
-  Complete, RouteCompare, AskUser — none are commented-out/pending
+- AgentDecision enum has all 7 variants live: Route, Blueprint, Continue,
+  Complete, RouteCompare, AskUser, Hackathon — none are commented-out/pending (beta-final 2026-09-07: prompt hardening, runtime authoritative, Hackathon first-class, 1-2000 task_brief, no timeout/Kimi change)
 - GLM and Kimi both fully implemented as participant models
 - Debug logging (tracing + tracing-subscriber, file-backed rolling log) implemented
 - Agent brain fallback retry (D-038) and secondary brain (D-039) implemented
@@ -284,8 +284,8 @@ as context to leader on receipt. provide_user_answer command uses
 App.tsx root, calls provide_user_answer on every close path including
 Escape/backdrop click (RISK-ASKDISMISS resolved).
 
-### D-042: Kimi Participant (www.kimi.com) DONE
-agent_id: kimi | display_name: Kimi | base_url: https://www.kimi.com/
+### D-042: Kimi Participant (kimi.ai — canonical 2026-09-07, supersedes www.kimi.com) DONE
+agent_id: kimi | display_name: Kimi | base_url: https://kimi.ai/
 Input: div.chat-input-editor[contenteditable="true"] (Lexical editor,
 execCommand injection path) | Send: div.send-button-container
 Vue.js framework -- data-v-* attributes ignored, class selectors used.
@@ -663,6 +663,9 @@ All D-035 through D-042 implemented, confirmed via direct code read.
 
 ### O-006: Formal preview-redesign audit RESOLVED
 See `/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/preview-redesign-post.md`.
+
+### D-060: Beta Prompt Hardening — Three Production Templates Frozen (2026-09-07) DONE
+`leader_priming.md`, `participant_priming.md`, `agent_system.md` at repo root are the single authoritative copies (embedded via `include_str!` and seeded into `settings.db` on first open). Hardened per final spec: runtime state is authoritative (no invented roster/cycle/module/Hackathon/checkpoint), module completion now requires guaranteed pass + no unresolved contradiction + synthesized explicit implementable content (clean pass is valid, no fake objections), global `complete` requires all modules + closed product ambiguity + no pending Hackathon + no remaining mandatory pass, Hackathon is first-class with strict 6-condition trigger + 5 forbidden shortcuts + required PROBLEM STATEMENT/CONSTRAINTS/REQUIRED REPORT STRUCTURE (1-2000 chars) + advisory-only result evaluation on 8 dimensions, participant research honesty is conditional on actual tool availability, `AgentDecision` has 7 variants with strict field contracts (`Continue`/`Complete` carry no extra fields, `Hackathon` carries only `task_brief`, roster from Context is authoritative). Prompt/runtime contract verified against `agent_brain.rs` enum, `response_router.rs` exhaustive match, `hackathon::execute_hackathon`, and `session_runner.rs` placeholder rendering. No timeout change (90_000 ms preserved) and Kimi domain preserved at `https://www.kimi.com/`.
 
 ---
 

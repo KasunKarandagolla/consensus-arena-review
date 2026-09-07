@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ChevronDown, ChevronUp, Cpu, Network, Plus } from 'lucide-react'
+import { ChevronDown, ChevronUp, Cpu, Network, Plus, Settings2, Zap } from 'lucide-react'
 import { buildCommandErrorMessage, safeInvoke as invoke } from '@/lib/tauri'
 import { loadParticipants } from '@/lib/agents'
 import { useAppStore } from '@/stores/useAppStore'
@@ -12,25 +12,31 @@ interface ModelHealth { agent_id:string;is_available:boolean;error_count:number;
 const types:[SessionType,string][]=[['architecture','Architecture'],['mvp','MVP'],['api','API design'],['security','Security'],['custom','Custom']]
 
 export default function SetupView(){
-  const {setupBrief,setSetupBrief,setSessionStatus,setSessionAgentIds,addToast,participants,setSettingsOpen}=useAppStore()
+  const {setupBrief,setSetupBrief,setSessionStatus,setIsDraftSession,setSessionAgentIds,addToast,participants,setSettingsOpen, hackathonConfig, setHackathonOpen, setHackathonConfig}=useAppStore()
   const [sessionType,setType]=useState<SessionType>('architecture')
   const [selected,setSelected]=useState<Set<string>>(()=>new Set(['chatgpt','claude','deepseek']))
   const [leader,setLeader]=useState<string>('claude')
   const [brain,setBrain]=useState<BrainConfig>({api_key:'',base_url:'',model:'',system_prompt:''})
   const [health,setHealth]=useState<Record<string,ModelHealth>>({})
   const [open,setOpen]=useState(false),[loading,setLoading]=useState(false),[error,setError]=useState('')
+  const [hackathonEnabled, setHackathonEnabled] = useState(false)
 
-  useEffect(()=>{void Promise.allSettled([invoke<string>('get_agent_brain_config'),invoke<string>('get_agent_health'),loadParticipants()]).then(results=>{
+  useEffect(()=>{void Promise.allSettled([invoke<string>('get_agent_brain_config'),invoke<string>('get_agent_health'),loadParticipants(), invoke<string>('get_hackathon_config')]).then(results=>{
     if(results[0].status==='fulfilled')try{setBrain(JSON.parse(results[0].value) as BrainConfig)}catch(e){console.error(e)}
     if(results[1].status==='fulfilled')try{setHealth(JSON.parse(results[1].value) as Record<string,ModelHealth>)}catch(e){console.error(e)}
-  })},[])
+    if(results[3].status==='fulfilled')try{
+      const cfg = JSON.parse(results[3].value) as import('@/stores/useAppStore').HackathonConfigSafe
+      setHackathonConfig(cfg)
+      setHackathonEnabled(Boolean(cfg?.enabled))
+    }catch{}
+  })},[setHackathonConfig])
   useEffect(()=>{if(!selected.has(leader)){const first=participants.map(p=>p.agent_id).find(id=>selected.has(id));if(first)setLeader(first)}},[leader,selected,participants])
 
   function toggle(id:string){setSelected(current=>{const next=new Set(current);if(next.has(id)){if(next.size===2){setError('Select at least 2 participants.');return current}next.delete(id)}else next.add(id);setError('');return next})}
   const brainReady=Boolean(brain.api_key.trim()&&brain.base_url.trim()&&brain.model.trim()&&brain.system_prompt.trim())
   const canStart=Boolean(setupBrief.trim()&&selected.size>=2&&selected.has(leader)&&brainReady&&!loading)
   async function start(){if(!canStart){setError('Complete the brief and agent brain configuration, then select at least 2 participants.');setOpen(true);return}setLoading(true);setError('')
-    try{await invoke('save_agent_brain_config',{api_key:brain.api_key,base_url:brain.base_url,model:brain.model,system_prompt:brain.system_prompt});const ids=participants.map(p=>p.agent_id).filter(id=>selected.has(id));const setupOrder=[leader,...ids.filter(id=>id!==leader)];await invoke('start_session',{project_brief:setupBrief.trim(),session_type:sessionType,agent_ids:ids,leader_agent_id:leader});setSessionAgentIds(setupOrder);setSessionStatus('setup')}
+    try{await invoke('save_agent_brain_config',{api_key:brain.api_key,base_url:brain.base_url,model:brain.model,system_prompt:brain.system_prompt});const ids=participants.map(p=>p.agent_id).filter(id=>selected.has(id));const setupOrder=[leader,...ids.filter(id=>id!==leader)];await invoke('start_session',{project_brief:setupBrief.trim(),session_type:sessionType,agent_ids:ids,leader_agent_id:leader});setSessionAgentIds(setupOrder);setIsDraftSession(false);setSessionStatus('setup')}
     catch(e){const message=buildCommandErrorMessage('start_session',e);console.error(message);setError(message);addToast(message,7000)}finally{setLoading(false)}}
 
   return <section className="view"><Topbar title="New session"/><div className="scroll pt" style={{display:'flex',flexDirection:'column',alignItems:'center'}}><div className="fw">
@@ -42,10 +48,54 @@ export default function SetupView(){
       <button className="pc pc-add" onClick={()=>setSettingsOpen(true)} title="Add a custom AI chat service by URL"><Plus size={15}/><span>Add custom AI</span></button>
     </div></div>
     <div className="fg"><label className="fl">Leader model</label><select className="fi" value={leader} onChange={e=>setLeader(e.target.value)}>{participants.filter(p=>selected.has(p.agent_id)).map(p=><option value={p.agent_id} key={p.agent_id}>{p.display_name}</option>)}</select></div>
-    <div className="fg"><div className="coll-h" onClick={()=>setOpen(v=>!v)} style={{borderRadius:open?'10px 10px 0 0':10}}><span><Cpu size={15}/>Agent brain</span>{open?<ChevronUp size={14}/>:<ChevronDown size={14}/>}</div>{open&&<div className="coll-body">
+     <div className="fg"><div className="coll-h" onClick={()=>setOpen(v=>!v)} style={{borderRadius:open?'10px 10px 0 0':10}}><span><Cpu size={15}/>Agent brain</span>{open?<ChevronUp size={14}/>:<ChevronDown size={14}/>}</div>{open&&<div className="coll-body">
       <input className="fi" placeholder="API base URL" value={brain.base_url} onChange={e=>setBrain({...brain,base_url:e.target.value})}/><input className="fi" type="password" placeholder="API key" value={brain.api_key} onChange={e=>setBrain({...brain,api_key:e.target.value})}/><input className="fi" placeholder="Model name" value={brain.model} onChange={e=>setBrain({...brain,model:e.target.value})}/><textarea className="fi" style={{minHeight:72}} placeholder="System prompt..." value={brain.system_prompt} onChange={e=>setBrain({...brain,system_prompt:e.target.value})}/>
       <div className="brain-note"><Network size={15}/><span>Optional fallback and secondary brains are available in Settings for reliability: fallback retries once; secondary takes over after repeated primary failures.</span></div>
     </div>}</div>
+    {/* Hackathon Mode */}
+    <div className="fg" style={{ border: '1px solid var(--border)', borderRadius: 12, padding: 14, background: 'var(--surface)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: hackathonEnabled ? 12 : 0 }}>
+        <label className="fl" style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Zap size={14} style={{ color: 'var(--accent)' }} /> Hackathon Mode
+          <span className="fl-s">— wide idea burst via API models</span>
+        </label>
+        <button
+          role="switch"
+          aria-checked={hackathonEnabled}
+          aria-label="Hackathon mode"
+          className={`tgl${hackathonEnabled ? ' on' : ''}`}
+          onClick={async () => {
+            const next = !hackathonEnabled
+            setHackathonEnabled(next)
+            // Persist enabled flag — reuse save_hackathon_config with current groups/models
+            try {
+              const cfg = hackathonConfig ?? { groups: [], models: [], max_questions_per_teammate: 3, enabled: false }
+              const toSave = { ...cfg, enabled: next, max_questions_per_teammate: cfg.max_questions_per_teammate ?? 3, groups: cfg.groups ?? [], models: (cfg.models as Array<{id:string;model_name:string;base_url:string;group_id:string;api_key?:string}>).map(m=>({ ...m, api_key: (m as {api_key?:string}).api_key ?? '' })) }
+              await invoke('save_hackathon_config', { config: toSave })
+              const raw = await invoke<string>('get_hackathon_config')
+              setHackathonConfig(JSON.parse(raw) as import('@/stores/useAppStore').HackathonConfigSafe)
+              if (next) setHackathonOpen(true)
+            } catch (e) {
+              console.error('[hackathon] toggle save failed', e)
+              setHackathonEnabled(!next)
+            }
+          }}
+        />
+      </div>
+      {hackathonEnabled && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 12.5, color: 'var(--t2)' }}>
+            {hackathonConfig?.groups?.length ? `${hackathonConfig.groups.filter(g=>g.selected).length} team(s) selected · ${hackathonConfig.models.length} models` : 'No teams configured'}
+          </span>
+          <button className="cr-btn" onClick={() => setHackathonOpen(true)} style={{ marginLeft: 'auto' }}>
+            <Settings2 size={12} /> Configure Hackathon
+          </button>
+        </div>
+      )}
+      {!hackathonEnabled && (
+        <p style={{ fontSize: 12, color: 'var(--t3)', marginTop: 8, lineHeight: 1.5 }}>Enable to run parallel API-model teams for divergent ideas. Output feeds the main leader as raw material.</p>
+      )}
+    </div>
     <button className="btn-p" disabled={!canStart} onClick={()=>void start()}>{loading?'Starting…':'Start session'}</button>
   </div></div><InputBar/></section>
 }

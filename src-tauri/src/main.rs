@@ -1,16 +1,18 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod agentic_manager;
 mod agent_brain;
+mod agentic_manager;
 mod blueprint_store;
 mod browser_backend;
 mod browser_harness;
 mod capability_registry;
+mod checkpoint;
 mod commands;
 mod context_manager;
 mod db_helpers;
 mod errors;
+mod hackathon;
 mod memory_store;
 mod orchestrator;
 mod persona_manager;
@@ -122,6 +124,8 @@ fn main() {
             commands::get_participants,             // P3 unified registry
             commands::save_prompt_template,
             commands::get_prompt_template,
+            commands::get_maintenance_mode,
+            commands::set_maintenance_mode,
             commands::get_diagnostic_snapshot,
             commands::get_browser_timeline,
             commands::get_browser_reliability_report,
@@ -136,6 +140,10 @@ fn main() {
             commands::delete_session,
             commands::rename_session,
             commands::get_session_details,
+            commands::get_session_transcript,
+            commands::get_blueprint_sections,
+            commands::request_pause,
+            commands::get_session_checkpoint,
             // IMP-7: Session recovery
             commands::get_recovery_state,
             commands::recover_session,
@@ -155,6 +163,13 @@ fn main() {
             commands::get_patterns,
             commands::export_memory,
             commands::restore_memory,
+            // Hackathon Mode
+            commands::get_hackathon_config,
+            commands::save_hackathon_config,
+            commands::get_hackathon_run_state,
+            commands::cancel_hackathon_run,
+            commands::send_hackathon_invitations,
+            commands::run_hackathon,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

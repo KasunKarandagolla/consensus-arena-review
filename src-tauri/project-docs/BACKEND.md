@@ -243,7 +243,7 @@ in sync just because most entries match.)
 
 ---
 
-## AgentDecision Enum — All 6 Variants Implemented
+## AgentDecision Enum — All 7 Variants Implemented (beta-final 2026-09-07)
 
 ```rust
 #[derive(Debug, Serialize, Deserialize)]
@@ -255,8 +255,10 @@ pub enum AgentDecision {
     Complete,
     RouteCompare { models: Vec<String>, prompt: String },   // D-035
     AskUser { question: String, options: Vec<String>, allow_custom: bool }, // D-041
+    Hackathon { task_brief: String },                       // Hackathon first-class
 }
 ```
+Beta-final hardening 2026-09-07: prompt contracts verified — `Continue` carries no `prompt`, `Complete` is global, `Hackathon` task_brief is 1-2000 chars with PROBLEM STATEMENT/CONSTRAINTS/REQUIRED REPORT STRUCTURE, roster from runtime is authoritative, malformed decisions fall back safely. Timeout 90_000 ms and Kimi https://www.kimi.com/ preserved.
 
 Note: `rename_all = "snake_case"`, not `"lowercase"` as an earlier version
 of this document said — this specifically matters for `RouteCompare` (→
@@ -597,11 +599,11 @@ against this, since it was referenced but not fully re-transcribed here.
 | deepseek | DeepSeek     | https://chat.deepseek.com     | (existing)                                  | textarea        | (existing)              |
 | qwen     | Qwen         | https://chat.qwen.ai          | (existing)                                  | textarea        | (existing)              |
 | glm      | GLM          | https://chat.z.ai/            | #chat-input                                 | textarea        | #send-message-button    |
-| kimi     | Kimi         | https://www.kimi.com/         | div.chat-input-editor[contenteditable=true] | Lexical/CE      | div.send-button-container |
+| kimi     | Kimi         | https://kimi.ai/              | div.chat-input-editor[contenteditable=true] | Lexical/CE      | div.send-button-container |
 
 GLM notes: Svelte framework — ignore .svelte-* hash classes. ID selectors are stable.
 Kimi notes: Vue.js — ignore data-v-* scoped attributes. Class selectors only.
-           Conversation URL: https://www.kimi.com/chat/{uuid}
+            Conversation URL: https://kimi.ai/chat/{uuid} — canonical 2026-09-07
            Input is Lexical editor — requires execCommand injection path.
 
 ---

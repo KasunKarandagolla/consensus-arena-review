@@ -11,7 +11,9 @@ use crate::blueprint_store::{BlueprintSection, SectionStatus};
 use crate::browser_backend::NavEvent;
 use crate::errors::{AgentError, ErrorKind};
 use crate::memory_store::SessionSummaryData;
-use crate::orchestrator::{ActiveBrainKind, ActiveBrainStatus, AppState, ModelHealth, SessionConfig};
+use crate::orchestrator::{
+    ActiveBrainKind, ActiveBrainStatus, AppState, ModelHealth, SessionConfig,
+};
 
 struct PendingAdoptionCheck {
     model_id: String,
@@ -65,6 +67,18 @@ fn should_retry_after_failure(
     agent_id: &str,
     attempt: u32,
 ) -> bool {
+    // Idempotency: if a response was already observed after injection for this agent/turn,
+    // retrying same turn would duplicate. This catches late responses arriving during backoff.
+    if diagnostics.has_response_observed_after_injection(agent_id) {
+        tracing::info!(
+            "[RETRY] {} not retrying — late response already observed after injection (attempt {}/{}): {}",
+            agent_id,
+            attempt,
+            MAX_RETRIES,
+            error
+        );
+        return false;
+    }
     if attempt >= MAX_RETRIES {
         return false;
     }
@@ -101,15 +115,23 @@ fn resolve_selected_agent_id(target: &str, config: &SessionConfig) -> Option<Str
 
 fn leader_requests_consultation(response: &str) -> bool {
     let response = response.to_ascii_lowercase();
-    ["questions to consult another model", "consult another model", "consult deepseek", "risks", "simplification", "critique"]
-        .iter()
-        .any(|phrase| response.contains(phrase))
+    [
+        "questions to consult another model",
+        "consult another model",
+        "consult deepseek",
+        "risks",
+        "simplification",
+        "critique",
+    ]
+    .iter()
+    .any(|phrase| response.contains(phrase))
 }
 
 fn looks_like_blueprint(response: &str) -> bool {
     let response = response.to_ascii_lowercase();
     response.contains("blueprint")
-        || (response.contains("mvp") && (response.contains("feature") || response.contains("scope")))
+        || (response.contains("mvp")
+            && (response.contains("feature") || response.contains("scope")))
         || (response.contains("architecture") && response.contains("implementation"))
 }
 
@@ -117,7 +139,10 @@ fn drain_stale_active_events(nav_rx: &mut Receiver<NavEvent>) -> usize {
     let mut drained = 0usize;
     while let Ok(event) = nav_rx.try_recv() {
         drained = drained.saturating_add(1);
-        tracing::warn!("[ACTIVE] Drained pre-turn stale navigation event: {:?}", event);
+        tracing::warn!(
+            "[ACTIVE] Drained pre-turn stale navigation event: {:?}",
+            event
+        );
     }
     drained
 }
@@ -156,7 +181,9 @@ async fn await_submit_ack(
                 }
                 let detail =
                     error.unwrap_or_else(|| format!("method={method} enabled={send_enabled}"));
-                return Err(AgentError::InjectionFailed(format!("submit failed: {detail}")));
+                return Err(AgentError::InjectionFailed(format!(
+                    "submit failed: {detail}"
+                )));
             }
             Some(NavEvent::Response(ev_agent, ev_turn, text))
                 if ev_agent == agent_id && ev_turn == turn =>
@@ -170,8 +197,7 @@ async fn await_submit_ack(
                 agent_id: ev_agent,
                 turn: ev_turn,
                 response,
-            }) if ev_agent == agent_id && ev_turn == turn =>
-            {
+            }) if ev_agent == agent_id && ev_turn == turn => {
                 return Ok(Some(response));
             }
             Some(NavEvent::SessionAborted) => {
@@ -218,9 +244,7 @@ async fn confirm_active_submit(
                 return Ok(SubmitOutcome::ResponseEarly(response));
             }
             Ok(Ok(None)) => {
-                tracing::debug!(
-                    "[SUBMIT] {agent_id} turn {turn} confirmed (attempt {attempt})"
-                );
+                tracing::debug!("[SUBMIT] {agent_id} turn {turn} confirmed (attempt {attempt})");
                 return Ok(SubmitOutcome::Confirmed);
             }
             Ok(Err(e)) => {
@@ -241,9 +265,7 @@ async fn confirm_active_submit(
 
         if attempt < MAX_SUBMIT_ACTION_RETRIES {
             if let Err(e) = crate::browser_backend::retry_active_submit(window, agent_id, turn) {
-                tracing::warn!(
-                    "[SUBMIT] retry eval for {agent_id} turn {turn} failed: {e}"
-                );
+                tracing::warn!("[SUBMIT] retry eval for {agent_id} turn {turn} failed: {e}");
             }
         }
     }
@@ -257,12 +279,15 @@ async fn confirm_active_submit(
         ),
         "message_type": "status"
     }));
-    let _ = app.emit("active-turn-state", serde_json::json!({
-        "event": "active_submit_failed",
-        "agent_id": agent_id,
-        "turn_number": turn,
-        "error": detail,
-    }));
+    let _ = app.emit(
+        "active-turn-state",
+        serde_json::json!({
+            "event": "active_submit_failed",
+            "agent_id": agent_id,
+            "turn_number": turn,
+            "error": detail,
+        }),
+    );
     Ok(SubmitOutcome::ManualRecovery)
 }
 
@@ -282,11 +307,14 @@ async fn inject_active_prompt(
         let mut browser = state.browser_state.lock().await;
         browser.begin_active_turn(agent_id, turn);
     }
-    let _ = app.emit("active-turn-state", serde_json::json!({
-        "event": "active_turn_started",
-        "agent_id": agent_id,
-        "turn_number": turn,
-    }));
+    let _ = app.emit(
+        "active-turn-state",
+        serde_json::json!({
+            "event": "active_turn_started",
+            "agent_id": agent_id,
+            "turn_number": turn,
+        }),
+    );
     crate::browser_backend::inject_to_window(
         window.clone(),
         agent_id,
@@ -328,16 +356,22 @@ async fn inject_active_prompt(
         let browser = state.browser_state.lock().await;
         browser.mark_active_waiting(agent_id, turn);
     }
-    let _ = app.emit("active-turn-state", serde_json::json!({
-        "event": "active_prompt_injected",
-        "agent_id": agent_id,
-        "turn_number": turn,
-    }));
-    let _ = app.emit("active-turn-state", serde_json::json!({
-        "event": "active_waiting_for_response",
-        "agent_id": agent_id,
-        "turn_number": turn,
-    }));
+    let _ = app.emit(
+        "active-turn-state",
+        serde_json::json!({
+            "event": "active_prompt_injected",
+            "agent_id": agent_id,
+            "turn_number": turn,
+        }),
+    );
+    let _ = app.emit(
+        "active-turn-state",
+        serde_json::json!({
+            "event": "active_waiting_for_response",
+            "agent_id": agent_id,
+            "turn_number": turn,
+        }),
+    );
     Ok(early_response)
 }
 
@@ -442,9 +476,12 @@ pub async fn run_agent_loop(
     let mut iterations_since_last_section: u32 = 0;
     let mut blueprint_titles: Vec<String> = Vec::new();
     let mut routing_observations: Vec<String> = Vec::new();
-    let deepseek_selected = config.agent_ids.iter().any(|id| id == "deepseek")
-        && leader_id != "deepseek";
-    let consult_deepseek_once = config.project_brief.to_ascii_lowercase().contains("consult deepseek once");
+    let deepseek_selected =
+        config.agent_ids.iter().any(|id| id == "deepseek") && leader_id != "deepseek";
+    let consult_deepseek_once = config
+        .project_brief
+        .to_ascii_lowercase()
+        .contains("consult deepseek once");
     let mut deepseek_consulted = false;
     let mut unclassified_count = 0u32;
 
@@ -455,57 +492,95 @@ pub async fn run_agent_loop(
     // Initialize brain status to Unknown at session start
     {
         let mut ab = state.active_brain.lock().await;
-        *ab = ActiveBrainStatus { kind: ActiveBrainKind::Unknown, model: String::new() };
+        *ab = ActiveBrainStatus {
+            kind: ActiveBrainKind::Unknown,
+            model: String::new(),
+        };
     }
-    let _ = app.emit("brain-status", serde_json::json!({ "active": "unknown", "model": "" }));
+    let _ = app.emit(
+        "brain-status",
+        serde_json::json!({ "active": "unknown", "model": "" }),
+    );
 
     let drained = drain_stale_active_events(nav_rx);
     if drained > 0 {
         tracing::warn!("[ACTIVE] Drained {drained} setup-era events before turn 1");
     }
-    let leader_window = {
-        let browser = state.browser_state.lock().await;
-        browser.leader_window.clone().ok_or_else(|| {
-            AgentError::NavigationFailed("leader window not initialised for active turn 1".to_string())
-        })?
+    let is_resume = state
+        .checkpoint
+        .lock()
+        .await
+        .clone()
+        .map(|cp| cp.session_id == config.session_id && cp.paused)
+        .unwrap_or(false);
+    let (mut next_leader_turn, mut early_leader_response) = if is_resume {
+        let cp = state.checkpoint.lock().await.clone().unwrap();
+        // Restore iteration from checkpoint
+        iteration = cp.turn_number;
+        tracing::info!(
+            "[RECOVERY] Resuming session {} from checkpoint turn {} next_step {:?}",
+            cp.session_id,
+            cp.turn_number,
+            cp.next_step
+        );
+        (
+            cp.turn_number.saturating_add(1),
+            cp.last_leader_response.clone(),
+        )
+    } else {
+        let leader_window = {
+            let browser = state.browser_state.lock().await;
+            browser.leader_window.clone().ok_or_else(|| {
+                AgentError::NavigationFailed(
+                    "leader window not initialised for active turn 1".to_string(),
+                )
+            })?
+        };
+        let first_prompt = format!(
+            "Consensus Arena active turn 1 (session {}).\n\nProject brief:\n{}\n\nConstraints: work as the panel leader, keep the first draft practical and concise, and identify decisions or questions worth consulting another model on. Produce the first short proposal/blueprint draft now. Do not answer only CONSENSUS on this active turn. Respond now with the requested draft/proposal.",
+            config.session_id, config.project_brief
+        );
+        let early_turn1 = match inject_active_prompt(
+            leader_window.clone(),
+            &leader_id,
+            &first_prompt,
+            1,
+            state,
+            app,
+            nav_rx,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let diagnostics = {
+                    let browser = state.browser_state.lock().await;
+                    browser.diagnostics.clone()
+                };
+                crate::browser_backend::record_browser_error(
+                    app,
+                    &diagnostics,
+                    &leader_id,
+                    &e.to_string(),
+                );
+                let _ = app.emit(
+                    "boss-message",
+                    serde_json::json!({
+                        "text": format!("Leader window injection failed (turn 1): {e}"),
+                        "message_type": "status"
+                    }),
+                );
+                return Err(e);
+            }
+        };
+        (2, early_turn1)
     };
-    let first_prompt = format!(
-        "Consensus Arena active turn 1 (session {}).\n\nProject brief:\n{}\n\nConstraints: work as the panel leader, keep the first draft practical and concise, and identify decisions or questions worth consulting another model on. Produce the first short proposal/blueprint draft now. Do not answer only CONSENSUS on this active turn. Respond now with the requested draft/proposal.",
-        config.session_id, config.project_brief
-    );
-    // RC1-A2: leader injection is intentionally fatal — no participant fallback.
-    // Make error semantics explicit: record diagnostic + boss-message before
-    // propagating, so an injection failure does not silently crash.
-    let early_turn1 = match inject_active_prompt(
-        leader_window.clone(),
-        &leader_id,
-        &first_prompt,
-        1,
-        state,
-        app,
-        nav_rx,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            let diagnostics = {
-                let browser = state.browser_state.lock().await;
-                browser.diagnostics.clone()
-            };
-            crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
-            let _ = app.emit(
-                "boss-message",
-                serde_json::json!({
-                    "text": format!("Leader window injection failed (turn 1): {e}"),
-                    "message_type": "status"
-                }),
-            );
-            return Err(e);
-        }
-    };
-    let mut next_leader_turn: u32 = 2;
-    let mut early_leader_response: Option<String> = early_turn1;
+    if is_resume && early_leader_response.is_none() {
+        early_leader_response = Some(format!(
+            "Resumed from checkpoint at turn {} — please continue with the next decision.",
+            iteration
+        ));
+    }
 
     loop {
         iteration += 1;
@@ -527,11 +602,14 @@ pub async fn run_agent_loop(
                 match wait_for_response(&leader_id, active_turn, nav_rx).await {
                     Ok(response) => break response,
                     Err(AgentError::Timeout(error)) => {
-                        let _ = app.emit("active-turn-state", serde_json::json!({
-                            "event": "active_turn_timeout",
-                            "agent_id": &leader_id,
-                            "turn_number": active_turn,
-                        }));
+                        let _ = app.emit(
+                            "active-turn-state",
+                            serde_json::json!({
+                                "event": "active_turn_timeout",
+                                "agent_id": &leader_id,
+                                "turn_number": active_turn,
+                            }),
+                        );
                         let _ = app.emit(
                             "boss-message",
                             serde_json::json!({
@@ -568,11 +646,14 @@ pub async fn run_agent_loop(
         };
         finish_active_turn(state, &leader_id, active_turn).await;
 
-        let _ = app.emit("active-turn-state", serde_json::json!({
-            "event": "active_response_captured",
-            "agent_id": &leader_id,
-            "turn_number": active_turn,
-        }));
+        let _ = app.emit(
+            "active-turn-state",
+            serde_json::json!({
+                "event": "active_response_captured",
+                "agent_id": &leader_id,
+                "turn_number": active_turn,
+            }),
+        );
 
         let _ = app.emit(
             "agent-state-change",
@@ -595,15 +676,146 @@ pub async fn run_agent_loop(
             }),
         );
 
-        let context = format!(
+        // ── Graceful pause checkpoint ─────────────────────────────────────
+        // If user requested pause after previous atomic action completed, persist checkpoint now.
+        // This is safe boundary: leader response captured and emitted, before next decision.
+        if state.pause_requested.load(Ordering::SeqCst) {
+            let pending_msgs = {
+                let mut ctx = state.context_manager.lock().await;
+                ctx.take_pending_user_input_if_session(&config.session_id)
+                    .map(|m| vec![m])
+                    .unwrap_or_default()
+            };
+            let hackathon_run_id = state.hackathon_run_id.lock().await.clone();
+            let hackathon_task_brief = {
+                let run = state.hackathon_run.lock().await;
+                run.as_ref().map(|r| r.task_brief.clone())
+            };
+            let cp = crate::checkpoint::SessionCheckpoint {
+                checkpoint_version: crate::checkpoint::CHECKPOINT_VERSION,
+                session_id: config.session_id.clone(),
+                run_id: format!(
+                    "run-{}",
+                    &config.session_id[..config.session_id.len().min(8)]
+                ),
+                turn_number: active_turn,
+                phase: "leader_decision".to_string(),
+                leader_id: leader_id.clone(),
+                target_participant: None,
+                next_step: crate::checkpoint::CheckpointNextStep::LeaderDecision,
+                pending_user_messages: pending_msgs,
+                pause_requested: true,
+                paused: true,
+                pause_reason: crate::checkpoint::PauseReason::UserRequested,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                agent_ids: config.agent_ids.clone(),
+                project_brief: config.project_brief.clone(),
+                session_type: format!("{:?}", config.session_type),
+                hackathon_run_id,
+                hackathon_task_brief,
+                last_leader_response: Some(leader_response.clone()),
+            };
+            if cp.validate().is_ok() {
+                let key = crate::checkpoint::SessionCheckpoint::key_for(&config.session_id);
+                let json = serde_json::to_string(&cp).unwrap_or_default();
+                {
+                    let mut store = state.settings_store.lock().await;
+                    let _ = store.set(&key, &json);
+                }
+                {
+                    let mut cached = state.checkpoint.lock().await;
+                    *cached = Some(cp.clone());
+                }
+            }
+            {
+                let mut orch = state.orchestrator.lock().await;
+                orch.status = crate::orchestrator::OrchestratorStatus::Paused;
+            }
+            let _ = app.emit(
+                "session-status",
+                serde_json::json!({ "status": "paused", "session_id": config.session_id }),
+            );
+            let _ = app.emit("session-checkpoint", serde_json::json!({ "checkpoint_id": config.session_id, "phase": "paused", "session_id": config.session_id, "next_step": "leader_decision" }));
+            // Keep loop alive waiting for resume; do not exit and clear session_active.
+            // Poll pause_requested until cleared by resume_session (which sets Running).
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                if !state.pause_requested.load(Ordering::SeqCst) {
+                    let status = state.orchestrator.lock().await.status.clone();
+                    if status == crate::orchestrator::OrchestratorStatus::Running {
+                        let _ = app.emit("session-status", serde_json::json!({ "status": "running", "session_id": config.session_id }));
+                        break;
+                    }
+                }
+                // If abort requested, exit loop
+                if !state.session_active.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                let orch_status = state.orchestrator.lock().await.status.clone();
+                if orch_status == crate::orchestrator::OrchestratorStatus::Ended {
+                    return Ok(());
+                }
+            }
+            // Resume: continue to next iteration without re-processing same leader_response
+            // The checkpoint's next_step is LeaderDecision, so we proceed to decision with enriched leader_response
+            // Already have leader_response from before pause; do not discard it.
+        }
+
+        // ── User pipeline input (injected before next leader decision) ───
+        // Drain pending user message queued via user_input. Stale-session protected.
+        let pending_user_message: Option<String> = {
+            let mut ctx = state.context_manager.lock().await;
+            ctx.take_pending_user_input_if_session(&config.session_id)
+        };
+        let has_pending = pending_user_message.is_some();
+        let leader_response = if let Some(user_msg) = pending_user_message {
+            let enriched = format!("{}\n\n[User message]: {}", leader_response, user_msg);
+            let _ = app.emit("boss-message", serde_json::json!({ "text": format!("User message queued: {}", user_msg.chars().take(80).collect::<String>()), "message_type": "status" }));
+            // Record as session fact for audit (best-effort)
+            let memory_store = state.memory_store.clone();
+            let project_brief = config.project_brief.clone();
+            let sid = config.session_id.clone();
+            let msg_clone = user_msg.clone();
+            let _ = crate::db_helpers::run_blocking(move || {
+                let mut memory = memory_store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let _ = memory.add_session_fact(
+                    &sid,
+                    &project_brief,
+                    "user_input",
+                    &format!("User steered: {}", msg_clone),
+                    None,
+                    "user",
+                    "confirmed",
+                );
+                Ok::<(), crate::errors::AgentError>(())
+            })
+            .await;
+            enriched
+        } else {
+            leader_response
+        };
+
+        let mut context = format!(
             "Session iteration: {}\nSelected participant IDs: {}\nLeader ID: {}\nDeepSeek selected: {}\nDeepSeek consulted this session: {}\nProject brief requires DeepSeek once: {}",
-            iteration, config.agent_ids.join(", "), leader_id, deepseek_selected,
-            deepseek_consulted, consult_deepseek_once,
+            iteration,
+            config.agent_ids.join(", "),
+            leader_id,
+            deepseek_selected,
+            deepseek_consulted,
+            consult_deepseek_once,
         );
-        let _ = app.emit("agent_brain_decision_started", serde_json::json!({
-            "iteration": iteration,
-            "response_length": leader_response.len(),
-        }));
+        if has_pending {
+            context.push_str("\nUser has steered the discussion — consider the [User message] in the leader response above before routing or finalizing.");
+        }
+        let _ = app.emit(
+            "agent_brain_decision_started",
+            serde_json::json!({
+                "iteration": iteration,
+                "response_length": leader_response.len(),
+            }),
+        );
 
         // ── IMP-10: Brain selection ───────────────────────────────────────
         // Check whether the consecutive-failure threshold has been crossed.
@@ -626,36 +838,70 @@ pub async fn run_agent_loop(
         // Call decide() on whichever brain is active.
         // Holding the brain2 guard across .await is acceptable for
         // tokio::sync::MutexGuard (it is Send).
-        let decision_result: Result<(AgentDecision, ActiveBrainKind, String), AgentError> = if use_secondary {
-            let guard = state.agent_brain_2.lock().await;
-            if let Some(b2) = guard.as_ref() {
-                let model = b2.model_name().to_string();
-                match b2.decide_with_source(&leader_response, &context, mem_ctx).await {
-                    Ok((decision, _source)) => Ok((decision, ActiveBrainKind::Secondary, model)),
-                    Err(e) => Err(e),
+        let decision_result: Result<(AgentDecision, ActiveBrainKind, String), AgentError> =
+            if use_secondary {
+                let guard = state.agent_brain_2.lock().await;
+                if let Some(b2) = guard.as_ref() {
+                    let model = b2.model_name().to_string();
+                    match b2
+                        .decide_with_source(&leader_response, &context, mem_ctx)
+                        .await
+                    {
+                        Ok((decision, _source)) => {
+                            Ok((decision, ActiveBrainKind::Secondary, model))
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    drop(guard);
+                    // No secondary configured — fall back to primary for this iter.
+                    match brain
+                        .decide_with_source(&leader_response, &context, mem_ctx)
+                        .await
+                    {
+                        Ok((decision, source)) => {
+                            let kind = if source == BrainSource::Fallback {
+                                ActiveBrainKind::Fallback
+                            } else {
+                                ActiveBrainKind::Primary
+                            };
+                            let model = if kind == ActiveBrainKind::Fallback {
+                                brain
+                                    .fallback_model_name()
+                                    .unwrap_or(brain.model_name())
+                                    .to_string()
+                            } else {
+                                brain.model_name().to_string()
+                            };
+                            Ok((decision, kind, model))
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
             } else {
-                drop(guard);
-                // No secondary configured — fall back to primary for this iter.
-                match brain.decide_with_source(&leader_response, &context, mem_ctx).await {
+                match brain
+                    .decide_with_source(&leader_response, &context, mem_ctx)
+                    .await
+                {
                     Ok((decision, source)) => {
-                        let kind = if source == BrainSource::Fallback { ActiveBrainKind::Fallback } else { ActiveBrainKind::Primary };
-                        let model = if kind == ActiveBrainKind::Fallback { brain.fallback_model_name().unwrap_or(brain.model_name()).to_string() } else { brain.model_name().to_string() };
+                        let kind = if source == BrainSource::Fallback {
+                            ActiveBrainKind::Fallback
+                        } else {
+                            ActiveBrainKind::Primary
+                        };
+                        let model = if kind == ActiveBrainKind::Fallback {
+                            brain
+                                .fallback_model_name()
+                                .unwrap_or(brain.model_name())
+                                .to_string()
+                        } else {
+                            brain.model_name().to_string()
+                        };
                         Ok((decision, kind, model))
                     }
                     Err(e) => Err(e),
                 }
-            }
-        } else {
-            match brain.decide_with_source(&leader_response, &context, mem_ctx).await {
-                Ok((decision, source)) => {
-                    let kind = if source == BrainSource::Fallback { ActiveBrainKind::Fallback } else { ActiveBrainKind::Primary };
-                    let model = if kind == ActiveBrainKind::Fallback { brain.fallback_model_name().unwrap_or(brain.model_name()).to_string() } else { brain.model_name().to_string() };
-                    Ok((decision, kind, model))
-                }
-                Err(e) => Err(e),
-            }
-        };
+            };
 
         let decision = match decision_result {
             Ok((d, kind, model)) => {
@@ -664,7 +910,10 @@ pub async fn run_agent_loop(
                 // Update active brain status and emit event
                 {
                     let mut ab = state.active_brain.lock().await;
-                    *ab = ActiveBrainStatus { kind: kind.clone(), model: model.clone() };
+                    *ab = ActiveBrainStatus {
+                        kind: kind.clone(),
+                        model: model.clone(),
+                    };
                 }
                 let kind_str = match kind {
                     ActiveBrainKind::Primary => "primary",
@@ -685,16 +934,23 @@ pub async fn run_agent_loop(
                 // Update active brain to unavailable
                 {
                     let mut ab = state.active_brain.lock().await;
-                    *ab = ActiveBrainStatus { kind: ActiveBrainKind::Unavailable, model: String::new() };
+                    *ab = ActiveBrainStatus {
+                        kind: ActiveBrainKind::Unavailable,
+                        model: String::new(),
+                    };
                 }
                 let _ = app.emit("brain-status", serde_json::json!({ "active": "unavailable", "model": "", "iteration": iteration }));
                 unclassified_count = unclassified_count.saturating_add(1);
-                let _ = app.emit("agent_brain_decision_failed", serde_json::json!({
-                    "iteration": iteration,
-                    "error": "decision parsing or provider request failed",
-                    "unclassified_count": unclassified_count,
-                }));
-                if deepseek_selected && !deepseek_consulted
+                let _ = app.emit(
+                    "agent_brain_decision_failed",
+                    serde_json::json!({
+                        "iteration": iteration,
+                        "error": "decision parsing or provider request failed",
+                        "unclassified_count": unclassified_count,
+                    }),
+                );
+                if deepseek_selected
+                    && !deepseek_consulted
                     && (consult_deepseek_once || leader_requests_consultation(&leader_response))
                 {
                     let _ = app.emit("agent_brain_decision_fallback", serde_json::json!({
@@ -702,24 +958,36 @@ pub async fn run_agent_loop(
                     }));
                     AgentDecision::Route {
                         target_model: "deepseek".to_string(),
-                        prompt: format!("Review the leader proposal for risks and simplifications. Return concise actionable critique.\n\nLeader proposal:\n{}", leader_response),
+                        prompt: format!(
+                            "Review the leader proposal for risks and simplifications. Return concise actionable critique.\n\nLeader proposal:\n{}",
+                            leader_response
+                        ),
                     }
                 } else if looks_like_blueprint(&leader_response) {
-                    let _ = app.emit("agent_brain_decision_fallback", serde_json::json!({
-                        "kind": "blueprint", "unclassified_count": unclassified_count,
-                    }));
+                    let _ = app.emit(
+                        "agent_brain_decision_fallback",
+                        serde_json::json!({
+                            "kind": "blueprint", "unclassified_count": unclassified_count,
+                        }),
+                    );
                     AgentDecision::Blueprint {
                         section_title: "Draft Blueprint".to_string(),
                         section_content: leader_response.clone(),
                     }
                 } else if unclassified_count <= MAX_UNCLASSIFIED_CONTINUES {
-                    let _ = app.emit("agent_brain_decision_fallback", serde_json::json!({
-                        "kind": "continue", "unclassified_count": unclassified_count,
-                    }));
+                    let _ = app.emit(
+                        "agent_brain_decision_fallback",
+                        serde_json::json!({
+                            "kind": "continue", "unclassified_count": unclassified_count,
+                        }),
+                    );
                     AgentDecision::Continue
                 } else {
                     let message = "Agent brain could not classify repeated unusable responses. Paste a clearer leader response or stop and restart the session.";
-                    let _ = app.emit("boss-message", serde_json::json!({ "text": message, "message_type": "status" }));
+                    let _ = app.emit(
+                        "boss-message",
+                        serde_json::json!({ "text": message, "message_type": "status" }),
+                    );
                     return Err(AgentError::UnknownError(message.to_string()));
                 }
             }
@@ -799,15 +1067,19 @@ pub async fn run_agent_loop(
                 target_model,
                 prompt,
             } => {
-                let target_model = resolve_selected_agent_id(&target_model, config).ok_or_else(|| {
-                    AgentError::NavigationFailed(format!(
-                        "Agent brain selected an unavailable participant: {target_model}"
-                    ))
-                })?;
-                let _ = app.emit("route_started", serde_json::json!({
-                    "iteration": iteration,
-                    "route_target_agent_id": &target_model,
-                }));
+                let target_model =
+                    resolve_selected_agent_id(&target_model, config).ok_or_else(|| {
+                        AgentError::NavigationFailed(format!(
+                            "Agent brain selected an unavailable participant: {target_model}"
+                        ))
+                    })?;
+                let _ = app.emit(
+                    "route_started",
+                    serde_json::json!({
+                        "iteration": iteration,
+                        "route_target_agent_id": &target_model,
+                    }),
+                );
                 let _ = app.emit(
                     "agent-routing",
                     serde_json::json!({
@@ -950,7 +1222,12 @@ pub async fn run_agent_loop(
                             let browser = state.browser_state.lock().await;
                             browser.diagnostics.clone()
                         };
-                        crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
+                        crate::browser_backend::record_browser_error(
+                            app,
+                            &diagnostics,
+                            &leader_id,
+                            &e.to_string(),
+                        );
                         let _ = app.emit(
                             "boss-message",
                             serde_json::json!({
@@ -1053,11 +1330,11 @@ pub async fn run_agent_loop(
                     .await
                     {
                         Ok(response) => {
-                            combined.push_str(&format!("[{} said]:\n{}\n\n", target_model, response));
+                            combined
+                                .push_str(&format!("[{} said]:\n{}\n\n", target_model, response));
                             compare_succeeded.push(target_model.clone());
                         }
-                        Err(error)
-                            if matches!(&error, AgentError::UnknownError(msg) if msg.contains("Session aborted")) =>
+                        Err(error) if matches!(&error, AgentError::UnknownError(msg) if msg.contains("Session aborted")) =>
                         {
                             return Err(error);
                         }
@@ -1147,7 +1424,12 @@ pub async fn run_agent_loop(
                             let browser = state.browser_state.lock().await;
                             browser.diagnostics.clone()
                         };
-                        crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
+                        crate::browser_backend::record_browser_error(
+                            app,
+                            &diagnostics,
+                            &leader_id,
+                            &e.to_string(),
+                        );
                         let _ = app.emit(
                             "boss-message",
                             serde_json::json!({
@@ -1247,10 +1529,13 @@ pub async fn run_agent_loop(
                         "content":    &section_content
                     }),
                 );
-                let _ = app.emit("blueprint_emitted", serde_json::json!({
-                    "iteration": iteration,
-                    "section_title": &section_title,
-                }));
+                let _ = app.emit(
+                    "blueprint_emitted",
+                    serde_json::json!({
+                        "iteration": iteration,
+                        "section_title": &section_title,
+                    }),
+                );
 
                 tracing::debug!("[LOCK] acquiring browser_state for Blueprint/ack");
                 let leader_window = {
@@ -1282,7 +1567,12 @@ pub async fn run_agent_loop(
                             let browser = state.browser_state.lock().await;
                             browser.diagnostics.clone()
                         };
-                        crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
+                        crate::browser_backend::record_browser_error(
+                            app,
+                            &diagnostics,
+                            &leader_id,
+                            &e.to_string(),
+                        );
                         let _ = app.emit(
                             "boss-message",
                             serde_json::json!({
@@ -1334,7 +1624,12 @@ pub async fn run_agent_loop(
                             let browser = state.browser_state.lock().await;
                             browser.diagnostics.clone()
                         };
-                        crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
+                        crate::browser_backend::record_browser_error(
+                            app,
+                            &diagnostics,
+                            &leader_id,
+                            &e.to_string(),
+                        );
                         let _ = app.emit(
                             "boss-message",
                             serde_json::json!({
@@ -1488,7 +1783,12 @@ pub async fn run_agent_loop(
                             let browser = state.browser_state.lock().await;
                             browser.diagnostics.clone()
                         };
-                        crate::browser_backend::record_browser_error(app, &diagnostics, &leader_id, &e.to_string());
+                        crate::browser_backend::record_browser_error(
+                            app,
+                            &diagnostics,
+                            &leader_id,
+                            &e.to_string(),
+                        );
                         let _ = app.emit(
                             "boss-message",
                             serde_json::json!({
@@ -1500,6 +1800,202 @@ pub async fn run_agent_loop(
                     }
                 };
                 next_leader_turn = next_leader_turn.saturating_add(1);
+            }
+
+            // ── Hackathon — first-class leader decision ───────────────────────
+            AgentDecision::Hackathon { task_brief } => {
+                let trimmed = task_brief.trim();
+                if trimmed.is_empty() || trimmed.len() > 2000 {
+                    let _ = app.emit(
+                        "boss-message",
+                        serde_json::json!({
+                            "text": "Hackathon request malformed (empty or too long) — continuing without hackathon",
+                            "message_type": "status"
+                        }),
+                    );
+                    // Fallback to Continue
+                    let leader_window = {
+                        let browser = state.browser_state.lock().await;
+                        browser.leader_window.clone().ok_or_else(|| {
+                            AgentError::NavigationFailed(
+                                "leader window not initialised".to_string(),
+                            )
+                        })?
+                    };
+                    early_leader_response = match inject_active_prompt(
+                        leader_window,
+                        &leader_id,
+                        "Hackathon request was malformed; please continue with normal discussion.",
+                        next_leader_turn,
+                        state,
+                        app,
+                        nav_rx,
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let diagnostics = {
+                                let browser = state.browser_state.lock().await;
+                                browser.diagnostics.clone()
+                            };
+                            crate::browser_backend::record_browser_error(
+                                app,
+                                &diagnostics,
+                                &leader_id,
+                                &e.to_string(),
+                            );
+                            return Err(e);
+                        }
+                    };
+                    next_leader_turn = next_leader_turn.saturating_add(1);
+                    continue;
+                }
+
+                let _ = app.emit(
+                    "boss-message",
+                    serde_json::json!({
+                        "text": format!("Leader requested Hackathon: {} — running parallel teams…", trimmed.chars().take(80).collect::<String>()),
+                        "message_type": "status"
+                    }),
+                );
+                let _ = app.emit(
+                    "agent_brain_decision_fallback",
+                    serde_json::json!({
+                        "kind": "hackathon", "task_brief_len": trimmed.len(), "iteration": iteration
+                    }),
+                );
+
+                // Execute hackathon — uses configured groups, server-validated, concurrent
+                let hackathon_result =
+                    crate::hackathon::execute_hackathon(trimmed.to_string(), None, state, app)
+                        .await;
+
+                match hackathon_result {
+                    Ok(report) => {
+                        // Advisory delimited report — leader will evaluate, not auto-blueprint
+                        let delimited = format!(
+                            "=== Hackathon Results ===\n{}\n=== End Hackathon Results ===\n\nThe above is advisory hackathon output from parallel API teams. Synthesize, accept, reject, or build upon it using your normal Blueprint/Route/Continue/Complete logic. The hackathon does not override your authority.",
+                            report
+                        );
+                        // Record fact for memory (best-effort, non-fatal)
+                        {
+                            let memory_store = state.memory_store.clone();
+                            let project_brief = config.project_brief.clone();
+                            let sid = config.session_id.clone();
+                            let tb = trimmed.to_string();
+                            let delimited_len = delimited.len();
+                            let _ = crate::db_helpers::run_blocking(move || {
+                                let mut memory = memory_store
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner());
+                                let _ = memory.add_session_fact(
+                                    &sid,
+                                    &project_brief,
+                                    "hackathon",
+                                    &format!(
+                                        "Hackathon requested: {} — report {} chars",
+                                        tb, delimited_len
+                                    ),
+                                    None,
+                                    "leader",
+                                    "llm",
+                                );
+                                Ok::<(), AgentError>(())
+                            })
+                            .await;
+                            let _ = app.emit(
+                                "memory-updated",
+                                serde_json::json!({"memory_type":"session","trigger":"hackathon"}),
+                            );
+                        }
+                        let leader_window = {
+                            let browser = state.browser_state.lock().await;
+                            browser.leader_window.clone().ok_or_else(|| {
+                                AgentError::NavigationFailed(
+                                    "leader window not initialised".to_string(),
+                                )
+                            })?
+                        };
+                        early_leader_response = match inject_active_prompt(
+                            leader_window,
+                            &leader_id,
+                            &delimited,
+                            next_leader_turn,
+                            state,
+                            app,
+                            nav_rx,
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let diagnostics = {
+                                    let browser = state.browser_state.lock().await;
+                                    browser.diagnostics.clone()
+                                };
+                                crate::browser_backend::record_browser_error(
+                                    app,
+                                    &diagnostics,
+                                    &leader_id,
+                                    &e.to_string(),
+                                );
+                                return Err(e);
+                            }
+                        };
+                        next_leader_turn = next_leader_turn.saturating_add(1);
+                        // Loop continues — leader will now see hackathon report before next decision
+                    }
+                    Err(e) => {
+                        let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Hackathon failed: {} — continuing with normal discussion", e),
+                                "message_type": "status"
+                            }),
+                        );
+                        // Inject failure notice so leader can adapt, then continue
+                        let leader_window = {
+                            let browser = state.browser_state.lock().await;
+                            browser.leader_window.clone().ok_or_else(|| {
+                                AgentError::NavigationFailed(
+                                    "leader window not initialised".to_string(),
+                                )
+                            })?
+                        };
+                        let failure_note = format!(
+                            "[Hackathon attempt failed: {}]\nPlease continue without hackathon output, or retry with a clearer task_brief.",
+                            e
+                        );
+                        early_leader_response = match inject_active_prompt(
+                            leader_window,
+                            &leader_id,
+                            &failure_note,
+                            next_leader_turn,
+                            state,
+                            app,
+                            nav_rx,
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(ie) => {
+                                let diagnostics = {
+                                    let browser = state.browser_state.lock().await;
+                                    browser.diagnostics.clone()
+                                };
+                                crate::browser_backend::record_browser_error(
+                                    app,
+                                    &diagnostics,
+                                    &leader_id,
+                                    &ie.to_string(),
+                                );
+                                return Err(ie);
+                            }
+                        };
+                        next_leader_turn = next_leader_turn.saturating_add(1);
+                    }
+                }
             }
 
             // ── Complete ──────────────────────────────────────────────────
@@ -1702,7 +2198,16 @@ async fn inject_and_wait_with_retry(
             attempt
         );
 
-        if let Err(e) = crate::browser_backend::navigate_agent_window(
+        // Retry idempotency: if already at target URL with composer ready, skip re-navigation which would cause a SPA refresh.
+        let skip_navigate = attempt > 0 && diagnostics.can_skip_navigation_on_retry(target_model, &target_url);
+        if skip_navigate {
+            tracing::info!(
+                "[RETRY] skipping navigation for {} attempt {} — already at {} with composer_detected",
+                target_model,
+                attempt,
+                target_url
+            );
+        } else if let Err(e) = crate::browser_backend::navigate_agent_window(
             app,
             &diagnostics,
             &nav_window,
@@ -1731,11 +2236,14 @@ async fn inject_and_wait_with_retry(
             let mut browser = state.browser_state.lock().await;
             browser.begin_active_turn(target_model, turn);
         }
-        let _ = app.emit("active-turn-state", serde_json::json!({
-            "event": "active_turn_started",
-            "agent_id": target_model,
-            "turn_number": turn,
-        }));
+        let _ = app.emit(
+            "active-turn-state",
+            serde_json::json!({
+                "event": "active_turn_started",
+                "agent_id": target_model,
+                "turn_number": turn,
+            }),
+        );
         match crate::browser_backend::inject_to_window(
             nav_window.clone(),
             target_model,
@@ -1777,60 +2285,72 @@ async fn inject_and_wait_with_retry(
                 continue; // retry
             }
             Ok(()) => {
-                let outcome = confirm_active_submit(
-                    &nav_window,
-                    target_model,
-                    turn,
-                    nav_rx,
-                    app,
-                )
-                .await?;
+                let outcome =
+                    confirm_active_submit(&nav_window, target_model, turn, nav_rx, app).await?;
                 match outcome {
                     SubmitOutcome::ResponseEarly(response) => {
                         finish_active_turn(state, target_model, turn).await;
-                        let _ = app.emit("active-turn-state", serde_json::json!({
-                            "event": "active_response_captured",
-                            "agent_id": target_model,
-                            "turn_number": turn,
-                        }));
-                        let _ = app.emit("agent-message", serde_json::json!({
-                            "agent_id": target_model,
-                            "role": "participant",
-                            "response": &response,
-                            "tokens": 0,
-                            "iteration": turn,
-                            "source_type": "browser_or_manual"
-                        }));
+                        let _ = app.emit(
+                            "active-turn-state",
+                            serde_json::json!({
+                                "event": "active_response_captured",
+                                "agent_id": target_model,
+                                "turn_number": turn,
+                            }),
+                        );
+                        let _ = app.emit(
+                            "agent-message",
+                            serde_json::json!({
+                                "agent_id": target_model,
+                                "role": "participant",
+                                "response": &response,
+                                "tokens": 0,
+                                "iteration": turn,
+                                "source_type": "browser_or_manual"
+                            }),
+                        );
                         update_model_health(state, target_model, true, None).await;
                         return Ok(response);
                     }
                     SubmitOutcome::ManualRecovery => {
                         let browser = state.browser_state.lock().await;
                         browser.mark_active_waiting(target_model, turn);
-                        let _ = app.emit("active-turn-state", serde_json::json!({
-                            "event": "active_prompt_injected",
-                            "agent_id": target_model,
-                            "turn_number": turn,
-                        }));
-                        let _ = app.emit("active-turn-state", serde_json::json!({
-                            "event": "active_waiting_for_response",
-                            "agent_id": target_model,
-                            "turn_number": turn,
-                        }));
+                        let _ = app.emit(
+                            "active-turn-state",
+                            serde_json::json!({
+                                "event": "active_prompt_injected",
+                                "agent_id": target_model,
+                                "turn_number": turn,
+                            }),
+                        );
+                        let _ = app.emit(
+                            "active-turn-state",
+                            serde_json::json!({
+                                "event": "active_waiting_for_response",
+                                "agent_id": target_model,
+                                "turn_number": turn,
+                            }),
+                        );
                     }
                     SubmitOutcome::Confirmed => {
                         let browser = state.browser_state.lock().await;
                         browser.mark_active_waiting(target_model, turn);
-                        let _ = app.emit("active-turn-state", serde_json::json!({
-                            "event": "active_prompt_injected",
-                            "agent_id": target_model,
-                            "turn_number": turn,
-                        }));
-                        let _ = app.emit("active-turn-state", serde_json::json!({
-                            "event": "active_waiting_for_response",
-                            "agent_id": target_model,
-                            "turn_number": turn,
-                        }));
+                        let _ = app.emit(
+                            "active-turn-state",
+                            serde_json::json!({
+                                "event": "active_prompt_injected",
+                                "agent_id": target_model,
+                                "turn_number": turn,
+                            }),
+                        );
+                        let _ = app.emit(
+                            "active-turn-state",
+                            serde_json::json!({
+                                "event": "active_waiting_for_response",
+                                "agent_id": target_model,
+                                "turn_number": turn,
+                            }),
+                        );
                     }
                 }
             }
@@ -1840,30 +2360,39 @@ async fn inject_and_wait_with_retry(
         match wait_for_response(target_model, turn, nav_rx).await {
             Ok(response) => {
                 finish_active_turn(state, target_model, turn).await;
-                let _ = app.emit("active-turn-state", serde_json::json!({
-                    "event": "active_response_captured",
-                    "agent_id": target_model,
-                    "turn_number": turn,
-                }));
-                let _ = app.emit("agent-message", serde_json::json!({
-                    "agent_id": target_model,
-                    "role": "participant",
-                    "response": &response,
-                    "tokens": 0,
-                    "iteration": turn,
-                    "source_type": "browser_or_manual"
-                }));
+                let _ = app.emit(
+                    "active-turn-state",
+                    serde_json::json!({
+                        "event": "active_response_captured",
+                        "agent_id": target_model,
+                        "turn_number": turn,
+                    }),
+                );
+                let _ = app.emit(
+                    "agent-message",
+                    serde_json::json!({
+                        "agent_id": target_model,
+                        "role": "participant",
+                        "response": &response,
+                        "tokens": 0,
+                        "iteration": turn,
+                        "source_type": "browser_or_manual"
+                    }),
+                );
                 // IMP-5: Mark agent healthy on success.
                 update_model_health(state, target_model, true, None).await;
                 return Ok(response);
             }
             Err(e) => {
                 finish_active_turn(state, target_model, turn).await;
-                let _ = app.emit("active-turn-state", serde_json::json!({
-                    "event": "active_turn_timeout",
-                    "agent_id": target_model,
-                    "turn_number": turn,
-                }));
+                let _ = app.emit(
+                    "active-turn-state",
+                    serde_json::json!({
+                        "event": "active_turn_timeout",
+                        "agent_id": target_model,
+                        "turn_number": turn,
+                    }),
+                );
                 if matches!(&e, AgentError::Timeout(_) | AgentError::InjectionFailed(_)) {
                     crate::browser_backend::record_browser_error(
                         app,
@@ -2020,12 +2549,11 @@ async fn wait_for_response(
                                         );
                                         break;
                                     }
-                                    Ok(Some(NavEvent::Ready(req_id)))
-                                        if req_id == agent_id =>
-                                    {
+                                    Ok(Some(NavEvent::Ready(req_id))) if req_id == agent_id => {
                                         tracing::info!(
                                             "[CHALLENGE] {} ready after challenge, continuing wait (turn {})",
-                                            agent_id, turn
+                                            agent_id,
+                                            turn
                                         );
                                         break;
                                     }
@@ -2035,7 +2563,8 @@ async fn wait_for_response(
                                     ))) if ch_id == agent_id => {
                                         tracing::warn!(
                                             "[CHALLENGE] {} still blocked: {}",
-                                            agent_id, next_indicator
+                                            agent_id,
+                                            next_indicator
                                         );
                                         continue;
                                     }
@@ -2054,12 +2583,10 @@ async fn wait_for_response(
                                     Ok(Some(NavEvent::UnshowableUrl(u_id, url)))
                                         if u_id == agent_id =>
                                     {
-                                        return Err(AgentError::NavigationFailed(
-                                            format!(
-                                                "{} navigated to unshowable URL while blocked: {}",
-                                                agent_id, url
-                                            ),
-                                        ));
+                                        return Err(AgentError::NavigationFailed(format!(
+                                            "{} navigated to unshowable URL while blocked: {}",
+                                            agent_id, url
+                                        )));
                                     }
                                     Ok(Some(NavEvent::SessionAborted)) => {
                                         return Err(AgentError::UnknownError(
@@ -2145,40 +2672,66 @@ mod tests {
     #[tokio::test]
     async fn ack_accepts_success_report_for_exact_agent_turn() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(active_submit_report("deepseek", 3, true, None)).await.unwrap();
+        tx.send(active_submit_report("deepseek", 3, true, None))
+            .await
+            .unwrap();
         drop(tx);
         let result = await_submit_ack("deepseek", 3, &mut rx).await;
-        assert!(matches!(result, Ok(None)), "expected Ok(None), got {result:?}");
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None), got {result:?}"
+        );
     }
 
     #[tokio::test]
     async fn ack_rejects_failure_report_for_exact_agent_turn() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(active_submit_report("chatgpt", 2, false, Some("enabled_send_button_not_found_after_retry")))
-            .await
-            .unwrap();
+        tx.send(active_submit_report(
+            "chatgpt",
+            2,
+            false,
+            Some("enabled_send_button_not_found_after_retry"),
+        ))
+        .await
+        .unwrap();
         drop(tx);
         let result = await_submit_ack("chatgpt", 2, &mut rx).await;
-        assert!(matches!(result, Err(AgentError::InjectionFailed(_))), "got {result:?}");
+        assert!(
+            matches!(result, Err(AgentError::InjectionFailed(_))),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]
     async fn ack_skips_stale_reports_from_other_agents_and_turns() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(active_submit_report("deepseek", 3, true, None)).await.unwrap();
-        tx.send(active_submit_report("chatgpt", 1, true, None)).await.unwrap();
-        tx.send(active_submit_report("chatgpt", 2, true, None)).await.unwrap();
+        tx.send(active_submit_report("deepseek", 3, true, None))
+            .await
+            .unwrap();
+        tx.send(active_submit_report("chatgpt", 1, true, None))
+            .await
+            .unwrap();
+        tx.send(active_submit_report("chatgpt", 2, true, None))
+            .await
+            .unwrap();
         drop(tx);
         let result = await_submit_ack("chatgpt", 2, &mut rx).await;
-        assert!(matches!(result, Ok(None)), "expected Ok(None), got {result:?}");
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None), got {result:?}"
+        );
     }
 
     #[tokio::test]
     async fn ack_captures_early_response_for_exact_agent_turn() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(NavEvent::Response("chatgpt".to_string(), 4, "early text".to_string()))
-            .await
-            .unwrap();
+        tx.send(NavEvent::Response(
+            "chatgpt".to_string(),
+            4,
+            "early text".to_string(),
+        ))
+        .await
+        .unwrap();
         drop(tx);
         let result = await_submit_ack("chatgpt", 4, &mut rx).await;
         assert!(
@@ -2211,7 +2764,10 @@ mod tests {
         tx.send(NavEvent::SessionAborted).await.unwrap();
         drop(tx);
         let result = await_submit_ack("chatgpt", 1, &mut rx).await;
-        assert!(matches!(result, Err(AgentError::UnknownError(_))), "got {result:?}");
+        assert!(
+            matches!(result, Err(AgentError::UnknownError(_))),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -2228,14 +2784,25 @@ mod tests {
     #[tokio::test]
     async fn drain_stale_active_events_consumes_pending_signals() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(active_submit_report("chatgpt", 1, false, None)).await.unwrap();
-        tx.send(NavEvent::Ready("chatgpt".to_string())).await.unwrap();
-        tx.send(NavEvent::Response("chatgpt".to_string(), 1, "stale".to_string()))
+        tx.send(active_submit_report("chatgpt", 1, false, None))
             .await
             .unwrap();
+        tx.send(NavEvent::Ready("chatgpt".to_string()))
+            .await
+            .unwrap();
+        tx.send(NavEvent::Response(
+            "chatgpt".to_string(),
+            1,
+            "stale".to_string(),
+        ))
+        .await
+        .unwrap();
         let drained = drain_stale_active_events(&mut rx);
         assert_eq!(drained, 3);
-        assert!(rx.try_recv().is_err(), "channel should be empty after drain");
+        assert!(
+            rx.try_recv().is_err(),
+            "channel should be empty after drain"
+        );
     }
 
     #[tokio::test]
@@ -2255,22 +2822,40 @@ mod tests {
         let turn = 7;
         let handle = tokio::spawn(async move { wait_for_response(agent, turn, &mut rx).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        tx.send(NavEvent::ChallengeDetected(agent.to_string(), "captcha".to_string()))
+        tx.send(NavEvent::ChallengeDetected(
+            agent.to_string(),
+            "captcha".to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "should still be waiting for ResumeRequested"
+        );
+        tx.send(NavEvent::ResumeRequested(agent.to_string()))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!handle.is_finished(), "should still be waiting for ResumeRequested");
-        tx.send(NavEvent::ResumeRequested(agent.to_string())).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!handle.is_finished(), "should still be waiting for Response after resume");
-        tx.send(NavEvent::Response(agent.to_string(), turn, "hello".to_string()))
-            .await
-            .unwrap();
+        assert!(
+            !handle.is_finished(),
+            "should still be waiting for Response after resume"
+        );
+        tx.send(NavEvent::Response(
+            agent.to_string(),
+            turn,
+            "hello".to_string(),
+        ))
+        .await
+        .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("wait_for_response should complete after resume+response")
             .unwrap();
-        assert!(matches!(result, Ok(ref text) if text == "hello"), "got {result:?}");
+        assert!(
+            matches!(result, Ok(ref text) if text == "hello"),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -2280,9 +2865,12 @@ mod tests {
         let turn = 3;
         let handle = tokio::spawn(async move { wait_for_response(agent, turn, &mut rx).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        tx.send(NavEvent::ChallengeDetected(agent.to_string(), "login required".to_string()))
-            .await
-            .unwrap();
+        tx.send(NavEvent::ChallengeDetected(
+            agent.to_string(),
+            "login required".to_string(),
+        ))
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         tx.send(NavEvent::ManualResponse {
             agent_id: agent.to_string(),
@@ -2295,7 +2883,10 @@ mod tests {
             .await
             .expect("should resolve via ManualResponse during challenge wait")
             .unwrap();
-        assert!(matches!(result, Ok(ref t) if t == "pasted"), "got {result:?}");
+        assert!(
+            matches!(result, Ok(ref t) if t == "pasted"),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -2305,9 +2896,12 @@ mod tests {
         let turn = 2;
         let handle = tokio::spawn(async move { wait_for_response(agent, turn, &mut rx).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        tx.send(NavEvent::ChallengeDetected(agent.to_string(), "captcha".to_string()))
-            .await
-            .unwrap();
+        tx.send(NavEvent::ChallengeDetected(
+            agent.to_string(),
+            "captcha".to_string(),
+        ))
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         tx.send(NavEvent::SessionAborted).await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
@@ -2327,14 +2921,24 @@ mod tests {
         let turn = 5;
         let handle = tokio::spawn(async move { wait_for_response(agent, turn, &mut rx).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        tx.send(NavEvent::ChallengeDetected("other".to_string(), "captcha".to_string()))
-            .await
-            .unwrap();
+        tx.send(NavEvent::ChallengeDetected(
+            "other".to_string(),
+            "captcha".to_string(),
+        ))
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!handle.is_finished(), "challenge for other agent should be ignored");
-        tx.send(NavEvent::Response(agent.to_string(), turn, "ok".to_string()))
-            .await
-            .unwrap();
+        assert!(
+            !handle.is_finished(),
+            "challenge for other agent should be ignored"
+        );
+        tx.send(NavEvent::Response(
+            agent.to_string(),
+            turn,
+            "ok".to_string(),
+        ))
+        .await
+        .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .unwrap()
@@ -2346,12 +2950,19 @@ mod tests {
     async fn wait_for_response_normal_timeout_is_not_captcha() {
         let (_tx, mut rx) = tokio::sync::mpsc::channel::<NavEvent>(8);
         // No events — wait_for_response should timeout with Timeout, not CaptchaRequired
-        let result = tokio::time::timeout(Duration::from_millis(350), wait_for_response("chatgpt", 1, &mut rx)).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(350),
+            wait_for_response("chatgpt", 1, &mut rx),
+        )
+        .await;
         // The inner timeout is 300s, so the outer 350ms timeout will hit first — we just verify
         // that without any ChallengeDetected, the error kind is Timeout when it eventually fires.
         // For a fast deterministic check, we instead verify that an immediate Response works and
         // that a Challenge for other agent does not turn into CaptchaRequired.
-        assert!(result.is_err(), "outer timeout should hit before inner 300s");
+        assert!(
+            result.is_err(),
+            "outer timeout should hit before inner 300s"
+        );
         // Directly verify classification: a normal wait that times out is Timeout, not CaptchaRequired
         // (this is covered by the existing is_ignored test and by the fact that only ChallengeDetected
         // produces CaptchaRequired).
@@ -2370,10 +2981,17 @@ mod tests {
             selected_agent_ids: vec!["chatgpt".to_string()],
             setup_order: vec!["chatgpt".to_string()],
         });
-        diagnostics.register("chatgpt", crate::browser_backend::LEADER_WINDOW_LABEL, "leader");
+        diagnostics.register(
+            "chatgpt",
+            crate::browser_backend::LEADER_WINDOW_LABEL,
+            "leader",
+        );
         diagnostics.set_active(crate::browser_backend::LEADER_WINDOW_LABEL, "chatgpt");
         // Simulate empty-shell classification
-        diagnostics.set_page_state_hint_for_test("chatgpt", Some("empty_shell_or_hydration_stuck".to_string()));
+        diagnostics.set_page_state_hint_for_test(
+            "chatgpt",
+            Some("empty_shell_or_hydration_stuck".to_string()),
+        );
         let err = AgentError::Timeout("readiness timeout".to_string());
         assert!(
             !super::should_retry_after_failure(&err, &diagnostics, "chatgpt", 0),
@@ -2424,13 +3042,37 @@ mod tests {
             selected_agent_ids: vec!["chatgpt".to_string()],
             setup_order: vec!["chatgpt".to_string()],
         });
-        diagnostics.register("chatgpt", crate::browser_backend::LEADER_WINDOW_LABEL, "leader");
+        diagnostics.register(
+            "chatgpt",
+            crate::browser_backend::LEADER_WINDOW_LABEL,
+            "leader",
+        );
         let perm = AgentError::CaptchaRequired("captcha".to_string());
-        assert!(!super::should_retry_after_failure(&perm, &diagnostics, "chatgpt", 0));
-        assert!(!super::should_retry_after_failure(&perm, &diagnostics, "chatgpt", 1));
+        assert!(!super::should_retry_after_failure(
+            &perm,
+            &diagnostics,
+            "chatgpt",
+            0
+        ));
+        assert!(!super::should_retry_after_failure(
+            &perm,
+            &diagnostics,
+            "chatgpt",
+            1
+        ));
         let transient = AgentError::Timeout("t".to_string());
-        assert!(!super::should_retry_after_failure(&transient, &diagnostics, "chatgpt", super::MAX_RETRIES));
-        assert!(!super::should_retry_after_failure(&transient, &diagnostics, "chatgpt", super::MAX_RETRIES + 1));
+        assert!(!super::should_retry_after_failure(
+            &transient,
+            &diagnostics,
+            "chatgpt",
+            super::MAX_RETRIES
+        ));
+        assert!(!super::should_retry_after_failure(
+            &transient,
+            &diagnostics,
+            "chatgpt",
+            super::MAX_RETRIES + 1
+        ));
     }
 
     #[test]
@@ -2445,9 +3087,17 @@ mod tests {
             setup_order: vec!["qwen".to_string()],
         });
         diagnostics.register("qwen", crate::browser_backend::NAV_WINDOW_LABEL, "nav");
-        diagnostics.set_page_state_hint_for_test("qwen", Some("empty_shell_or_hydration_stuck".to_string()));
+        diagnostics.set_page_state_hint_for_test(
+            "qwen",
+            Some("empty_shell_or_hydration_stuck".to_string()),
+        );
         // Even if error is considered transient, empty-shell overrides
         let err = AgentError::Timeout("timeout".to_string());
-        assert!(!super::should_retry_after_failure(&err, &diagnostics, "qwen", 0));
+        assert!(!super::should_retry_after_failure(
+            &err,
+            &diagnostics,
+            "qwen",
+            0
+        ));
     }
 }

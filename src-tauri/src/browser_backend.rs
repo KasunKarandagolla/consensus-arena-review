@@ -1,5 +1,6 @@
 use crate::browser_harness::{
-    self, ActionRecord, ActionTarget, BoundingRect, BrowserEvent, BrowserTimeline, EventType, NavigationIntent, PageLifecycleEvent, SafeDomForensics, SafeElement,
+    self, ActionRecord, ActionTarget, BoundingRect, BrowserEvent, BrowserTimeline, EventType,
+    NavigationIntent, PageLifecycleEvent, SafeDomForensics, SafeElement,
 };
 use crate::errors::AgentError;
 use serde::Serialize;
@@ -12,8 +13,12 @@ pub type AsyncNavReceiver<T> = sync::mpsc::Receiver<T>;
 
 pub const LEADER_WINDOW_LABEL: &str = "arena-leader";
 pub const NAV_WINDOW_LABEL: &str = "arena-nav";
-pub const READINESS_TIMEOUT_MS: u32 = 45_000;
-pub const READINESS_WAIT_TIMEOUT_SECS: u64 = 50;
+// Priming refresh timeout — doubled (45s → 90s / 50s → 100s) to allow slow Celeron/WebKit hydrate, login and challenge flows before retry.
+// READINESS_TIMEOUT_MS: JS GENERIC_INIT_SCRIPT checkReady probe timeout before arena://ready/error-*
+// READINESS_WAIT_TIMEOUT_SECS: Rust wait_for_setup_ready tokio::timeout awaiting that signal
+pub const READINESS_TIMEOUT_MS: u32 = 90_000;
+pub const READINESS_WAIT_TIMEOUT_SECS: u64 = 100;
+pub const CHROME_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 pub const MAX_CONSOLE_DIAGNOSTICS_PER_AGENT: usize = 20;
 pub const MAX_CONSOLE_MESSAGE_LENGTH: usize = 2048;
 pub const CONSOLE_DEDUP_WINDOW_SECS: u64 = 30;
@@ -180,10 +185,13 @@ pub struct BrowserDiagnostics {
     current_operation: Arc<Mutex<HashMap<String, String>>>,
     current_phase: Arc<Mutex<HashMap<String, String>>>,
     // Cross-platform forensics extensions (§4-9, §17) — bounded 100 per agent
-    pub navigation_intents: Arc<Mutex<HashMap<String, std::collections::VecDeque<NavigationIntent>>>>,
-    pub lifecycle_events: Arc<Mutex<HashMap<String, std::collections::VecDeque<PageLifecycleEvent>>>>,
+    pub navigation_intents:
+        Arc<Mutex<HashMap<String, std::collections::VecDeque<NavigationIntent>>>>,
+    pub lifecycle_events:
+        Arc<Mutex<HashMap<String, std::collections::VecDeque<PageLifecycleEvent>>>>,
     pub action_records: Arc<Mutex<HashMap<String, std::collections::VecDeque<ActionRecord>>>>,
-    pub safe_dom_snapshots: Arc<Mutex<HashMap<String, std::collections::VecDeque<SafeDomForensics>>>>,
+    pub safe_dom_snapshots:
+        Arc<Mutex<HashMap<String, std::collections::VecDeque<SafeDomForensics>>>>,
 }
 
 impl BrowserDiagnostics {
@@ -203,7 +211,14 @@ impl BrowserDiagnostics {
         }
     }
 
-    pub fn record_navigation_intent(&self, agent_id: &str, window_label: &str, window_kind: &str, url: &str, reason: &str) -> String {
+    pub fn record_navigation_intent(
+        &self,
+        agent_id: &str,
+        window_label: &str,
+        window_kind: &str,
+        url: &str,
+        reason: &str,
+    ) -> String {
         let intent_id = crate::browser_harness::new_navigation_intent_id();
         let generation = self.setup_generation();
         let operation_id = self.current_operation_id(agent_id);
@@ -218,8 +233,13 @@ impl BrowserDiagnostics {
             setup_generation: generation,
             operation_id: operation_id.clone(),
         };
-        let mut map = self.navigation_intents.lock().unwrap_or_else(|p| p.into_inner());
-        let deque = map.entry(agent_id.to_string()).or_insert_with(std::collections::VecDeque::new);
+        let mut map = self
+            .navigation_intents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let deque = map
+            .entry(agent_id.to_string())
+            .or_insert_with(std::collections::VecDeque::new);
         if deque.len() >= crate::browser_harness::MAX_NAVIGATION_INTENT_RECORDS_PER_AGENT {
             deque.pop_front();
         }
@@ -231,7 +251,13 @@ impl BrowserDiagnostics {
     pub fn record_lifecycle_event(&self, agent_id: &str, event_type: &str, url: &str, title: &str) {
         let generation = self.setup_generation();
         let operation_id = self.current_operation_id(agent_id);
-        let window_info = self.records.lock().unwrap_or_else(|p| p.into_inner()).get(agent_id).map(|r| (r.window_label.clone(), r.window_kind.clone())).unwrap_or(("unknown".to_string(), "nav".to_string()));
+        let window_info = self
+            .records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .map(|r| (r.window_label.clone(), r.window_kind.clone()))
+            .unwrap_or(("unknown".to_string(), "nav".to_string()));
         let ev = PageLifecycleEvent {
             event_type: event_type.to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -243,8 +269,13 @@ impl BrowserDiagnostics {
             setup_generation: generation,
             operation_id: operation_id.clone(),
         };
-        let mut map = self.lifecycle_events.lock().unwrap_or_else(|p| p.into_inner());
-        let deque = map.entry(agent_id.to_string()).or_insert_with(std::collections::VecDeque::new);
+        let mut map = self
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let deque = map
+            .entry(agent_id.to_string())
+            .or_insert_with(std::collections::VecDeque::new);
         if deque.len() >= crate::browser_harness::MAX_LIFECYCLE_RECORDS_PER_AGENT {
             deque.pop_front();
         }
@@ -264,18 +295,43 @@ impl BrowserDiagnostics {
     }
 
     pub fn record_safe_dom_forensics(&self, agent_id: &str, forensics: SafeDomForensics) {
-        let mut map = self.safe_dom_snapshots.lock().unwrap_or_else(|p| p.into_inner());
-        let deque = map.entry(agent_id.to_string()).or_insert_with(std::collections::VecDeque::new);
+        let mut map = self
+            .safe_dom_snapshots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let deque = map
+            .entry(agent_id.to_string())
+            .or_insert_with(std::collections::VecDeque::new);
         if deque.len() >= crate::browser_harness::MAX_SAFE_DOM_SNAPSHOTS_PER_AGENT {
             deque.pop_front();
         }
         deque.push_back(forensics.clone());
-        self.emit_harness_event(agent_id, EventType::DomSnapshot, &self.current_phase_str(agent_id), &forensics.operation_id, &forensics.url, serde_json::to_value(&forensics).unwrap_or(serde_json::Value::Null));
+        self.emit_harness_event(
+            agent_id,
+            EventType::DomSnapshot,
+            &self.current_phase_str(agent_id),
+            &forensics.operation_id,
+            &forensics.url,
+            serde_json::to_value(&forensics).unwrap_or(serde_json::Value::Null),
+        );
     }
 
-    pub fn record_action(&self, agent_id: &str, action: &str, actor: &str, reason: &str, target: ActionTarget) {
+    pub fn record_action(
+        &self,
+        agent_id: &str,
+        action: &str,
+        actor: &str,
+        reason: &str,
+        target: ActionTarget,
+    ) {
         let operation_id = self.current_operation_id(agent_id);
-        let window_info = self.records.lock().unwrap_or_else(|p| p.into_inner()).get(agent_id).map(|r| (r.window_label.clone(), r.window_kind.clone())).unwrap_or(("unknown".to_string(), "nav".to_string()));
+        let window_info = self
+            .records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .map(|r| (r.window_label.clone(), r.window_kind.clone()))
+            .unwrap_or(("unknown".to_string(), "nav".to_string()));
         let rec = ActionRecord {
             action: action.to_string(),
             actor: actor.to_string(),
@@ -287,8 +343,13 @@ impl BrowserDiagnostics {
             target: target.clone(),
             operation_id: operation_id.clone(),
         };
-        let mut map = self.action_records.lock().unwrap_or_else(|p| p.into_inner());
-        let deque = map.entry(agent_id.to_string()).or_insert_with(std::collections::VecDeque::new);
+        let mut map = self
+            .action_records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let deque = map
+            .entry(agent_id.to_string())
+            .or_insert_with(std::collections::VecDeque::new);
         if deque.len() >= crate::browser_harness::MAX_ACTION_RECORDS_PER_AGENT {
             deque.pop_front();
         }
@@ -311,7 +372,14 @@ impl BrowserDiagnostics {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(agent_id.to_string(), phase.to_string());
-        let _ = self.emit_timeline(agent_id, EventType::StateChanged, phase, operation_id, "", serde_json::json!({ "operation_set": operation_id }));
+        let _ = self.emit_timeline(
+            agent_id,
+            EventType::StateChanged,
+            phase,
+            operation_id,
+            "",
+            serde_json::json!({ "operation_set": operation_id }),
+        );
     }
 
     pub fn clear_operation(&self, agent_id: &str) {
@@ -374,11 +442,18 @@ impl BrowserDiagnostics {
             .get(agent_id)
             .cloned();
         let (window_label, window_kind, display_name) = if let Some(r) = record_opt.as_ref() {
-            (r.window_label.clone(), r.window_kind.clone(), r.display_name.clone())
+            (
+                r.window_label.clone(),
+                r.window_kind.clone(),
+                r.display_name.clone(),
+            )
         } else {
             // fallback before register
             let cfg = get_agent_config(agent_id);
-            let intended = cfg.map(|c| c.display_name).unwrap_or("Unknown Model").to_string();
+            let intended = cfg
+                .map(|c| c.display_name)
+                .unwrap_or("Unknown Model")
+                .to_string();
             ("unknown".to_string(), "nav".to_string(), intended)
         };
         let session_id = metadata.session_id.clone();
@@ -397,7 +472,12 @@ impl BrowserDiagnostics {
             record_opt
                 .as_ref()
                 .and_then(|r| r.last_navigation_url.clone())
-                .unwrap_or_else(|| record_opt.as_ref().map(|r| r.intended_url.clone()).unwrap_or_default())
+                .unwrap_or_else(|| {
+                    record_opt
+                        .as_ref()
+                        .map(|r| r.intended_url.clone())
+                        .unwrap_or_default()
+                })
         } else {
             url.to_string()
         };
@@ -427,9 +507,30 @@ impl BrowserDiagnostics {
         phase: &str,
     ) {
         let details = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
-        let _ = self.emit_timeline(agent_id, EventType::DomSnapshot, phase, operation_id, "", details);
-        let _ = self.emit_timeline(agent_id, EventType::ComposerSnapshot, phase, operation_id, "", serde_json::json!({ "composer": snapshot.composer }));
-        let _ = self.emit_timeline(agent_id, EventType::SendSnapshot, phase, operation_id, "", serde_json::json!({ "send": snapshot.send }));
+        let _ = self.emit_timeline(
+            agent_id,
+            EventType::DomSnapshot,
+            phase,
+            operation_id,
+            "",
+            details,
+        );
+        let _ = self.emit_timeline(
+            agent_id,
+            EventType::ComposerSnapshot,
+            phase,
+            operation_id,
+            "",
+            serde_json::json!({ "composer": snapshot.composer }),
+        );
+        let _ = self.emit_timeline(
+            agent_id,
+            EventType::SendSnapshot,
+            phase,
+            operation_id,
+            "",
+            serde_json::json!({ "send": snapshot.send }),
+        );
     }
 
     pub fn emit_harness_event(
@@ -501,9 +602,24 @@ impl BrowserDiagnostics {
         // Emit window_created timeline for each agent in setup_order
         for agent_id in &metadata.setup_order {
             let op = browser_harness::operation_id_setup(agent_id, metadata.setup_generation);
-            let window_kind = if agent_id == &metadata.selected_leader_id { "leader" } else { "nav" };
-            let window_label = if window_kind == "leader" { LEADER_WINDOW_LABEL } else { NAV_WINDOW_LABEL };
-            let _ = self.emit_timeline(agent_id, EventType::WindowCreated, "setup", &op, "", serde_json::json!({ "setup_generation": metadata.setup_generation }));
+            let window_kind = if agent_id == &metadata.selected_leader_id {
+                "leader"
+            } else {
+                "nav"
+            };
+            let window_label = if window_kind == "leader" {
+                LEADER_WINDOW_LABEL
+            } else {
+                NAV_WINDOW_LABEL
+            };
+            let _ = self.emit_timeline(
+                agent_id,
+                EventType::WindowCreated,
+                "setup",
+                &op,
+                "",
+                serde_json::json!({ "setup_generation": metadata.setup_generation }),
+            );
             // also emit navigation_started expected
             let _ = self.emit_timeline(agent_id, EventType::NavigationStarted, "setup", &op, "", serde_json::json!({ "intended_url": get_agent_config(agent_id).map(|c| c.base_url).unwrap_or_default(), "window_label": window_label, "window_kind": window_kind }));
         }
@@ -523,84 +639,85 @@ impl BrowserDiagnostics {
             .records
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let record = records
-            .entry(agent_id.to_string())
-            .or_insert_with(|| BrowserDiagnosticRecord {
-                agent_id: agent_id.to_string(),
-                display_name: display_name_for(agent_id).to_string(),
-                setup_generation: metadata.setup_generation,
-                session_id: metadata.session_id.clone(),
-                selected_leader_id: metadata.selected_leader_id.clone(),
-                selected_agent_ids: metadata.selected_agent_ids.clone(),
-                setup_order: metadata.setup_order.clone(),
-                intended_url: intended_url.to_string(),
-                window_label: window_label.to_string(),
-                window_kind: window_kind.to_string(),
-                assigned_window_label: window_label.to_string(),
-                assigned_window_kind: window_kind.to_string(),
-                is_selected_leader,
-                created_at: now_timestamp(),
-                last_navigation_url: None,
-                last_ready_at: None,
-                last_send_detected_at: None,
-                last_response_at: None,
-                last_error: None,
-                current_phase: "unknown".to_string(),
-                last_blocker: "none".to_string(),
-                last_blocker_url_redacted: None,
-                last_challenge_detected_at: None,
-                resume_attempt_count: 0,
-                last_resume_at: None,
-                input_found: false,
-                send_button_found: false,
-                last_send_probe_at: None,
-                last_user_submit_event_at: None,
-                last_message_count_seen: None,
-                sent_signal_emitted: false,
-                expected_agent_id: None,
-                last_signal_agent_id: None,
-                last_signal_type: None,
-                last_signal_at: None,
-                stale_signal_count: 0,
-                response_observed_before_send: false,
-                response_observed_after_injection: false,
-                setup_completion_reason: None,
-                prompt_injected_at: None,
-                prompt_injection_error: None,
-                prompt_injection_method: None,
-                prompt_visible_prefix_ok: None,
-                prompt_visible_suffix_ok: None,
-                prompt_visible_length: None,
-                send_button_enabled_after_injection: None,
-                injection_target_tag: None,
-                injection_target_role: None,
-                injection_target_contenteditable: None,
-                readiness_timeout_ms: None,
-                readiness_probe_count: None,
-                input_candidate_count: None,
-                composer_candidate_count: None,
-                send_button_candidate_count: None,
-                page_state_hint: None,
-                page_health_hint: None,
-                active_expected_agent_id: None,
-                active_turn_number: None,
-                last_active_prompt_injected_at: None,
-                last_active_response_at: None,
-                active_auto_submit_attempted: false,
-                active_auto_submit_succeeded: None,
-                active_auto_submit_method: None,
-                active_send_button_enabled_before_submit: None,
-                active_submit_error: None,
-                active_submit_at: None,
-                console_diagnostics: Vec::new(),
-                browser_console_error_count: 0,
-                browser_console_warning_count: 0,
-                browser_console_last_error_at: None,
-                navigation_diagnostics: Vec::new(),
-                setup_navigation_recovery_count: 0,
-                last_navigation: None,
-                user_agent: None,
-            });
+        let record =
+            records
+                .entry(agent_id.to_string())
+                .or_insert_with(|| BrowserDiagnosticRecord {
+                    agent_id: agent_id.to_string(),
+                    display_name: display_name_for(agent_id).to_string(),
+                    setup_generation: metadata.setup_generation,
+                    session_id: metadata.session_id.clone(),
+                    selected_leader_id: metadata.selected_leader_id.clone(),
+                    selected_agent_ids: metadata.selected_agent_ids.clone(),
+                    setup_order: metadata.setup_order.clone(),
+                    intended_url: intended_url.to_string(),
+                    window_label: window_label.to_string(),
+                    window_kind: window_kind.to_string(),
+                    assigned_window_label: window_label.to_string(),
+                    assigned_window_kind: window_kind.to_string(),
+                    is_selected_leader,
+                    created_at: now_timestamp(),
+                    last_navigation_url: None,
+                    last_ready_at: None,
+                    last_send_detected_at: None,
+                    last_response_at: None,
+                    last_error: None,
+                    current_phase: "unknown".to_string(),
+                    last_blocker: "none".to_string(),
+                    last_blocker_url_redacted: None,
+                    last_challenge_detected_at: None,
+                    resume_attempt_count: 0,
+                    last_resume_at: None,
+                    input_found: false,
+                    send_button_found: false,
+                    last_send_probe_at: None,
+                    last_user_submit_event_at: None,
+                    last_message_count_seen: None,
+                    sent_signal_emitted: false,
+                    expected_agent_id: None,
+                    last_signal_agent_id: None,
+                    last_signal_type: None,
+                    last_signal_at: None,
+                    stale_signal_count: 0,
+                    response_observed_before_send: false,
+                    response_observed_after_injection: false,
+                    setup_completion_reason: None,
+                    prompt_injected_at: None,
+                    prompt_injection_error: None,
+                    prompt_injection_method: None,
+                    prompt_visible_prefix_ok: None,
+                    prompt_visible_suffix_ok: None,
+                    prompt_visible_length: None,
+                    send_button_enabled_after_injection: None,
+                    injection_target_tag: None,
+                    injection_target_role: None,
+                    injection_target_contenteditable: None,
+                    readiness_timeout_ms: None,
+                    readiness_probe_count: None,
+                    input_candidate_count: None,
+                    composer_candidate_count: None,
+                    send_button_candidate_count: None,
+                    page_state_hint: None,
+                    page_health_hint: None,
+                    active_expected_agent_id: None,
+                    active_turn_number: None,
+                    last_active_prompt_injected_at: None,
+                    last_active_response_at: None,
+                    active_auto_submit_attempted: false,
+                    active_auto_submit_succeeded: None,
+                    active_auto_submit_method: None,
+                    active_send_button_enabled_before_submit: None,
+                    active_submit_error: None,
+                    active_submit_at: None,
+                    console_diagnostics: Vec::new(),
+                    browser_console_error_count: 0,
+                    browser_console_warning_count: 0,
+                    browser_console_last_error_at: None,
+                    navigation_diagnostics: Vec::new(),
+                    setup_navigation_recovery_count: 0,
+                    last_navigation: None,
+                    user_agent: None,
+                });
         record.display_name = display_name_for(agent_id).to_string();
         record.setup_generation = metadata.setup_generation;
         record.session_id = metadata.session_id;
@@ -643,16 +760,22 @@ impl BrowserDiagnostics {
     }
 
     pub fn prompt_already_visible(&self, agent_id: &str) -> bool {
-        self.records.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.records
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
             .get(agent_id)
-            .map(|record| record.prompt_injected_at.is_some()
-                && record.prompt_visible_prefix_ok == Some(true)
-                && record.prompt_visible_suffix_ok == Some(true))
+            .map(|record| {
+                record.prompt_injected_at.is_some()
+                    && record.prompt_visible_prefix_ok == Some(true)
+                    && record.prompt_visible_suffix_ok == Some(true)
+            })
             .unwrap_or(false)
     }
 
     pub fn setup_completed(&self, agent_id: &str) -> bool {
-        self.records.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.records
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
             .get(agent_id)
             .and_then(|record| record.setup_completion_reason.as_ref())
             .is_some()
@@ -671,14 +794,21 @@ impl BrowserDiagnostics {
     }
 
     pub fn has_pending_user_submit(&self, agent_id: &str) -> bool {
-        self.records.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.records
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
             .get(agent_id)
-            .map(|record| record.last_user_submit_event_at.is_some() && record.last_send_detected_at.is_none())
+            .map(|record| {
+                record.last_user_submit_event_at.is_some() && record.last_send_detected_at.is_none()
+            })
             .unwrap_or(false)
     }
 
     pub fn mark_setup_failed_recoverable(&self) -> Option<String> {
-        let mut records = self.records.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let record = records.values_mut().find(|record| {
             record.expected_agent_id.as_deref() == Some(record.agent_id.as_str())
                 && record.setup_completion_reason.is_none()
@@ -796,7 +926,10 @@ impl BrowserDiagnostics {
         );
     }
 
-    fn consume_pending_arena_navigation(&self, window_label: &str) -> Option<PendingArenaNavigation> {
+    fn consume_pending_arena_navigation(
+        &self,
+        window_label: &str,
+    ) -> Option<PendingArenaNavigation> {
         self.pending_arena_navigations
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -829,7 +962,10 @@ impl BrowserDiagnostics {
                 let url_match = entry.requested_url == to_url_sanitized
                     || to_url_sanitized.starts_with(&entry.requested_url)
                     || entry.requested_url.starts_with(&to_url_sanitized);
-                if elapsed < ARENA_NAVIGATION_CORRELATION_SECS && entry.agent_id == agent_id && url_match {
+                if elapsed < ARENA_NAVIGATION_CORRELATION_SECS
+                    && entry.agent_id == agent_id
+                    && url_match
+                {
                     cause = "arena_requested";
                     arena_requested = true;
                 } else if elapsed < ARENA_NAVIGATION_CORRELATION_SECS {
@@ -849,7 +985,10 @@ impl BrowserDiagnostics {
             }
         }
         // If not arena_requested and from != to, it's likely page-initiated
-        if !arena_requested && !from_url_sanitized.is_empty() && from_url_sanitized != to_url_sanitized {
+        if !arena_requested
+            && !from_url_sanitized.is_empty()
+            && from_url_sanitized != to_url_sanitized
+        {
             cause = "page_initiated";
         }
         let setup_generation = self
@@ -857,7 +996,12 @@ impl BrowserDiagnostics {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .setup_generation;
-        let window_kind = if window_label == LEADER_WINDOW_LABEL { "leader" } else { "nav" }.to_string();
+        let window_kind = if window_label == LEADER_WINDOW_LABEL {
+            "leader"
+        } else {
+            "nav"
+        }
+        .to_string();
         let entry = NavigationDiagnosticEntry {
             timestamp: now_timestamp(),
             agent_id: agent_id.clone(),
@@ -875,7 +1019,8 @@ impl BrowserDiagnostics {
         if let Some(record) = records.get_mut(&agent_id) {
             record.navigation_diagnostics.push(entry.clone());
             if record.navigation_diagnostics.len() > MAX_NAVIGATION_DIAGNOSTICS_PER_AGENT {
-                let excess = record.navigation_diagnostics.len() - MAX_NAVIGATION_DIAGNOSTICS_PER_AGENT;
+                let excess =
+                    record.navigation_diagnostics.len() - MAX_NAVIGATION_DIAGNOSTICS_PER_AGENT;
                 record.navigation_diagnostics.drain(0..excess);
             }
             record.last_navigation = Some(entry.clone());
@@ -900,7 +1045,8 @@ impl BrowserDiagnostics {
     pub fn increment_setup_navigation_recovery(&self, agent_id: &str) -> u32 {
         let mut records = self.records.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(record) = records.get_mut(agent_id) {
-            record.setup_navigation_recovery_count = record.setup_navigation_recovery_count.saturating_add(1);
+            record.setup_navigation_recovery_count =
+                record.setup_navigation_recovery_count.saturating_add(1);
             return record.setup_navigation_recovery_count;
         }
         0
@@ -923,11 +1069,18 @@ impl BrowserDiagnostics {
     }
 
     pub fn has_recent_unexpected_navigation(&self, agent_id: &str, within_secs: u64) -> bool {
-        let setup_generation = self.metadata.lock().unwrap_or_else(|p| p.into_inner()).setup_generation;
+        let setup_generation = self
+            .metadata
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .setup_generation;
         let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(rec) = records.get(agent_id) {
             if let Some(nav) = rec.last_navigation.as_ref() {
-                if nav.cause == "page_initiated" && !nav.arena_requested && nav.setup_generation == setup_generation {
+                if nav.cause == "page_initiated"
+                    && !nav.arena_requested
+                    && nav.setup_generation == setup_generation
+                {
                     if let Ok(dt) = nav.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
                         return (chrono::Utc::now() - dt).num_seconds() < within_secs as i64;
                     }
@@ -939,7 +1092,9 @@ impl BrowserDiagnostics {
 
     pub fn last_navigation_for(&self, agent_id: &str) -> Option<NavigationDiagnosticEntry> {
         let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
-        records.get(agent_id).and_then(|r| r.last_navigation.clone())
+        records
+            .get(agent_id)
+            .and_then(|r| r.last_navigation.clone())
     }
 
     /// W1-C: check whether the last classified page state for this agent is an
@@ -965,6 +1120,33 @@ impl BrowserDiagnostics {
             .unwrap_or_else(|p| p.into_inner())
             .get(agent_id)
             .and_then(|r| r.page_state_hint.clone())
+    }
+
+    /// Idempotency guard for retry: if a response was already observed after prompt injection for this agent,
+    /// a retry would duplicate the prompt. This is true when the last signal for this agent was a response/done
+    /// after the most recent prompt_injected_at.
+    pub fn has_response_observed_after_injection(&self, agent_id: &str) -> bool {
+        let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(rec) = records.get(agent_id) {
+            return rec.response_observed_after_injection;
+        }
+        false
+    }
+
+    /// Heuristic: composer already detected at last navigation URL means we may skip re-navigation on retry
+    /// if the target URL is already the last real navigation URL and page hint is composer_detected.
+    pub fn can_skip_navigation_on_retry(&self, agent_id: &str, target_url: &str) -> bool {
+        let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(rec) = records.get(agent_id) {
+            let same_url = rec
+                .last_navigation_url
+                .as_deref()
+                .map(|u| u == target_url)
+                .unwrap_or(false);
+            let composer_ready = rec.page_state_hint.as_deref() == Some("composer_detected");
+            return same_url && composer_ready;
+        }
+        false
     }
 
     #[cfg(test)]
@@ -1213,7 +1395,14 @@ pub fn record_browser_blocker(
 
 pub fn record_browser_resume(app: &AppHandle, diagnostics: &BrowserDiagnostics, agent_id: &str) {
     let op = diagnostics.current_operation_id(agent_id);
-    diagnostics.emit_harness_event(agent_id, EventType::RetryStarted, "navigation_started", &op, "", serde_json::json!({ "resume_attempt": true }));
+    diagnostics.emit_harness_event(
+        agent_id,
+        EventType::RetryStarted,
+        "navigation_started",
+        &op,
+        "",
+        serde_json::json!({ "resume_attempt": true }),
+    );
     if let Some(record) = update_diagnostic(diagnostics, agent_id, |record| {
         record.resume_attempt_count = record.resume_attempt_count.saturating_add(1);
         record.last_resume_at = Some(now_timestamp());
@@ -1238,8 +1427,22 @@ pub fn record_setup_expected_agent(diagnostics: &BrowserDiagnostics, agent_id: &
     let generation = diagnostics.setup_generation();
     let op = browser_harness::operation_id_priming(agent_id, generation);
     diagnostics.set_operation(agent_id, &op, "priming");
-    diagnostics.emit_harness_event(agent_id, EventType::PrimingStarted, "priming", &op, "", serde_json::json!({ "agent_id": agent_id }));
-    diagnostics.emit_harness_event(agent_id, EventType::ComposerProbeStarted, "priming", &op, "", serde_json::json!({}));
+    diagnostics.emit_harness_event(
+        agent_id,
+        EventType::PrimingStarted,
+        "priming",
+        &op,
+        "",
+        serde_json::json!({ "agent_id": agent_id }),
+    );
+    diagnostics.emit_harness_event(
+        agent_id,
+        EventType::ComposerProbeStarted,
+        "priming",
+        &op,
+        "",
+        serde_json::json!({}),
+    );
 }
 
 pub fn record_prompt_injected(diagnostics: &BrowserDiagnostics, agent_id: &str) {
@@ -1251,7 +1454,14 @@ pub fn record_prompt_injected(diagnostics: &BrowserDiagnostics, agent_id: &str) 
         record.setup_completion_reason = None;
     });
     let op = diagnostics.current_operation_id(agent_id);
-    diagnostics.emit_harness_event(agent_id, EventType::PrimingInjectionStarted, "priming", &op, "", serde_json::json!({}));
+    diagnostics.emit_harness_event(
+        agent_id,
+        EventType::PrimingInjectionStarted,
+        "priming",
+        &op,
+        "",
+        serde_json::json!({}),
+    );
     // Before-injection DOM snapshot (metadata only, no prompt content)
     let snapshot = browser_harness::empty_dom_snapshot();
     diagnostics.emit_dom_snapshot(agent_id, snapshot, &op, "priming");
@@ -1287,11 +1497,32 @@ pub fn record_prompt_injection_report(
     });
     // Harness: after injection snapshot
     let snapshot = browser_harness::DomSnapshot {
-        input: browser_harness::DomInputSnapshot { tag: target_tag_clone.clone(), exists: true, visible: true, value_length: visible_length.unwrap_or(0) as usize },
-        composer: browser_harness::DomComposerSnapshot { exists: true, candidate_count: 1 },
-        send: browser_harness::DomSendSnapshot { exists: true, candidate_count: 1, enabled: send_enabled, text: "".to_string(), aria_label: "".to_string() },
-        attachment: browser_harness::DomAttachmentSnapshot { exists: false, candidate_count: 0 },
-        input_identity: Some(format!("{}#{}", target_tag_clone.to_ascii_lowercase(), visible_length.unwrap_or(0))),
+        input: browser_harness::DomInputSnapshot {
+            tag: target_tag_clone.clone(),
+            exists: true,
+            visible: true,
+            value_length: visible_length.unwrap_or(0) as usize,
+        },
+        composer: browser_harness::DomComposerSnapshot {
+            exists: true,
+            candidate_count: 1,
+        },
+        send: browser_harness::DomSendSnapshot {
+            exists: true,
+            candidate_count: 1,
+            enabled: send_enabled,
+            text: "".to_string(),
+            aria_label: "".to_string(),
+        },
+        attachment: browser_harness::DomAttachmentSnapshot {
+            exists: false,
+            candidate_count: 0,
+        },
+        input_identity: Some(format!(
+            "{}#{}",
+            target_tag_clone.to_ascii_lowercase(),
+            visible_length.unwrap_or(0)
+        )),
         composer_identity: Some(format!("composer#{}", visible_length.unwrap_or(0))),
         send_identity: Some("send#1".to_string()),
         attachment_identity: None,
@@ -1299,7 +1530,11 @@ pub fn record_prompt_injection_report(
     diagnostics.emit_dom_snapshot(agent_id, snapshot, &op, "priming");
     diagnostics.emit_harness_event(
         agent_id,
-        if success { EventType::PrimingInjectionCompleted } else { EventType::PrimingInjectionFailed },
+        if success {
+            EventType::PrimingInjectionCompleted
+        } else {
+            EventType::PrimingInjectionFailed
+        },
         "priming",
         &op,
         "",
@@ -1314,11 +1549,32 @@ pub fn record_prompt_injection_report(
         }),
     );
     if success {
-        diagnostics.emit_harness_event(agent_id, EventType::PrimingPromptVisible, "priming", &op, "", serde_json::json!({ "prefix_ok": prefix_ok, "suffix_ok": suffix_ok }));
+        diagnostics.emit_harness_event(
+            agent_id,
+            EventType::PrimingPromptVisible,
+            "priming",
+            &op,
+            "",
+            serde_json::json!({ "prefix_ok": prefix_ok, "suffix_ok": suffix_ok }),
+        );
         if send_enabled {
-            diagnostics.emit_harness_event(agent_id, EventType::PrimingSendEnabled, "priming", &op, "", serde_json::json!({}));
+            diagnostics.emit_harness_event(
+                agent_id,
+                EventType::PrimingSendEnabled,
+                "priming",
+                &op,
+                "",
+                serde_json::json!({}),
+            );
         } else {
-            diagnostics.emit_harness_event(agent_id, EventType::PrimingSendDisabled, "priming", &op, "", serde_json::json!({}));
+            diagnostics.emit_harness_event(
+                agent_id,
+                EventType::PrimingSendDisabled,
+                "priming",
+                &op,
+                "",
+                serde_json::json!({}),
+            );
         }
     }
 }
@@ -1329,7 +1585,14 @@ pub fn record_prompt_injection_error(
     error: &str,
 ) {
     let op = diagnostics.current_operation_id(agent_id);
-    diagnostics.emit_harness_event(agent_id, EventType::PrimingInjectionFailed, "priming", &op, "", serde_json::json!({ "error": browser_harness::sanitize_details_value(error) }));
+    diagnostics.emit_harness_event(
+        agent_id,
+        EventType::PrimingInjectionFailed,
+        "priming",
+        &op,
+        "",
+        serde_json::json!({ "error": browser_harness::sanitize_details_value(error) }),
+    );
     let _ = update_diagnostic(diagnostics, agent_id, |record| {
         record.prompt_injection_error = Some(error.to_string());
     });
@@ -1344,7 +1607,9 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
         NavEvent::SetupResponseObserved(agent_id) => Some((agent_id.as_str(), "setup-response")),
         NavEvent::SendDetected(agent_id, _) => Some((agent_id.as_str(), "sent")),
         NavEvent::SetupManualConfirmed(agent_id) => Some((agent_id.as_str(), "manual_confirm")),
-        NavEvent::PromptInjectionReport { agent_id, .. } => Some((agent_id.as_str(), "prompt-injection")),
+        NavEvent::PromptInjectionReport { agent_id, .. } => {
+            Some((agent_id.as_str(), "prompt-injection"))
+        }
         NavEvent::ActiveSubmitReport { agent_id, .. } => Some((agent_id.as_str(), "active-submit")),
         NavEvent::SendProbe { agent_id, .. } => Some((agent_id.as_str(), "send-probe")),
         NavEvent::ChallengeDetected(agent_id, _) => Some((agent_id.as_str(), "challenge")),
@@ -1456,22 +1721,62 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
         return;
     }
 
-    if let NavEvent::PageLifecycle { agent_id, window_label, event_type, url, title } = event {
+    if let NavEvent::PageLifecycle {
+        agent_id,
+        window_label,
+        event_type,
+        url,
+        title,
+    } = event
+    {
         diagnostics.record_lifecycle_event(agent_id, event_type, url, title);
         return;
     }
 
-    if let NavEvent::SafeDomForensics { agent_id, window_label: _, forensics } = event {
+    if let NavEvent::SafeDomForensics {
+        agent_id,
+        window_label: _,
+        forensics,
+    } = event
+    {
         diagnostics.record_safe_dom_forensics(agent_id, forensics.clone());
         return;
     }
 
-    if let NavEvent::ActionEvent { agent_id, window_label: _, action, actor, reason, target } = event {
+    if let NavEvent::ActionEvent {
+        agent_id,
+        window_label: _,
+        action,
+        actor,
+        reason,
+        target,
+    } = event
+    {
         diagnostics.record_action(agent_id, action, actor, reason, target.clone());
         return;
     }
 
-    if let NavEvent::UserAgent { agent_id, window_label: _, user_agent } = event {
+    if let NavEvent::UserAgent {
+        agent_id: reported_agent_id,
+        window_label,
+        user_agent,
+    } = event
+    {
+        // Resolve authoritative agent via window's active mapping (like console diagnostics)
+        // to handle `unknown` fallback when `window.__ca_agentId` not yet restored.
+        let attributed_agent = diagnostics
+            .active_agent(window_label)
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| reported_agent_id.clone());
+        if reported_agent_id.as_str() != attributed_agent.as_str() {
+            tracing::warn!(
+                "[UA] attribution mismatch window={} reported={} active={}",
+                window_label,
+                reported_agent_id,
+                attributed_agent
+            );
+        }
+        let agent_id = &attributed_agent;
         let sanitized = {
             let mut s = user_agent.trim().to_string();
             if s.len() > 500 {
@@ -1479,7 +1784,9 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 s.push_str(" [truncated]");
             }
             // Keep controls stripped but keep UA intact
-            s.chars().filter(|c| !c.is_control() || *c == ' ').collect::<String>()
+            s.chars()
+                .filter(|c| !c.is_control() || *c == ' ')
+                .collect::<String>()
         };
         if !sanitized.is_empty() {
             let _ = update_diagnostic(diagnostics, agent_id, |record| {
@@ -1607,7 +1914,10 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             // (every 5 probes) for liveness. The diagnostic record is always
             // updated, so the latest state is never lost.
             let should_emit_harness = {
-                let records = diagnostics.records.lock().unwrap_or_else(|p| p.into_inner());
+                let records = diagnostics
+                    .records
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 if let Some(rec) = records.get(agent_id) {
                     let hint_changed = rec.page_state_hint != *page_state_hint;
                     let health_changed = rec.page_health_hint != *page_health_hint;
@@ -1615,7 +1925,14 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                     let send_changed = rec.send_button_found != *send_button_found;
                     let periodic = readiness_probe_count.map(|c| c % 5 == 0).unwrap_or(true);
                     let first = rec.readiness_probe_count.is_none();
-                    hint_changed || health_changed || input_changed || send_changed || periodic || first || *sent_signal_emitted || *user_submit_seen
+                    hint_changed
+                        || health_changed
+                        || input_changed
+                        || send_changed
+                        || periodic
+                        || first
+                        || *sent_signal_emitted
+                        || *user_submit_seen
                 } else {
                     true
                 }
@@ -1625,69 +1942,210 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 let op = diagnostics.current_operation_id(agent_id);
                 let phase = diagnostics.current_phase_str(agent_id);
                 diagnostics.emit_harness_event(agent_id, EventType::ComposerProbeStarted, &phase, &op, "", serde_json::json!({ "input_found": input_found, "send_button_found": send_button_found }));
-                diagnostics.emit_harness_event(agent_id, EventType::SendProbeStarted, &phase, &op, "", serde_json::json!({ "send_button_found": send_button_found }));
+                diagnostics.emit_harness_event(
+                    agent_id,
+                    EventType::SendProbeStarted,
+                    &phase,
+                    &op,
+                    "",
+                    serde_json::json!({ "send_button_found": send_button_found }),
+                );
                 if *input_found {
-                    diagnostics.emit_harness_event(agent_id, EventType::InputDetected, &phase, &op, "", serde_json::json!({ "candidate_count": input_candidate_count }));
-                    diagnostics.emit_harness_event(agent_id, EventType::ComposerDetected, &phase, &op, "", serde_json::json!({ "candidate_count": composer_candidate_count }));
+                    diagnostics.emit_harness_event(
+                        agent_id,
+                        EventType::InputDetected,
+                        &phase,
+                        &op,
+                        "",
+                        serde_json::json!({ "candidate_count": input_candidate_count }),
+                    );
+                    diagnostics.emit_harness_event(
+                        agent_id,
+                        EventType::ComposerDetected,
+                        &phase,
+                        &op,
+                        "",
+                        serde_json::json!({ "candidate_count": composer_candidate_count }),
+                    );
                 } else {
-                    diagnostics.emit_harness_event(agent_id, EventType::InputLost, &phase, &op, "", serde_json::json!({}));
-                    diagnostics.emit_harness_event(agent_id, EventType::ComposerLost, &phase, &op, "", serde_json::json!({}));
+                    diagnostics.emit_harness_event(
+                        agent_id,
+                        EventType::InputLost,
+                        &phase,
+                        &op,
+                        "",
+                        serde_json::json!({}),
+                    );
+                    diagnostics.emit_harness_event(
+                        agent_id,
+                        EventType::ComposerLost,
+                        &phase,
+                        &op,
+                        "",
+                        serde_json::json!({}),
+                    );
                 }
                 if *send_button_found {
-                    diagnostics.emit_harness_event(agent_id, EventType::SendDetected, &phase, &op, "", serde_json::json!({ "candidate_count": send_button_candidate_count }));
+                    diagnostics.emit_harness_event(
+                        agent_id,
+                        EventType::SendDetected,
+                        &phase,
+                        &op,
+                        "",
+                        serde_json::json!({ "candidate_count": send_button_candidate_count }),
+                    );
                 } else {
-                    diagnostics.emit_harness_event(agent_id, EventType::SendLost, &phase, &op, "", serde_json::json!({}));
+                    diagnostics.emit_harness_event(
+                        agent_id,
+                        EventType::SendLost,
+                        &phase,
+                        &op,
+                        "",
+                        serde_json::json!({}),
+                    );
                 }
                 // Auth / blocker classification from page hints (spec 20)
                 if let Some(hint) = page_state_hint {
                     match hint.as_str() {
                         "possible_login_required" => {
-                            diagnostics.emit_harness_event(agent_id, EventType::LoginPageDetected, &phase, &op, "", serde_json::json!({ "hint": hint }));
-                            diagnostics.emit_harness_event(agent_id, EventType::LoginRequired, &phase, &op, "", serde_json::json!({}));
+                            diagnostics.emit_harness_event(
+                                agent_id,
+                                EventType::LoginPageDetected,
+                                &phase,
+                                &op,
+                                "",
+                                serde_json::json!({ "hint": hint }),
+                            );
+                            diagnostics.emit_harness_event(
+                                agent_id,
+                                EventType::LoginRequired,
+                                &phase,
+                                &op,
+                                "",
+                                serde_json::json!({}),
+                            );
                         }
                         "possible_challenge_or_security" => {
-                            diagnostics.emit_harness_event(agent_id, EventType::ChallengeDetected, &phase, &op, "", serde_json::json!({ "hint": hint }));
+                            diagnostics.emit_harness_event(
+                                agent_id,
+                                EventType::ChallengeDetected,
+                                &phase,
+                                &op,
+                                "",
+                                serde_json::json!({ "hint": hint }),
+                            );
                         }
                         "empty_shell_or_hydration_stuck" => {
-                            diagnostics.emit_harness_event(agent_id, EventType::LoginStateUnknown, &phase, &op, "", serde_json::json!({ "hint": hint }));
+                            diagnostics.emit_harness_event(
+                                agent_id,
+                                EventType::LoginStateUnknown,
+                                &phase,
+                                &op,
+                                "",
+                                serde_json::json!({ "hint": hint }),
+                            );
                         }
                         "composer_detected" => {
-                            diagnostics.emit_harness_event(agent_id, EventType::LoginStateAuthenticated, &phase, &op, "", serde_json::json!({}));
+                            diagnostics.emit_harness_event(
+                                agent_id,
+                                EventType::LoginStateAuthenticated,
+                                &phase,
+                                &op,
+                                "",
+                                serde_json::json!({}),
+                            );
                         }
                         _ => {}
                     }
                 }
                 if let Some(health) = page_health_hint {
                     if health.contains("cloudflare") {
-                        diagnostics.emit_harness_event(agent_id, EventType::CloudflareDetected, &phase, &op, "", serde_json::json!({ "health": health }));
+                        diagnostics.emit_harness_event(
+                            agent_id,
+                            EventType::CloudflareDetected,
+                            &phase,
+                            &op,
+                            "",
+                            serde_json::json!({ "health": health }),
+                        );
                     }
                     if health.contains("captcha") {
-                        diagnostics.emit_harness_event(agent_id, EventType::CaptchaDetected, &phase, &op, "", serde_json::json!({ "health": health }));
+                        diagnostics.emit_harness_event(
+                            agent_id,
+                            EventType::CaptchaDetected,
+                            &phase,
+                            &op,
+                            "",
+                            serde_json::json!({ "health": health }),
+                        );
                     }
                 }
                 let snapshot = browser_harness::DomSnapshot {
-                    input: browser_harness::DomInputSnapshot { tag: if *input_found { "TEXTAREA".to_string() } else { "".to_string() }, exists: *input_found, visible: *input_found, value_length: 0 },
-                    composer: browser_harness::DomComposerSnapshot { exists: *input_found, candidate_count: input_candidate_count.unwrap_or(0) as usize },
-                    send: browser_harness::DomSendSnapshot { exists: *send_button_found, candidate_count: send_button_candidate_count.unwrap_or(0) as usize, enabled: false, text: "".to_string(), aria_label: "".to_string() },
-                    attachment: browser_harness::DomAttachmentSnapshot { exists: false, candidate_count: 0 },
-                    input_identity: if *input_found { Some(format!("input#{}", input_candidate_count.unwrap_or(0))) } else { None },
-                    composer_identity: if composer_candidate_count.unwrap_or(0) > 0 { Some(format!("composer#{}", composer_candidate_count.unwrap_or(0))) } else { None },
-                    send_identity: if *send_button_found { Some(format!("send#{}", send_button_candidate_count.unwrap_or(0))) } else { None },
+                    input: browser_harness::DomInputSnapshot {
+                        tag: if *input_found {
+                            "TEXTAREA".to_string()
+                        } else {
+                            "".to_string()
+                        },
+                        exists: *input_found,
+                        visible: *input_found,
+                        value_length: 0,
+                    },
+                    composer: browser_harness::DomComposerSnapshot {
+                        exists: *input_found,
+                        candidate_count: input_candidate_count.unwrap_or(0) as usize,
+                    },
+                    send: browser_harness::DomSendSnapshot {
+                        exists: *send_button_found,
+                        candidate_count: send_button_candidate_count.unwrap_or(0) as usize,
+                        enabled: false,
+                        text: "".to_string(),
+                        aria_label: "".to_string(),
+                    },
+                    attachment: browser_harness::DomAttachmentSnapshot {
+                        exists: false,
+                        candidate_count: 0,
+                    },
+                    input_identity: if *input_found {
+                        Some(format!("input#{}", input_candidate_count.unwrap_or(0)))
+                    } else {
+                        None
+                    },
+                    composer_identity: if composer_candidate_count.unwrap_or(0) > 0 {
+                        Some(format!(
+                            "composer#{}",
+                            composer_candidate_count.unwrap_or(0)
+                        ))
+                    } else {
+                        None
+                    },
+                    send_identity: if *send_button_found {
+                        Some(format!("send#{}", send_button_candidate_count.unwrap_or(0)))
+                    } else {
+                        None
+                    },
                     attachment_identity: None,
                 };
                 diagnostics.emit_dom_snapshot(agent_id, snapshot, &op, &phase);
-                diagnostics.emit_harness_event(agent_id, EventType::DomSnapshot, &phase, &op, "", serde_json::json!({
-                    "page_state_hint": page_state_hint.clone(),
-                    "page_health_hint": page_health_hint.clone(),
-                    "readiness_probe_count": readiness_probe_count,
-                    "input_candidate_count": input_candidate_count,
-                    "composer_candidate_count": composer_candidate_count,
-                    "send_button_candidate_count": send_button_candidate_count,
-                    "readiness_timeout_ms": readiness_timeout_ms,
-                    "user_submit_seen": user_submit_seen,
-                    "message_count_seen": message_count_seen,
-                    "sent_signal_emitted": sent_signal_emitted
-                }));
+                diagnostics.emit_harness_event(
+                    agent_id,
+                    EventType::DomSnapshot,
+                    &phase,
+                    &op,
+                    "",
+                    serde_json::json!({
+                        "page_state_hint": page_state_hint.clone(),
+                        "page_health_hint": page_health_hint.clone(),
+                        "readiness_probe_count": readiness_probe_count,
+                        "input_candidate_count": input_candidate_count,
+                        "composer_candidate_count": composer_candidate_count,
+                        "send_button_candidate_count": send_button_candidate_count,
+                        "readiness_timeout_ms": readiness_timeout_ms,
+                        "user_submit_seen": user_submit_seen,
+                        "message_count_seen": message_count_seen,
+                        "sent_signal_emitted": sent_signal_emitted
+                    }),
+                );
             }
             let _ = update_diagnostic(diagnostics, agent_id, |record| {
                 record.input_found = *input_found;
@@ -1705,7 +2163,9 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 record.readiness_timeout_ms = *readiness_timeout_ms;
                 record.page_state_hint = page_state_hint.clone();
                 record.page_health_hint = page_health_hint.clone();
-                if record.current_phase == "real_url_loaded" || record.current_phase == "navigation_started" {
+                if record.current_phase == "real_url_loaded"
+                    || record.current_phase == "navigation_started"
+                {
                     record.current_phase = if *input_found {
                         "composer_detected".to_string()
                     } else {
@@ -1736,11 +2196,9 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             (agent_id, "consulting", "Setup response detected")
         }
         NavEvent::SendDetected(agent_id, _) => (agent_id, "consulting", "User send detected"),
-        NavEvent::SetupManualConfirmed(agent_id) => (
-            agent_id,
-            "primed",
-            "User confirmed setup completion",
-        ),
+        NavEvent::SetupManualConfirmed(agent_id) => {
+            (agent_id, "primed", "User confirmed setup completion")
+        }
         NavEvent::ManualResponse { agent_id, .. } => (
             agent_id,
             "active_response_captured",
@@ -1751,10 +2209,22 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             "prompt_injection_report",
             "Prompt injection report received; method, verification state, and error status recorded",
         ),
-        NavEvent::ActiveSubmitReport { agent_id, succeeded, .. } => (
+        NavEvent::ActiveSubmitReport {
             agent_id,
-            if *succeeded { "active_prompt_submitted" } else { "active_submit_failed" },
-            if *succeeded { "Active prompt submitted automatically" } else { "Active prompt inserted but was not submitted" },
+            succeeded,
+            ..
+        } => (
+            agent_id,
+            if *succeeded {
+                "active_prompt_submitted"
+            } else {
+                "active_submit_failed"
+            },
+            if *succeeded {
+                "Active prompt submitted automatically"
+            } else {
+                "Active prompt inserted but was not submitted"
+            },
         ),
         NavEvent::Response(agent_id, _, _) => (agent_id, "ready", "Model response detected"),
         NavEvent::Done(agent_id, _) => (agent_id, "ready", "Model response completed"),
@@ -1779,20 +2249,48 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             NavEvent::SetupManualConfirmed(_) => EventType::PrimingCompleted,
             NavEvent::ManualResponse { .. } => EventType::ResponseObserved,
             NavEvent::PromptInjectionReport { .. } => EventType::DomSnapshot,
-            NavEvent::ActiveSubmitReport { succeeded, .. } => if *succeeded { EventType::ActiveSubmitCompleted } else { EventType::ActiveSubmitFailed },
+            NavEvent::ActiveSubmitReport { succeeded, .. } => {
+                if *succeeded {
+                    EventType::ActiveSubmitCompleted
+                } else {
+                    EventType::ActiveSubmitFailed
+                }
+            }
             NavEvent::SetupResponseObserved(_) => EventType::ResponseObserved,
             NavEvent::Response(_, _, _) => EventType::ResponseObserved,
             NavEvent::Done(_, _) => EventType::ResponseCompleted,
             _ => EventType::Unknown,
         };
         let details = match event {
-            NavEvent::Ready(_) => serde_json::json!({ "input_found": true, "composer_detected": true }),
+            NavEvent::Ready(_) => {
+                serde_json::json!({ "input_found": true, "composer_detected": true })
+            }
             NavEvent::SendDetected(_, reason) => serde_json::json!({ "reason": reason.clone() }),
-            NavEvent::PromptInjectionReport { method, prefix_ok, suffix_ok, visible_length, send_enabled, target_tag, error, .. } => serde_json::json!({
+            NavEvent::PromptInjectionReport {
+                method,
+                prefix_ok,
+                suffix_ok,
+                visible_length,
+                send_enabled,
+                target_tag,
+                error,
+                ..
+            } => serde_json::json!({
                 "method": method, "prefix_ok": prefix_ok, "suffix_ok": suffix_ok, "visible_length": visible_length, "send_enabled": send_enabled, "target_tag": target_tag, "error": error
             }),
-            NavEvent::ActiveSubmitReport { turn, succeeded, method, send_enabled, error, .. } => serde_json::json!({ "turn": turn, "succeeded": succeeded, "method": method, "send_enabled": send_enabled, "error": error }),
-            NavEvent::Response(_, turn, text) => serde_json::json!({ "turn": turn, "text_length": text.len() }),
+            NavEvent::ActiveSubmitReport {
+                turn,
+                succeeded,
+                method,
+                send_enabled,
+                error,
+                ..
+            } => {
+                serde_json::json!({ "turn": turn, "succeeded": succeeded, "method": method, "send_enabled": send_enabled, "error": error })
+            }
+            NavEvent::Response(_, turn, text) => {
+                serde_json::json!({ "turn": turn, "text_length": text.len() })
+            }
             NavEvent::Done(_, turn) => serde_json::json!({ "turn": turn }),
             NavEvent::ManualResponse { turn, .. } => serde_json::json!({ "turn": turn }),
             _ => serde_json::json!({}),
@@ -1801,14 +2299,42 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
         // Additional specialized events
         match event {
             NavEvent::Ready(_) => {
-                diagnostics.emit_harness_event(agent_id, EventType::InputDetected, phase, &op, "", serde_json::json!({}));
-                diagnostics.emit_harness_event(agent_id, EventType::PhaseChanged, phase, &op, "", serde_json::json!({ "new_phase": phase }));
+                diagnostics.emit_harness_event(
+                    agent_id,
+                    EventType::InputDetected,
+                    phase,
+                    &op,
+                    "",
+                    serde_json::json!({}),
+                );
+                diagnostics.emit_harness_event(
+                    agent_id,
+                    EventType::PhaseChanged,
+                    phase,
+                    &op,
+                    "",
+                    serde_json::json!({ "new_phase": phase }),
+                );
             }
             NavEvent::SendDetected(_, _) => {
-                diagnostics.emit_harness_event(agent_id, EventType::PrimingCompleted, "priming", &op, "", serde_json::json!({}));
+                diagnostics.emit_harness_event(
+                    agent_id,
+                    EventType::PrimingCompleted,
+                    "priming",
+                    &op,
+                    "",
+                    serde_json::json!({}),
+                );
             }
             NavEvent::SetupResponseObserved(_) | NavEvent::Response(_, _, _) => {
-                diagnostics.emit_harness_event(agent_id, EventType::ResponseStarted, phase, &op, "", serde_json::json!({}));
+                diagnostics.emit_harness_event(
+                    agent_id,
+                    EventType::ResponseStarted,
+                    phase,
+                    &op,
+                    "",
+                    serde_json::json!({}),
+                );
             }
             _ => {}
         }
@@ -1934,7 +2460,16 @@ fn is_valid_console_category(cat: &str) -> bool {
 fn severity_for_category(category: &str) -> &'static str {
     match category {
         "console_warning" => "warning",
-        "javascript_exception" | "unhandled_rejection" | "console_error" | "navigation_error" | "automation_error" | "injection_error" | "submission_error" | "challenge_blocker" | "login_blocker" | "diagnostic_bridge_error" => "error",
+        "javascript_exception"
+        | "unhandled_rejection"
+        | "console_error"
+        | "navigation_error"
+        | "automation_error"
+        | "injection_error"
+        | "submission_error"
+        | "challenge_blocker"
+        | "login_blocker"
+        | "diagnostic_bridge_error" => "error",
         _ => "info",
     }
 }
@@ -1993,7 +2528,9 @@ pub fn record_console_diagnostic(
                 .records
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            guard.get(&agent_id).and_then(|r| r.last_navigation_url.clone())
+            guard
+                .get(&agent_id)
+                .and_then(|r| r.last_navigation_url.clone())
         };
         if let Some(val) = from_last {
             sanitized_url(&val)
@@ -2046,7 +2583,9 @@ pub fn record_console_diagnostic(
                 .timestamp
                 .parse::<chrono::DateTime<chrono::Utc>>()
                 .ok()
-                .map(|dt| (chrono::Utc::now() - dt).num_seconds() < CONSOLE_DEDUP_WINDOW_SECS as i64)
+                .map(|dt| {
+                    (chrono::Utc::now() - dt).num_seconds() < CONSOLE_DEDUP_WINDOW_SECS as i64
+                })
                 .unwrap_or(true);
             if is_recent {
                 tracing::debug!("[CONSOLE] dedup suppressed {} {}", agent_id, category);
@@ -2061,10 +2600,16 @@ pub fn record_console_diagnostic(
                     .timestamp
                     .parse::<chrono::DateTime<chrono::Utc>>()
                     .ok()
-                    .map(|dt| (chrono::Utc::now() - dt).num_seconds() < CONSOLE_DEDUP_WINDOW_SECS as i64)
+                    .map(|dt| {
+                        (chrono::Utc::now() - dt).num_seconds() < CONSOLE_DEDUP_WINDOW_SECS as i64
+                    })
                     .unwrap_or(false);
                 if is_recent {
-                    tracing::debug!("[CONSOLE] dedup suppressed (recent) {} {}", agent_id, category);
+                    tracing::debug!(
+                        "[CONSOLE] dedup suppressed (recent) {} {}",
+                        agent_id,
+                        category
+                    );
                     return;
                 }
             }
@@ -2101,7 +2646,10 @@ pub fn record_console_diagnostic(
         record.browser_console_last_error_at = Some(timestamp.clone());
     }
     // Also surface as last_error for snapshot visibility but keep separate field
-    if category == "javascript_exception" || category == "unhandled_rejection" || category == "console_error" {
+    if category == "javascript_exception"
+        || category == "unhandled_rejection"
+        || category == "console_error"
+    {
         record.last_error = Some(format!("[{}] {}", category, message));
     }
     tracing::warn!(
@@ -2115,7 +2663,12 @@ pub fn record_console_diagnostic(
     );
     // Harness: classified error + timeline
     let classified = browser_harness::classify_console_error(&category, &message, &source);
-    let op = diagnostics.timeline.all_events_sorted().last().map(|e| e.operation_id.clone()).unwrap_or_else(|| diagnostics.current_operation_id(&agent_id));
+    let op = diagnostics
+        .timeline
+        .all_events_sorted()
+        .last()
+        .map(|e| e.operation_id.clone())
+        .unwrap_or_else(|| diagnostics.current_operation_id(&agent_id));
     // We need phase for harness; use current_phase
     let phase = diagnostics.current_phase_str(&agent_id);
     // Drop records lock before emitting timeline (to avoid deadlock – emit_timeline locks records again but we already hold it)
@@ -2136,7 +2689,9 @@ pub fn record_console_diagnostic(
             "javascript_exception" => EventType::JavascriptError,
             "unhandled_rejection" => EventType::UnhandledRejection,
             "navigation_error" => EventType::AutomationError,
-            "automation_error" | "injection_error" | "submission_error" => EventType::AutomationError,
+            "automation_error" | "injection_error" | "submission_error" => {
+                EventType::AutomationError
+            }
             _ => EventType::ConsoleError,
         },
         &phase,
@@ -2193,11 +2748,11 @@ pub const AGENTS: &[AgentConfig] = &[
         display_name: "GLM",
         base_url: "https://chat.z.ai/",
     },
-    // D-042: Kimi via Kimi.com (Lexical contenteditable editor)
+    // D-042: Kimi via kimi.ai (Lexical contenteditable editor) — canonical https://kimi.ai/
     AgentConfig {
         agent_id: "kimi",
         display_name: "Kimi",
-        base_url: "https://www.kimi.com/",
+        base_url: "https://kimi.ai/",
     },
 ];
 
@@ -2304,8 +2859,6 @@ pub fn resolve_display_name(
     }
     "Unknown Model".to_string()
 }
-
-
 
 #[derive(Debug)]
 pub enum NavEvent {
@@ -2475,7 +3028,14 @@ impl BrowserState {
         let generation = self.diagnostics.setup_generation();
         let op = browser_harness::operation_id_active_turn(agent_id, generation, turn);
         self.diagnostics.set_operation(agent_id, &op, "submitting");
-        self.diagnostics.emit_harness_event(agent_id, EventType::ActivePromptInjectionStarted, "submitting", &op, "", serde_json::json!({ "turn": turn }));
+        self.diagnostics.emit_harness_event(
+            agent_id,
+            EventType::ActivePromptInjectionStarted,
+            "submitting",
+            &op,
+            "",
+            serde_json::json!({ "turn": turn }),
+        );
         let _ = update_diagnostic(&self.diagnostics, agent_id, |record| {
             record.active_expected_agent_id = Some(agent_id.to_string());
             record.active_turn_number = Some(turn);
@@ -2487,9 +3047,30 @@ impl BrowserState {
 
     pub fn mark_active_waiting(&self, agent_id: &str, turn: u32) {
         let op = self.diagnostics.current_operation_id(agent_id);
-        self.diagnostics.emit_harness_event(agent_id, EventType::ActivePromptInjectionCompleted, "submitting", &op, "", serde_json::json!({ "turn": turn }));
-        self.diagnostics.emit_harness_event(agent_id, EventType::ActiveSubmitStarted, "submitting", &op, "", serde_json::json!({ "turn": turn }));
-        self.diagnostics.emit_harness_event(agent_id, EventType::ResponseStarted, "waiting_for_response", &op, "", serde_json::json!({ "turn": turn }));
+        self.diagnostics.emit_harness_event(
+            agent_id,
+            EventType::ActivePromptInjectionCompleted,
+            "submitting",
+            &op,
+            "",
+            serde_json::json!({ "turn": turn }),
+        );
+        self.diagnostics.emit_harness_event(
+            agent_id,
+            EventType::ActiveSubmitStarted,
+            "submitting",
+            &op,
+            "",
+            serde_json::json!({ "turn": turn }),
+        );
+        self.diagnostics.emit_harness_event(
+            agent_id,
+            EventType::ResponseStarted,
+            "waiting_for_response",
+            &op,
+            "",
+            serde_json::json!({ "turn": turn }),
+        );
         let _ = update_diagnostic(&self.diagnostics, agent_id, |record| {
             record.active_expected_agent_id = Some(agent_id.to_string());
             record.active_turn_number = Some(turn);
@@ -2502,7 +3083,14 @@ impl BrowserState {
             self.active_turn = None;
         }
         let op = self.diagnostics.current_operation_id(agent_id);
-        self.diagnostics.emit_harness_event(agent_id, EventType::ResponseCompleted, "response_capture", &op, "", serde_json::json!({ "turn": turn }));
+        self.diagnostics.emit_harness_event(
+            agent_id,
+            EventType::ResponseCompleted,
+            "response_capture",
+            &op,
+            "",
+            serde_json::json!({ "turn": turn }),
+        );
         let _ = update_diagnostic(&self.diagnostics, agent_id, |record| {
             if record.active_turn_number == Some(turn) {
                 record.current_phase = "active_response_captured".to_string();
@@ -2561,8 +3149,19 @@ pub fn navigate_agent_window(
             serde_json::json!({}),
         );
     }
-    diagnostics.record_arena_navigation_request(agent_id, &window_label, target_url, "navigation_started");
-    diagnostics.record_navigation_intent(agent_id, &window_label, window_kind, target_url, "app_navigation");
+    diagnostics.record_arena_navigation_request(
+        agent_id,
+        &window_label,
+        target_url,
+        "navigation_started",
+    );
+    diagnostics.record_navigation_intent(
+        agent_id,
+        &window_label,
+        window_kind,
+        target_url,
+        "app_navigation",
+    );
 
     let sanitized = sanitized_url(target_url);
     if let Some(record) = update_diagnostic(diagnostics, agent_id, |record| {
@@ -2637,8 +3236,13 @@ fn handle_page_load(
     let event = payload.event();
     // Capture from_url before updating
     let from_url = {
-        let guard = diagnostics.records.lock().unwrap_or_else(|p| p.into_inner());
-        guard.get(&agent_id).and_then(|r| r.last_navigation_url.clone())
+        let guard = diagnostics
+            .records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard
+            .get(&agent_id)
+            .and_then(|r| r.last_navigation_url.clone())
     };
     let phase_str = if event == PageLoadEvent::Finished {
         "real_url_loaded"
@@ -2651,7 +3255,8 @@ fn handle_page_load(
     {
         let op = diagnostics.current_operation_id(&agent_id);
         let from_cloned = from_url.clone().unwrap_or_default();
-        let (reason, conf) = browser_harness::classify_navigation_reason(&from_cloned, &url, None, None);
+        let (reason, conf) =
+            browser_harness::classify_navigation_reason(&from_cloned, &url, None, None);
         let (cause, arena_requested) = diagnostics
             .last_navigation_for(&agent_id)
             .map(|n| (n.cause.clone(), n.arena_requested))
@@ -2664,13 +3269,22 @@ fn handle_page_load(
             phase: phase_str.to_string(),
             same_document: None,
             navigation_reason: reason.as_str().to_string(),
-            confidence: match conf { browser_harness::Confidence::Low => "low", browser_harness::Confidence::Medium => "medium", browser_harness::Confidence::High => "high" }.to_string(),
+            confidence: match conf {
+                browser_harness::Confidence::Low => "low",
+                browser_harness::Confidence::Medium => "medium",
+                browser_harness::Confidence::High => "high",
+            }
+            .to_string(),
             cause: cause.clone(),
             arena_requested,
         };
         diagnostics.emit_harness_event(
             &agent_id,
-            if event == PageLoadEvent::Finished { EventType::NavigationFinished } else { EventType::NavigationStarted },
+            if event == PageLoadEvent::Finished {
+                EventType::NavigationFinished
+            } else {
+                EventType::NavigationStarted
+            },
             phase_str,
             &op,
             &url,
@@ -2728,11 +3342,35 @@ fn make_new_window_handler(
 + Send
 + 'static {
     move |url, _features| {
+        let url_str = url.as_str();
+        let host = url.host_str().unwrap_or("");
+        // OAuth popup handling (Issue A): Claude login via Google uses
+        // accounts.google.com. Previously all popups were denied to preserve
+        // the two-WebView limit, which made the "Maybe blocked by the browser"
+        // message appear and left the session unauthenticated (403 on
+        // /api/auth/login_methods etc). Allowing the OAuth popup is the
+        // smallest safe fix: it is a temporary window that closes after auth,
+        // not a third persistent WebView. All other popups remain denied.
+        let is_oauth = host == "accounts.google.com"
+            || host.ends_with(".accounts.google.com")
+            || (host.contains("google") && url_str.contains("oauth"))
+            || (host.contains("claude.ai") && url_str.contains("oauth"));
+        if is_oauth {
+            send_nav_event(
+                &tx,
+                NavEvent::UnsupportedNavigation {
+                    window_label: window_label.to_string(),
+                    url: redacted_url(url_str),
+                    reason: "OAuth popup allowed (temporary)".to_string(),
+                },
+            );
+            return NewWindowResponse::Allow;
+        }
         send_nav_event(
             &tx,
             NavEvent::UnsupportedNavigation {
                 window_label: window_label.to_string(),
-                url: redacted_url(url.as_str()),
+                url: redacted_url(url_str),
                 reason: "new window request denied to preserve the two-WebView architecture"
                     .to_string(),
             },
@@ -2956,7 +3594,18 @@ fn handle_arena_url(
         }
         (
             "prompt-injection",
-            [agent_id, method, prefix, suffix, length, enabled, tag, role, contenteditable, encoded_error],
+            [
+                agent_id,
+                method,
+                prefix,
+                suffix,
+                length,
+                enabled,
+                tag,
+                role,
+                contenteditable,
+                encoded_error,
+            ],
         ) => {
             let error = urlencoding::decode(encoded_error)
                 .unwrap_or_default()
@@ -3096,10 +3745,16 @@ fn handle_arena_url(
                 let agent_id = args[0].clone();
                 let category = args[1].clone();
                 let severity = args[2].clone();
-                let source = urlencoding::decode(&args[3]).unwrap_or_default().into_owned();
-                let message = urlencoding::decode(&args[4]).unwrap_or_default().into_owned();
+                let source = urlencoding::decode(&args[3])
+                    .unwrap_or_default()
+                    .into_owned();
+                let message = urlencoding::decode(&args[4])
+                    .unwrap_or_default()
+                    .into_owned();
                 let url = if args.len() >= 6 {
-                    urlencoding::decode(&args[5]).unwrap_or_default().into_owned()
+                    urlencoding::decode(&args[5])
+                        .unwrap_or_default()
+                        .into_owned()
                 } else {
                     String::new()
                 };
@@ -3123,9 +3778,13 @@ fn handle_arena_url(
             if args.len() >= 3 {
                 let agent_id = args[0].clone();
                 let event_type = args[1].clone();
-                let url = urlencoding::decode(&args[2]).unwrap_or_default().into_owned();
+                let url = urlencoding::decode(&args[2])
+                    .unwrap_or_default()
+                    .into_owned();
                 let title = if args.len() >= 4 {
-                    urlencoding::decode(&args[3]).unwrap_or_default().into_owned()
+                    urlencoding::decode(&args[3])
+                        .unwrap_or_default()
+                        .into_owned()
                 } else {
                     String::new()
                 };
@@ -3147,8 +3806,12 @@ fn handle_arena_url(
             if !args.is_empty() {
                 let agent_id = args[0].clone();
                 let encoded = args[1..].join("/");
-                let json_str = urlencoding::decode(&encoded).unwrap_or_default().into_owned();
-                if let Ok(forensics) = serde_json::from_str::<crate::browser_harness::SafeDomForensics>(&json_str) {
+                let json_str = urlencoding::decode(&encoded)
+                    .unwrap_or_default()
+                    .into_owned();
+                if let Ok(forensics) =
+                    serde_json::from_str::<crate::browser_harness::SafeDomForensics>(&json_str)
+                {
                     send_nav_event(
                         &tx,
                         NavEvent::SafeDomForensics {
@@ -3169,10 +3832,16 @@ fn handle_arena_url(
                 let agent_id = args[0].clone();
                 let action = args[1].clone();
                 let actor = args[2].clone();
-                let reason = urlencoding::decode(&args[3]).unwrap_or_default().into_owned();
+                let reason = urlencoding::decode(&args[3])
+                    .unwrap_or_default()
+                    .into_owned();
                 let encoded_target = args[4..].join("/");
-                let target_json = urlencoding::decode(&encoded_target).unwrap_or_default().into_owned();
-                if let Ok(target) = serde_json::from_str::<crate::browser_harness::ActionTarget>(&target_json) {
+                let target_json = urlencoding::decode(&encoded_target)
+                    .unwrap_or_default()
+                    .into_owned();
+                if let Ok(target) =
+                    serde_json::from_str::<crate::browser_harness::ActionTarget>(&target_json)
+                {
                     send_nav_event(
                         &tx,
                         NavEvent::ActionEvent {
@@ -3381,15 +4050,17 @@ mod tests {
                     "262".to_string(),
                     "1".to_string(),
                     "TEXTAREA".to_string(),
-                    "".to_string(),  // role (empty)
-                    "".to_string(),  // contenteditable (empty)
-                    "".to_string(),  // error (empty)
+                    "".to_string(), // role (empty)
+                    "".to_string(), // contenteditable (empty)
+                    "".to_string(), // error (empty)
                 ],
             }
         );
         // Also test with some non-empty values (URL-encoded as they appear in the raw URL)
         assert_eq!(
-            parse("arena://prompt-injection/chatgpt/textarea_value/1/1/100/1/TEXTAREA/textarea/textarea/some%20error"),
+            parse(
+                "arena://prompt-injection/chatgpt/textarea_value/1/1/100/1/TEXTAREA/textarea/textarea/some%20error"
+            ),
             ArenaSignal {
                 action: "prompt-injection".to_string(),
                 args: vec![
@@ -3418,7 +4089,7 @@ mod tests {
             "possible_login_required",
             "possible_challenge_or_security",
             "composer_selector_miss",
-            "READY_TIMEOUT_MS = 45000",
+            "READY_TIMEOUT_MS = 90000",
             "__caSubmitActivePrompt",
             "active-submit",
             "MAX_SUBMIT_ATTEMPTS",
@@ -3490,9 +4161,13 @@ mod tests {
         // heuristic (classifyPageState) still counts interactive elements
         // document-wide, but a Send candidate list must never be built from a
         // document-wide button/role/input scan.
+        // Forensics candidateButtons uses document-wide scan for diagnostics — allowed.
+        // Send discovery itself is composer-rooted (see root.querySelectorAll above).
         assert!(
-            !GENERIC_INIT_SCRIPT.contains("document.querySelectorAll('button,[role=\"button\"]"),
-            "document-wide Send-capable button scan must not exist in GENERIC_INIT_SCRIPT"
+            GENERIC_INIT_SCRIPT.contains(
+                "root.querySelectorAll('button,[role=\"button\"],input[type=\"submit\"]')"
+            ) || GENERIC_INIT_SCRIPT.contains("root.querySelectorAll(SEND_SELECTORS"),
+            "composer-rooted Send discovery marker missing"
         );
     }
 
@@ -3676,9 +4351,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/browser-ownership-fixtures.mjs"
         );
-        let node_check = std::process::Command::new("node")
-            .arg("--version")
-            .output();
+        let node_check = std::process::Command::new("node").arg("--version").output();
         let Ok(node_status) = node_check else {
             eprintln!("node unavailable; skipping behavioral fixture test");
             return;
@@ -3727,7 +4400,7 @@ mod tests {
                 "https://chat.deepseek.com",
                 "https://chat.qwen.ai",
                 "https://chat.z.ai/",
-                "https://www.kimi.com/"
+                "https://kimi.ai/"
             ]
         );
     }
@@ -3954,7 +4627,10 @@ mod tests {
         assert!(super::is_valid_console_category("console_error"));
         assert!(super::is_valid_console_category("console_warning"));
         assert_eq!(super::severity_for_category("console_warning"), "warning");
-        assert_eq!(super::severity_for_category("javascript_exception"), "error");
+        assert_eq!(
+            super::severity_for_category("javascript_exception"),
+            "error"
+        );
         assert_eq!(super::severity_for_category("console_error"), "error");
         assert_eq!(super::severity_for_category("unknown_cat"), "info");
     }
@@ -3974,13 +4650,26 @@ mod tests {
             Some("https://chat.deepseek.com/"),
         );
         let records = diagnostics.snapshot();
-        let deepseek = records.iter().find(|r| r.agent_id == "deepseek").expect("deepseek exists");
+        let deepseek = records
+            .iter()
+            .find(|r| r.agent_id == "deepseek")
+            .expect("deepseek exists");
         assert_eq!(deepseek.console_diagnostics.len(), 1);
         assert_eq!(deepseek.console_diagnostics[0].category, "console_error");
-        assert!(deepseek.console_diagnostics[0].message.contains("TypeError"));
+        assert!(
+            deepseek.console_diagnostics[0]
+                .message
+                .contains("TypeError")
+        );
         // chatgpt should have no console diagnostics, proving not attributed to last setup agent
-        let chatgpt = records.iter().find(|r| r.agent_id == "chatgpt").expect("chatgpt exists");
-        assert!(chatgpt.console_diagnostics.is_empty(), "chatgpt should not have deepseek's error");
+        let chatgpt = records
+            .iter()
+            .find(|r| r.agent_id == "chatgpt")
+            .expect("chatgpt exists");
+        assert!(
+            chatgpt.console_diagnostics.is_empty(),
+            "chatgpt should not have deepseek's error"
+        );
     }
 
     #[test]
@@ -4035,8 +4724,15 @@ mod tests {
         let chatgpt = records.iter().find(|r| r.agent_id == "chatgpt").unwrap();
         assert_eq!(chatgpt.console_diagnostics.len(), 1);
         let msg = &chatgpt.console_diagnostics[0].message;
-        assert!(msg.len() <= super::MAX_CONSOLE_MESSAGE_LENGTH + 20, "msg len {} exceeds bound", msg.len());
-        assert!(msg.contains("[truncated]"), "huge message should be truncated");
+        assert!(
+            msg.len() <= super::MAX_CONSOLE_MESSAGE_LENGTH + 20,
+            "msg len {} exceeds bound",
+            msg.len()
+        );
+        assert!(
+            msg.contains("[truncated]"),
+            "huge message should be truncated"
+        );
     }
 
     #[test]
@@ -4066,7 +4762,11 @@ mod tests {
         );
         let records = diagnostics.snapshot();
         let deepseek = records.iter().find(|r| r.agent_id == "deepseek").unwrap();
-        assert_eq!(deepseek.console_diagnostics.len(), 1, "duplicate within dedup window should be suppressed");
+        assert_eq!(
+            deepseek.console_diagnostics.len(),
+            1,
+            "duplicate within dedup window should be suppressed"
+        );
         // Different message should not be suppressed
         super::record_console_diagnostic(
             &diagnostics,
@@ -4100,10 +4800,20 @@ mod tests {
         }
         let records = diagnostics.snapshot();
         let chatgpt = records.iter().find(|r| r.agent_id == "chatgpt").unwrap();
-        assert_eq!(chatgpt.console_diagnostics.len(), super::MAX_CONSOLE_DIAGNOSTICS_PER_AGENT);
+        assert_eq!(
+            chatgpt.console_diagnostics.len(),
+            super::MAX_CONSOLE_DIAGNOSTICS_PER_AGENT
+        );
         // Oldest (error 0) should have been dropped, newest retained
-        assert!(!chatgpt.console_diagnostics.iter().any(|e| e.message == "error 0"));
-        assert!(chatgpt.console_diagnostics.iter().any(|e| e.message == format!("error {}", super::MAX_CONSOLE_DIAGNOSTICS_PER_AGENT + 4)));
+        assert!(
+            !chatgpt
+                .console_diagnostics
+                .iter()
+                .any(|e| e.message == "error 0")
+        );
+        assert!(chatgpt.console_diagnostics.iter().any(
+            |e| e.message == format!("error {}", super::MAX_CONSOLE_DIAGNOSTICS_PER_AGENT + 4)
+        ));
     }
 
     #[test]
@@ -4137,7 +4847,10 @@ mod tests {
         let records = diagnostics.snapshot();
         let chatgpt = records.iter().find(|r| r.agent_id == "chatgpt").unwrap();
         assert_eq!(chatgpt.console_diagnostics.len(), 1);
-        assert_eq!(chatgpt.console_diagnostics[0].category, "diagnostic_bridge_error");
+        assert_eq!(
+            chatgpt.console_diagnostics[0].category,
+            "diagnostic_bridge_error"
+        );
     }
 
     #[test]
@@ -4154,15 +4867,22 @@ mod tests {
         ];
         for msg in cases {
             let encoded = urlencoding::encode(msg);
-            let decoded = urlencoding::decode(&encoded).unwrap_or_default().into_owned();
+            let decoded = urlencoding::decode(&encoded)
+                .unwrap_or_default()
+                .into_owned();
             assert_eq!(decoded, msg, "round-trip failed for {:?}", msg);
             // Also test via arena signal parse
-            let url_str = format!("arena://console/chatgpt/console_error/error/console.error/{}/https%3A%2F%2Fchatgpt.com%2F", encoded);
+            let url_str = format!(
+                "arena://console/chatgpt/console_error/error/console.error/{}/https%3A%2F%2Fchatgpt.com%2F",
+                encoded
+            );
             let parsed = parse(&url_str);
             assert_eq!(parsed.action, "console");
             assert_eq!(parsed.args[0], "chatgpt");
             // arg 4 is the encoded message which should still be encoded at parse time; decode it and compare
-            let decoded_arg = urlencoding::decode(&parsed.args[4]).unwrap_or_default().into_owned();
+            let decoded_arg = urlencoding::decode(&parsed.args[4])
+                .unwrap_or_default()
+                .into_owned();
             assert_eq!(decoded_arg, msg);
         }
     }
@@ -4184,12 +4904,16 @@ mod tests {
         assert!(super::GENERIC_INIT_SCRIPT.contains("_ce.apply"));
         assert!(super::GENERIC_INIT_SCRIPT.contains("_cw.apply"));
         // Should be generic, not hardcode specific agent ids
-        for agent in ["chatgpt", "deepseek", "claude", "gemini", "qwen", "glm", "kimi"] {
+        for agent in [
+            "chatgpt", "deepseek", "claude", "gemini", "qwen", "glm", "kimi",
+        ] {
             // The script is generic; it should not contain literal agent strings except maybe in comments/selectors
             // But it must not contain a hardcoded assignment like "__ca_agentId = \"chatgpt\""
             assert!(
-                !super::GENERIC_INIT_SCRIPT.contains(&format!("\"{}\"", agent)) || super::GENERIC_INIT_SCRIPT.contains("display_name_for"),
-                "GENERIC_INIT_SCRIPT should not hardcode agent_id {}", agent
+                !super::GENERIC_INIT_SCRIPT.contains(&format!("\"{}\"", agent))
+                    || super::GENERIC_INIT_SCRIPT.contains("display_name_for"),
+                "GENERIC_INIT_SCRIPT should not hardcode agent_id {}",
+                agent
             );
         }
     }
@@ -4198,7 +4922,10 @@ mod tests {
     fn console_sanitize_redacts_and_bounds() {
         let msg = "Bearer sk-1234567890abcdef1234567890abcdef token-xyz and normal text";
         let sanitized = super::sanitize_console_message(msg);
-        assert!(!sanitized.contains("sk-1234567890"), "should redact sk- token");
+        assert!(
+            !sanitized.contains("sk-1234567890"),
+            "should redact sk- token"
+        );
         assert!(sanitized.contains("[REDACTED]"));
         let long = "x".repeat(5000);
         let sanitized_long = super::sanitize_console_message(&long);
@@ -4211,9 +4938,23 @@ mod tests {
     #[test]
     fn navigation_arena_requested_is_correlated() {
         let diagnostics = make_console_diagnostics();
-        diagnostics.record_arena_navigation_request("chatgpt", super::LEADER_WINDOW_LABEL, "https://chatgpt.com", "navigation_started");
-        diagnostics.record_navigation(super::LEADER_WINDOW_LABEL, Some("https://chatgpt.com/".to_string()), "https://chatgpt.com", "navigation_started");
-        let rec = diagnostics.snapshot().into_iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        diagnostics.record_arena_navigation_request(
+            "chatgpt",
+            super::LEADER_WINDOW_LABEL,
+            "https://chatgpt.com",
+            "navigation_started",
+        );
+        diagnostics.record_navigation(
+            super::LEADER_WINDOW_LABEL,
+            Some("https://chatgpt.com/".to_string()),
+            "https://chatgpt.com",
+            "navigation_started",
+        );
+        let rec = diagnostics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.agent_id == "chatgpt")
+            .unwrap();
         assert_eq!(rec.navigation_diagnostics.len(), 1);
         assert_eq!(rec.navigation_diagnostics[0].cause, "arena_requested");
         assert!(rec.navigation_diagnostics[0].arena_requested);
@@ -4222,8 +4963,17 @@ mod tests {
     #[test]
     fn navigation_page_initiated_is_detected() {
         let diagnostics = make_console_diagnostics();
-        diagnostics.record_navigation(super::NAV_WINDOW_LABEL, Some("https://chat.deepseek.com/".to_string()), "https://chat.deepseek.com/c/abc123", "real_url_loaded");
-        let rec = diagnostics.snapshot().into_iter().find(|r| r.agent_id == "deepseek").unwrap();
+        diagnostics.record_navigation(
+            super::NAV_WINDOW_LABEL,
+            Some("https://chat.deepseek.com/".to_string()),
+            "https://chat.deepseek.com/c/abc123",
+            "real_url_loaded",
+        );
+        let rec = diagnostics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.agent_id == "deepseek")
+            .unwrap();
         assert_eq!(rec.navigation_diagnostics.len(), 1);
         assert_eq!(rec.navigation_diagnostics[0].cause, "page_initiated");
         assert!(!rec.navigation_diagnostics[0].arena_requested);
@@ -4240,25 +4990,53 @@ mod tests {
                 "navigation_started",
             );
         }
-        let rec = diagnostics.snapshot().into_iter().find(|r| r.agent_id == "chatgpt").unwrap();
-        assert_eq!(rec.navigation_diagnostics.len(), super::MAX_NAVIGATION_DIAGNOSTICS_PER_AGENT);
-        assert!(!rec.navigation_diagnostics.iter().any(|e| e.from_url == "https://chatgpt.com/0"));
+        let rec = diagnostics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.agent_id == "chatgpt")
+            .unwrap();
+        assert_eq!(
+            rec.navigation_diagnostics.len(),
+            super::MAX_NAVIGATION_DIAGNOSTICS_PER_AGENT
+        );
+        assert!(
+            !rec.navigation_diagnostics
+                .iter()
+                .any(|e| e.from_url == "https://chatgpt.com/0")
+        );
     }
 
     #[test]
     fn navigation_setup_generation_is_tracked() {
         let diagnostics = make_console_diagnostics();
-        diagnostics.record_navigation(super::LEADER_WINDOW_LABEL, None, "https://chatgpt.com", "navigation_started");
-        let rec = diagnostics.snapshot().into_iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        diagnostics.record_navigation(
+            super::LEADER_WINDOW_LABEL,
+            None,
+            "https://chatgpt.com",
+            "navigation_started",
+        );
+        let rec = diagnostics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.agent_id == "chatgpt")
+            .unwrap();
         assert_eq!(rec.navigation_diagnostics[0].setup_generation, 1);
         assert_eq!(rec.navigation_diagnostics[0].agent_id, "chatgpt");
-        assert_eq!(rec.navigation_diagnostics[0].window_label, super::LEADER_WINDOW_LABEL);
+        assert_eq!(
+            rec.navigation_diagnostics[0].window_label,
+            super::LEADER_WINDOW_LABEL
+        );
     }
 
     #[test]
     fn navigation_recent_unexpected_is_detected() {
         let diagnostics = make_console_diagnostics();
-        diagnostics.record_navigation(super::LEADER_WINDOW_LABEL, Some("https://chatgpt.com/".to_string()), "https://chatgpt.com/c/new", "real_url_loaded");
+        diagnostics.record_navigation(
+            super::LEADER_WINDOW_LABEL,
+            Some("https://chatgpt.com/".to_string()),
+            "https://chatgpt.com/c/new",
+            "real_url_loaded",
+        );
         assert!(diagnostics.has_recent_unexpected_navigation("chatgpt", 15));
         assert!(!diagnostics.has_recent_unexpected_navigation("nonexistent", 15));
     }
@@ -4287,7 +5065,10 @@ mod tests {
             r.page_state_hint = Some("empty_shell_or_hydration_stuck".to_string());
         });
         assert!(diagnostics.is_empty_shell_failure("chatgpt"));
-        assert_eq!(diagnostics.page_state_hint_for("chatgpt"), Some("empty_shell_or_hydration_stuck".to_string()));
+        assert_eq!(
+            diagnostics.page_state_hint_for("chatgpt"),
+            Some("empty_shell_or_hydration_stuck".to_string())
+        );
         // Other hint should not be considered empty shell
         let _ = super::update_diagnostic(&diagnostics, "deepseek", |r| {
             r.page_state_hint = Some("composer_detected".to_string());
@@ -4310,7 +5091,11 @@ mod tests {
         let _ = super::update_diagnostic(&diagnostics, "chatgpt", |r| {
             r.user_agent = Some(ua.to_string());
         });
-        let rec = diagnostics.snapshot().into_iter().find(|r| r.agent_id == "chatgpt").unwrap();
+        let rec = diagnostics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.agent_id == "chatgpt")
+            .unwrap();
         assert_eq!(rec.user_agent, Some(ua.to_string()));
         let before = rec.user_agent.clone();
         assert_eq!(before, Some(ua.to_string()));
@@ -4319,7 +5104,10 @@ mod tests {
         assert!(long.len() > 500);
         let truncated = {
             let mut s = long.clone();
-            if s.len() > 500 { s.truncate(500); s.push_str(" [truncated]"); }
+            if s.len() > 500 {
+                s.truncate(500);
+                s.push_str(" [truncated]");
+            }
             s
         };
         assert!(truncated.contains("[truncated]"));
@@ -4351,42 +5139,54 @@ mod tests {
             input_types: vec!["text".to_string(); 10],
             input_placeholders: vec!["placeholder".repeat(5); 10],
             link_labels: button_labels.clone(),
-            candidate_login_buttons: vec![crate::browser_harness::SafeElement {
-                tag: "BUTTON".to_string(),
-                role: "button".to_string(),
-                aria_label: "login".to_string(),
-                name: "login".to_string(),
-                enabled: true,
-                visible: true,
-                bounding_rect: None,
-            }; 3],
-            candidate_next_buttons: vec![crate::browser_harness::SafeElement {
-                tag: "BUTTON".to_string(),
-                role: "button".to_string(),
-                aria_label: "next".to_string(),
-                name: "next".to_string(),
-                enabled: true,
-                visible: true,
-                bounding_rect: None,
-            }; 3],
-            candidate_send_buttons: vec![crate::browser_harness::SafeElement {
-                tag: "BUTTON".to_string(),
-                role: "button".to_string(),
-                aria_label: "send".to_string(),
-                name: "send".to_string(),
-                enabled: true,
-                visible: true,
-                bounding_rect: None,
-            }; 3],
-            candidate_attachment_buttons: vec![crate::browser_harness::SafeElement {
-                tag: "BUTTON".to_string(),
-                role: "button".to_string(),
-                aria_label: "attach".to_string(),
-                name: "attach".to_string(),
-                enabled: true,
-                visible: true,
-                bounding_rect: None,
-            }; 3],
+            candidate_login_buttons: vec![
+                crate::browser_harness::SafeElement {
+                    tag: "BUTTON".to_string(),
+                    role: "button".to_string(),
+                    aria_label: "login".to_string(),
+                    name: "login".to_string(),
+                    enabled: true,
+                    visible: true,
+                    bounding_rect: None,
+                };
+                3
+            ],
+            candidate_next_buttons: vec![
+                crate::browser_harness::SafeElement {
+                    tag: "BUTTON".to_string(),
+                    role: "button".to_string(),
+                    aria_label: "next".to_string(),
+                    name: "next".to_string(),
+                    enabled: true,
+                    visible: true,
+                    bounding_rect: None,
+                };
+                3
+            ],
+            candidate_send_buttons: vec![
+                crate::browser_harness::SafeElement {
+                    tag: "BUTTON".to_string(),
+                    role: "button".to_string(),
+                    aria_label: "send".to_string(),
+                    name: "send".to_string(),
+                    enabled: true,
+                    visible: true,
+                    bounding_rect: None,
+                };
+                3
+            ],
+            candidate_attachment_buttons: vec![
+                crate::browser_harness::SafeElement {
+                    tag: "BUTTON".to_string(),
+                    role: "button".to_string(),
+                    aria_label: "attach".to_string(),
+                    name: "attach".to_string(),
+                    enabled: true,
+                    visible: true,
+                    bounding_rect: None,
+                };
+                3
+            ],
             timestamp: chrono::Utc::now().to_rfc3339(),
             operation_id: "op-test".to_string(),
         };
@@ -4395,8 +5195,18 @@ mod tests {
         let mut obj = forensics.clone();
         let mut j = serde_json::to_string(&obj).unwrap();
         if j.len() > 4000 {
-            obj.button_labels = obj.button_labels.into_iter().take(5).map(|s| s[..30.min(s.len())].to_string()).collect();
-            obj.link_labels = obj.link_labels.into_iter().take(5).map(|s| s[..30.min(s.len())].to_string()).collect();
+            obj.button_labels = obj
+                .button_labels
+                .into_iter()
+                .take(5)
+                .map(|s| s[..30.min(s.len())].to_string())
+                .collect();
+            obj.link_labels = obj
+                .link_labels
+                .into_iter()
+                .take(5)
+                .map(|s| s[..30.min(s.len())].to_string())
+                .collect();
             obj.input_types = obj.input_types.into_iter().take(5).collect();
             obj.title = obj.title[..100.min(obj.title.len())].to_string();
             j = serde_json::to_string(&obj).unwrap();
@@ -4408,13 +5218,25 @@ mod tests {
             obj.candidate_attachment_buttons.clear();
             j = serde_json::to_string(&obj).unwrap();
         }
-        assert!(j.len() <= 4000, "truncated json len {} exceeds 4000", j.len());
+        assert!(
+            j.len() <= 4000,
+            "truncated json len {} exceeds 4000",
+            j.len()
+        );
         // Must still parse as valid SafeDomForensics
-        let parsed: crate::browser_harness::SafeDomForensics = serde_json::from_str(&j).expect("truncated json must be valid");
+        let parsed: crate::browser_harness::SafeDomForensics =
+            serde_json::from_str(&j).expect("truncated json must be valid");
         assert_eq!(parsed.operation_id, "op-test");
         // Original naive slice would have produced invalid JSON — ensure our method does not
-        let naive = if json.len() > 4000 { json[..4000].to_string() + " [truncated]" } else { json.clone() };
-        assert!(serde_json::from_str::<crate::browser_harness::SafeDomForensics>(&naive).is_err(), "naive slice should be invalid JSON");
+        let naive = if json.len() > 4000 {
+            json[..4000].to_string() + " [truncated]"
+        } else {
+            json.clone()
+        };
+        assert!(
+            serde_json::from_str::<crate::browser_harness::SafeDomForensics>(&naive).is_err(),
+            "naive slice should be invalid JSON"
+        );
     }
 
     // RC1-H1: high-frequency readiness probes must be summarized, not spammed
@@ -4433,25 +5255,38 @@ mod tests {
         });
         // Second probe same values, count=2 not periodic and no flag => should NOT emit
         let should_emit = {
-            let records = diagnostics.records.lock().unwrap_or_else(|p| p.into_inner());
+            let records = diagnostics
+                .records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let rec = records.get("chatgpt").unwrap();
             let hint_changed = rec.page_state_hint != Some("still_loading".to_string());
             let input_changed = rec.input_found != true;
             let send_changed = rec.send_button_found != true;
             let periodic = Some(2).map(|c| c % 5 == 0).unwrap_or(true);
-            hint_changed || input_changed || send_changed || periodic || rec.readiness_probe_count.is_none()
+            hint_changed
+                || input_changed
+                || send_changed
+                || periodic
+                || rec.readiness_probe_count.is_none()
         };
         assert!(!should_emit, "identical probe count 2 should be deduped");
         // Probe count 5 periodic should emit
         let periodic_emit = {
-            let records = diagnostics.records.lock().unwrap_or_else(|p| p.into_inner());
+            let records = diagnostics
+                .records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let rec = records.get("chatgpt").unwrap();
             Some(5).map(|c| c % 5 == 0).unwrap_or(true)
         };
         assert!(periodic_emit, "periodic probe 5 should emit");
         // Hint change should emit
         let hint_emit = {
-            let records = diagnostics.records.lock().unwrap_or_else(|p| p.into_inner());
+            let records = diagnostics
+                .records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let rec = records.get("chatgpt").unwrap();
             rec.page_state_hint != Some("composer_detected".to_string())
         };
@@ -4465,22 +5300,42 @@ mod tests {
         let mut state = super::BrowserState::new(tx);
         let now = std::time::Instant::now();
         state.connected_account_busy_until = Some(now + std::time::Duration::from_secs(10));
-        assert!(state.connected_account_busy_until.unwrap() > now + std::time::Duration::from_secs(9));
+        assert!(
+            state.connected_account_busy_until.unwrap() > now + std::time::Duration::from_secs(9)
+        );
         // Short guard (old 3s) would be <= now+3s
         let short = now + std::time::Duration::from_secs(3);
-        assert!(state.connected_account_busy_until.unwrap() > short, "guard must be longer than old 3s");
+        assert!(
+            state.connected_account_busy_until.unwrap() > short,
+            "guard must be longer than old 3s"
+        );
     }
 
     #[test]
     fn generic_init_script_has_rc1_guards() {
         // RC1-INITSCRIPT: main init must be idempotent
-        assert!(super::GENERIC_INIT_SCRIPT.contains("window.__ca_mainInstalled"), "missing idempotent guard for main init");
+        assert!(
+            super::GENERIC_INIT_SCRIPT.contains("window.__ca_mainInstalled"),
+            "missing idempotent guard for main init"
+        );
         // RC1-H2: forensics must use field-level truncation, not naive slice
-        assert!(super::GENERIC_INIT_SCRIPT.contains("forensicsJson"), "missing field-level forensics truncation helper");
-        assert!(!super::GENERIC_INIT_SCRIPT.contains("if(json.length>4000) json=json.slice(0,4000)"), "naive JSON slice must be removed");
+        assert!(
+            super::GENERIC_INIT_SCRIPT.contains("forensicsJson"),
+            "missing field-level forensics truncation helper"
+        );
+        assert!(
+            !super::GENERIC_INIT_SCRIPT.contains("if(json.length>4000) json=json.slice(0,4000)"),
+            "naive JSON slice must be removed"
+        );
         // RC1-H1: readiness stable 3-probe must exist
-        assert!(super::GENERIC_INIT_SCRIPT.contains("_readyStableCount"), "missing 3-probe stable readiness");
-        assert!(super::GENERIC_INIT_SCRIPT.contains("possible_login_required"), "missing login guard");
+        assert!(
+            super::GENERIC_INIT_SCRIPT.contains("_readyStableCount"),
+            "missing 3-probe stable readiness"
+        );
+        assert!(
+            super::GENERIC_INIT_SCRIPT.contains("possible_login_required"),
+            "missing login guard"
+        );
     }
 }
 
@@ -4850,7 +5705,7 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         '[data-testid*="textbox" i]',
         '[data-testid*="input" i]'
     ];
-    const READY_TIMEOUT_MS = 45000;
+    const READY_TIMEOUT_MS = 90000;
     const READY_CHECK_INTERVAL_MS = 500;
 
     function getAgentId() {
@@ -5027,7 +5882,16 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
                 'continue with email',
                 'enter your password',
                 'create your account',
-                'verify your email'
+                'verify your email',
+                // Chinese login phrases for GLM/Qwen/DeepSeek/Kimi (Z.ai etc.)
+                '登录',
+                '注册',
+                '验证码',
+                '手机号',
+                '邮箱',
+                '密码',
+                '微信',
+                '支付宝'
             ])
         ) {
             return 'possible_login_required';
@@ -5855,6 +6719,7 @@ pub fn create_windows(
     .title("Consensus Arena — Leader")
     .inner_size(1200.0, 800.0)
     .visible(false)
+    .user_agent(CHROME_USER_AGENT)
     .initialization_script(GENERIC_INIT_SCRIPT)
     .on_navigation(make_nav_closure(leader_tx, LEADER_WINDOW_LABEL))
     .on_new_window(make_new_window_handler(
@@ -5879,6 +6744,7 @@ pub fn create_windows(
     .title("Consensus Arena — Agent")
     .inner_size(1200.0, 800.0)
     .visible(false)
+    .user_agent(CHROME_USER_AGENT)
     .initialization_script(GENERIC_INIT_SCRIPT)
     .on_navigation(make_nav_closure(nav_tx, NAV_WINDOW_LABEL))
     .on_new_window(make_new_window_handler(nav_popup_tx, NAV_WINDOW_LABEL))
@@ -5896,7 +6762,10 @@ pub fn create_windows(
 /// Restore the one shared participant WebView if it was closed after setup.
 /// This never creates a second nav window and leaves the persistent leader
 /// WebView intact.
-pub fn ensure_nav_window(app: &AppHandle, state: &mut BrowserState) -> Result<WebviewWindow, AgentError> {
+pub fn ensure_nav_window(
+    app: &AppHandle,
+    state: &mut BrowserState,
+) -> Result<WebviewWindow, AgentError> {
     if let Some(window) = state.nav_window.clone() {
         return Ok(window);
     }
@@ -5914,12 +6783,13 @@ pub fn ensure_nav_window(app: &AppHandle, state: &mut BrowserState) -> Result<We
         WebviewUrl::External(
             "about:blank"
                 .parse()
-                .map_err(|e| AgentError::NavigationFailed(format!("url parse: {e}")) )?,
+                .map_err(|e| AgentError::NavigationFailed(format!("url parse: {e}")))?,
         ),
     )
     .title("Consensus Arena — Agent")
     .inner_size(1200.0, 800.0)
     .visible(false)
+    .user_agent(CHROME_USER_AGENT)
     .initialization_script(GENERIC_INIT_SCRIPT)
     .on_navigation(make_nav_closure(nav_tx, NAV_WINDOW_LABEL))
     .on_new_window(make_new_window_handler(nav_popup_tx, NAV_WINDOW_LABEL))
@@ -5949,9 +6819,9 @@ pub fn retry_active_submit(
     let js = format!(
         "try {{ if (typeof window.__caRetrySubmit === 'function') {{ window.__caRetrySubmit({agent_json}, {turn}); }} }} catch (e) {{}}"
     );
-    window.eval(&js).map_err(|error| {
-        AgentError::InjectionFailed(format!("retry submit eval failed: {error}"))
-    })
+    window
+        .eval(&js)
+        .map_err(|error| AgentError::InjectionFailed(format!("retry submit eval failed: {error}")))
 }
 
 /// Start response capture for a message the user sent manually during setup.
@@ -6351,6 +7221,9 @@ var _injectAttempts = 0;
   // setup injection remains observation-only.
   setTimeout(pollResponse, 1500);
 }})();"#,
-        agent_id, turn, prompt_json, if auto_submit { "true" } else { "false" }
+        agent_id,
+        turn,
+        prompt_json,
+        if auto_submit { "true" } else { "false" }
     )
 }

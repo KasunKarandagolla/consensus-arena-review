@@ -171,20 +171,20 @@ export default function MemoryPanel({ projectBrief }: Props) {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 7, marginTop: 10 }}>
         {health?.fts_needs_repair && (
           <button className="cr-btn" disabled={disabled} onClick={() => void repairIndex()} style={{ gridColumn: '1 / -1' }}>
-            <Wrench size={12} style={{ marginRight: 5 }} />{busy === 'repair' ? 'Repairing…' : 'Repair Search Index'}
+            <Wrench size={12} />{busy === 'repair' ? 'Repairing…' : 'Repair Search Index'}
           </button>
         )}
         <button className="cr-btn" disabled={disabled} onClick={() => void exportBackup()}>
-          <Download size={12} style={{ marginRight: 5 }} />{busy === 'export' ? 'Exporting…' : 'Export Backup'}
+          <Download size={12} />{busy === 'export' ? 'Exporting…' : 'Export Backup'}
         </button>
         <button className="cr-btn" disabled={disabled} onClick={() => void restoreBackup()}>
-          <Upload size={12} style={{ marginRight: 5 }} />{busy === 'restore' ? 'Restoring…' : 'Restore Backup'}
+          <Upload size={12} />{busy === 'restore' ? 'Restoring…' : 'Restore Backup'}
         </button>
         <button className="cr-btn" disabled={disabled || !projectBrief} onClick={() => void loadFacts()}>
-          <Eye size={12} style={{ marginRight: 5 }} />{busy === 'facts' ? 'Loading…' : 'View Stored Facts'}
+          <Eye size={12} />{busy === 'facts' ? 'Loading…' : 'View Stored Facts'}
         </button>
         <button className="cr-btn" disabled={disabled || !projectBrief} onClick={() => void clearMemory()} style={{ color: 'var(--red)' }}>
-          <Trash2 size={12} style={{ marginRight: 5 }} />{busy === 'clear' ? 'Clearing…' : 'Clear Project Memory'}
+          <Trash2 size={12} />{busy === 'clear' ? 'Clearing…' : 'Clear Project Memory'}
         </button>
       </div>
       {facts !== null && (

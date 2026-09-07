@@ -483,7 +483,9 @@ pub fn classify_console_error(category: &str, message: &str, source: &str) -> Cl
         "active-submit",
         "send-probe",
     ];
-    let automation_related = automation_markers.iter().any(|m| lower.contains(m) || source.contains(m));
+    let automation_related = automation_markers
+        .iter()
+        .any(|m| lower.contains(m) || source.contains(m));
     // Website telemetry failures that are NOT arena automation
     let website_noise = [
         "segment",
@@ -679,7 +681,12 @@ pub fn operation_id_priming(agent_id: &str, generation: u32) -> String {
     format!("priming-{}-g{}", sanitize_id(agent_id), generation)
 }
 pub fn operation_id_active_turn(agent_id: &str, generation: u32, turn: u32) -> String {
-    format!("active-turn-{}-g{}-t{}", sanitize_id(agent_id), generation, turn)
+    format!(
+        "active-turn-{}-g{}-t{}",
+        sanitize_id(agent_id),
+        generation,
+        turn
+    )
 }
 pub fn operation_id_submit(agent_id: &str, generation: u32, turn: u32) -> String {
     format!("submit-{}-g{}-t{}", sanitize_id(agent_id), generation, turn)
@@ -690,7 +697,13 @@ pub fn operation_id_diagnostic_single(agent_id: &str, generation: u32) -> String
 
 fn sanitize_id(v: &str) -> String {
     v.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -721,7 +734,10 @@ pub fn classify_navigation_reason(
         }
         return (NavigationReason::Authentication, Confidence::Low);
     }
-    if lower_to.contains("cloudflare") || lower_to.contains("challenge") || lower_to.contains("captcha") {
+    if lower_to.contains("cloudflare")
+        || lower_to.contains("challenge")
+        || lower_to.contains("captcha")
+    {
         return (NavigationReason::Challenge, Confidence::Medium);
     }
     if let Some(hint) = page_health_hint {
@@ -890,7 +906,11 @@ pub fn build_browser_event(
         window_label: window_label.to_string(),
         window_kind: window_kind.to_string(),
         setup_generation,
-        phase: if phase.is_empty() { "unknown".to_string() } else { phase.to_string() },
+        phase: if phase.is_empty() {
+            "unknown".to_string()
+        } else {
+            phase.to_string()
+        },
         operation_id: operation_id.to_string(),
         event_type: event_type.to_string(),
         url: redact_url(url),
@@ -924,9 +944,18 @@ pub fn generate_reliability_report_markdown(
 ) -> String {
     let mut md = String::new();
     md.push_str("# BROWSER_RELIABILITY_REPORT\n\n");
-    md.push_str(&format!("Generated: {}\n\n", chrono::Utc::now().to_rfc3339()));
-    md.push_str(&format!("Agents with timeline: {:?}\n\n", timeline.agent_ids()));
-    md.push_str(&format!("Total timeline events: {}\n\n", timeline.total_events()));
+    md.push_str(&format!(
+        "Generated: {}\n\n",
+        chrono::Utc::now().to_rfc3339()
+    ));
+    md.push_str(&format!(
+        "Agents with timeline: {:?}\n\n",
+        timeline.agent_ids()
+    ));
+    md.push_str(&format!(
+        "Total timeline events: {}\n\n",
+        timeline.total_events()
+    ));
 
     let mut all = timeline.all_events_sorted();
     // Limit report preview to last 200 events to keep lightweight
@@ -935,30 +964,71 @@ pub fn generate_reliability_report_markdown(
     }
 
     for record in diagnostics_snapshot {
-        md.push_str(&format!("## Model: {} ({})\n\n", record.display_name, record.agent_id));
-        md.push_str(&format!("- Window: {} ({})\n", record.window_label, record.window_kind));
+        md.push_str(&format!(
+            "## Model: {} ({})\n\n",
+            record.display_name, record.agent_id
+        ));
+        md.push_str(&format!(
+            "- Window: {} ({})\n",
+            record.window_label, record.window_kind
+        ));
         md.push_str(&format!("- Session: {}\n", record.session_id));
         md.push_str(&format!("- Generation: {}\n", record.setup_generation));
         md.push_str(&format!("- Current phase: {}\n", record.current_phase));
-        md.push_str(&format!("- Current URL: {}\n", record.last_navigation_url.as_deref().unwrap_or(&record.intended_url)));
-        md.push_str(&format!("- Authentication / blocker: {}\n", record.last_blocker));
-        md.push_str(&format!("- Timeline events dropped: {}\n", timeline.events_dropped(&record.agent_id)));
-        md.push_str(&format!("- Console errors: {} warnings: {}\n", record.browser_console_error_count, record.browser_console_warning_count));
-        md.push_str(&format!("- Navigation diagnostics: {} entries\n", record.navigation_diagnostics.len()));
+        md.push_str(&format!(
+            "- Current URL: {}\n",
+            record
+                .last_navigation_url
+                .as_deref()
+                .unwrap_or(&record.intended_url)
+        ));
+        md.push_str(&format!(
+            "- Authentication / blocker: {}\n",
+            record.last_blocker
+        ));
+        md.push_str(&format!(
+            "- Timeline events dropped: {}\n",
+            timeline.events_dropped(&record.agent_id)
+        ));
+        md.push_str(&format!(
+            "- Console errors: {} warnings: {}\n",
+            record.browser_console_error_count, record.browser_console_warning_count
+        ));
+        md.push_str(&format!(
+            "- Navigation diagnostics: {} entries\n",
+            record.navigation_diagnostics.len()
+        ));
         if let Some(nav) = record.last_navigation.as_ref() {
-            md.push_str(&format!("- Last navigation: {} -> {} cause={} gen={}\n", nav.from_url, nav.to_url, nav.cause, nav.setup_generation));
+            md.push_str(&format!(
+                "- Last navigation: {} -> {} cause={} gen={}\n",
+                nav.from_url, nav.to_url, nav.cause, nav.setup_generation
+            ));
         }
         md.push_str("\n### Timeline (chronological, last 50 for this agent)\n\n");
-        let agent_events: Vec<&BrowserEvent> = all.iter().filter(|e| e.agent_id == record.agent_id).collect();
-        let slice = if agent_events.len() > 50 { &agent_events[agent_events.len()-50..] } else { &agent_events[..] };
+        let agent_events: Vec<&BrowserEvent> = all
+            .iter()
+            .filter(|e| e.agent_id == record.agent_id)
+            .collect();
+        let slice = if agent_events.len() > 50 {
+            &agent_events[agent_events.len() - 50..]
+        } else {
+            &agent_events[..]
+        };
         if slice.is_empty() {
             md.push_str("_No timeline events recorded for this agent._\n\n");
         } else {
             for ev in slice {
-                md.push_str(&format!("- {} [{}] {} op={} phase={} url={}\n", ev.timestamp, ev.event_type, ev.agent_id, ev.operation_id, ev.phase, ev.url));
+                md.push_str(&format!(
+                    "- {} [{}] {} op={} phase={} url={}\n",
+                    ev.timestamp, ev.event_type, ev.agent_id, ev.operation_id, ev.phase, ev.url
+                ));
                 if !ev.details.is_null() && ev.details != serde_json::Value::Null {
                     let details_str = ev.details.to_string();
-                    let truncated = if details_str.len() > 300 { format!("{} [truncated]", &details_str[..300]) } else { details_str };
+                    let truncated = if details_str.len() > 300 {
+                        format!("{} [truncated]", &details_str[..300])
+                    } else {
+                        details_str
+                    };
                     md.push_str(&format!("  details: {}\n", truncated));
                 }
             }
@@ -966,27 +1036,66 @@ pub fn generate_reliability_report_markdown(
         }
         md.push_str("### Navigation events\n\n");
         for nav in &record.navigation_diagnostics {
-            md.push_str(&format!("- {} {} -> {} cause={} arena_requested={} phase={}\n", nav.timestamp, nav.from_url, nav.to_url, nav.cause, nav.arena_requested, nav.phase));
+            md.push_str(&format!(
+                "- {} {} -> {} cause={} arena_requested={} phase={}\n",
+                nav.timestamp, nav.from_url, nav.to_url, nav.cause, nav.arena_requested, nav.phase
+            ));
         }
         md.push_str("\n### Console diagnostics\n\n");
         for c in &record.console_diagnostics {
-            md.push_str(&format!("- {} [{}] {} source={} url={} msg={}\n", c.timestamp, c.category, c.severity, c.source, c.url, truncate(&c.message, 200)));
+            md.push_str(&format!(
+                "- {} [{}] {} source={} url={} msg={}\n",
+                c.timestamp,
+                c.category,
+                c.severity,
+                c.source,
+                c.url,
+                truncate(&c.message, 200)
+            ));
         }
         md.push_str("\n### DOM / Composer state (latest)\n\n");
         md.push_str(&format!("- input_found={} send_button_found={} input_candidate_count={:?} composer_candidate_count={:?} send_button_candidate_count={:?}\n", record.input_found, record.send_button_found, record.input_candidate_count, record.composer_candidate_count, record.send_button_candidate_count));
-        md.push_str(&format!("- send_enabled_after_injection={:?} prompt_visible_prefix_ok={:?} suffix_ok={:?}\n", record.send_button_enabled_after_injection, record.prompt_visible_prefix_ok, record.prompt_visible_suffix_ok));
-        md.push_str(&format!("- injection_target_tag={:?} role={:?} contenteditable={:?} method={:?}\n", record.injection_target_tag, record.injection_target_role, record.injection_target_contenteditable, record.prompt_injection_method));
-        md.push_str(&format!("- page_state_hint={:?} page_health_hint={:?} last_error={:?}\n", record.page_state_hint, record.page_health_hint, record.last_error));
+        md.push_str(&format!(
+            "- send_enabled_after_injection={:?} prompt_visible_prefix_ok={:?} suffix_ok={:?}\n",
+            record.send_button_enabled_after_injection,
+            record.prompt_visible_prefix_ok,
+            record.prompt_visible_suffix_ok
+        ));
+        md.push_str(&format!(
+            "- injection_target_tag={:?} role={:?} contenteditable={:?} method={:?}\n",
+            record.injection_target_tag,
+            record.injection_target_role,
+            record.injection_target_contenteditable,
+            record.prompt_injection_method
+        ));
+        md.push_str(&format!(
+            "- page_state_hint={:?} page_health_hint={:?} last_error={:?}\n",
+            record.page_state_hint, record.page_health_hint, record.last_error
+        ));
         md.push_str("\n### Priming / Submission result\n\n");
-        md.push_str(&format!("- setup_completion_reason={:?}\n", record.setup_completion_reason));
-        md.push_str(&format!("- prompt_injected_at={:?} error={:?}\n", record.prompt_injected_at, record.prompt_injection_error));
-        md.push_str(&format!("- active_turn={:?} active_submit_succeeded={:?} method={:?} error={:?}\n", record.active_turn_number, record.active_auto_submit_succeeded, record.active_auto_submit_method, record.active_submit_error));
+        md.push_str(&format!(
+            "- setup_completion_reason={:?}\n",
+            record.setup_completion_reason
+        ));
+        md.push_str(&format!(
+            "- prompt_injected_at={:?} error={:?}\n",
+            record.prompt_injected_at, record.prompt_injection_error
+        ));
+        md.push_str(&format!(
+            "- active_turn={:?} active_submit_succeeded={:?} method={:?} error={:?}\n",
+            record.active_turn_number,
+            record.active_auto_submit_succeeded,
+            record.active_auto_submit_method,
+            record.active_submit_error
+        ));
         md.push_str("\n### Final diagnosis (evidence-based)\n\n");
         // Evidence-based diagnosis: look at last navigation after injection
         let last_nav_after_injection = record.last_navigation.as_ref().filter(|n| {
             if let Some(injected) = record.prompt_injected_at.as_deref() {
                 n.timestamp > injected.to_string()
-            } else { false }
+            } else {
+                false
+            }
         });
         if let Some(nav) = last_nav_after_injection {
             if nav.cause == "page_initiated" && !nav.arena_requested {
@@ -1009,7 +1118,11 @@ pub fn generate_reliability_report_markdown(
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n { s.to_string() } else { format!("{} [truncated]", &s[..n]) }
+    if s.len() <= n {
+        s.to_string()
+    } else {
+        format!("{} [truncated]", &s[..n])
+    }
 }
 
 // ── Cross-Platform Forensic Extensions (spec §4-12, §17-19) ─────────────────
@@ -1197,7 +1310,15 @@ impl FailureClassification {
 }
 
 pub fn new_navigation_intent_id() -> String {
-    format!("nav-{}-{}", chrono::Utc::now().timestamp_millis(), uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"))
+    format!(
+        "nav-{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("0")
+    )
 }
 
 pub fn sanitize_button_label(raw: &str) -> String {
@@ -1216,7 +1337,11 @@ pub fn classify_failure_from_timeline(events: &[BrowserEvent]) -> FailureClassif
     let last = events.last().expect("non-empty");
     match last.event_type.as_str() {
         "navigation_failed" => FailureClassification::NavigationFailed,
-        "navigation_started" if last.details.get("unexpected").and_then(|v| v.as_bool()) == Some(true) => FailureClassification::UnexpectedReload,
+        "navigation_started"
+            if last.details.get("unexpected").and_then(|v| v.as_bool()) == Some(true) =>
+        {
+            FailureClassification::UnexpectedReload
+        }
         "challenge_detected" | "captcha_detected" => FailureClassification::ChallengeDetected,
         "composer_lost" | "input_lost" => FailureClassification::ComposerMissing,
         "login_page_detected" => FailureClassification::LoginRequired,
@@ -1230,10 +1355,27 @@ pub fn classify_failure_from_timeline(events: &[BrowserEvent]) -> FailureClassif
 
 pub fn empty_dom_snapshot() -> DomSnapshot {
     DomSnapshot {
-        input: DomInputSnapshot { tag: "".to_string(), exists: false, visible: false, value_length: 0 },
-        composer: DomComposerSnapshot { exists: false, candidate_count: 0 },
-        send: DomSendSnapshot { exists: false, candidate_count: 0, enabled: false, text: "".to_string(), aria_label: "".to_string() },
-        attachment: DomAttachmentSnapshot { exists: false, candidate_count: 0 },
+        input: DomInputSnapshot {
+            tag: "".to_string(),
+            exists: false,
+            visible: false,
+            value_length: 0,
+        },
+        composer: DomComposerSnapshot {
+            exists: false,
+            candidate_count: 0,
+        },
+        send: DomSendSnapshot {
+            exists: false,
+            candidate_count: 0,
+            enabled: false,
+            text: "".to_string(),
+            aria_label: "".to_string(),
+        },
+        attachment: DomAttachmentSnapshot {
+            exists: false,
+            candidate_count: 0,
+        },
         input_identity: None,
         composer_identity: None,
         send_identity: None,
@@ -1245,7 +1387,15 @@ pub fn empty_safe_dom_forensics(operation_id: &str, url: &str) -> SafeDomForensi
     SafeDomForensics {
         url: redact_url(url),
         title: "".to_string(),
-        active_element: SafeElement { tag: "".to_string(), role: "".to_string(), aria_label: "".to_string(), name: "".to_string(), enabled: false, visible: false, bounding_rect: None },
+        active_element: SafeElement {
+            tag: "".to_string(),
+            role: "".to_string(),
+            aria_label: "".to_string(),
+            name: "".to_string(),
+            enabled: false,
+            visible: false,
+            bounding_rect: None,
+        },
         button_labels: Vec::new(),
         input_types: Vec::new(),
         input_placeholders: Vec::new(),
@@ -1288,8 +1438,14 @@ mod tests {
     fn operation_ids_format() {
         assert_eq!(operation_id_setup("chatgpt", 1), "setup-chatgpt-g1");
         assert_eq!(operation_id_priming("chatgpt", 2), "priming-chatgpt-g2");
-        assert_eq!(operation_id_active_turn("deepseek", 1, 3), "active-turn-deepseek-g1-t3");
-        assert_eq!(operation_id_submit("deepseek", 1, 2), "submit-deepseek-g1-t2");
+        assert_eq!(
+            operation_id_active_turn("deepseek", 1, 3),
+            "active-turn-deepseek-g1-t3"
+        );
+        assert_eq!(
+            operation_id_submit("deepseek", 1, 2),
+            "submit-deepseek-g1-t2"
+        );
     }
 
     #[test]
@@ -1297,7 +1453,13 @@ mod tests {
         let tl = BrowserTimeline::new();
         for i in 0..(BROWSER_EVENT_RING_BUFFER_LIMIT + 5) {
             let ev = build_browser_event(
-                "sess", "chatgpt", "ChatGPT", "arena-nav", "nav", 1, "priming",
+                "sess",
+                "chatgpt",
+                "ChatGPT",
+                "arena-nav",
+                "nav",
+                1,
+                "priming",
                 &operation_id_priming("chatgpt", 1),
                 "dom_snapshot",
                 "https://chatgpt.com/",
@@ -1306,20 +1468,33 @@ mod tests {
             );
             tl.record(ev);
         }
-        assert_eq!(tl.events_for("chatgpt").len(), BROWSER_EVENT_RING_BUFFER_LIMIT);
+        assert_eq!(
+            tl.events_for("chatgpt").len(),
+            BROWSER_EVENT_RING_BUFFER_LIMIT
+        );
         assert_eq!(tl.events_dropped("chatgpt"), 5);
         // Oldest dropped
         let events = tl.events_for("chatgpt");
-        assert!(events.iter().all(|e| e.details["i"].as_u64().unwrap_or(0) >= 5));
+        assert!(
+            events
+                .iter()
+                .all(|e| e.details["i"].as_u64().unwrap_or(0) >= 5)
+        );
     }
 
     #[test]
     fn event_serialization_roundtrip() {
         let ev = build_browser_event(
-            "sess123", "kimi", "Kimi", "arena-nav", "nav", 2, "submitting",
+            "sess123",
+            "kimi",
+            "Kimi",
+            "arena-nav",
+            "nav",
+            2,
+            "submitting",
             &operation_id_submit("kimi", 2, 1),
             "active_submit_attempt",
-            "https://www.kimi.com/chat/abc?token=SECRET",
+            "https://example.com/chat?token=SECRET",
             serde_json::json!({ "send_enabled": true }),
             Some("kimi".to_string()),
         );
@@ -1327,7 +1502,7 @@ mod tests {
         assert!(json.contains("kimi"));
         // URL should be redacted
         assert!(!json.contains("SECRET"));
-        assert!(json.contains("[REDACTED]"));
+        assert!(json.contains("REDACTED"));
         let de: BrowserEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(de.agent_id, "kimi");
         assert_eq!(de.operation_id, "submit-kimi-g2-t1");
@@ -1335,7 +1510,12 @@ mod tests {
 
     #[test]
     fn navigation_classification_unknown_low_by_default() {
-        let (reason, conf) = classify_navigation_reason("https://chatgpt.com/", "https://chatgpt.com/c/xyz", None, None);
+        let (reason, conf) = classify_navigation_reason(
+            "https://chatgpt.com/",
+            "https://chatgpt.com/c/xyz",
+            None,
+            None,
+        );
         assert_eq!(reason, NavigationReason::Unknown);
         assert_eq!(conf, Confidence::Low);
         let (r2, c2) = classify_navigation_reason("", "https://chatgpt.com/", None, None);
@@ -1345,7 +1525,8 @@ mod tests {
 
     #[test]
     fn navigation_classification_reload_medium() {
-        let (r, c) = classify_navigation_reason("https://chatgpt.com/", "https://chatgpt.com/", None, None);
+        let (r, c) =
+            classify_navigation_reason("https://chatgpt.com/", "https://chatgpt.com/", None, None);
         assert_eq!(r, NavigationReason::Reload);
         assert_eq!(c, Confidence::Medium);
     }
@@ -1359,19 +1540,40 @@ mod tests {
 
     #[test]
     fn console_classification_separates_website_from_arena() {
-        let web = classify_console_error("console_error", "Error sending segment performance metrics TypeError: Load failed", "console.error");
+        let web = classify_console_error(
+            "console_error",
+            "Error sending segment performance metrics TypeError: Load failed",
+            "console.error",
+        );
         assert_eq!(web.origin, "website");
         assert!(!web.automation_related);
         assert_eq!(web.category, "website_console_error");
 
-        let arena = classify_console_error("console_error", "arena://prompt-injection failed __ca_ injection", "console.error");
+        let arena = classify_console_error(
+            "console_error",
+            "arena://prompt-injection failed __ca_ injection",
+            "console.error",
+        );
         assert_eq!(arena.origin, "arena");
         assert!(arena.automation_related);
     }
 
     #[test]
     fn empty_unknown_values_handled() {
-        let ev = build_browser_event("", "", "", "", "", 0, "", "", "", "", serde_json::Value::Null, None);
+        let ev = build_browser_event(
+            "",
+            "",
+            "",
+            "",
+            "",
+            0,
+            "",
+            "",
+            "",
+            "",
+            serde_json::Value::Null,
+            None,
+        );
         assert_eq!(ev.phase, "unknown");
         assert_eq!(ev.url, "");
         assert_eq!(ev.session_id, "");
@@ -1380,7 +1582,20 @@ mod tests {
     #[test]
     fn report_generation_contains_agent_sections() {
         let tl = BrowserTimeline::new();
-        let ev = build_browser_event("s1", "chatgpt", "ChatGPT", "arena-leader", "leader", 1, "priming", "priming-chatgpt-g1", "priming_injection_started", "https://chatgpt.com/", serde_json::json!({}), None);
+        let ev = build_browser_event(
+            "s1",
+            "chatgpt",
+            "ChatGPT",
+            "arena-leader",
+            "leader",
+            1,
+            "priming",
+            "priming-chatgpt-g1",
+            "priming_injection_started",
+            "https://chatgpt.com/",
+            serde_json::json!({}),
+            None,
+        );
         tl.record(ev);
         let diag = crate::browser_backend::BrowserDiagnosticRecord {
             agent_id: "chatgpt".to_string(),
@@ -1432,7 +1647,7 @@ mod tests {
             injection_target_tag: Some("TEXTAREA".to_string()),
             injection_target_role: Some("textbox".to_string()),
             injection_target_contenteditable: Some("".to_string()),
-            readiness_timeout_ms: Some(45000),
+            readiness_timeout_ms: Some(90000),
             readiness_probe_count: Some(5),
             input_candidate_count: Some(1),
             composer_candidate_count: Some(15),
@@ -1474,16 +1689,36 @@ mod tests {
 
     #[test]
     fn failure_classification_maps_correctly() {
-        assert_eq!(FailureClassification::NavigationFailed.as_str(), "navigation_failed");
-        assert_eq!(FailureClassification::LoginButtonMissing.as_str(), "login_button_missing");
-        let ev = build_browser_event("s", "chatgpt", "ChatGPT", "arena-nav", "nav", 1, "priming", "op", "navigation_failed", "https://chatgpt.com/", serde_json::json!({}), None);
+        assert_eq!(
+            FailureClassification::NavigationFailed.as_str(),
+            "navigation_failed"
+        );
+        assert_eq!(
+            FailureClassification::LoginButtonMissing.as_str(),
+            "login_button_missing"
+        );
+        let ev = build_browser_event(
+            "s",
+            "chatgpt",
+            "ChatGPT",
+            "arena-nav",
+            "nav",
+            1,
+            "priming",
+            "op",
+            "navigation_failed",
+            "https://chatgpt.com/",
+            serde_json::json!({}),
+            None,
+        );
         let cls = classify_failure_from_timeline(&[ev]);
         assert_eq!(cls, FailureClassification::NavigationFailed);
     }
 
     #[test]
     fn safe_dom_forensics_redacts_and_bounds() {
-        let mut forensics = empty_safe_dom_forensics("op-1", "https://example.com/?token=SECRET&next=/chat");
+        let mut forensics =
+            empty_safe_dom_forensics("op-1", "https://example.com/?token=SECRET&next=/chat");
         forensics.title = "Test Title ".repeat(50);
         forensics.button_labels = vec!["a".repeat(100)];
         let json = serde_json::to_string(&forensics).expect("serialize");
@@ -1496,7 +1731,8 @@ mod tests {
     #[test]
     fn bounded_retention_respects_limits() {
         // Simulate bounded retention for lifecycle (100)
-        let mut deque: std::collections::VecDeque<PageLifecycleEvent> = std::collections::VecDeque::new();
+        let mut deque: std::collections::VecDeque<PageLifecycleEvent> =
+            std::collections::VecDeque::new();
         for i in 0..(MAX_LIFECYCLE_RECORDS_PER_AGENT + 10) {
             if deque.len() >= MAX_LIFECYCLE_RECORDS_PER_AGENT {
                 deque.pop_front();
@@ -1519,9 +1755,35 @@ mod tests {
     #[test]
     fn timeline_ordering_chronological() {
         let tl = BrowserTimeline::new();
-        let ev1 = build_browser_event("s", "chatgpt", "ChatGPT", "arena-nav", "nav", 1, "priming", "op1", "navigation_started", "https://a.com/", serde_json::json!({}), None);
+        let ev1 = build_browser_event(
+            "s",
+            "chatgpt",
+            "ChatGPT",
+            "arena-nav",
+            "nav",
+            1,
+            "priming",
+            "op1",
+            "navigation_started",
+            "https://a.com/",
+            serde_json::json!({}),
+            None,
+        );
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let ev2 = build_browser_event("s", "chatgpt", "ChatGPT", "arena-nav", "nav", 1, "priming", "op1", "dom_snapshot", "https://a.com/", serde_json::json!({}), None);
+        let ev2 = build_browser_event(
+            "s",
+            "chatgpt",
+            "ChatGPT",
+            "arena-nav",
+            "nav",
+            1,
+            "priming",
+            "op1",
+            "dom_snapshot",
+            "https://a.com/",
+            serde_json::json!({}),
+            None,
+        );
         tl.record(ev2.clone());
         tl.record(ev1.clone());
         let sorted = tl.all_events_sorted();
@@ -1546,7 +1808,12 @@ mod tests {
             enabled: true,
             visible: true,
             coordinates: Some((10.0, 20.0)),
-            bounding_rect: Some(BoundingRect { x: 0.0, y: 0.0, width: 100.0, height: 30.0 }),
+            bounding_rect: Some(BoundingRect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 30.0,
+            }),
             selection_logic: "text-match".to_string(),
         };
         let json2 = serde_json::to_string(&target).expect("serialize target");

@@ -1,5 +1,5 @@
 use crate::browser_backend::{
-    NavEvent, READINESS_WAIT_TIMEOUT_SECS, MAX_SETUP_NAVIGATION_RECOVERIES, display_name_for,
+    MAX_SETUP_NAVIGATION_RECOVERIES, NavEvent, READINESS_WAIT_TIMEOUT_SECS, display_name_for,
     navigate_agent_window, record_browser_blocker, record_browser_error, record_prompt_injected,
     record_prompt_injection_error, record_prompt_injection_report, record_setup_completion,
     record_setup_expected_agent, record_setup_stale_signal, resolve_participant,
@@ -17,6 +17,20 @@ const ROLES: &[&str] = &[
     "Validator",
     "Precedent Analyst",
 ];
+
+fn prompt_hash_for_log(s: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
+    let hex: String = digest.as_ref().iter().map(|b| format!("{:02x}", b)).collect();
+    format!("len={} sha256={}...", s.len(), &hex[..16.min(hex.len())])
+}
+
+fn has_canonical_leader_markers(s: &str) -> bool {
+    s.contains("You are the leader of an expert AI panel assembled")
+        && s.contains("Runtime state is authoritative")
+        && s.contains("Route — consult one participant")
+        && s.contains("Phase 1")
+        && s.contains("Phase 2")
+}
 
 enum SetupCompletionProof {
     SendDetected(String),
@@ -54,8 +68,9 @@ fn capability_verified(
 }
 
 fn build_priming_script(priming: &str) -> Result<String, AgentError> {
-    let priming_json = serde_json::to_string(priming)
-        .map_err(|e| AgentError::InjectionFailed(format!("priming prompt serialization failed: {e}")))?;
+    let priming_json = serde_json::to_string(priming).map_err(|e| {
+        AgentError::InjectionFailed(format!("priming prompt serialization failed: {e}"))
+    })?;
     Ok(format!(
         r#"(function() {{
                 const text = {};
@@ -223,8 +238,15 @@ async fn perform_priming_injection(
                     error,
                 }) if agent_id == report_agent_id => {
                     break Some((
-                        method, prefix_ok, suffix_ok, visible_length, send_enabled, target_tag, target_role,
-                        target_contenteditable, error,
+                        method,
+                        prefix_ok,
+                        suffix_ok,
+                        visible_length,
+                        send_enabled,
+                        target_tag,
+                        target_role,
+                        target_contenteditable,
+                        error,
                     ));
                 }
                 Some(NavEvent::SessionAborted) => break None,
@@ -237,12 +259,36 @@ async fn perform_priming_injection(
     })
     .await;
     match report {
-        Ok(Some((method, prefix_ok, suffix_ok, visible_length, send_enabled, target_tag, target_role, target_contenteditable, error))) => {
+        Ok(Some((
+            method,
+            prefix_ok,
+            suffix_ok,
+            visible_length,
+            send_enabled,
+            target_tag,
+            target_role,
+            target_contenteditable,
+            error,
+        ))) => {
             record_prompt_injection_report(
-                diagnostics, agent_id, method, prefix_ok, suffix_ok, visible_length, send_enabled, target_tag,
-                target_role, target_contenteditable, error.clone(),
+                diagnostics,
+                agent_id,
+                method,
+                prefix_ok,
+                suffix_ok,
+                visible_length,
+                send_enabled,
+                target_tag,
+                target_role,
+                target_contenteditable,
+                error.clone(),
             );
-            Ok(capability_verified(prefix_ok, suffix_ok, send_enabled, error.as_deref()))
+            Ok(capability_verified(
+                prefix_ok,
+                suffix_ok,
+                send_enabled,
+                error.as_deref(),
+            ))
         }
         Ok(None) | Err(_) => {
             record_prompt_injection_error(
@@ -288,7 +334,7 @@ fn assign_role(agent_id: &str, config: &SessionConfig) -> String {
     ROLES.get(pos + 1).unwrap_or(&"Analyst").to_string()
 }
 
-async fn wait_for_setup_ready(
+pub(crate) async fn wait_for_setup_ready(
     agent_id: &str,
     base_url: &str,
     display_name: &str,
@@ -302,32 +348,47 @@ async fn wait_for_setup_ready(
         let ready = tokio::time::timeout(
             std::time::Duration::from_secs(READINESS_WAIT_TIMEOUT_SECS),
             async {
-            loop {
-                match nav_rx.recv().await {
-                    Some(NavEvent::Ready(id)) if id == agent_id_owned => break Ok(()),
-                    Some(NavEvent::Error(id)) if id == agent_id_owned => {
-                        break Err(AgentError::NavigationFailed(
-                            diagnostics.readiness_timeout_message(&id, display_name),
-                        ));
+                loop {
+                    match nav_rx.recv().await {
+                        Some(NavEvent::Ready(id)) if id == agent_id_owned => break Ok(()),
+                        Some(NavEvent::Error(id)) if id == agent_id_owned => {
+                            break Err(AgentError::NavigationFailed(
+                                diagnostics.readiness_timeout_message(&id, display_name),
+                            ));
+                        }
+                        Some(NavEvent::ChallengeDetected(id, indicator))
+                            if id == agent_id_owned =>
+                        {
+                            break Err(AgentError::CaptchaRequired(indicator));
+                        }
+                        Some(NavEvent::UnshowableUrl(id, url)) if id == agent_id_owned => {
+                            break Err(AgentError::NavigationFailed(format!(
+                                "{} navigated to a URL this WebView cannot display: {}",
+                                display_name_for(&id),
+                                url
+                            )));
+                        }
+                        Some(NavEvent::SessionAborted) => {
+                            break Err(AgentError::UnknownError("Session aborted".to_string()));
+                        }
+                        // Login page detected (e.g., Claude at /login, GLM Chinese login) — treat
+                        // like a challenge: wait for user to complete login (600s) rather than
+                        // timing out after 100s. This prevents premature `setup_failed_recoverable`
+                        // for pages that correctly show login UI but have no composer yet.
+                        Some(NavEvent::SendProbe {
+                            agent_id: probe_id,
+                            page_state_hint: Some(hint),
+                            ..
+                        }) if probe_id == agent_id_owned && hint == "possible_login_required" => {
+                            break Err(AgentError::CaptchaRequired("login_required".to_string()));
+                        }
+                        Some(_) => continue,
+                        None => {
+                            break Err(AgentError::NavigationFailed("channel closed".to_string()));
+                        }
                     }
-                    Some(NavEvent::ChallengeDetected(id, indicator)) if id == agent_id_owned => {
-                        break Err(AgentError::CaptchaRequired(indicator));
-                    }
-                    Some(NavEvent::UnshowableUrl(id, url)) if id == agent_id_owned => {
-                        break Err(AgentError::NavigationFailed(format!(
-                            "{} navigated to a URL this WebView cannot display: {}",
-                            display_name_for(&id),
-                            url
-                        )));
-                    }
-                    Some(NavEvent::SessionAborted) => {
-                        break Err(AgentError::UnknownError("Session aborted".to_string()));
-                    }
-                    Some(_) => continue,
-                    None => break Err(AgentError::NavigationFailed("channel closed".to_string())),
                 }
-            }
-        },
+            },
         )
         .await;
 
@@ -336,8 +397,13 @@ async fn wait_for_setup_ready(
             Ok(Err(AgentError::CaptchaRequired(indicator))) => {
                 challenge_seen = true;
                 let _ = app.emit("captcha-detected", json!({ "agent_id": agent_id }));
+                let is_login = indicator == "login_required";
                 let _ = app.emit("boss-message", json!({
-                    "text": format!("{display_name} needs verification ({indicator}). Complete the check in the model window, then click Resume."),
+                    "text": if is_login {
+                        format!("{display_name} is showing a login page at {base_url}. Please log in in the {} window, then click Resume or wait for it to become ready.", display_name)
+                    } else {
+                        format!("{display_name} needs verification ({indicator}). Complete the check in the model window, then click Resume.")
+                    },
                     "message_type": "status"
                 }));
                 let resumed = tokio::time::timeout(std::time::Duration::from_secs(600), async {
@@ -420,6 +486,19 @@ async fn wait_for_setup_ready(
     }
 }
 
+fn format_display_list(names: &[String]) -> String {
+    match names.len() {
+        0 => String::new(),
+        1 => names[0].clone(),
+        2 => format!("{} and {}", names[0], names[1]),
+        _ => {
+            let last = names.last().unwrap();
+            let init = &names[..names.len() - 1];
+            format!("{}, and {}", init.join(", "), last)
+        }
+    }
+}
+
 pub async fn run_setup(
     config: &SessionConfig,
     state: &AppState,
@@ -438,6 +517,63 @@ pub async fn run_setup(
         .await
         .get_custom_participants()
         .unwrap_or_default();
+
+    // Load hardened priming templates with embedded defaults (single source:
+    // leader_priming.md / participant_priming.md at repo root). Placeholders
+    // {{...}} are filled from live session config so the model sees real
+    // roster/leader/count, not a generic string.
+    // Differential provenance logging: record hashes/lengths of canonical vs retrieved.
+    let (leader_template_raw, participant_template_raw) = {
+        let store = state.settings_store.lock().await;
+        let leader = store
+            .get_prompt_template_with_default("prompt_leader_priming")
+            .unwrap_or_else(|_| crate::settings_store::default_leader_priming());
+        let participant = store
+            .get_prompt_template_with_default("prompt_participant_priming")
+            .unwrap_or_else(|_| crate::settings_store::default_participant_priming());
+        let canon_leader = crate::settings_store::default_leader_priming();
+        let canon_part = crate::settings_store::default_participant_priming();
+        tracing::info!(
+            "[PROMPT] provenance retrieval leader stored={} canonical={} participant stored={} canonical={} markers_leader={} markers_participant={}",
+            prompt_hash_for_log(&leader),
+            prompt_hash_for_log(&canon_leader),
+            prompt_hash_for_log(&participant),
+            prompt_hash_for_log(&canon_part),
+            has_canonical_leader_markers(&leader),
+            participant.contains("You are a reviewing member of an expert AI panel")
+        );
+        if !has_canonical_leader_markers(&leader) {
+            tracing::warn!(
+                "[PROMPT] RETRIEVED leader prompt missing canonical markers — likely legacy short prompt still in DB! stored={}",
+                prompt_hash_for_log(&leader)
+            );
+        }
+        (leader, participant)
+    };
+    let leader_display = display_name_for(&config.leader_agent_id).to_string();
+    let participant_count_total = config.agent_ids.len().to_string();
+    let other_count = config.agent_ids.len().saturating_sub(1).to_string();
+    let other_display_names: Vec<String> = config
+        .agent_ids
+        .iter()
+        .filter(|id| *id != &config.leader_agent_id)
+        .map(|id| display_name_for(id).to_string())
+        .collect();
+    let other_list = format_display_list(&other_display_names);
+    let full_display_names: Vec<String> = config
+        .agent_ids
+        .iter()
+        .map(|id| display_name_for(id).to_string())
+        .collect();
+    let full_list = format_display_list(&full_display_names);
+    let session_type_str = match &config.session_type {
+        crate::orchestrator::SessionType::Architecture => "Architecture",
+        crate::orchestrator::SessionType::Mvp => "MVP",
+        crate::orchestrator::SessionType::Api => "API Design",
+        crate::orchestrator::SessionType::Security => "Security Review",
+        crate::orchestrator::SessionType::Custom => "Custom",
+    }
+    .to_string();
 
     for agent_id in &setup_order {
         let role = assign_role(agent_id, config);
@@ -538,15 +674,78 @@ pub async fn run_setup(
         }
 
         // Build and inject role-priming prompt into input field (not sent; user sends manually).
-        // The setup response monitor captures a post-injection assistant baseline
-        // and emits only a content-free signal when a new response appears.
-        let priming = format!(
-            "You are participating in a structured expert panel discussion.\n\
-             Your role is {}. Respond thoughtfully, be concise, and signal\n\
-             clearly when you agree or disagree with a proposal. When you have\n\
-             nothing to improve on the current proposal, respond with CONSENSUS.",
-            role
-        );
+        // Uses hardened templates (leader_priming.md / participant_priming.md) with
+        // live placeholder substitution. Falls back to a minimal generic prompt only
+        // if the template is unexpectedly empty after substitution.
+        let priming_raw = if is_leader {
+            let mut t = leader_template_raw.clone();
+            t = t.replace("{{participant_count}}", &other_count);
+            t = t.replace("{{participant_list_with_display_names}}", &other_list);
+            t = t.replace("{{leader_display_name}}", &leader_display);
+            t = t.replace("{{full_participant_list_including_leader}}", &full_list);
+            t = t.replace("{{project_brief}}", &config.project_brief);
+            t = t.replace("{{session_type}}", &session_type_str);
+            t = t.replace("{{role}}", &role);
+            t
+        } else {
+            let mut t = participant_template_raw.clone();
+            t = t.replace("{{leader_display_name}}", &leader_display);
+            t = t.replace("{{participant_count}}", &participant_count_total);
+            t = t.replace("{{full_participant_list_including_leader}}", &full_list);
+            t = t.replace("{{participant_list_with_display_names}}", &other_list);
+            t = t.replace("{{project_brief}}", &config.project_brief);
+            t = t.replace("{{session_type}}", &session_type_str);
+            t = t.replace("{{role}}", &role);
+            t
+        };
+        let priming = if priming_raw.trim().is_empty() {
+            tracing::warn!("[PROMPT] priming interpolation resulted in empty string for {} (leader={}) — using minimal fallback", agent_id, is_leader);
+            format!(
+                "You are participating in a structured expert panel discussion.\n\
+                 Your role is {}. Respond thoughtfully, be concise, and signal\n\
+                 clearly when you agree or disagree with a proposal. When you have\n\
+                 nothing to improve on the current proposal, respond with CONSENSUS.",
+                role
+            )
+        } else {
+            // Interpolation provenance: log hash/length and whether canonical markers survived
+            let canonical_hash = if is_leader {
+                prompt_hash_for_log(&leader_template_raw)
+            } else {
+                prompt_hash_for_log(&participant_template_raw)
+            };
+            let interpolated_hash = prompt_hash_for_log(&priming_raw);
+            let has_markers = if is_leader {
+                has_canonical_leader_markers(&priming_raw)
+            } else {
+                priming_raw.contains("You are a reviewing member of an expert AI panel")
+            };
+            // Participant count semantics: leader "other_count" vs participant total — verify matches canonical wording
+            tracing::info!(
+                "[PROMPT] interpolated agent_id={} leader={} role={} participant_count={} other_list_len={} full_list_len={} template={} interpolated={} has_markers={} other_count={} participant_count_total={}",
+                agent_id,
+                is_leader,
+                role,
+                if is_leader { &other_count } else { &participant_count_total },
+                other_list.len(),
+                full_list.len(),
+                canonical_hash,
+                interpolated_hash,
+                has_markers,
+                other_count,
+                participant_count_total
+            );
+            if is_leader && !has_markers {
+                tracing::error!("[PROMPT] INTERPOLATED leader prompt missing canonical markers! agent={} template_hash={} interpolated_hash={}", agent_id, canonical_hash, interpolated_hash);
+            }
+            // Verify no hardcoded 7-model list leaked: injected string must not contain the full legacy hardcoded line unless those models are actually selected
+            if priming_raw.contains("Ask ChatGPT, Claude, Gemini, DeepSeek, Qwen, GLM, or Kimi") {
+                tracing::error!("[PROMPT] interpolated prompt contains legacy hardcoded 7-model list! This indicates old template still in use for {} ", agent_id);
+            }
+            // Verify dynamic participant reflection: check that other_list appears and unselected models do not appear as participants
+            tracing::debug!("[PROMPT] dynamic participants leader={} participants={:?} other_list='{}' full_list='{}'", config.leader_agent_id, config.agent_ids, other_list, full_list);
+            priming_raw
+        };
 
         // Strong setup capability proof, set when the priming injection is
         // confirmed verbatim (prefix+suffix), a composer-owned Send control is
@@ -556,11 +755,22 @@ pub async fn run_setup(
         // performs the real turn submissions.
         let mut setup_capability_verified = false;
 
+        // Injection provenance: hash/length before eval
+        tracing::info!(
+            "[PROMPT] injection agent_id={} leader={} injected_hash={} role={} participant_count={}",
+            agent_id,
+            is_leader,
+            prompt_hash_for_log(&priming),
+            role,
+            if is_leader { &other_count } else { &participant_count_total }
+        );
+
         if !diagnostics.prompt_already_visible(agent_id) {
             let priming_json = serde_json::to_string(&priming).map_err(|error| {
                 AgentError::InjectionFailed(format!("priming prompt serialization failed: {error}"))
             })?;
-            let script = format!(r#"(function() {{
+            let script = format!(
+                r#"(function() {{
                 const text = {};
                 const selectors = ['textarea', '#prompt-textarea', '#chat-input', 'div.ProseMirror[contenteditable="true"]', '[contenteditable="true"]', '[role="textbox"]', '[aria-multiline="true"]', 'p[data-placeholder]'];
                 function visible(el) {{ if (!el || !(el instanceof Element)) return false; const s = getComputedStyle(el), r = el.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0; }}
@@ -680,7 +890,9 @@ pub async fn run_setup(
                     doReport();
                 }}
                 setTimeout(checkStabilityAndReport, 300);
-            }})();"#, priming_json);
+            }})();"#,
+                priming_json
+            );
             if let Err(error) = window.eval(&script) {
                 let message = format!("priming prompt eval failed: {error}");
                 record_prompt_injection_error(&diagnostics, agent_id, &message);
@@ -705,8 +917,15 @@ pub async fn run_setup(
                             error,
                         }) if agent_id == report_agent_id => {
                             break Some((
-                                method, prefix_ok, suffix_ok, visible_length, send_enabled,
-                                target_tag, target_role, target_contenteditable, error,
+                                method,
+                                prefix_ok,
+                                suffix_ok,
+                                visible_length,
+                                send_enabled,
+                                target_tag,
+                                target_role,
+                                target_contenteditable,
+                                error,
                             ));
                         }
                         Some(NavEvent::SessionAborted) => break None,
@@ -716,19 +935,35 @@ pub async fn run_setup(
                         None => break None,
                     }
                 }
-            }).await;
+            })
+            .await;
             match report {
-                Ok(Some((method, prefix_ok, suffix_ok, visible_length, send_enabled, target_tag, target_role, target_contenteditable, error))) => {
+                Ok(Some((
+                    method,
+                    prefix_ok,
+                    suffix_ok,
+                    visible_length,
+                    send_enabled,
+                    target_tag,
+                    target_role,
+                    target_contenteditable,
+                    error,
+                ))) => {
                     record_prompt_injection_report(
-                        &diagnostics, agent_id, method, prefix_ok, suffix_ok, visible_length,
-                        send_enabled, target_tag, target_role, target_contenteditable, error.clone(),
-                    );
-                    setup_capability_verified = capability_verified(
+                        &diagnostics,
+                        agent_id,
+                        method,
                         prefix_ok,
                         suffix_ok,
+                        visible_length,
                         send_enabled,
-                        error.as_deref(),
+                        target_tag,
+                        target_role,
+                        target_contenteditable,
+                        error.clone(),
                     );
+                    setup_capability_verified =
+                        capability_verified(prefix_ok, suffix_ok, send_enabled, error.as_deref());
                 }
                 Ok(None) | Err(_) => record_prompt_injection_error(
                     &diagnostics,
@@ -751,12 +986,12 @@ pub async fn run_setup(
         // This wait is skipped when the strong capability proof already
         // advanced setup: the ACTIVE loop performs the real submissions.
         if !setup_capability_verified {
-        let agent_id_clone = agent_id.clone();
-        let mut nav_recovery_count: u32 = 0;
-        let mut final_proof: Option<SetupCompletionProof> = None;
-        let mut final_error: Option<AgentError> = None;
-        for _ in 0..=MAX_SETUP_NAVIGATION_RECOVERIES {
-        let sent = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let agent_id_clone = agent_id.clone();
+            let mut nav_recovery_count: u32 = 0;
+            let mut final_proof: Option<SetupCompletionProof> = None;
+            let mut final_error: Option<AgentError> = None;
+            for _ in 0..=MAX_SETUP_NAVIGATION_RECOVERIES {
+                let sent = tokio::time::timeout(std::time::Duration::from_secs(120), async {
             loop {
                 match nav_rx.recv().await {
                     Some(NavEvent::SendDetected(id, reason)) if id == agent_id_clone => {
@@ -788,6 +1023,11 @@ pub async fn run_setup(
                         break Err(AgentError::UnknownError("Session aborted".to_string()));
                     }
                     Some(NavEvent::Ready(id)) if id == agent_id_clone => {
+                        // Idempotency: if a response was already observed after injection, treat Ready as completion, not as failure requiring re-prime.
+                        if diagnostics.has_response_observed_after_injection(&agent_id_clone) {
+                            let _ = app.emit("boss-message", json!({"text": format!("{} response already observed — treating Ready as completion", agent_config.display_name), "message_type": "status"}));
+                            break Ok(SetupCompletionProof::ResponseAfterInjection);
+                        }
                         if diagnostics.has_pending_user_submit(&agent_id_clone) {
                             let _ = app.emit("boss-message", json!({"text": format!("{} navigated to new chat; treating as sent...", agent_config.display_name), "message_type": "status"}));
                             break Ok(SetupCompletionProof::SendDetected("trusted_submit".to_string()));
@@ -817,52 +1057,88 @@ pub async fn run_setup(
         })
         .await;
 
-        match sent {
-            Ok(Ok(proof)) => { final_proof = Some(proof); break; }
-            Ok(Err(e)) => { final_error = Some(e); break; }
-            Err(_) => {
-                if diagnostics.has_recent_unexpected_navigation(agent_id, 15) && nav_recovery_count < MAX_SETUP_NAVIGATION_RECOVERIES {
-                    nav_recovery_count += 1;
-                    diagnostics.increment_setup_navigation_recovery(agent_id);
-                    let _ = app.emit("boss-message", json!({"text": format!("{} page navigation detected after timeout; re-priming... (attempt {}/{})", agent_config.display_name, nav_recovery_count, MAX_SETUP_NAVIGATION_RECOVERIES), "message_type": "status"}));
-                    if let Err(e) = wait_for_setup_ready(agent_id, &agent_config.base_url, &agent_config.display_name, app, &diagnostics, nav_rx).await {
+                match sent {
+                    Ok(Ok(proof)) => {
+                        final_proof = Some(proof);
+                        break;
+                    }
+                    Ok(Err(e)) => {
                         final_error = Some(e);
                         break;
                     }
-                    match perform_priming_injection(&window, &priming, &diagnostics, agent_id, nav_rx).await {
-                        Ok(verified) => {
-                            if verified {
-                                final_proof = Some(SetupCompletionProof::SendDetected("capability_verified".to_string()));
+                    Err(_) => {
+                        if diagnostics.has_recent_unexpected_navigation(agent_id, 15)
+                            && nav_recovery_count < MAX_SETUP_NAVIGATION_RECOVERIES
+                        {
+                            nav_recovery_count += 1;
+                            diagnostics.increment_setup_navigation_recovery(agent_id);
+                            let _ = app.emit("boss-message", json!({"text": format!("{} page navigation detected after timeout; re-priming... (attempt {}/{})", agent_config.display_name, nav_recovery_count, MAX_SETUP_NAVIGATION_RECOVERIES), "message_type": "status"}));
+                            if let Err(e) = wait_for_setup_ready(
+                                agent_id,
+                                &agent_config.base_url,
+                                &agent_config.display_name,
+                                app,
+                                &diagnostics,
+                                nav_rx,
+                            )
+                            .await
+                            {
+                                final_error = Some(e);
                                 break;
                             }
-                            continue;
+                            match perform_priming_injection(
+                                &window,
+                                &priming,
+                                &diagnostics,
+                                agent_id,
+                                nav_rx,
+                            )
+                            .await
+                            {
+                                Ok(verified) => {
+                                    if verified {
+                                        final_proof = Some(SetupCompletionProof::SendDetected(
+                                            "capability_verified".to_string(),
+                                        ));
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Err(e) => {
+                                    final_error = Some(e);
+                                    break;
+                                }
+                            }
                         }
-                        Err(e) => { final_error = Some(e); break; }
+                        let message = diagnostics
+                            .send_detection_timeout_message(agent_id, &agent_config.display_name);
+                        record_browser_error(app, &diagnostics, agent_id, &message);
+                        let _ = app.emit(
+                            "boss-message",
+                            json!({
+                                "text": message.clone(),
+                                "message_type": "status"
+                            }),
+                        );
+                        final_error = Some(AgentError::Timeout(message));
+                        break;
                     }
                 }
-                let message =
-                    diagnostics.send_detection_timeout_message(agent_id, &agent_config.display_name);
-                record_browser_error(app, &diagnostics, agent_id, &message);
-                let _ = app.emit(
-                    "boss-message",
-                    json!({
-                        "text": message.clone(),
-                        "message_type": "status"
-                    }),
-                );
-                final_error = Some(AgentError::Timeout(message));
-                break;
             }
-        }
-        }
-        match (final_proof, final_error) {
-            (Some(SetupCompletionProof::SendDetected(reason)), _) => record_setup_completion(&diagnostics, agent_id, &reason),
-            (Some(SetupCompletionProof::ResponseAfterInjection), _) => record_setup_completion(&diagnostics, agent_id, "response_after_injection"),
-            (Some(SetupCompletionProof::UserConfirmedManual), _) => record_setup_completion(&diagnostics, agent_id, "user_confirmed_manual"),
-            (Some(_), _) => unreachable!(),
-            (None, Some(e)) => return Err(e),
-            (None, None) => unreachable!(),
-        }
+            match (final_proof, final_error) {
+                (Some(SetupCompletionProof::SendDetected(reason)), _) => {
+                    record_setup_completion(&diagnostics, agent_id, &reason)
+                }
+                (Some(SetupCompletionProof::ResponseAfterInjection), _) => {
+                    record_setup_completion(&diagnostics, agent_id, "response_after_injection")
+                }
+                (Some(SetupCompletionProof::UserConfirmedManual), _) => {
+                    record_setup_completion(&diagnostics, agent_id, "user_confirmed_manual")
+                }
+                (Some(_), _) => unreachable!(),
+                (None, Some(e)) => return Err(e),
+                (None, None) => unreachable!(),
+            }
         } else {
             // Strong capability proof (composer accepted priming verbatim, an
             // owned Send is enabled, no injection error) advanced this agent
@@ -890,9 +1166,7 @@ pub async fn run_setup(
             // No real conversation was created — do not persist base_url.
             {
                 let mut browser = state.browser_state.lock().await;
-                browser
-                    .conversation_urls
-                    .insert(agent_id.clone(), None);
+                browser.conversation_urls.insert(agent_id.clone(), None);
             }
             tracing::info!(
                 "[SETUP] capability_verified for participant {} — not saving fake conversation URL (will use base_url on first route)",
@@ -1037,14 +1311,12 @@ mod tests {
     //    setup even when the other signals look strong.
     #[test]
     fn failed_prompt_integrity_not_verified() {
-        assert!(
-            !capability_verified(
-                true,
-                true,
-                true,
-                Some("prompt integrity check failed; composer did not show the full prompt")
-            )
-        );
+        assert!(!capability_verified(
+            true,
+            true,
+            true,
+            Some("prompt integrity check failed; composer did not show the full prompt")
+        ));
     }
 
     // D. Disabled Send control must NOT complete setup.

@@ -1,0 +1,19 @@
+Branch: forensics/browser-auth-diagnostics
+HEAD: a3ab85f fix(browser): close known reliability gaps before Windows validation
+
+Dirty files (pre-existing, DO NOT overwrite):
+ M src-tauri/project-docs/IPC.md
+ M src-tauri/src/commands.rs
+ M src-tauri/src/main.rs
+ M src-tauri/src/settings_store.rs
+ M src/index.css
+ M src/panels/MemoryPanel.tsx
+ M src/panels/SettingsPanel.tsx
+?? HACKATHON_MODE_DESIGN.md
+?? dist/
+?? src-tauri/project-docs/mockup/hackathon-mini-window.html
+
+Note: HACKATHON_MODE_DESIGN.md and hackathon-mini-window.html are new design assets, not modifications.
+dist/ is build artifact, ignore.
+
+Recovery: git diff captured separately. No stash/reset.
