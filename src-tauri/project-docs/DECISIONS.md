@@ -136,6 +136,32 @@ navigating window. Never more than 2 windows. Memory constraint:
 total must stay under 2GB on a 4GB/Celeron machine.
 Implemented in browser_backend.rs.
 
+### D-001A: Stable Native Browser Identity and Lifetime DONE (2026-09-08)
+The two named Arena WebViews (`arena-leader` and `arena-nav`) are stable
+process-lifetime browsing contexts. Connected Accounts, session start, and
+session resume reuse a healthy named window; they create one only when its
+registry entry is absent. They must not destroy/recreate a healthy WebView to
+repair callback ownership. A site-requested, narrowly allowlisted OAuth popup
+is transient and is not a third Arena-managed browsing context; all other new
+window requests remain denied.
+
+Every `on_navigation` callback captures a sender for one process-lifetime
+`std::sync::mpsc` ingress. Commands attach the single current bounded Tokio
+consumer to its dispatcher. The ingress receiver is never dropped while the
+app is running, and changing consumers never replaces the sender captured by a
+WebView. Tokio mpsc remains outside `on_navigation`.
+
+Arena does not override the WebView user agent. WebKitGTK/WebView2 supplies its
+native, truthful identity; passive `navigator.userAgent` diagnostics remain.
+No navigator/client-hint spoofing is permitted.
+
+Human-verification invariants: repeated challenge signals are idempotent;
+Resume requests another check but is not readiness evidence; only a genuine
+same-agent Ready/composer signal advances readiness. Post-verification setup
+recovery stays on the current document and resets only its bounded proof
+deadline. Active retry suppression requires exact agent, turn, and setup/window
+generation evidence before any navigation or reinjection.
+
 ### D-002: arena:// Protocol for JS-to-Rust IPC DONE
 Fake URL navigation intercepted by on_navigation callback.
 Below CSP enforcement. Proven working. Do not replace.

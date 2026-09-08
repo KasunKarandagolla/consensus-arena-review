@@ -36,7 +36,11 @@ pub fn default_agent_system() -> String {
 fn prompt_hash_for_log(s: &str) -> String {
     // Dev-safe: length + first 16 hex of SHA256, no prompt content leaked as full text.
     let digest = ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
-    let hex: String = digest.as_ref().iter().map(|b| format!("{:02x}", b)).collect();
+    let hex: String = digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
     format!("len={} sha256={}...", s.len(), &hex[..16.min(hex.len())])
 }
 
@@ -250,8 +254,10 @@ impl SettingsStore {
             }
             fn is_old_participant_factory(s: &str) -> bool {
                 is_legacy_short_participant(s)
-                    || (s.contains("participant_priming") && !s.contains("Runtime context is authoritative"))
-                    || (s.contains("Runtime context is authoritative") && !s.contains("{{project_brief}}"))
+                    || (s.contains("participant_priming")
+                        && !s.contains("Runtime context is authoritative"))
+                    || (s.contains("Runtime context is authoritative")
+                        && !s.contains("{{project_brief}}"))
             }
             fn is_legacy_short_agent(s: &str) -> bool {
                 // Canonical agent_system is >8000 chars and contains hackathon + Roster authoritative + 12 classification rules.

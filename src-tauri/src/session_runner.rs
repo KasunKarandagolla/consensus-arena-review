@@ -20,7 +20,11 @@ const ROLES: &[&str] = &[
 
 fn prompt_hash_for_log(s: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
-    let hex: String = digest.as_ref().iter().map(|b| format!("{:02x}", b)).collect();
+    let hex: String = digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
     format!("len={} sha256={}...", s.len(), &hex[..16.min(hex.len())])
 }
 
@@ -342,7 +346,6 @@ pub(crate) async fn wait_for_setup_ready(
     diagnostics: &crate::browser_backend::BrowserDiagnostics,
     nav_rx: &mut Receiver<NavEvent>,
 ) -> Result<(), AgentError> {
-    let mut challenge_seen = false;
     loop {
         let agent_id_owned = agent_id.to_string();
         let ready = tokio::time::timeout(
@@ -395,7 +398,6 @@ pub(crate) async fn wait_for_setup_ready(
         match ready {
             Ok(Ok(())) => return Ok(()),
             Ok(Err(AgentError::CaptchaRequired(indicator))) => {
-                challenge_seen = true;
                 let _ = app.emit("captcha-detected", json!({ "agent_id": agent_id }));
                 let is_login = indicator == "login_required";
                 let _ = app.emit("boss-message", json!({
@@ -409,7 +411,15 @@ pub(crate) async fn wait_for_setup_ready(
                 let resumed = tokio::time::timeout(std::time::Duration::from_secs(600), async {
                     loop {
                         match nav_rx.recv().await {
-                            Some(NavEvent::ResumeRequested(id)) if id == agent_id => break Ok(()),
+                            Some(NavEvent::ResumeRequested(id)) if id == agent_id => {
+                                let _ = app.emit("boss-message", json!({
+                                    "text": format!(
+                                        "Checking {display_name} again; waiting for a ready composer."
+                                    ),
+                                    "message_type": "status"
+                                }));
+                                continue;
+                            }
                             Some(NavEvent::Ready(id)) if id == agent_id => break Ok(()),
                             Some(NavEvent::ChallengeDetected(id, next_indicator)) if id == agent_id => {
                                 record_browser_blocker(
@@ -441,7 +451,7 @@ pub(crate) async fn wait_for_setup_ready(
                 })
                 .await;
                 match resumed {
-                    Ok(Ok(())) => continue,
+                    Ok(Ok(())) => return Ok(()),
                     Ok(Err(error)) => return Err(error),
                     Err(_) => {
                         let message = "timeout waiting for verification resume (600s)".to_string();
@@ -465,15 +475,6 @@ pub(crate) async fn wait_for_setup_ready(
                 }
             }
             Ok(Err(error)) => return Err(error),
-            Err(_) if challenge_seen => {
-                let _ = app.emit("captcha-detected", json!({ "agent_id": agent_id }));
-                let last_real_url = diagnostics
-                    .last_real_navigation_url(agent_id)
-                    .unwrap_or_else(|| "unknown".to_string());
-                return Err(AgentError::Timeout(format!(
-                    "{display_name} window timed out waiting for readiness from {base_url} after verification resume. Last real URL: {last_real_url}. See Settings → Diagnostics."
-                )));
-            }
             Err(_) => {
                 let last_real_url = diagnostics
                     .last_real_navigation_url(agent_id)
@@ -699,7 +700,11 @@ pub async fn run_setup(
             t
         };
         let priming = if priming_raw.trim().is_empty() {
-            tracing::warn!("[PROMPT] priming interpolation resulted in empty string for {} (leader={}) — using minimal fallback", agent_id, is_leader);
+            tracing::warn!(
+                "[PROMPT] priming interpolation resulted in empty string for {} (leader={}) — using minimal fallback",
+                agent_id,
+                is_leader
+            );
             format!(
                 "You are participating in a structured expert panel discussion.\n\
                  Your role is {}. Respond thoughtfully, be concise, and signal\n\
@@ -726,7 +731,11 @@ pub async fn run_setup(
                 agent_id,
                 is_leader,
                 role,
-                if is_leader { &other_count } else { &participant_count_total },
+                if is_leader {
+                    &other_count
+                } else {
+                    &participant_count_total
+                },
                 other_list.len(),
                 full_list.len(),
                 canonical_hash,
@@ -736,14 +745,28 @@ pub async fn run_setup(
                 participant_count_total
             );
             if is_leader && !has_markers {
-                tracing::error!("[PROMPT] INTERPOLATED leader prompt missing canonical markers! agent={} template_hash={} interpolated_hash={}", agent_id, canonical_hash, interpolated_hash);
+                tracing::error!(
+                    "[PROMPT] INTERPOLATED leader prompt missing canonical markers! agent={} template_hash={} interpolated_hash={}",
+                    agent_id,
+                    canonical_hash,
+                    interpolated_hash
+                );
             }
             // Verify no hardcoded 7-model list leaked: injected string must not contain the full legacy hardcoded line unless those models are actually selected
             if priming_raw.contains("Ask ChatGPT, Claude, Gemini, DeepSeek, Qwen, GLM, or Kimi") {
-                tracing::error!("[PROMPT] interpolated prompt contains legacy hardcoded 7-model list! This indicates old template still in use for {} ", agent_id);
+                tracing::error!(
+                    "[PROMPT] interpolated prompt contains legacy hardcoded 7-model list! This indicates old template still in use for {} ",
+                    agent_id
+                );
             }
             // Verify dynamic participant reflection: check that other_list appears and unselected models do not appear as participants
-            tracing::debug!("[PROMPT] dynamic participants leader={} participants={:?} other_list='{}' full_list='{}'", config.leader_agent_id, config.agent_ids, other_list, full_list);
+            tracing::debug!(
+                "[PROMPT] dynamic participants leader={} participants={:?} other_list='{}' full_list='{}'",
+                config.leader_agent_id,
+                config.agent_ids,
+                other_list,
+                full_list
+            );
             priming_raw
         };
 
@@ -762,7 +785,11 @@ pub async fn run_setup(
             is_leader,
             prompt_hash_for_log(&priming),
             role,
-            if is_leader { &other_count } else { &participant_count_total }
+            if is_leader {
+                &other_count
+            } else {
+                &participant_count_total
+            }
         );
 
         if !diagnostics.prompt_already_visible(agent_id) {
@@ -991,9 +1018,15 @@ pub async fn run_setup(
             let mut final_proof: Option<SetupCompletionProof> = None;
             let mut final_error: Option<AgentError> = None;
             for _ in 0..=MAX_SETUP_NAVIGATION_RECOVERIES {
-                let sent = tokio::time::timeout(std::time::Duration::from_secs(120), async {
-            loop {
-                match nav_rx.recv().await {
+                let mut proof_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                let sent = async {
+            'setup_proof: loop {
+                match tokio::time::timeout_at(proof_deadline, nav_rx.recv())
+                    .await
+                    .ok()
+                    .flatten()
+                {
                     Some(NavEvent::SendDetected(id, reason)) if id == agent_id_clone => {
                         break Ok(SetupCompletionProof::SendDetected(setup_send_reason(
                             reason.as_deref(),
@@ -1006,7 +1039,163 @@ pub async fn run_setup(
                         break Ok(SetupCompletionProof::UserConfirmedManual);
                     }
                     Some(NavEvent::ChallengeDetected(id, indicator)) if id == agent_id_clone => {
-                        break Err(AgentError::CaptchaRequired(indicator));
+                        let _ = app.emit(
+                            "captcha-detected",
+                            json!({ "agent_id": agent_id_clone }),
+                        );
+                        let _ = app.emit("boss-message", json!({
+                            "text": format!(
+                                "{} needs verification ({}). Complete it in the current model window; Resume only requests another readiness check.",
+                                agent_config.display_name, indicator
+                            ),
+                            "message_type": "status"
+                        }));
+                        let deadline = tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(600);
+                        loop {
+                            match tokio::time::timeout_at(deadline, nav_rx.recv()).await {
+                                Ok(Some(NavEvent::Ready(ready_id)))
+                                    if ready_id == agent_id_clone =>
+                                {
+                                    if diagnostics
+                                        .has_response_observed_after_injection(&agent_id_clone)
+                                    {
+                                        break 'setup_proof Ok(
+                                            SetupCompletionProof::ResponseAfterInjection,
+                                        );
+                                    }
+                                    if diagnostics.has_pending_user_submit(&agent_id_clone) {
+                                        break 'setup_proof Ok(
+                                            SetupCompletionProof::SendDetected(
+                                                "trusted_submit".to_string(),
+                                            ),
+                                        );
+                                    }
+                                    if nav_recovery_count >= MAX_SETUP_NAVIGATION_RECOVERIES {
+                                        break 'setup_proof Err(AgentError::NavigationFailed(
+                                            "repeated_navigation_during_setup".to_string(),
+                                        ));
+                                    }
+                                    nav_recovery_count += 1;
+                                    diagnostics.increment_setup_navigation_recovery(
+                                        &agent_id_clone,
+                                    );
+                                    let _ = app.emit("boss-message", json!({
+                                        "text": format!(
+                                            "{} verification resolved; checking the priming prompt on the current page ({}/{}).",
+                                            agent_config.display_name,
+                                            nav_recovery_count,
+                                            MAX_SETUP_NAVIGATION_RECOVERIES
+                                        ),
+                                        "message_type": "status"
+                                    }));
+                                    match perform_priming_injection(
+                                        &window,
+                                        &priming,
+                                        &diagnostics,
+                                        &agent_id_clone,
+                                        nav_rx,
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            proof_deadline = tokio::time::Instant::now()
+                                                + std::time::Duration::from_secs(120);
+                                            continue 'setup_proof;
+                                        }
+                                        Err(error) => break 'setup_proof Err(error),
+                                    }
+                                }
+                                Ok(Some(NavEvent::ResumeRequested(resume_id)))
+                                    if resume_id == agent_id_clone =>
+                                {
+                                    let _ = app.emit("boss-message", json!({
+                                        "text": format!(
+                                            "Checking {} again; waiting for the page to report a ready composer.",
+                                            agent_config.display_name
+                                        ),
+                                        "message_type": "status"
+                                    }));
+                                }
+                                Ok(Some(NavEvent::ChallengeDetected(
+                                    challenge_id,
+                                    next_indicator,
+                                ))) if challenge_id == agent_id_clone => {
+                                    record_browser_blocker(
+                                        app,
+                                        &diagnostics,
+                                        &agent_id_clone,
+                                        "captcha_or_challenge",
+                                        "captcha_or_challenge",
+                                        None,
+                                        "Verification challenge still present",
+                                        Some(&next_indicator),
+                                    );
+                                    let _ = app.emit(
+                                        "captcha-detected",
+                                        json!({ "agent_id": agent_id_clone }),
+                                    );
+                                }
+                                Ok(Some(NavEvent::SetupResponseObserved(response_id)))
+                                    if response_id == agent_id_clone =>
+                                {
+                                    break 'setup_proof Ok(
+                                        SetupCompletionProof::ResponseAfterInjection,
+                                    );
+                                }
+                                Ok(Some(NavEvent::Response(response_id, _, _)))
+                                | Ok(Some(NavEvent::Done(response_id, _)))
+                                    if response_id == agent_id_clone =>
+                                {
+                                    break 'setup_proof Ok(
+                                        SetupCompletionProof::ResponseAfterInjection,
+                                    );
+                                }
+                                Ok(Some(NavEvent::SetupManualConfirmed(confirm_id)))
+                                    if confirm_id == agent_id_clone =>
+                                {
+                                    break 'setup_proof Ok(
+                                        SetupCompletionProof::UserConfirmedManual,
+                                    );
+                                }
+                                Ok(Some(NavEvent::UnshowableUrl(unshowable_id, url)))
+                                    if unshowable_id == agent_id_clone =>
+                                {
+                                    break 'setup_proof Err(AgentError::NavigationFailed(
+                                        format!(
+                                            "{} navigated to a URL this WebView cannot display: {}",
+                                            agent_config.display_name, url
+                                        ),
+                                    ));
+                                }
+                                Ok(Some(NavEvent::SessionAborted)) => {
+                                    break 'setup_proof Err(AgentError::UnknownError(
+                                        "Session aborted".to_string(),
+                                    ));
+                                }
+                                Ok(Some(event)) => {
+                                    record_setup_stale_signal(
+                                        &diagnostics,
+                                        &agent_id_clone,
+                                        &event,
+                                    );
+                                }
+                                Ok(None) => {
+                                    break 'setup_proof Err(AgentError::NavigationFailed(
+                                        "channel closed while waiting for verification"
+                                            .to_string(),
+                                    ));
+                                }
+                                Err(_) => {
+                                    break 'setup_proof Err(AgentError::CaptchaRequired(
+                                        format!(
+                                            "{} verification did not become ready within 600s",
+                                            agent_config.display_name
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
                     }
                     Some(NavEvent::UnshowableUrl(id, url)) if id == agent_id_clone => {
                         break Err(AgentError::NavigationFailed(format!(
@@ -1039,7 +1228,11 @@ pub async fn run_setup(
                         diagnostics.increment_setup_navigation_recovery(&agent_id_clone);
                         let _ = app.emit("boss-message", json!({"text": format!("{} page refreshed; re-priming... (attempt {}/{})", agent_config.display_name, nav_recovery_count, MAX_SETUP_NAVIGATION_RECOVERIES), "message_type": "status"}));
                         match perform_priming_injection(&window, &priming, &diagnostics, &agent_id_clone, nav_rx).await {
-                            Ok(_) => continue,
+                            Ok(_) => {
+                                proof_deadline = tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(120);
+                                continue;
+                            }
                             Err(e) => break Err(e),
                         }
                     }
@@ -1054,15 +1247,15 @@ pub async fn run_setup(
                     }
                 }
             }
-        })
+        }
         .await;
 
                 match sent {
-                    Ok(Ok(proof)) => {
+                    Ok(proof) => {
                         final_proof = Some(proof);
                         break;
                     }
-                    Ok(Err(e)) => {
+                    Err(e) if !matches!(e, AgentError::Timeout(_)) => {
                         final_error = Some(e);
                         break;
                     }

@@ -18,7 +18,6 @@ pub const NAV_WINDOW_LABEL: &str = "arena-nav";
 // READINESS_WAIT_TIMEOUT_SECS: Rust wait_for_setup_ready tokio::timeout awaiting that signal
 pub const READINESS_TIMEOUT_MS: u32 = 90_000;
 pub const READINESS_WAIT_TIMEOUT_SECS: u64 = 100;
-pub const CHROME_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 pub const MAX_CONSOLE_DIAGNOSTICS_PER_AGENT: usize = 20;
 pub const MAX_CONSOLE_MESSAGE_LENGTH: usize = 2048;
 pub const CONSOLE_DEDUP_WINDOW_SECS: u64 = 30;
@@ -134,6 +133,9 @@ pub struct BrowserDiagnosticRecord {
     pub page_health_hint: Option<String>,
     pub active_expected_agent_id: Option<String>,
     pub active_turn_number: Option<u32>,
+    pub active_turn_generation: Option<u32>,
+    pub active_response_observed_turn: Option<u32>,
+    pub active_response_observed_generation: Option<u32>,
     pub last_active_prompt_injected_at: Option<String>,
     pub last_active_response_at: Option<String>,
     pub active_auto_submit_attempted: bool,
@@ -599,30 +601,9 @@ impl BrowserDiagnostics {
             .metadata
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = metadata.clone();
-        // Emit window_created timeline for each agent in setup_order
-        for agent_id in &metadata.setup_order {
-            let op = browser_harness::operation_id_setup(agent_id, metadata.setup_generation);
-            let window_kind = if agent_id == &metadata.selected_leader_id {
-                "leader"
-            } else {
-                "nav"
-            };
-            let window_label = if window_kind == "leader" {
-                LEADER_WINDOW_LABEL
-            } else {
-                NAV_WINDOW_LABEL
-            };
-            let _ = self.emit_timeline(
-                agent_id,
-                EventType::WindowCreated,
-                "setup",
-                &op,
-                "",
-                serde_json::json!({ "setup_generation": metadata.setup_generation }),
-            );
-            // also emit navigation_started expected
-            let _ = self.emit_timeline(agent_id, EventType::NavigationStarted, "setup", &op, "", serde_json::json!({ "intended_url": get_agent_config(agent_id).map(|c| c.base_url).unwrap_or_default(), "window_label": window_label, "window_kind": window_kind }));
-        }
+        // Actual window creation/reuse and navigation are recorded at their
+        // call sites. Do not manufacture WindowCreated/NavigationStarted
+        // events here: named WebViews may now be healthy and reused.
     }
 
     pub(crate) fn register(&self, agent_id: &str, window_label: &str, window_kind: &str) {
@@ -701,6 +682,9 @@ impl BrowserDiagnostics {
                     page_health_hint: None,
                     active_expected_agent_id: None,
                     active_turn_number: None,
+                    active_turn_generation: None,
+                    active_response_observed_turn: None,
+                    active_response_observed_generation: None,
                     last_active_prompt_injected_at: None,
                     last_active_response_at: None,
                     active_auto_submit_attempted: false,
@@ -1122,31 +1106,94 @@ impl BrowserDiagnostics {
             .and_then(|r| r.page_state_hint.clone())
     }
 
-    /// Idempotency guard for retry: if a response was already observed after prompt injection for this agent,
-    /// a retry would duplicate the prompt. This is true when the last signal for this agent was a response/done
-    /// after the most recent prompt_injected_at.
-    pub fn has_response_observed_after_injection(&self, agent_id: &str) -> bool {
+    /// Exact active-turn idempotency guard. Setup-era response evidence must
+    /// never suppress a later autonomous turn, so all three correlation keys
+    /// (agent, turn, setup/window generation) must match.
+    pub fn has_active_response_observed(&self, agent_id: &str, turn: u32) -> bool {
         let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(rec) = records.get(agent_id) {
-            return rec.response_observed_after_injection;
+            return rec.active_expected_agent_id.as_deref() == Some(agent_id)
+                && rec.active_turn_number == Some(turn)
+                && rec.active_turn_generation == Some(rec.setup_generation)
+                && rec.active_response_observed_turn == Some(turn)
+                && rec.active_response_observed_generation == Some(rec.setup_generation);
         }
         false
     }
 
-    /// Heuristic: composer already detected at last navigation URL means we may skip re-navigation on retry
-    /// if the target URL is already the last real navigation URL and page hint is composer_detected.
+    /// Setup-only response evidence used by the priming completion state
+    /// machine. Active-turn retry code must use `has_active_response_observed`.
+    pub fn has_response_observed_after_injection(&self, agent_id: &str) -> bool {
+        self.records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .is_some_and(|record| record.response_observed_after_injection)
+    }
+
+    /// Exact retry reuse gate. The current generation, live shared-window
+    /// ownership, Arena navigation cause, URL and healthy composer evidence
+    /// must all agree before a retry may avoid navigation.
     pub fn can_skip_navigation_on_retry(&self, agent_id: &str, target_url: &str) -> bool {
+        let target_url = sanitized_url(target_url);
         let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(rec) = records.get(agent_id) {
-            let same_url = rec
-                .last_navigation_url
-                .as_deref()
-                .map(|u| u == target_url)
-                .unwrap_or(false);
-            let composer_ready = rec.page_state_hint.as_deref() == Some("composer_detected");
-            return same_url && composer_ready;
+            let active_agent = self
+                .active_by_window
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(NAV_WINDOW_LABEL)
+                .cloned();
+            let navigation_matches = rec.last_navigation.as_ref().is_some_and(|nav| {
+                nav.agent_id == agent_id
+                    && nav.window_label == NAV_WINDOW_LABEL
+                    && nav.setup_generation == rec.setup_generation
+                    && nav.to_url == target_url
+                    && nav.arena_requested
+                    && nav.cause == "arena_requested"
+            });
+            return rec.setup_generation == self.setup_generation()
+                && active_agent.as_deref() == Some(agent_id)
+                && navigation_matches
+                && rec.page_state_hint.as_deref() == Some("composer_detected")
+                && rec.last_blocker == "none";
         }
         false
+    }
+
+    /// Connected Accounts may focus an already healthy same-agent page rather
+    /// than issuing another navigation. This deliberately requires stronger
+    /// evidence than host equality alone.
+    pub fn can_reuse_connected_page(
+        &self,
+        agent_id: &str,
+        window_label: &str,
+        current_url: &str,
+        target_url: &str,
+    ) -> bool {
+        let same_origin = match (
+            current_url.parse::<tauri::Url>(),
+            target_url.parse::<tauri::Url>(),
+        ) {
+            (Ok(current), Ok(target)) => {
+                current.scheme() == target.scheme()
+                    && current.host_str() == target.host_str()
+                    && current.port_or_known_default() == target.port_or_known_default()
+            }
+            _ => false,
+        };
+        if !same_origin || self.active_agent(window_label).as_deref() != Some(agent_id) {
+            return false;
+        }
+        self.records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .is_some_and(|record| {
+                record.setup_generation == self.setup_generation()
+                    && record.page_state_hint.as_deref() == Some("composer_detected")
+                    && record.last_blocker == "none"
+            })
     }
 
     #[cfg(test)]
@@ -1154,6 +1201,24 @@ impl BrowserDiagnostics {
         let mut records = self.records.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(rec) = records.get_mut(agent_id) {
             rec.page_state_hint = hint;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_active_response_for_test(
+        &self,
+        agent_id: &str,
+        active_turn: u32,
+        response_turn: u32,
+        response_generation: u32,
+    ) {
+        let mut records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(record) = records.get_mut(agent_id) {
+            record.active_expected_agent_id = Some(agent_id.to_string());
+            record.active_turn_number = Some(active_turn);
+            record.active_turn_generation = Some(record.setup_generation);
+            record.active_response_observed_turn = Some(response_turn);
+            record.active_response_observed_generation = Some(response_generation);
         }
     }
 }
@@ -1653,6 +1718,10 @@ fn record_signal_metadata(diagnostics: &BrowserDiagnostics, event: &NavEvent) {
     });
 }
 
+fn is_allowed_oauth_notice(reason: &str) -> bool {
+    reason == "OAuth popup allowed (temporary)"
+}
+
 pub fn record_setup_stale_signal(
     diagnostics: &BrowserDiagnostics,
     expected_agent_id: &str,
@@ -1870,6 +1939,26 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             reason,
         } => {
             if let Some(agent_id) = diagnostics.active_agent(window_label) {
+                if is_allowed_oauth_notice(reason) {
+                    let op = diagnostics.current_operation_id(&agent_id);
+                    diagnostics.emit_harness_event(
+                        &agent_id,
+                        EventType::Unknown,
+                        &diagnostics.current_phase_str(&agent_id),
+                        &op,
+                        url,
+                        serde_json::json!({
+                            "oauth_popup": "allowed_temporary",
+                            "window_label": window_label
+                        }),
+                    );
+                    tracing::info!(
+                        "[OAUTH] temporary popup allowed for {} in {}",
+                        agent_id,
+                        window_label
+                    );
+                    return;
+                }
                 let message = if reason == "Unknown arena diagnostic signal ignored" {
                     "Unknown arena diagnostic signal ignored"
                 } else {
@@ -2403,6 +2492,7 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             } => {
                 record.active_expected_agent_id = Some(record.agent_id.clone());
                 record.active_turn_number = Some(*turn);
+                record.active_turn_generation = Some(record.setup_generation);
                 record.active_auto_submit_attempted = true;
                 record.active_auto_submit_succeeded = Some(*succeeded);
                 record.active_auto_submit_method = Some(method.clone());
@@ -2410,17 +2500,30 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 record.active_submit_error = error.clone();
                 record.active_submit_at = Some(timestamp.clone());
             }
-            NavEvent::Response(_, _, _)
-            | NavEvent::Done(_, _)
-            | NavEvent::SetupResponseObserved(_) => {
+            NavEvent::Response(_, event_turn, _) | NavEvent::Done(_, event_turn) => {
                 record.last_response_at = Some(timestamp.clone());
-                if record.active_expected_agent_id.as_deref() == Some(record.agent_id.as_str()) {
+                if record.active_expected_agent_id.as_deref() == Some(record.agent_id.as_str())
+                    && record.active_turn_number == Some(*event_turn)
+                    && record.active_turn_generation == Some(record.setup_generation)
+                {
                     record.last_active_response_at = Some(timestamp.clone());
+                    record.active_response_observed_turn = Some(*event_turn);
+                    record.active_response_observed_generation = Some(record.setup_generation);
                 }
             }
-            NavEvent::ManualResponse { .. } => {
+            NavEvent::SetupResponseObserved(_) => {
                 record.last_response_at = Some(timestamp.clone());
-                record.last_active_response_at = Some(timestamp.clone());
+            }
+            NavEvent::ManualResponse { turn, .. } => {
+                record.last_response_at = Some(timestamp.clone());
+                if record.active_expected_agent_id.as_deref() == Some(record.agent_id.as_str())
+                    && record.active_turn_number == Some(*turn)
+                    && record.active_turn_generation == Some(record.setup_generation)
+                {
+                    record.last_active_response_at = Some(timestamp.clone());
+                    record.active_response_observed_turn = Some(*turn);
+                    record.active_response_observed_generation = Some(record.setup_generation);
+                }
             }
             NavEvent::Error(_)
             | NavEvent::SendProbe { .. }
@@ -2959,12 +3062,42 @@ pub enum NavEvent {
 
 // ── BrowserState ──────────────────────────────────────────────────────────────
 
+type NavEventSink = Arc<Mutex<Option<sync::mpsc::Sender<NavEvent>>>>;
+
+fn forward_nav_event(sink_slot: &NavEventSink, event: NavEvent) {
+    let sink = sink_slot
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let Some(sink) = sink else {
+        return;
+    };
+    match sink.try_send(event) {
+        Ok(()) => {}
+        Err(sync::mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!("[NAV] async navigation consumer is full; event dropped");
+        }
+        Err(sync::mpsc::error::TrySendError::Closed(_)) => {
+            let mut current = sink_slot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if current
+                .as_ref()
+                .is_some_and(|candidate| candidate.same_channel(&sink))
+            {
+                *current = None;
+            }
+        }
+    }
+}
+
 pub struct BrowserState {
     pub leader_window: Option<WebviewWindow>,
     pub leader_agent_id: String,
     pub nav_window: Option<WebviewWindow>,
     pub conversation_urls: HashMap<String, Option<String>>,
     pub nav_tx: std::sync::mpsc::SyncSender<NavEvent>,
+    nav_sink: NavEventSink,
     pub diagnostics: BrowserDiagnostics,
     pub pending_sends: HashSet<String>,
     pub captcha_resolved: HashSet<String>,
@@ -2987,6 +3120,7 @@ impl BrowserState {
             nav_window: None,
             conversation_urls: HashMap::new(),
             nav_tx,
+            nav_sink: Arc::new(Mutex::new(None)),
             diagnostics: BrowserDiagnostics::new(),
             pending_sends: HashSet::new(),
             captcha_resolved: HashSet::new(),
@@ -2994,6 +3128,49 @@ impl BrowserState {
             active_turn: None,
             connected_account_busy_until: None,
         }
+    }
+
+    /// Construct the one process-lifetime navigation ingress. WebView
+    /// callbacks permanently capture `nav_tx`; this receiver and bridge live
+    /// for the same lifetime, while commands attach the one current async
+    /// consumer through `attach_nav_receiver`.
+    pub fn new_live(app: &AppHandle) -> Self {
+        let (nav_tx, nav_rx) = std::sync::mpsc::sync_channel::<NavEvent>(256);
+        let state = Self::new(nav_tx);
+        let diagnostics = state.diagnostics.clone();
+        let sink_slot = state.nav_sink.clone();
+        let bridge_app = app.clone();
+        std::thread::spawn(move || {
+            while let Ok(event) = nav_rx.recv() {
+                record_nav_event(&bridge_app, &diagnostics, &event);
+                forward_nav_event(&sink_slot, event);
+            }
+            tracing::error!("[NAV] process-lifetime navigation ingress disconnected");
+        });
+        state
+    }
+
+    /// Replace only the current async event consumer. This never replaces the
+    /// std sender captured by a WebView and therefore never requires window
+    /// destruction to repair callback ownership.
+    pub fn attach_nav_receiver(&mut self) -> AsyncNavReceiver<NavEvent> {
+        let (tx, rx) = sync::mpsc::channel::<NavEvent>(256);
+        *self
+            .nav_sink
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(tx);
+        rx
+    }
+
+    /// Clear session-only browser state without replacing the process-lifetime
+    /// channel, diagnostics object, or named WebView handles.
+    pub fn reset_for_session(&mut self) {
+        self.conversation_urls.clear();
+        self.pending_sends.clear();
+        self.captcha_resolved.clear();
+        self.cooldowns.clear();
+        self.active_turn = None;
+        self.connected_account_busy_until = None;
     }
 
     pub fn select_window(&self, is_leader: bool) -> Option<WebviewWindow> {
@@ -3037,8 +3214,17 @@ impl BrowserState {
             serde_json::json!({ "turn": turn }),
         );
         let _ = update_diagnostic(&self.diagnostics, agent_id, |record| {
+            let same_logical_turn = record.active_expected_agent_id.as_deref() == Some(agent_id)
+                && record.active_turn_number == Some(turn)
+                && record.active_turn_generation == Some(record.setup_generation);
             record.active_expected_agent_id = Some(agent_id.to_string());
             record.active_turn_number = Some(turn);
+            record.active_turn_generation = Some(record.setup_generation);
+            if !same_logical_turn {
+                record.active_response_observed_turn = None;
+                record.active_response_observed_generation = None;
+                record.last_active_response_at = None;
+            }
             record.last_active_prompt_injected_at = Some(now_timestamp());
             record.current_phase = "active_prompt_injected".to_string();
             record.last_error = None;
@@ -3078,23 +3264,28 @@ impl BrowserState {
         });
     }
 
-    pub fn clear_active_turn(&mut self, agent_id: &str, turn: u32) {
+    pub fn clear_active_turn(&mut self, agent_id: &str, turn: u32, response_captured: bool) {
         if self.active_turn.as_ref() == Some(&(agent_id.to_string(), turn)) {
             self.active_turn = None;
         }
-        let op = self.diagnostics.current_operation_id(agent_id);
-        self.diagnostics.emit_harness_event(
-            agent_id,
-            EventType::ResponseCompleted,
-            "response_capture",
-            &op,
-            "",
-            serde_json::json!({ "turn": turn }),
-        );
+        if response_captured {
+            let op = self.diagnostics.current_operation_id(agent_id);
+            self.diagnostics.emit_harness_event(
+                agent_id,
+                EventType::ResponseCompleted,
+                "response_capture",
+                &op,
+                "",
+                serde_json::json!({ "turn": turn }),
+            );
+        }
         let _ = update_diagnostic(&self.diagnostics, agent_id, |record| {
             if record.active_turn_number == Some(turn) {
-                record.current_phase = "active_response_captured".to_string();
-                record.last_active_response_at = Some(now_timestamp());
+                record.current_phase = if response_captured {
+                    "active_response_captured".to_string()
+                } else {
+                    "active_turn_ended_without_response".to_string()
+                };
             }
         });
     }
@@ -3343,7 +3534,6 @@ fn make_new_window_handler(
 + 'static {
     move |url, _features| {
         let url_str = url.as_str();
-        let host = url.host_str().unwrap_or("");
         // OAuth popup handling (Issue A): Claude login via Google uses
         // accounts.google.com. Previously all popups were denied to preserve
         // the two-WebView limit, which made the "Maybe blocked by the browser"
@@ -3351,11 +3541,7 @@ fn make_new_window_handler(
         // /api/auth/login_methods etc). Allowing the OAuth popup is the
         // smallest safe fix: it is a temporary window that closes after auth,
         // not a third persistent WebView. All other popups remain denied.
-        let is_oauth = host == "accounts.google.com"
-            || host.ends_with(".accounts.google.com")
-            || (host.contains("google") && url_str.contains("oauth"))
-            || (host.contains("claude.ai") && url_str.contains("oauth"));
-        if is_oauth {
+        if is_allowed_oauth_popup(&url) {
             send_nav_event(
                 &tx,
                 NavEvent::UnsupportedNavigation {
@@ -3377,6 +3563,15 @@ fn make_new_window_handler(
         );
         NewWindowResponse::Deny
     }
+}
+
+fn is_allowed_oauth_popup(url: &tauri::Url) -> bool {
+    let url_str = url.as_str();
+    let host = url.host_str().unwrap_or("");
+    host == "accounts.google.com"
+        || host.ends_with(".accounts.google.com")
+        || (host.contains("google") && url_str.contains("oauth"))
+        || (host.contains("claude.ai") && url_str.contains("oauth"))
 }
 
 // ── inject_to_window (lock-safe — caller drops BrowserState lock first) ───────
@@ -3469,13 +3664,28 @@ async fn wait_for_ready(
             }
             Some(NavEvent::ChallengeDetected(id, indicator)) if id == agent_id => loop {
                 match nav_rx.recv().await {
-                    Some(NavEvent::ResumeRequested(resume_id)) if resume_id == agent_id => break,
+                    Some(NavEvent::Ready(ready_id)) if ready_id == agent_id => return Ok(()),
+                    Some(NavEvent::ResumeRequested(resume_id)) if resume_id == agent_id => {
+                        tracing::info!(
+                            "[CHALLENGE] {} resume requested; waiting for genuine Ready evidence",
+                            agent_id
+                        );
+                        continue;
+                    }
                     Some(NavEvent::ChallengeDetected(challenge_id, _))
                         if challenge_id == agent_id =>
                     {
-                        return Err(AgentError::CaptchaRequired(format!(
-                            "Agent {} is still blocked by verification challenge: {}",
-                            agent_id, indicator
+                        tracing::info!(
+                            "[CHALLENGE] {} verification remains active: {}",
+                            agent_id,
+                            indicator
+                        );
+                        continue;
+                    }
+                    Some(NavEvent::Error(error_id)) if error_id == agent_id => {
+                        return Err(AgentError::NavigationFailed(format!(
+                            "Agent {} reported an error while waiting for verification",
+                            agent_id
                         )));
                     }
                     Some(NavEvent::UnshowableUrl(unshowable_id, url))
@@ -5337,6 +5547,151 @@ mod tests {
             "missing login guard"
         );
     }
+
+    #[tokio::test]
+    async fn repeated_challenge_and_resume_wait_for_genuine_ready() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let wait =
+            tokio::spawn(async move { super::wait_for_ready("claude".to_string(), &mut rx).await });
+        tx.send(super::NavEvent::ChallengeDetected(
+            "claude".to_string(),
+            "cloudflare".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(super::NavEvent::ChallengeDetected(
+            "claude".to_string(),
+            "cloudflare".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(super::NavEvent::ResumeRequested("claude".to_string()))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "repeated challenge or Resume must not resolve readiness"
+        );
+        tx.send(super::NavEvent::Ready("claude".to_string()))
+            .await
+            .unwrap();
+        assert!(wait.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ready_for_wrong_agent_is_ignored() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let wait =
+            tokio::spawn(async move { super::wait_for_ready("claude".to_string(), &mut rx).await });
+        tx.send(super::NavEvent::Ready("chatgpt".to_string()))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished(), "wrong-agent Ready must remain stale");
+        tx.send(super::NavEvent::Ready("claude".to_string()))
+            .await
+            .unwrap();
+        assert!(wait.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn navigation_sink_can_change_without_replacing_ingress() {
+        let sink_slot: super::NavEventSink = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(8);
+        *sink_slot.lock().unwrap() = Some(first_tx);
+        super::forward_nav_event(&sink_slot, super::NavEvent::Ready("claude".to_string()));
+        assert!(matches!(
+            first_rx.recv().await,
+            Some(super::NavEvent::Ready(id)) if id == "claude"
+        ));
+
+        let (second_tx, mut second_rx) = tokio::sync::mpsc::channel(8);
+        *sink_slot.lock().unwrap() = Some(second_tx);
+        super::forward_nav_event(&sink_slot, super::NavEvent::Ready("gemini".to_string()));
+        assert!(matches!(
+            second_rx.recv().await,
+            Some(super::NavEvent::Ready(id)) if id == "gemini"
+        ));
+    }
+
+    #[test]
+    fn arena_builders_use_native_user_agent_and_no_destructive_reuse() {
+        let source = include_str!("browser_backend.rs");
+        let custom_ua_call = [".user", "_agent("].concat();
+        let custom_ua_constant = ["CHROME", "_USER_AGENT"].concat();
+        let destructive_call = [".", "destroy()"].concat();
+        assert!(!source.contains(&custom_ua_call));
+        assert!(!source.contains(&custom_ua_constant));
+        assert!(!source.contains(&destructive_call));
+    }
+
+    #[test]
+    fn oauth_popup_allow_policy_is_preserved() {
+        let google = "https://accounts.google.com/o/oauth2/v2/auth"
+            .parse::<tauri::Url>()
+            .unwrap();
+        let claude = "https://claude.ai/oauth/callback"
+            .parse::<tauri::Url>()
+            .unwrap();
+        let ordinary = "https://example.com/help".parse::<tauri::Url>().unwrap();
+        assert!(super::is_allowed_oauth_popup(&google));
+        assert!(super::is_allowed_oauth_popup(&claude));
+        assert!(!super::is_allowed_oauth_popup(&ordinary));
+        assert!(super::is_allowed_oauth_notice(
+            "OAuth popup allowed (temporary)"
+        ));
+    }
+
+    #[test]
+    fn retry_navigation_reuse_requires_current_owned_arena_navigation() {
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.begin_setup_run(super::BrowserSetupMetadata {
+            setup_generation: 4,
+            session_id: "session".to_string(),
+            selected_leader_id: "chatgpt".to_string(),
+            selected_agent_ids: vec!["chatgpt".to_string(), "claude".to_string()],
+            setup_order: vec!["chatgpt".to_string(), "claude".to_string()],
+        });
+        diagnostics.register("claude", super::NAV_WINDOW_LABEL, "nav");
+        diagnostics.set_active(super::NAV_WINDOW_LABEL, "claude");
+        diagnostics.record_arena_navigation_request(
+            "claude",
+            super::NAV_WINDOW_LABEL,
+            "https://claude.ai/new",
+            "active_navigation",
+        );
+        diagnostics.record_navigation(
+            super::NAV_WINDOW_LABEL,
+            None,
+            "https://claude.ai/new",
+            "real_url_loaded",
+        );
+        diagnostics.set_page_state_hint_for_test("claude", Some("composer_detected".to_string()));
+        assert!(diagnostics.can_skip_navigation_on_retry("claude", "https://claude.ai/new"));
+        diagnostics.set_active(super::NAV_WINDOW_LABEL, "gemini");
+        assert!(!diagnostics.can_skip_navigation_on_retry("claude", "https://claude.ai/new"));
+    }
+
+    #[test]
+    fn connected_page_reuse_requires_same_agent_origin_and_healthy_composer() {
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.register("claude", super::NAV_WINDOW_LABEL, "nav");
+        diagnostics.set_active(super::NAV_WINDOW_LABEL, "claude");
+        diagnostics.set_page_state_hint_for_test("claude", Some("composer_detected".to_string()));
+        assert!(diagnostics.can_reuse_connected_page(
+            "claude",
+            super::NAV_WINDOW_LABEL,
+            "https://claude.ai/new",
+            "https://claude.ai/"
+        ));
+        assert!(!diagnostics.can_reuse_connected_page(
+            "gemini",
+            super::NAV_WINDOW_LABEL,
+            "https://claude.ai/new",
+            "https://gemini.google.com/"
+        ));
+    }
 }
 
 // ── GENERIC_INIT_SCRIPT ───────────────────────────────────────────────────────
@@ -6661,16 +7016,6 @@ pub fn create_windows(
     });
     state.leader_agent_id = leader_agent_id.to_string();
 
-    for label in [LEADER_WINDOW_LABEL, NAV_WINDOW_LABEL] {
-        if let Some(existing) = app.get_webview_window(label) {
-            existing.destroy().map_err(|error| {
-                AgentError::NavigationFailed(format!(
-                    "failed to destroy stale {label} window before session start: {error}"
-                ))
-            })?;
-        }
-    }
-
     for agent_id in agent_ids {
         let (label, kind) = if agent_id == leader_agent_id {
             (LEADER_WINDOW_LABEL, "leader")
@@ -6700,26 +7045,39 @@ pub fn create_windows(
         );
     }
 
+    let leader_win = ensure_leader_window(app, state)?;
+    let nav_win = ensure_nav_window(app, state)?;
+    state.leader_window = Some(leader_win);
+    state.nav_window = Some(nav_win);
+    Ok(())
+}
+
+fn ensure_leader_window(
+    app: &AppHandle,
+    state: &mut BrowserState,
+) -> Result<WebviewWindow, AgentError> {
+    if let Some(window) = app.get_webview_window(LEADER_WINDOW_LABEL) {
+        tracing::info!("[WEBVIEW] reusing persistent {}", LEADER_WINDOW_LABEL);
+        state.leader_window = Some(window.clone());
+        return Ok(window);
+    }
+    state.leader_window = None;
+
     let leader_tx = state.nav_tx.clone();
     let leader_popup_tx = state.nav_tx.clone();
-    let nav_tx = state.nav_tx.clone();
-    let nav_popup_tx = state.nav_tx.clone();
     let leader_diagnostics = state.diagnostics.clone();
-    let nav_diagnostics = state.diagnostics.clone();
-
-    let leader_win = WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         app,
         LEADER_WINDOW_LABEL,
         WebviewUrl::External(
             "about:blank"
                 .parse()
-                .map_err(|e| AgentError::NavigationFailed(format!("url parse: {}", e)))?,
+                .map_err(|e| AgentError::NavigationFailed(format!("url parse: {e}")))?,
         ),
     )
     .title("Consensus Arena — Leader")
     .inner_size(1200.0, 800.0)
     .visible(false)
-    .user_agent(CHROME_USER_AGENT)
     .initialization_script(GENERIC_INIT_SCRIPT)
     .on_navigation(make_nav_closure(leader_tx, LEADER_WINDOW_LABEL))
     .on_new_window(make_new_window_handler(
@@ -6730,33 +7088,10 @@ pub fn create_windows(
         handle_page_load(window, payload, &leader_diagnostics);
     })
     .build()
-    .map_err(|e| AgentError::NavigationFailed(format!("leader window build failed: {}", e)))?;
-
-    let nav_win = WebviewWindowBuilder::new(
-        app,
-        NAV_WINDOW_LABEL,
-        WebviewUrl::External(
-            "about:blank"
-                .parse()
-                .map_err(|e| AgentError::NavigationFailed(format!("url parse: {}", e)))?,
-        ),
-    )
-    .title("Consensus Arena — Agent")
-    .inner_size(1200.0, 800.0)
-    .visible(false)
-    .user_agent(CHROME_USER_AGENT)
-    .initialization_script(GENERIC_INIT_SCRIPT)
-    .on_navigation(make_nav_closure(nav_tx, NAV_WINDOW_LABEL))
-    .on_new_window(make_new_window_handler(nav_popup_tx, NAV_WINDOW_LABEL))
-    .on_page_load(move |window, payload| {
-        handle_page_load(window, payload, &nav_diagnostics);
-    })
-    .build()
-    .map_err(|e| AgentError::NavigationFailed(format!("nav window build failed: {}", e)))?;
-
-    state.leader_window = Some(leader_win.clone());
-    state.nav_window = Some(nav_win.clone());
-    Ok(())
+    .map_err(|e| AgentError::NavigationFailed(format!("leader window build failed: {e}")))?;
+    tracing::info!("[WEBVIEW] created persistent {}", LEADER_WINDOW_LABEL);
+    state.leader_window = Some(window.clone());
+    Ok(window)
 }
 
 /// Restore the one shared participant WebView if it was closed after setup.
@@ -6766,13 +7101,12 @@ pub fn ensure_nav_window(
     app: &AppHandle,
     state: &mut BrowserState,
 ) -> Result<WebviewWindow, AgentError> {
-    if let Some(window) = state.nav_window.clone() {
-        return Ok(window);
-    }
     if let Some(window) = app.get_webview_window(NAV_WINDOW_LABEL) {
+        tracing::info!("[WEBVIEW] reusing persistent {}", NAV_WINDOW_LABEL);
         state.nav_window = Some(window.clone());
         return Ok(window);
     }
+    state.nav_window = None;
 
     let nav_tx = state.nav_tx.clone();
     let nav_popup_tx = state.nav_tx.clone();
@@ -6789,7 +7123,6 @@ pub fn ensure_nav_window(
     .title("Consensus Arena — Agent")
     .inner_size(1200.0, 800.0)
     .visible(false)
-    .user_agent(CHROME_USER_AGENT)
     .initialization_script(GENERIC_INIT_SCRIPT)
     .on_navigation(make_nav_closure(nav_tx, NAV_WINDOW_LABEL))
     .on_new_window(make_new_window_handler(nav_popup_tx, NAV_WINDOW_LABEL))
@@ -6798,6 +7131,7 @@ pub fn ensure_nav_window(
     })
     .build()
     .map_err(|e| AgentError::NavigationFailed(format!("nav window recreate failed: {e}")))?;
+    tracing::info!("[WEBVIEW] created persistent {}", NAV_WINDOW_LABEL);
     state.nav_window = Some(window.clone());
     Ok(window)
 }

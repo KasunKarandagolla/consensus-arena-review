@@ -60,7 +60,7 @@ fn main() {
 
             // ── AppState ──────────────────────────────────────────────────────
             let data_dir_str = data_dir.to_string_lossy().into_owned();
-            let app_state = AppState::new(&data_dir_str);
+            let app_state = AppState::new(&data_dir_str, app.handle());
             if !app_state.last_memory_health.is_healthy
                 || app_state.last_memory_health.fts_needs_repair
             {

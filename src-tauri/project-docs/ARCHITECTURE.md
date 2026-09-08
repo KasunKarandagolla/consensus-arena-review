@@ -211,6 +211,28 @@ Maximum 2 WebViews active simultaneously. Hard constraint — never exceeded.
 Leader window never closed during session.
 Non-leader models share one navigating window using saved conversation URLs.
 
+The named windows are also stable across Connected Accounts and session
+boundaries. `AppState` owns a process-lifetime standard-channel navigation
+ingress. WebView callbacks keep that sender for their lifetime; a small bridge
+records diagnostics and forwards to the one currently attached bounded async
+receiver. Starting or resuming a session swaps only that receiver, not the
+callback channel or browser window. If the user closes a named window, the next
+operation recreates that missing window; healthy windows are reused.
+
+Authentication relies on the native WebView profile. Arena does not force a
+custom user agent, does not copy cookies through `SessionVault`, and does not
+use incognito or a custom data directory. A narrowly allowlisted temporary
+Claude/Google OAuth popup remains permitted; it is provider-driven and is not a
+third persistent Arena window.
+
+Challenge state is evidence-driven: Challenge remains pending across repeated
+signals, and Resume is only a request to inspect again. A same-agent Ready
+signal from the model page is required before setup/readiness continues. Setup
+does not replay navigation after human verification; bounded on-page priming
+verification is used instead. Active retries check exact agent, turn,
+generation, current window ownership, navigation cause, and page health before
+reusing state.
+
 ---
 
 ## Browser Automation Mechanism

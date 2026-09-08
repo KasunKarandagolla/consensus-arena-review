@@ -65,11 +65,12 @@ fn should_retry_after_failure(
     error: &AgentError,
     diagnostics: &crate::browser_backend::BrowserDiagnostics,
     agent_id: &str,
+    turn: u32,
     attempt: u32,
 ) -> bool {
-    // Idempotency: if a response was already observed after injection for this agent/turn,
-    // retrying same turn would duplicate. This catches late responses arriving during backoff.
-    if diagnostics.has_response_observed_after_injection(agent_id) {
+    // Exact active idempotency: setup responses and responses from another
+    // turn/generation cannot suppress or authorize this turn's retry.
+    if diagnostics.has_active_response_observed(agent_id, turn) {
         tracing::info!(
             "[RETRY] {} not retrying — late response already observed after injection (attempt {}/{}): {}",
             agent_id,
@@ -145,6 +146,34 @@ fn drain_stale_active_events(nav_rx: &mut Receiver<NavEvent>) -> usize {
         );
     }
     drained
+}
+
+fn take_queued_response_for_turn(
+    nav_rx: &mut Receiver<NavEvent>,
+    agent_id: &str,
+    turn: u32,
+) -> Option<String> {
+    while let Ok(event) = nav_rx.try_recv() {
+        match event {
+            NavEvent::Response(event_agent, event_turn, response)
+                if event_agent == agent_id && event_turn == turn =>
+            {
+                return Some(response);
+            }
+            NavEvent::ManualResponse {
+                agent_id: event_agent,
+                turn: event_turn,
+                response,
+            } if event_agent == agent_id && event_turn == turn => return Some(response),
+            stale => tracing::warn!(
+                "[ACTIVE] Drained non-response event while recovering late response for {} turn {}: {:?}",
+                agent_id,
+                turn,
+                stale
+            ),
+        }
+    }
+    None
 }
 
 /// Outcome of the active-turn auto-submit confirmation gate.
@@ -375,9 +404,9 @@ async fn inject_active_prompt(
     Ok(early_response)
 }
 
-async fn finish_active_turn(state: &AppState, agent_id: &str, turn: u32) {
+async fn finish_active_turn(state: &AppState, agent_id: &str, turn: u32, response_captured: bool) {
     let mut browser = state.browser_state.lock().await;
-    browser.clear_active_turn(agent_id, turn);
+    browser.clear_active_turn(agent_id, turn, response_captured);
 }
 
 // ── Main session loop ─────────────────────────────────────────────────────────
@@ -621,7 +650,7 @@ pub async fn run_agent_loop(
                         // remains valid after a browser-capture timeout.
                     }
                     Err(error) => {
-                        finish_active_turn(state, &leader_id, active_turn).await;
+                        finish_active_turn(state, &leader_id, active_turn, false).await;
                         let diagnostics = {
                             let browser = state.browser_state.lock().await;
                             browser.diagnostics.clone()
@@ -644,7 +673,7 @@ pub async fn run_agent_loop(
                 }
             },
         };
-        finish_active_turn(state, &leader_id, active_turn).await;
+        finish_active_turn(state, &leader_id, active_turn, true).await;
 
         let _ = app.emit(
             "active-turn-state",
@@ -2198,8 +2227,56 @@ async fn inject_and_wait_with_retry(
             attempt
         );
 
+        // A response can arrive while the outer retry is sleeping. Consult
+        // exact agent+turn+generation evidence before any new navigation or
+        // injection, then recover its queued text when available.
+        if attempt > 0 && diagnostics.has_active_response_observed(target_model, turn) {
+            if let Some(response) = take_queued_response_for_turn(nav_rx, target_model, turn) {
+                finish_active_turn(state, target_model, turn, true).await;
+                let _ = app.emit(
+                    "active-turn-state",
+                    serde_json::json!({
+                        "event": "active_response_captured",
+                        "agent_id": target_model,
+                        "turn_number": turn,
+                    }),
+                );
+                let _ = app.emit(
+                    "agent-message",
+                    serde_json::json!({
+                        "agent_id": target_model,
+                        "role": "participant",
+                        "response": &response,
+                        "tokens": 0,
+                        "iteration": turn,
+                        "source_type": "browser_or_manual"
+                    }),
+                );
+                update_model_health(state, target_model, true, None).await;
+                return Ok(response);
+            }
+            let error = AgentError::ExtractionFailed(format!(
+                "{} turn {} produced response evidence during retry backoff, but response text was unavailable; refusing duplicate navigation/injection",
+                target_model, turn
+            ));
+            update_model_health(state, target_model, false, Some(error.to_string())).await;
+            return Err(error);
+        }
+
+        let drained = drain_stale_active_events(nav_rx);
+        if drained > 0 {
+            tracing::warn!(
+                "[ACTIVE] drained {} pre-navigation events for {} turn {} attempt {}",
+                drained,
+                target_model,
+                turn,
+                attempt
+            );
+        }
+
         // Retry idempotency: if already at target URL with composer ready, skip re-navigation which would cause a SPA refresh.
-        let skip_navigate = attempt > 0 && diagnostics.can_skip_navigation_on_retry(target_model, &target_url);
+        let skip_navigate =
+            attempt > 0 && diagnostics.can_skip_navigation_on_retry(target_model, &target_url);
         if skip_navigate {
             tracing::info!(
                 "[RETRY] skipping navigation for {} attempt {} — already at {} with composer_detected",
@@ -2217,7 +2294,7 @@ async fn inject_and_wait_with_retry(
         ) {
             // W1-C: navigation failures retain bounded retry, but empty-shell
             // is not retryable via navigate (Category 2). Use helper to decide.
-            if !should_retry_after_failure(&e, &diagnostics, target_model, attempt) {
+            if !should_retry_after_failure(&e, &diagnostics, target_model, turn, attempt) {
                 update_model_health(state, target_model, false, Some(e.to_string())).await;
                 return Err(e);
             }
@@ -2250,13 +2327,13 @@ async fn inject_and_wait_with_retry(
             prompt,
             turn,
             nav_rx,
-            true,
+            !skip_navigate,
             true,
         )
         .await
         {
             Err(e) => {
-                finish_active_turn(state, target_model, turn).await;
+                finish_active_turn(state, target_model, turn, false).await;
                 if matches!(&e, AgentError::Timeout(_) | AgentError::InjectionFailed(_)) {
                     crate::browser_backend::record_browser_error(
                         app,
@@ -2271,7 +2348,7 @@ async fn inject_and_wait_with_retry(
                     browser.set_cooldown(target_model, 60);
                 }
                 // W1-C: empty-shell readiness failure should not be retried via full navigate.
-                if !should_retry_after_failure(&e, &diagnostics, target_model, attempt) {
+                if !should_retry_after_failure(&e, &diagnostics, target_model, turn, attempt) {
                     update_model_health(state, target_model, false, Some(e.to_string())).await;
                     return Err(e);
                 }
@@ -2289,7 +2366,7 @@ async fn inject_and_wait_with_retry(
                     confirm_active_submit(&nav_window, target_model, turn, nav_rx, app).await?;
                 match outcome {
                     SubmitOutcome::ResponseEarly(response) => {
-                        finish_active_turn(state, target_model, turn).await;
+                        finish_active_turn(state, target_model, turn, true).await;
                         let _ = app.emit(
                             "active-turn-state",
                             serde_json::json!({
@@ -2359,7 +2436,7 @@ async fn inject_and_wait_with_retry(
         // Wait for response.
         match wait_for_response(target_model, turn, nav_rx).await {
             Ok(response) => {
-                finish_active_turn(state, target_model, turn).await;
+                finish_active_turn(state, target_model, turn, true).await;
                 let _ = app.emit(
                     "active-turn-state",
                     serde_json::json!({
@@ -2384,7 +2461,7 @@ async fn inject_and_wait_with_retry(
                 return Ok(response);
             }
             Err(e) => {
-                finish_active_turn(state, target_model, turn).await;
+                finish_active_turn(state, target_model, turn, false).await;
                 let _ = app.emit(
                     "active-turn-state",
                     serde_json::json!({
@@ -2407,7 +2484,7 @@ async fn inject_and_wait_with_retry(
                     browser.set_cooldown(target_model, 60);
                 }
                 // W1-C: empty-shell should not trigger repeated full navigation.
-                if !should_retry_after_failure(&e, &diagnostics, target_model, attempt) {
+                if !should_retry_after_failure(&e, &diagnostics, target_model, turn, attempt) {
                     update_model_health(state, target_model, false, Some(e.to_string())).await;
                     return Err(e);
                 }
@@ -2536,9 +2613,11 @@ async fn wait_for_response(
                             // preserving the same agent_id+turn. This is distinct
                             // from MAX_RETRIES; it does not consume the retry
                             // budget and does not hammer the page after Resume.
-                            let resume_deadline = Duration::from_secs(600);
+                            let resume_deadline =
+                                tokio::time::Instant::now() + Duration::from_secs(600);
                             loop {
-                                match timeout(resume_deadline, nav_rx.recv()).await {
+                                match tokio::time::timeout_at(resume_deadline, nav_rx.recv()).await
+                                {
                                     Ok(Some(NavEvent::ResumeRequested(req_id)))
                                         if req_id == agent_id =>
                                     {
@@ -2813,6 +2892,36 @@ mod tests {
         assert_eq!(drained, 0);
     }
 
+    #[tokio::test]
+    async fn queued_response_recovery_requires_exact_agent_and_turn() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(NavEvent::Response(
+            "other".to_string(),
+            4,
+            "stale agent".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(NavEvent::Response(
+            "claude".to_string(),
+            3,
+            "stale turn".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(NavEvent::Response(
+            "claude".to_string(),
+            4,
+            "current".to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            super::take_queued_response_for_turn(&mut rx, "claude", 4).as_deref(),
+            Some("current")
+        );
+    }
+
     // ── R1.8: live challenge recovery ───────────────────────────────────────
 
     #[tokio::test]
@@ -2994,11 +3103,11 @@ mod tests {
         );
         let err = AgentError::Timeout("readiness timeout".to_string());
         assert!(
-            !super::should_retry_after_failure(&err, &diagnostics, "chatgpt", 0),
+            !super::should_retry_after_failure(&err, &diagnostics, "chatgpt", 1, 0),
             "empty-shell Timeout must not be retried via navigate"
         );
         assert!(
-            !super::should_retry_after_failure(&err, &diagnostics, "chatgpt", 1),
+            !super::should_retry_after_failure(&err, &diagnostics, "chatgpt", 1, 1),
             "empty-shell on retry 1 also must not be retried"
         );
     }
@@ -3020,13 +3129,13 @@ mod tests {
         diagnostics.set_page_state_hint_for_test("deepseek", Some("composer_detected".to_string()));
         let err = AgentError::NavigationFailed("transient nav".to_string());
         assert!(
-            super::should_retry_after_failure(&err, &diagnostics, "deepseek", 0),
+            super::should_retry_after_failure(&err, &diagnostics, "deepseek", 1, 0),
             "transient navigation with composer_detected should retry"
         );
         // No hint also retryable (conservative: not empty-shell)
         diagnostics.set_page_state_hint_for_test("deepseek", None);
         assert!(
-            super::should_retry_after_failure(&err, &diagnostics, "deepseek", 0),
+            super::should_retry_after_failure(&err, &diagnostics, "deepseek", 1, 0),
             "no hint should default to retryable"
         );
     }
@@ -3052,12 +3161,14 @@ mod tests {
             &perm,
             &diagnostics,
             "chatgpt",
+            1,
             0
         ));
         assert!(!super::should_retry_after_failure(
             &perm,
             &diagnostics,
             "chatgpt",
+            1,
             1
         ));
         let transient = AgentError::Timeout("t".to_string());
@@ -3065,12 +3176,14 @@ mod tests {
             &transient,
             &diagnostics,
             "chatgpt",
+            1,
             super::MAX_RETRIES
         ));
         assert!(!super::should_retry_after_failure(
             &transient,
             &diagnostics,
             "chatgpt",
+            1,
             super::MAX_RETRIES + 1
         ));
     }
@@ -3097,7 +3210,39 @@ mod tests {
             &err,
             &diagnostics,
             "qwen",
+            1,
             0
         ));
+    }
+
+    #[test]
+    fn retry_suppression_requires_exact_active_turn_and_generation() {
+        use crate::browser_backend::{BrowserDiagnostics, BrowserSetupMetadata};
+        let diagnostics = BrowserDiagnostics::new();
+        diagnostics.begin_setup_run(BrowserSetupMetadata {
+            setup_generation: 9,
+            session_id: "sess".to_string(),
+            selected_leader_id: "chatgpt".to_string(),
+            selected_agent_ids: vec!["claude".to_string()],
+            setup_order: vec!["claude".to_string()],
+        });
+        diagnostics.register("claude", crate::browser_backend::NAV_WINDOW_LABEL, "nav");
+        let timeout = AgentError::Timeout("late response race".to_string());
+
+        diagnostics.set_active_response_for_test("claude", 7, 7, 9);
+        assert!(
+            !super::should_retry_after_failure(&timeout, &diagnostics, "claude", 7, 0),
+            "exact response evidence must prevent reinjection"
+        );
+        assert!(
+            super::should_retry_after_failure(&timeout, &diagnostics, "claude", 8, 0),
+            "response from another turn must not suppress retry"
+        );
+
+        diagnostics.set_active_response_for_test("claude", 7, 7, 8);
+        assert!(
+            super::should_retry_after_failure(&timeout, &diagnostics, "claude", 7, 0),
+            "response from another generation must not suppress retry"
+        );
     }
 }

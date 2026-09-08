@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use crate::agent_brain::AgentBrain;
 use crate::browser_backend::{
     NavEvent, create_windows, ensure_nav_window, get_agent_config, navigate_agent_window,
-    record_nav_event, record_setup_completion, resolve_participant,
+    record_setup_completion, resolve_participant,
 };
 use crate::context_manager::ContextManager;
 use crate::errors::AgentError;
@@ -244,12 +244,13 @@ pub async fn start_session(
         .map_err(|e| e.to_string())?;
     }
 
-    // Build a fresh std::sync::mpsc channel and create windows.
-    let (std_nav_tx, std_nav_rx) = std::sync::mpsc::sync_channel::<NavEvent>(256);
-    let browser_diagnostics = {
+    // Attach this session to the process-lifetime navigation ingress. Named
+    // WebViews keep their original callback sender and can be reused without
+    // destroying authenticated browser state.
+    let tokio_rx = {
         let mut browser = state.browser_state.lock().await;
-        let new_browser = crate::browser_backend::BrowserState::new(std_nav_tx.clone());
-        *browser = new_browser;
+        browser.reset_for_session();
+        let nav_rx = browser.attach_nav_receiver();
         if let Err(error) = create_windows(
             &app,
             &mut browser,
@@ -267,20 +268,8 @@ pub async fn start_session(
             }
             return Err(error.to_string());
         }
-        browser.diagnostics.clone()
+        nav_rx
     };
-
-    // Bridge std::sync::mpsc → tokio::sync::mpsc for async session runner.
-    let (tokio_tx, tokio_rx) = tokio::sync::mpsc::channel::<NavEvent>(256);
-    let bridge_app = app.clone();
-    std::thread::spawn(move || {
-        while let Ok(event) = std_nav_rx.recv() {
-            record_nav_event(&bridge_app, &browser_diagnostics, &event);
-            if tokio_tx.blocking_send(event).is_err() {
-                break;
-            }
-        }
-    });
 
     app.emit(
         "session-status",
@@ -638,13 +627,12 @@ pub async fn resume_session(
             ));
         }
     }
-    // Create fresh BrowserState + windows (like start_session)
-    let (std_nav_tx, std_nav_rx) =
-        std::sync::mpsc::sync_channel::<crate::browser_backend::NavEvent>(256);
-    let browser_diagnostics = {
+    // Reattach the resumed session to the same process-lifetime ingress and
+    // reuse healthy named WebViews. Session-only routing state is reset.
+    let tokio_rx = {
         let mut browser = state.browser_state.lock().await;
-        let new_browser = crate::browser_backend::BrowserState::new(std_nav_tx.clone());
-        *browser = new_browser;
+        browser.reset_for_session();
+        let nav_rx = browser.attach_nav_receiver();
         if let Err(e) = crate::browser_backend::create_windows(
             &app,
             &mut browser,
@@ -658,19 +646,8 @@ pub async fn resume_session(
             state.resuming.store(false, Ordering::SeqCst);
             return Err(format!("Failed to recreate windows for resume: {}", e));
         }
-        browser.diagnostics.clone()
+        nav_rx
     };
-    let (tokio_tx, tokio_rx) = tokio::sync::mpsc::channel::<crate::browser_backend::NavEvent>(256);
-    let bridge_app = app.clone();
-    let bridge_diag = browser_diagnostics.clone();
-    std::thread::spawn(move || {
-        while let Ok(event) = std_nav_rx.recv() {
-            crate::browser_backend::record_nav_event(&bridge_app, &bridge_diag, &event);
-            if tokio_tx.blocking_send(event).is_err() {
-                break;
-            }
-        }
-    });
     // Restore AppState fields
     {
         let mut orch = state.orchestrator.lock().await;
@@ -2079,11 +2056,11 @@ pub async fn run_single_model_diagnostic(
     diagnostics.set_operation(&agent_id, &op, "diagnostic");
     diagnostics.emit_harness_event(
         &agent_id,
-        crate::browser_harness::EventType::WindowCreated,
+        crate::browser_harness::EventType::Unknown,
         "diagnostic",
         &op,
         &participant.base_url,
-        serde_json::json!({ "single_model": true }),
+        serde_json::json!({ "single_model": true, "window": "available" }),
     );
 
     // Navigate
@@ -2618,48 +2595,14 @@ pub async fn launch_connected_account(
             Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
     }
 
-    // Connected Accounts must reliably show the requested site even before any
-    // session has created windows. The original AppState is built with a dummy
-    // std::sync::mpsc channel whose receiver is dropped, so `arena://` signals
-    // (ready/error/challenge) would be disconnected and `record_nav_event` never
-    // runs. This caused the window to navigate but diagnostics/ready probes to be
-    // lost, making the page appear blank until a session's bridge was created.
-    //
-    // Fix: create a fresh std::sync::mpsc channel for this launch, replace
-    // BrowserState.nav_tx, and bridge it to a short-lived tokio channel that
-    // records diagnostics and lets this command await readiness. To ensure the
-    // WebView's `on_navigation` closure captures the live sender, we destroy any
-    // stale `arena-nav` window before recreating it via `ensure_nav_window`
-    // (which installs `make_nav_closure(live_tx)`). This keeps the 2-WebView
-    // limit and reuses the same `navigate_agent_window` helper as Priming.
-    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<NavEvent>(256);
-    let (tokio_tx, mut tokio_rx) = tokio::sync::mpsc::channel::<NavEvent>(256);
-    let diagnostics_for_bridge = {
+    // Attach this command to the process-lifetime ingress. The sender captured
+    // by the shared WebView never changes, so a healthy authenticated window
+    // does not need to be destroyed merely to receive navigation signals.
+    let (diagnostics, mut tokio_rx) = {
         let mut browser = state.browser_state.lock().await;
-        // Replace the (possibly disconnected) sender with the live one for this
-        // launch. The old sender's windows will be destroyed below so their
-        // closures don't keep the dead channel.
-        browser.nav_tx = std_tx.clone();
-        // Destroy stale nav window so the next `ensure_nav_window` builds a
-        // fresh WebView whose `on_navigation` captures the live tx.
-        if let Some(old) = browser.nav_window.take() {
-            let _ = old.destroy();
-        }
-        if let Some(existing) = app.get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL) {
-            let _ = existing.destroy();
-        }
-        browser.diagnostics.clone()
+        let nav_rx = browser.attach_nav_receiver();
+        (browser.diagnostics.clone(), nav_rx)
     };
-    let diagnostics_for_bridge_clone = diagnostics_for_bridge.clone();
-    let app_for_bridge = app.clone();
-    std::thread::spawn(move || {
-        while let Ok(event) = std_rx.recv() {
-            record_nav_event(&app_for_bridge, &diagnostics_for_bridge_clone, &event);
-            if tokio_tx.blocking_send(event).is_err() {
-                break;
-            }
-        }
-    });
 
     // Always use the shared nav window for Connected Accounts — it is the
     // single navigating participant window. Using the leader window would
@@ -2683,23 +2626,35 @@ pub async fn launch_connected_account(
         }
     };
 
-    let diagnostics = {
-        let browser = state.browser_state.lock().await;
-        browser.diagnostics.clone()
+    // A healthy same-agent/same-origin composer is already the desired account
+    // page. Focus it without another browsing transition. Any ownership,
+    // origin, blocker, or readiness mismatch still performs normal navigation.
+    let current_url = window.url().ok().map(|url| url.to_string());
+    let reuse_existing = current_url.as_deref().is_some_and(|url| {
+        diagnostics.can_reuse_connected_page(
+            &agent_id,
+            crate::browser_backend::NAV_WINDOW_LABEL,
+            url,
+            &participant.base_url,
+        )
+    });
+    let nav_result = if reuse_existing {
+        tracing::info!(
+            "[LAUNCH] reusing healthy connected account page for {} without navigation",
+            agent_id
+        );
+        Ok(())
+    } else {
+        navigate_agent_window(
+            &app,
+            &diagnostics,
+            &window,
+            &agent_id,
+            "nav",
+            &participant.base_url,
+        )
+        .map_err(|e| e.to_string())
     };
-
-    // Record navigation intent and perform the actual `window.navigate`.
-    // `navigate_agent_window` registers the agent, sets `window.name` /
-    // `__ca_agentId`, validates the URL, navigates, and shows/focuses.
-    let nav_result = navigate_agent_window(
-        &app,
-        &diagnostics,
-        &window,
-        &agent_id,
-        "nav",
-        &participant.base_url,
-    )
-    .map_err(|e| e.to_string());
 
     // Keep busy guard through the page-load tail so a second immediate click
     // at 11s does not steal the window while the first navigation is still
@@ -2725,13 +2680,15 @@ pub async fn launch_connected_account(
     // blank window. Challenge/Unshowable are treated as non-fatal for
     // Connected (user can handle login in the window); only a hard timeout or
     // channel close is surfaced as warning, but the window remains visible.
-    let wait_outcome = {
+    let wait_outcome = if reuse_existing {
+        Ok(Ok(()))
+    } else {
         let timeout =
             std::time::Duration::from_secs(crate::browser_backend::READINESS_WAIT_TIMEOUT_SECS);
         let agent_id_wait = agent_id.clone();
         let display_name_wait = participant.display_name.clone();
         let base_url_wait = participant.base_url.clone();
-        let diagnostics_wait = diagnostics_for_bridge.clone();
+        let diagnostics_wait = diagnostics.clone();
         let app_wait = app.clone();
         tokio::time::timeout(timeout, async move {
             loop {
@@ -2829,7 +2786,7 @@ pub async fn launch_connected_account(
                 agent_id,
                 crate::browser_backend::READINESS_WAIT_TIMEOUT_SECS
             );
-            let hint = diagnostics_for_bridge
+            let hint = diagnostics
                 .page_state_hint_for(&agent_id)
                 .unwrap_or_else(|| "still_loading".to_string());
             let _ = app.emit(

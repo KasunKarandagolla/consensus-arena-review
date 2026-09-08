@@ -48,6 +48,12 @@ src-tauri/src/
 ├── browser_backend.rs     — WebView management, JS injection, arena:// IPC,
 │                            inject_to_window (lock-safe), inject_to_agent (setup phase),
 │                            NavEvent enum, BrowserState, GENERIC_INIT_SCRIPT [BUILT]
+│                            Two stable named WebViews use the platform-native UA.
+│                            BrowserState owns one process-lifetime std::mpsc
+│                            ingress plus a replaceable single async consumer;
+│                            callbacks are not repaired by destroying windows.
+│                            Repeated verification is idempotent and Resume is
+│                            not Ready. OAuth popup allow rules remain narrow.
 │                            Kimi contenteditable injection support implemented (D-042)
 │                            NOTE: D-040 Tier 2 (console.error override / arena://log
 │                            branch) was not directly re-confirmed in the most recent
@@ -70,6 +76,9 @@ src-tauri/src/
 │                            RouteCompare arm, AskUser arm, 7 Tier-1 log points,
 │                            IMP-2 retry-with-backoff for participant injection,
 │                            IMP-5 model_health tracking, IMP-10 brain_fail_count
+│                            Active retry/reuse requires exact agent + turn +
+│                            setup generation and checks late response evidence
+│                            before any navigation/reinjection.
 │                            + automatic switch to agent_brain_2 after 3 consecutive
 │                            failures. Blueprint and Phase 1 memory DB calls go
 │                            through db_helpers::run_blocking; memory failures

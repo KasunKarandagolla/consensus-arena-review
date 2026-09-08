@@ -196,7 +196,7 @@ impl AppState {
     /// Task 9: transcript_store, blueprint_store, and session_vault are
     /// wrapped in `std::sync::Mutex` (see field docs above) instead of
     /// `tokio::sync::Mutex`.
-    pub fn new(data_dir: &str) -> Self {
+    pub fn new(data_dir: &str, app: &tauri::AppHandle) -> Self {
         let settings_db_path = format!("{}/settings.db", data_dir);
         let blueprint_db_path = format!("{}/blueprint.db", data_dir);
         let transcript_db_path = format!("{}/transcript.db", data_dir);
@@ -208,9 +208,6 @@ impl AppState {
                 MemoryStore::new_empty()
             });
         let last_memory_health = memory_store.check_health();
-
-        let (nav_tx, _nav_rx) =
-            std::sync::mpsc::sync_channel::<crate::browser_backend::NavEvent>(256);
 
         AppState {
             orchestrator: Arc::new(Mutex::new(Orchestrator::new())),
@@ -227,7 +224,7 @@ impl AppState {
             // this batch; flagging it separately rather than silently
             // "fixing" an unrequested behaviour change.
             session_vault: Arc::new(std::sync::Mutex::new(SessionVault::new())),
-            browser_state: Arc::new(Mutex::new(BrowserState::new(nav_tx))),
+            browser_state: Arc::new(Mutex::new(BrowserState::new_live(app))),
             context_manager: Arc::new(Mutex::new(ContextManager::new(
                 String::new(),
                 SessionType::Custom,

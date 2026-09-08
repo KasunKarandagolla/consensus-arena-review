@@ -263,7 +263,11 @@ impl AgentBrain {
         let stored_hash = {
             let d = ring::digest::digest(&ring::digest::SHA256, self.system_prompt.as_bytes());
             let hex: String = d.as_ref().iter().map(|b| format!("{:02x}", b)).collect();
-            format!("len={} sha256={}...", self.system_prompt.len(), &hex[..16.min(hex.len())])
+            format!(
+                "len={} sha256={}...",
+                self.system_prompt.len(),
+                &hex[..16.min(hex.len())]
+            )
         };
         let is_canonical = self.system_prompt.contains("Roster is authoritative")
             && self.system_prompt.contains("hackathon")
@@ -272,7 +276,9 @@ impl AgentBrain {
             "[PROMPT] agent_system provenance stored={} is_canonical={} memory_present={}",
             stored_hash,
             is_canonical,
-            memory_context.map(|m| !m.trim().is_empty()).unwrap_or(false)
+            memory_context
+                .map(|m| !m.trim().is_empty())
+                .unwrap_or(false)
         );
         if !is_canonical {
             tracing::warn!(
@@ -291,7 +297,11 @@ impl AgentBrain {
         let effective_hash = {
             let d = ring::digest::digest(&ring::digest::SHA256, prompt.as_bytes());
             let hex: String = d.as_ref().iter().map(|b| format!("{:02x}", b)).collect();
-            format!("len={} sha256={}...", prompt.len(), &hex[..16.min(hex.len())])
+            format!(
+                "len={} sha256={}...",
+                prompt.len(),
+                &hex[..16.min(hex.len())]
+            )
         };
         tracing::debug!("[PROMPT] effective_system_prompt {}", effective_hash);
         prompt
