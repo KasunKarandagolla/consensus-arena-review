@@ -219,11 +219,16 @@ receiver. Starting or resuming a session swaps only that receiver, not the
 callback channel or browser window. If the user closes a named window, the next
 operation recreates that missing window; healthy windows are reused.
 
-Authentication relies on the native WebView profile. Arena does not force a
-custom user agent, does not copy cookies through `SessionVault`, and does not
-use incognito or a custom data directory. A narrowly allowlisted temporary
-Claude/Google OAuth popup remains permitted; it is provider-driven and is not a
-third persistent Arena window.
+Authentication relies on the native WebView profile and does not copy cookies
+through `SessionVault`, use incognito, or use a custom data directory. Linux
+model WebViews use an engine-consistent WebKit compatibility UA because live
+testing established that WebKitGTK's native `Version/60.5` identity rendered all
+supported provider pages as unusable empty shells. This is Linux/WebKit/Safari
+compatibility, not Windows/Chromium impersonation; non-Linux model WebViews
+remain native unless future runtime evidence says otherwise. Passive UA
+diagnostics remain, with no navigator or client-hint spoofing. A narrowly
+allowlisted temporary Claude/Google OAuth popup remains permitted; it is
+provider-driven and is not a third persistent Arena window.
 
 Challenge state is evidence-driven: Challenge remains pending across repeated
 signals, and Resume is only a request to inspect again. A same-agent Ready

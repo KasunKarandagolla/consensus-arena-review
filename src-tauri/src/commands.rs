@@ -2556,6 +2556,43 @@ pub async fn recover_session(
 
 // ── Launch Connected Account (reuses 2-WebView, no third window) ───────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectedAccountOutcome {
+    ComposerReady,
+    LoginRequired,
+    ChallengePending,
+    EmptyShell,
+}
+
+fn connected_account_outcome(
+    event: &NavEvent,
+    expected_agent_id: &str,
+) -> Option<ConnectedAccountOutcome> {
+    match event {
+        NavEvent::Ready(agent_id) if agent_id == expected_agent_id => {
+            Some(ConnectedAccountOutcome::ComposerReady)
+        }
+        NavEvent::ChallengeDetected(agent_id, _) if agent_id == expected_agent_id => {
+            Some(ConnectedAccountOutcome::ChallengePending)
+        }
+        NavEvent::SendProbe {
+            agent_id,
+            page_state_hint: Some(hint),
+            ..
+        } if agent_id == expected_agent_id => match hint.as_str() {
+            "possible_login_required" => Some(ConnectedAccountOutcome::LoginRequired),
+            "empty_shell_or_hydration_stuck" => Some(ConnectedAccountOutcome::EmptyShell),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn announces_connected_account_ready(outcome: ConnectedAccountOutcome) -> bool {
+    outcome == ConnectedAccountOutcome::ComposerReady
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn launch_connected_account(
     agent_id: String,
@@ -2677,59 +2714,49 @@ pub async fn launch_connected_account(
     // (100s). This mirrors Priming's `wait_for_setup_ready` but without
     // requiring priming prompt injection — it only ensures the page actually
     // loaded and the generic composer was found, so the user does not see a
-    // blank window. Challenge/Unshowable are treated as non-fatal for
-    // Connected (user can handle login in the window); only a hard timeout or
-    // channel close is surfaced as warning, but the window remains visible.
+    // blank window. The outcome distinguishes a usable composer from login,
+    // challenge, and empty-shell states so only genuine composer evidence is
+    // announced as ready. The window stays visible for every non-fatal state.
     let wait_outcome = if reuse_existing {
-        Ok(Ok(()))
+        Ok(Ok(ConnectedAccountOutcome::ComposerReady))
     } else {
         let timeout =
             std::time::Duration::from_secs(crate::browser_backend::READINESS_WAIT_TIMEOUT_SECS);
         let agent_id_wait = agent_id.clone();
         let display_name_wait = participant.display_name.clone();
-        let base_url_wait = participant.base_url.clone();
         let diagnostics_wait = diagnostics.clone();
         let app_wait = app.clone();
         tokio::time::timeout(timeout, async move {
             loop {
                 match tokio_rx.recv().await {
-                    Some(NavEvent::Ready(id)) if id == agent_id_wait => break Ok(()),
-                    Some(NavEvent::Error(id)) if id == agent_id_wait => {
-                        break Err(format!(
-                            "Page did not become ready: {}",
-                            diagnostics_wait.readiness_timeout_message(&id, &display_name_wait)
-                        ))
+                    Some(event) => {
+                        if let Some(outcome) = connected_account_outcome(&event, &agent_id_wait) {
+                            if outcome == ConnectedAccountOutcome::ChallengePending {
+                                let _ = app_wait.emit(
+                                    "captcha-detected",
+                                    serde_json::json!({ "agent_id": agent_id_wait }),
+                                );
+                            }
+                            break Ok(outcome);
+                        }
+                        match event {
+                            NavEvent::Error(id) if id == agent_id_wait => {
+                                break Err(format!(
+                                    "Page did not become ready: {}",
+                                    diagnostics_wait
+                                        .readiness_timeout_message(&id, &display_name_wait)
+                                ));
+                            }
+                            NavEvent::UnshowableUrl(id, url) if id == agent_id_wait => {
+                                break Err(format!(
+                                    "{} navigated to an unshowable URL: {}",
+                                    display_name_wait, url
+                                ));
+                            }
+                            NavEvent::SessionAborted => break Err("Session aborted".to_string()),
+                            _ => continue,
+                        }
                     }
-                    Some(NavEvent::ChallengeDetected(id, _indicator)) if id == agent_id_wait => {
-                        // For Connected, a challenge/login page is not a hard
-                        // failure — the user can complete verification in the
-                        // window. Treat as ready enough and surface via
-                        // existing `captcha-detected` handling.
-                        let _ = app_wait.emit("captcha-detected", serde_json::json!({ "agent_id": id }));
-                        break Ok(());
-                    }
-                    Some(NavEvent::UnshowableUrl(id, url)) if id == agent_id_wait => {
-                        break Err(format!(
-                            "{} navigated to an unshowable URL: {}",
-                            display_name_wait, url
-                        ))
-                    }
-                    // Login page detected via periodic SendProbe — treat like
-                    // challenge: user can log in manually, window is not blank.
-                    Some(NavEvent::SendProbe { agent_id: probe_id, page_state_hint: Some(hint), .. })
-                        if probe_id == agent_id_wait && hint == "possible_login_required" =>
-                    {
-                        let _ = app_wait.emit(
-                            "boss-message",
-                            serde_json::json!({
-                                "text": format!("{} is showing a login page at {}. Please log in in the window.", display_name_wait, base_url_wait),
-                                "message_type": "status"
-                            }),
-                        );
-                        break Ok(());
-                    }
-                    Some(NavEvent::SessionAborted) => break Err("Session aborted".to_string()),
-                    Some(_) => continue,
                     None => break Err("Navigation channel closed".to_string()),
                 }
             }
@@ -2747,7 +2774,7 @@ pub async fn launch_connected_account(
     }
 
     match wait_outcome {
-        Ok(Ok(())) => {
+        Ok(Ok(ConnectedAccountOutcome::ComposerReady)) => {
             // Ready — clear extended guard to base tail and notify.
             {
                 let mut browser = state.browser_state.lock().await;
@@ -2761,6 +2788,45 @@ pub async fn launch_connected_account(
                         "{} is ready — window showing {}.",
                         participant.display_name, participant.base_url
                     ),
+                    "message_type": "status"
+                }),
+            );
+        }
+        Ok(Ok(ConnectedAccountOutcome::LoginRequired)) => {
+            let mut browser = state.browser_state.lock().await;
+            browser.connected_account_busy_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+            drop(browser);
+            let _ = app.emit(
+                "boss-message",
+                serde_json::json!({
+                    "text": format!("{} is showing a login page at {}. Please log in in the window.", participant.display_name, participant.base_url),
+                    "message_type": "status"
+                }),
+            );
+        }
+        Ok(Ok(ConnectedAccountOutcome::ChallengePending)) => {
+            let mut browser = state.browser_state.lock().await;
+            browser.connected_account_busy_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+            drop(browser);
+            let _ = app.emit(
+                "boss-message",
+                serde_json::json!({
+                    "text": format!("{} is waiting for verification in the model window. Complete the check there; it has not been announced as ready.", participant.display_name),
+                    "message_type": "status"
+                }),
+            );
+        }
+        Ok(Ok(ConnectedAccountOutcome::EmptyShell)) => {
+            let mut browser = state.browser_state.lock().await;
+            browser.connected_account_busy_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+            drop(browser);
+            let _ = app.emit(
+                "boss-message",
+                serde_json::json!({
+                    "text": format!("{} loaded, but its application UI did not render or hydrate. The window remains open for inspection; Arena will not reload it automatically. Check Settings → Diagnostics.", participant.display_name),
                     "message_type": "status"
                 }),
             );
@@ -3902,5 +3968,66 @@ mod tests {
         let ids = vec!["chatgpt".to_string(), "does-not-exist".to_string()];
         let result = validate_session_agents(&ids, "chatgpt", &custom);
         assert!(result.is_err(), "unknown participant should be rejected");
+    }
+
+    fn connected_send_probe(agent_id: &str, page_state_hint: &str) -> NavEvent {
+        NavEvent::SendProbe {
+            agent_id: agent_id.to_string(),
+            input_found: false,
+            send_button_found: false,
+            user_submit_seen: false,
+            message_count_seen: None,
+            sent_signal_emitted: false,
+            readiness_probe_count: Some(1),
+            input_candidate_count: Some(0),
+            composer_candidate_count: Some(0),
+            send_button_candidate_count: Some(0),
+            readiness_timeout_ms: Some(crate::browser_backend::READINESS_TIMEOUT_MS),
+            page_state_hint: Some(page_state_hint.to_string()),
+            page_health_hint: None,
+        }
+    }
+
+    #[test]
+    fn connected_account_outcomes_preserve_ready_semantics() {
+        assert_eq!(
+            connected_account_outcome(&NavEvent::Ready("chatgpt".to_string()), "chatgpt"),
+            Some(ConnectedAccountOutcome::ComposerReady)
+        );
+        assert_eq!(
+            connected_account_outcome(
+                &connected_send_probe("chatgpt", "possible_login_required"),
+                "chatgpt"
+            ),
+            Some(ConnectedAccountOutcome::LoginRequired)
+        );
+        assert_eq!(
+            connected_account_outcome(
+                &NavEvent::ChallengeDetected("chatgpt".to_string(), "captcha".to_string()),
+                "chatgpt"
+            ),
+            Some(ConnectedAccountOutcome::ChallengePending)
+        );
+        assert_eq!(
+            connected_account_outcome(
+                &connected_send_probe("chatgpt", "empty_shell_or_hydration_stuck"),
+                "chatgpt"
+            ),
+            Some(ConnectedAccountOutcome::EmptyShell)
+        );
+
+        assert!(announces_connected_account_ready(
+            ConnectedAccountOutcome::ComposerReady
+        ));
+        for outcome in [
+            ConnectedAccountOutcome::LoginRequired,
+            ConnectedAccountOutcome::ChallengePending,
+            ConnectedAccountOutcome::EmptyShell,
+        ] {
+            assert!(
+                !announces_connected_account_ready(outcome),
+                "only ComposerReady may announce ready"
+            );
+        }
     }
 }

@@ -18,6 +18,11 @@ pub const NAV_WINDOW_LABEL: &str = "arena-nav";
 // READINESS_WAIT_TIMEOUT_SECS: Rust wait_for_setup_ready tokio::timeout awaiting that signal
 pub const READINESS_TIMEOUT_MS: u32 = 90_000;
 pub const READINESS_WAIT_TIMEOUT_SECS: u64 = 100;
+/// WebKitGTK's native `Version/60.5` identity caused supported model pages to
+/// load as unusable empty shells in live Linux testing. This preserves the
+/// Linux/WebKit family while advertising a compatibility Safari version.
+#[cfg(target_os = "linux")]
+pub const LINUX_MODEL_WEBVIEW_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 pub const MAX_CONSOLE_DIAGNOSTICS_PER_AGENT: usize = 20;
 pub const MAX_CONSOLE_MESSAGE_LENGTH: usize = 2048;
 pub const CONSOLE_DEDUP_WINDOW_SECS: u64 = 30;
@@ -5297,7 +5302,7 @@ mod tests {
     fn user_agent_captured_via_nav_event() {
         let diagnostics = make_console_diagnostics();
         // Simulate UA signal storage path
-        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36 Edg/120.0";
+        let ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
         let _ = super::update_diagnostic(&diagnostics, "chatgpt", |r| {
             r.user_agent = Some(ua.to_string());
         });
@@ -5615,14 +5620,50 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn arena_builders_use_native_user_agent_and_no_destructive_reuse() {
+    fn linux_model_webview_user_agent_is_engine_consistent() {
+        let user_agent = super::LINUX_MODEL_WEBVIEW_USER_AGENT;
+        for required in [
+            "X11",
+            "Linux x86_64",
+            "AppleWebKit/605.1.15",
+            "Version/17.0",
+            "Safari/605.1.15",
+        ] {
+            assert!(user_agent.contains(required), "missing {required}");
+        }
+        for forbidden in ["Windows NT", "Chrome/", "Edg/"] {
+            assert!(!user_agent.contains(forbidden), "forbidden {forbidden}");
+        }
+    }
+
+    #[test]
+    fn model_builders_apply_linux_compatibility_ua_without_destructive_reuse() {
         let source = include_str!("browser_backend.rs");
-        let custom_ua_call = [".user", "_agent("].concat();
-        let custom_ua_constant = ["CHROME", "_USER_AGENT"].concat();
         let destructive_call = [".", "destroy()"].concat();
-        assert!(!source.contains(&custom_ua_call));
-        assert!(!source.contains(&custom_ua_constant));
+        let old_user_agent_constant = ["CHROME", "_USER_AGENT"].concat();
+        let old_windows_identity = ["Windows", " NT 10.0"].concat();
+        let old_chrome_identity = ["Chrome", "/126"].concat();
+        let leader_builder = source
+            .rfind("fn ensure_leader_window")
+            .and_then(|start| {
+                source[start..]
+                    .split("/// Restore the one shared participant")
+                    .next()
+            })
+            .unwrap_or_default();
+        let nav_builder = source
+            .rfind("pub fn ensure_nav_window")
+            .and_then(|start| source[start..].split("/// Re-run the submit ACTION").next())
+            .unwrap_or_default();
+        assert!(source.contains("#[cfg(target_os = \"linux\")]"));
+        assert!(source.contains("LINUX_MODEL_WEBVIEW_USER_AGENT"));
+        assert!(leader_builder.contains(".user_agent(LINUX_MODEL_WEBVIEW_USER_AGENT)"));
+        assert!(nav_builder.contains(".user_agent(LINUX_MODEL_WEBVIEW_USER_AGENT)"));
+        assert!(!source.contains(&old_user_agent_constant));
+        assert!(!source.contains(&old_windows_identity));
+        assert!(!source.contains(&old_chrome_identity));
         assert!(!source.contains(&destructive_call));
     }
 
@@ -6223,11 +6264,23 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
             return 'possible_challenge_or_security';
         }
 
-        if (
-            path.indexOf('login') !== -1 ||
-            path.indexOf('signin') !== -1 ||
-            path.indexOf('auth') !== -1 ||
-            textContainsAny(text, [
+        if (textContainsAny(text, ['something went wrong', 'application error', 'page not found', 'access denied', 'temporarily unavailable'])) {
+            return 'error_page';
+        }
+
+        var bodyLength = 0;
+        try { bodyLength = (document.body && (document.body.innerText || '').trim().length) || 0; } catch (e) {}
+        var interactive = 0;
+        try { interactive = document.querySelectorAll('button,a,input,textarea,select,[role="button"],[role="textbox"],[contenteditable="true"]').length; } catch (e) {}
+        var completed = document.readyState === 'complete';
+
+        // A completed, effectively empty document is a hydration failure even
+        // when its redirect path happens to include /login or /auth.
+        if (completed && bodyLength < 40 && interactive < 2) {
+            return 'empty_shell_or_hydration_stuck';
+        }
+
+        const loginTextEvidence = textContainsAny(text, [
                 'log in',
                 'login',
                 'sign in',
@@ -6247,8 +6300,12 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
                 '密码',
                 '微信',
                 '支付宝'
-            ])
-        ) {
+            ]);
+        const loginPath = path.indexOf('login') !== -1 ||
+            path.indexOf('signin') !== -1 || path.indexOf('auth') !== -1;
+        // A login path alone is not a login page. It needs visible text or
+        // meaningful rendered/interactive evidence from the completed page.
+        if (loginTextEvidence || (loginPath && (bodyLength >= 40 || interactive > 0))) {
             return 'possible_login_required';
         }
 
@@ -6256,18 +6313,12 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
             return 'composer_detected';
         }
 
-        if (document.readyState !== 'complete' || hasVisibleProgressIndicators() || textContainsAny(text, ['loading', 'please wait', 'starting'])) {
+        if (!completed || hasVisibleProgressIndicators() || textContainsAny(text, ['loading', 'please wait', 'starting'])) {
             return 'still_loading';
         }
 
-        var bodyLength = 0;
-        try { bodyLength = (document.body && (document.body.innerText || '').trim().length) || 0; } catch (e) {}
-        var interactive = 0;
-        try { interactive = document.querySelectorAll('button,a,input,textarea,select,[role="button"],[role="textbox"],[contenteditable="true"]').length; } catch (e) {}
-        if (textContainsAny(text, ['something went wrong', 'application error', 'page not found', 'access denied', 'temporarily unavailable'])) return 'error_page';
-        if (bodyLength < 40 && interactive < 2) return 'empty_shell_or_hydration_stuck';
         // A selector miss is meaningful only after a stable, interactive page.
-        if (document.readyState === 'complete' && !hasVisibleProgressIndicators() && interactive >= 2) return 'composer_selector_miss';
+        if (interactive >= 2) return 'composer_selector_miss';
         return 'still_loading';
     }
 
@@ -7066,7 +7117,7 @@ fn ensure_leader_window(
     let leader_tx = state.nav_tx.clone();
     let leader_popup_tx = state.nav_tx.clone();
     let leader_diagnostics = state.diagnostics.clone();
-    let window = WebviewWindowBuilder::new(
+    let builder = WebviewWindowBuilder::new(
         app,
         LEADER_WINDOW_LABEL,
         WebviewUrl::External(
@@ -7086,9 +7137,12 @@ fn ensure_leader_window(
     ))
     .on_page_load(move |window, payload| {
         handle_page_load(window, payload, &leader_diagnostics);
-    })
-    .build()
-    .map_err(|e| AgentError::NavigationFailed(format!("leader window build failed: {e}")))?;
+    });
+    #[cfg(target_os = "linux")]
+    let builder = builder.user_agent(LINUX_MODEL_WEBVIEW_USER_AGENT);
+    let window = builder
+        .build()
+        .map_err(|e| AgentError::NavigationFailed(format!("leader window build failed: {e}")))?;
     tracing::info!("[WEBVIEW] created persistent {}", LEADER_WINDOW_LABEL);
     state.leader_window = Some(window.clone());
     Ok(window)
@@ -7111,7 +7165,7 @@ pub fn ensure_nav_window(
     let nav_tx = state.nav_tx.clone();
     let nav_popup_tx = state.nav_tx.clone();
     let nav_diagnostics = state.diagnostics.clone();
-    let window = WebviewWindowBuilder::new(
+    let builder = WebviewWindowBuilder::new(
         app,
         NAV_WINDOW_LABEL,
         WebviewUrl::External(
@@ -7128,9 +7182,12 @@ pub fn ensure_nav_window(
     .on_new_window(make_new_window_handler(nav_popup_tx, NAV_WINDOW_LABEL))
     .on_page_load(move |window, payload| {
         handle_page_load(window, payload, &nav_diagnostics);
-    })
-    .build()
-    .map_err(|e| AgentError::NavigationFailed(format!("nav window recreate failed: {e}")))?;
+    });
+    #[cfg(target_os = "linux")]
+    let builder = builder.user_agent(LINUX_MODEL_WEBVIEW_USER_AGENT);
+    let window = builder
+        .build()
+        .map_err(|e| AgentError::NavigationFailed(format!("nav window recreate failed: {e}")))?;
     tracing::info!("[WEBVIEW] created persistent {}", NAV_WINDOW_LABEL);
     state.nav_window = Some(window.clone());
     Ok(window)

@@ -248,7 +248,7 @@ function makeSandbox() {
   return sandbox;
 }
 
-function runInitScript() {
+function runInitScript(keepInitialTimers = false) {
   queuedTimers = [];
   const sandbox = makeSandbox();
   const script = new Function('window', 'document', 'Element', 'HTMLElement', 'HTMLTextAreaElement', 'getComputedStyle', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'MutationObserver', 'Event', 'KeyboardEvent', 'InputEvent', 'performance', 'console', 'encodeURIComponent', INIT_SCRIPT);
@@ -259,14 +259,24 @@ function runInitScript() {
     sandbox.MutationObserver, sandbox.Event, sandbox.KeyboardEvent,
     sandbox.InputEvent, sandbox.performance, sandbox.console, sandbox.encodeURIComponent
   );
-  // Drop the load-time readiness timers; fixtures drive submit timers manually.
-  queuedTimers = [];
+  // Most fixtures drive submit timers manually. Classifier fixtures retain the
+  // first real readiness probe so they exercise classifyPageState as emitted.
+  if (!keepInitialTimers) queuedTimers = [];
   return { window: sandbox.window, document: sandbox.document, timers: () => queuedTimers };
 }
 
 function flushNextTimer(state) {
   const t = state.timers().shift();
   if (t) t.fn();
+}
+
+function driveInitialReadinessProbe(state) {
+  let guard = 0;
+  while (state.timers().length > 0 &&
+      state.window.__ca_pageStateHint === 'still_loading' && guard < 10) {
+    flushNextTimer(state);
+    guard++;
+  }
 }
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
@@ -677,6 +687,44 @@ function fixture8() {
     'active-submit signal carries custom id acme (' + href + ')');
 }
 
+// ── Fixture 9: page-state order distinguishes empty/login/challenge/composer ─
+function fixture9() {
+  console.log('[fixture 9] page-state classification uses rendered evidence');
+
+  const blankLogin = runInitScript(true);
+  blankLogin.window.location.pathname = '/login';
+  blankLogin.window.location.href = 'https://fixture.local/login';
+  driveInitialReadinessProbe(blankLogin);
+  assert(blankLogin.window.__ca_pageStateHint === 'empty_shell_or_hydration_stuck',
+    'blank completed /login is an empty shell, not a login page');
+
+  const renderedLogin = runInitScript(true);
+  renderedLogin.window.location.pathname = '/login';
+  renderedLogin.window.location.href = 'https://fixture.local/login';
+  renderedLogin.document.body.innerText = 'Welcome back. Log in with your email address and password to continue.';
+  const loginButton = new FakeNode('button', { 'aria-label': 'Log in' });
+  attach(renderedLogin.document.body, loginButton);
+  driveInitialReadinessProbe(renderedLogin);
+  assert(renderedLogin.window.__ca_pageStateHint === 'possible_login_required',
+    'rendered login page is classified as login required');
+
+  const challengeLogin = runInitScript(true);
+  challengeLogin.window.location.pathname = '/login';
+  challengeLogin.window.location.href = 'https://fixture.local/login';
+  challengeLogin.document.body.innerText = 'Checking your browser before continuing';
+  driveInitialReadinessProbe(challengeLogin);
+  assert(challengeLogin.window.__ca_pageStateHint === 'possible_challenge_or_security',
+    'challenge evidence wins over a login URL');
+
+  const composerReady = runInitScript(true);
+  const input = makeTextarea();
+  const send = makeSend();
+  attach(composerReady.document.body, composer(input, send));
+  driveInitialReadinessProbe(composerReady);
+  assert(composerReady.window.__ca_pageStateHint === 'composer_detected',
+    'normal detected composer is classified as composer detected');
+}
+
 fixture1();
 fixture2();
 fixture3();
@@ -685,6 +733,7 @@ fixture5();
 fixture6();
 fixture7();
 fixture8();
+fixture9();
 
 console.log(failures === 0 ? '\nALL FIXTURES PASSED' : `\n${failures} FIXTURE(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

@@ -136,7 +136,7 @@ navigating window. Never more than 2 windows. Memory constraint:
 total must stay under 2GB on a 4GB/Celeron machine.
 Implemented in browser_backend.rs.
 
-### D-001A: Stable Native Browser Identity and Lifetime DONE (2026-09-08)
+### D-001A: Stable Browser Identity and Lifetime DONE (2026-09-08)
 The two named Arena WebViews (`arena-leader` and `arena-nav`) are stable
 process-lifetime browsing contexts. Connected Accounts, session start, and
 session resume reuse a healthy named window; they create one only when its
@@ -151,9 +151,13 @@ consumer to its dispatcher. The ingress receiver is never dropped while the
 app is running, and changing consumers never replaces the sender captured by a
 WebView. Tokio mpsc remains outside `on_navigation`.
 
-Arena does not override the WebView user agent. WebKitGTK/WebView2 supplies its
-native, truthful identity; passive `navigator.userAgent` diagnostics remain.
-No navigator/client-hint spoofing is permitted.
+Linux model WebViews use an engine-consistent WebKit compatibility UA because
+live runtime testing showed WebKitGTK's native `Version/60.5` identity caused
+all supported provider pages to load as unusable empty shells. The compatibility
+UA remains Linux/WebKit/Safari (`Version/17.0`); it is not Windows or Chromium
+impersonation. Non-Linux model WebViews retain their native identity unless
+future runtime evidence requires otherwise. Passive `navigator.userAgent`
+diagnostics remain. No navigator/client-hint spoofing is permitted.
 
 Human-verification invariants: repeated challenge signals are idempotent;
 Resume requests another check but is not readiness evidence; only a genuine

@@ -48,7 +48,9 @@ src-tauri/src/
 ├── browser_backend.rs     — WebView management, JS injection, arena:// IPC,
 │                            inject_to_window (lock-safe), inject_to_agent (setup phase),
 │                            NavEvent enum, BrowserState, GENERIC_INIT_SCRIPT [BUILT]
-│                            Two stable named WebViews use the platform-native UA.
+│                            Linux model WebViews use an engine-consistent WebKit
+│                            compatibility UA; non-Linux model WebViews retain
+│                            their platform-native UA.
 │                            BrowserState owns one process-lifetime std::mpsc
 │                            ingress plus a replaceable single async consumer;
 │                            callbacks are not repaired by destroying windows.
