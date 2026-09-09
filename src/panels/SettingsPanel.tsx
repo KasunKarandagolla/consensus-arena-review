@@ -31,128 +31,6 @@ interface Fallback { [key: string]: string; api_key: string; base_url: string; m
 interface Health { agent_id: string; is_available: boolean; error_count: number; last_error: string | null }
 interface Props { open: boolean; onClose: () => void }
 interface LastSettingsError { kind: string; command: string; message: string }
-interface DiagnosticSnapshot {
-  app_data_dir: string
-  settings_db_exists: boolean
-  memory_db_exists: boolean
-  transcript_db_exists: boolean
-  blueprint_db_exists: boolean
-  session_active: boolean
-  primary_agent_brain_configured: boolean
-  fallback_brain_settings_present: boolean
-  secondary_brain_configured: boolean
-  memory_health: unknown
-  leader_window_exists: boolean
-  nav_window_exists: boolean
-  browser_diagnostics: Array<{
-    agent_id: string
-    display_name: string
-    setup_generation: number
-    session_id: string
-    selected_leader_id: string
-    selected_agent_ids: string[]
-    setup_order: string[]
-    intended_url: string
-    window_label: string
-    window_kind: 'leader' | 'nav'
-    assigned_window_label: string
-    assigned_window_kind: 'leader' | 'nav'
-    is_selected_leader: boolean
-    created_at: string
-    last_navigation_url: string | null
-    last_ready_at: string | null
-    last_send_detected_at: string | null
-    last_response_at: string | null
-    last_error: string | null
-    current_phase: string
-    last_blocker: 'none' | 'captcha_or_challenge' | 'unsupported_url' | 'navigation_error' | 'timeout' | string
-    last_blocker_url_redacted: string | null
-    last_challenge_detected_at: string | null
-    resume_attempt_count: number
-    last_resume_at: string | null
-    input_found: boolean
-    send_button_found: boolean
-    last_send_probe_at: string | null
-    last_user_submit_event_at: string | null
-    last_message_count_seen: number | null
-    sent_signal_emitted: boolean
-    expected_agent_id: string | null
-    last_signal_agent_id: string | null
-    last_signal_type: string | null
-    last_signal_at: string | null
-    stale_signal_count: number
-    response_observed_before_send: boolean
-    response_observed_after_injection: boolean
-    setup_completion_reason: string | null
-    prompt_injected_at: string | null
-    prompt_injection_error: string | null
-    prompt_injection_method: string | null
-    prompt_visible_prefix_ok: boolean | null
-    prompt_visible_suffix_ok: boolean | null
-    prompt_visible_length: number | null
-    send_button_enabled_after_injection: boolean | null
-    injection_target_tag: string | null
-    injection_target_role: string | null
-    injection_target_contenteditable: string | null
-    readiness_timeout_ms: number | null
-    readiness_probe_count: number | null
-    input_candidate_count: number | null
-    composer_candidate_count: number | null
-    send_button_candidate_count: number | null
-    page_state_hint: string | null
-    page_health_hint: string | null
-    console_diagnostics: Array<{
-      timestamp: string
-      category: string
-      severity: string
-      message: string
-      source: string
-      url: string
-    }>
-    browser_console_error_count: number
-    browser_console_warning_count: number
-    browser_console_last_error_at: string | null
-    navigation_diagnostics: Array<{
-      timestamp: string
-      agent_id: string
-      window_label: string
-      window_kind: string
-      from_url: string
-      to_url: string
-      phase: string
-      setup_generation: number
-      cause: string
-      arena_requested: boolean
-    }>
-     setup_navigation_recovery_count: number
-    last_navigation: {
-      timestamp: string
-      agent_id: string
-      window_label: string
-      window_kind: string
-      from_url: string
-      to_url: string
-      phase: string
-      setup_generation: number
-      cause: string
-      arena_requested: boolean
-    } | null
-    user_agent?: string | null
-  }>
-  browser_console_error_count: number
-  browser_console_warning_count: number
-  browser_console_last_error_at: string | null
-  browser_timeline?: unknown[]
-  browser_timeline_dropped?: Record<string, number>
-  browser_timeline_count?: number
-  // W1-D: minimal Windows WebView2 diagnostics (all optional for backwards compat)
-  webview_version?: string | null
-  os?: string
-  arch?: string
-  tauri_version?: string
-  command_timestamp: string
-}
-
 const emptyBrain: Brain = { api_key: '', base_url: '', model: '', system_prompt: '' }
 
 function Section({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
@@ -207,7 +85,7 @@ export default function SettingsPanel({ open, onClose }: Props) {
   const [projectContext, setProjectContext] = useState('')
   const [busy, setBusy] = useState('')
   const [lastSettingsError, setLastSettingsError] = useState<LastSettingsError | null>(null)
-  const [diagnosticSnapshot, setDiagnosticSnapshot] = useState<DiagnosticSnapshot | null>(null)
+  const [diagnosticBrief, setDiagnosticBrief] = useState('')
   const [maintenanceMode, setMaintenanceMode] = useState(false)
   const [customDraft, setCustomDraft] = useState<Participant | null>(null)
   const [customError, setCustomError] = useState('')
@@ -309,7 +187,7 @@ export default function SettingsPanel({ open, onClose }: Props) {
       setMaintenanceMode(next)
       setLastSettingsError((current) => current?.kind === 'maintenance' ? null : current)
       addToast(next ? 'Maintenance mode enabled' : 'Maintenance mode disabled')
-      if (!next) setDiagnosticSnapshot(null)
+      if (!next) setDiagnosticBrief('')
     } catch (error) {
       reportError('maintenance', 'set_maintenance_mode', error)
     } finally {
@@ -317,18 +195,18 @@ export default function SettingsPanel({ open, onClose }: Props) {
     }
   }
 
-  async function showDiagnosticSnapshot() {
+  async function generateDiagnosticBrief() {
     if (!maintenanceMode) {
       addToast('Enable Maintenance mode to capture diagnostics')
       return
     }
     setBusy('diagnostics')
     try {
-      const raw = await invoke<string>('get_diagnostic_snapshot')
-      setDiagnosticSnapshot(JSON.parse(raw) as DiagnosticSnapshot)
+      const brief = await invoke<string>('get_diagnostic_brief')
+      setDiagnosticBrief(brief)
       setLastSettingsError((current) => current?.kind === 'diagnostics' ? null : current)
     } catch (error) {
-      reportError('diagnostics', 'get_diagnostic_snapshot', error)
+      reportError('diagnostics', 'get_diagnostic_brief', error)
     } finally {
       setBusy('')
     }
@@ -448,6 +326,7 @@ export default function SettingsPanel({ open, onClose }: Props) {
             }
             return <div className="cr" key={p.agent_id}><span className={`cdot ${on ? 'on' : 'off'}`} /><span className="cr-n">{p.display_name}</span><span className="cr-btns" style={{ display: 'inline-flex', gap: 6, marginLeft: 'auto' }}><button className="cr-btn" onClick={() => void launch()} disabled={anyLaunchBusy || isActiveSession} title={isActiveSession ? 'Stop the active session before launching a model window (reuses the shared WebView)' : anyLaunchBusy ? 'Another model window is launching — wait a moment' : `Open ${p.display_name} in the app window for login/inspection (navigation will start, not imply ready)`}>{launchBusy === p.agent_id ? 'Opening…' : anyLaunchBusy ? 'Busy…' : 'Launch'}</button><button className="cr-btn" disabled title={p.is_custom ? 'Custom AI — log in manually in its window' : 'Account login is managed in each model WebView'}>{on ? 'Available' : 'Not checked'}</button></span></div>
           })}
+          <p style={{ fontSize: 11.5, lineHeight: 1.5, color: 'var(--t3)', marginTop: 8 }}>Google sign-in can be unavailable in embedded model windows, including Gemini. Prefer provider-native login methods where offered.</p>
         </Section>
         <Section icon={<Plus size={14} />} title="Custom AI">
           {participants.filter((p) => p.is_custom).map((p) => (
@@ -521,16 +400,16 @@ export default function SettingsPanel({ open, onClose }: Props) {
             className="sv-btn"
             style={{ marginTop: 0 }}
             disabled={busy === 'diagnostics' || !maintenanceMode}
-            title={maintenanceMode ? 'Capture diagnostic snapshot' : 'Enable Maintenance mode to capture diagnostics'}
-            onClick={() => void showDiagnosticSnapshot()}
+            title={maintenanceMode ? 'Generate compact diagnostic brief' : 'Enable Maintenance mode to capture diagnostics'}
+            onClick={() => void generateDiagnosticBrief()}
           >
-            {busy === 'diagnostics' ? 'Loading…' : 'Show Diagnostic Snapshot'}
+            {busy === 'diagnostics' ? 'Generating…' : 'Generate Diagnostic Brief'}
           </button>
           <ErrorDetails error={lastSettingsError} kinds={['diagnostics', 'maintenance']} onCopy={(text) => void copyText(text, 'Error details copied')} />
-          {diagnosticSnapshot && <details style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
-            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>Diagnostic snapshot (incl. harness timeline)</summary>
-            <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{JSON.stringify(diagnosticSnapshot, null, 2)}</pre>
-            <button className="sv-btn" style={{ marginTop: 8 }} onClick={() => void copyText(JSON.stringify(diagnosticSnapshot, null, 2), 'Diagnostic snapshot copied')}><ClipboardCopy size={12} /> Copy snapshot</button>
+          {diagnosticBrief && <details open style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', background: 'var(--surface2)' }}>
+            <summary style={{ cursor: 'pointer', fontSize: 12.5, fontWeight: 600 }}>Diagnostic Brief ({Array.from(diagnosticBrief).length.toLocaleString()} characters)</summary>
+            <pre style={{ marginTop: 8, maxHeight: 360, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word', userSelect: 'text', fontSize: 11.5, lineHeight: 1.55, color: 'var(--text)' }}>{diagnosticBrief}</pre>
+            <button className="sv-btn" style={{ marginTop: 8 }} onClick={() => void copyText(diagnosticBrief, 'Diagnostic Brief copied')}><ClipboardCopy size={12} /> Copy Diagnostic Brief</button>
           </details>}
         </Section>
         <Section icon={<Palette size={12} />} title="Appearance"><div className="th-g">{([{ t: 'blue', label: 'Blue', icon: <Droplets size={13} /> }, { t: 'light', label: 'Light', icon: <Sun size={13} /> }, { t: 'dark', label: 'Dark', icon: <Moon size={13} /> }] as const).map((item) => <button className={`th-b${theme === item.t ? ' on' : ''}`} onClick={() => choose(item.t)} key={item.t}>{item.icon}{item.label}</button>)}</div></Section>

@@ -18,11 +18,248 @@ pub const NAV_WINDOW_LABEL: &str = "arena-nav";
 // READINESS_WAIT_TIMEOUT_SECS: Rust wait_for_setup_ready tokio::timeout awaiting that signal
 pub const READINESS_TIMEOUT_MS: u32 = 90_000;
 pub const READINESS_WAIT_TIMEOUT_SECS: u64 = 100;
-/// WebKitGTK's native `Version/60.5` identity caused supported model pages to
-/// load as unusable empty shells in live Linux testing. This preserves the
-/// Linux/WebKit family while advertising a compatibility Safari version.
 #[cfg(target_os = "linux")]
-pub const LINUX_MODEL_WEBVIEW_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxWebkitContextMode {
+    Default,
+    EpiphanyLike,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_webkit_context_mode_for_mode(mode: Option<&str>) -> LinuxWebkitContextMode {
+    match mode {
+        Some("epiphany-like") => LinuxWebkitContextMode::EpiphanyLike,
+        _ => LinuxWebkitContextMode::Default,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_webkit_context_mode() -> LinuxWebkitContextMode {
+    let mode = std::env::var("CONSENSUS_ARENA_WEBKIT_CONTEXT").ok();
+    if let Some(other) = mode.as_deref().filter(|value| *value != "epiphany-like") {
+        tracing::warn!(
+            "[DIAGNOSTIC] ignoring unknown CONSENSUS_ARENA_WEBKIT_CONTEXT={other}; using default context"
+        );
+    }
+    linux_webkit_context_mode_for_mode(mode.as_deref())
+}
+
+/// Counts and names only: this must never retain cookie values or other
+/// credential material in diagnostics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CookieDiagnosticSummary {
+    pub available: bool,
+    pub count: usize,
+    pub names: Vec<String>,
+    pub any_secure: Option<bool>,
+    pub any_http_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelWebviewStorageDiagnostics {
+    pub window_label: Option<String>,
+    pub webview_ephemeral: Option<bool>,
+    pub webkit_itp_enabled: Option<bool>,
+    pub cookie_policy: Option<String>,
+    pub claude: CookieDiagnosticSummary,
+    pub cloudflare: CookieDiagnosticSummary,
+}
+
+fn diagnostic_cookie_name(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        .take(64)
+        .collect();
+    if safe.is_empty() {
+        "[redacted-name]".to_string()
+    } else {
+        safe
+    }
+}
+
+fn probe_indicates_challenge(
+    page_state_hint: Option<&str>,
+    page_health_hint: Option<&str>,
+) -> bool {
+    page_state_hint == Some("possible_challenge_or_security")
+        || page_health_hint
+            .is_some_and(|hint| hint.contains("cloudflare") || hint.contains("captcha"))
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_model_webview_context(window: &WebviewWindow) {
+    if linux_webkit_context_mode() != LinuxWebkitContextMode::EpiphanyLike {
+        return;
+    }
+
+    use webkit2gtk::{WebViewExt, WebsiteDataManagerExt};
+
+    if let Err(error) = window.with_webview(|webview| {
+        let view = webview.inner();
+        if let Some(data_manager) = view.website_data_manager() {
+            // Tauri/Wry already supplies this shared model context with its
+            // persistent Linux data directory. Match Epiphany's relevant
+            // storage behavior by opting into WebKitGTK ITP only; WebKitGTK
+            // applies its documented policy semantics without forcing a less
+            // restrictive cookie policy here.
+            data_manager.set_itp_enabled(true);
+        }
+    }) {
+        tracing::warn!("[DIAGNOSTIC] failed to configure WebKit context: {error}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_model_webview_context(_window: &WebviewWindow) {}
+
+/// Collect WebKitGTK's value-free cookie metadata for the active managed model
+/// WebView. The asynchronous cookie APIs run on the WebKit main context; any
+/// unavailable/closed window is represented as unknown rather than failing the
+/// diagnostic brief.
+#[cfg(target_os = "linux")]
+pub async fn collect_model_webview_storage_diagnostics(
+    window: Option<(WebviewWindow, String)>,
+) -> ModelWebviewStorageDiagnostics {
+    use webkit2gtk::{CookieAcceptPolicy, CookieManagerExt, WebViewExt, WebsiteDataManagerExt};
+
+    let Some((window, window_label)) = window else {
+        return ModelWebviewStorageDiagnostics::default();
+    };
+    let (metadata_tx, metadata_rx) = sync::oneshot::channel();
+    let (policy_tx, policy_rx) = sync::oneshot::channel();
+    let (claude_tx, claude_rx) = sync::oneshot::channel();
+    let (cloudflare_tx, cloudflare_rx) = sync::oneshot::channel();
+    let callback_result = window.with_webview(move |webview| {
+        let view = webview.inner();
+        let Some(data_manager) = view.website_data_manager() else {
+            let _ = metadata_tx.send((Some(view.is_ephemeral()), None));
+            return;
+        };
+        let _ = metadata_tx.send((
+            Some(view.is_ephemeral() || data_manager.is_ephemeral()),
+            Some(data_manager.is_itp_enabled()),
+        ));
+        let Some(cookie_manager) = data_manager.cookie_manager() else {
+            return;
+        };
+        cookie_manager.accept_policy(None::<&webkit2gtk::gio::Cancellable>, move |result| {
+            let policy = result.ok().map(|policy| match policy {
+                CookieAcceptPolicy::Always => "always",
+                CookieAcceptPolicy::NoThirdParty => "no-third-party",
+                CookieAcceptPolicy::Never => "never",
+                CookieAcceptPolicy::__Unknown(_) => "unknown",
+                _ => "unknown",
+            });
+            let _ = policy_tx.send(policy.map(str::to_string));
+        });
+        cookie_manager.cookies(
+            "https://claude.ai",
+            None::<&webkit2gtk::gio::Cancellable>,
+            move |result| {
+                let summary = result.map_or_else(
+                    |_| CookieDiagnosticSummary::default(),
+                    |mut cookies| {
+                        let count = cookies.len();
+                        let any_secure = cookies.iter_mut().any(|cookie| cookie.is_secure());
+                        let any_http_only = cookies.iter_mut().any(|cookie| cookie.is_http_only());
+                        let mut names = cookies
+                            .iter_mut()
+                            .filter_map(|cookie| cookie.name())
+                            .map(|name| diagnostic_cookie_name(name.as_str()))
+                            .collect::<Vec<_>>();
+                        names.sort();
+                        names.dedup();
+                        CookieDiagnosticSummary {
+                            available: true,
+                            count,
+                            names,
+                            any_secure: Some(any_secure),
+                            any_http_only: Some(any_http_only),
+                        }
+                    },
+                );
+                let _ = claude_tx.send(summary);
+            },
+        );
+        cookie_manager.cookies(
+            "https://challenges.cloudflare.com",
+            None::<&webkit2gtk::gio::Cancellable>,
+            move |result| {
+                let summary = result.map_or_else(
+                    |_| CookieDiagnosticSummary::default(),
+                    |mut cookies| {
+                        let count = cookies.len();
+                        let any_secure = cookies.iter_mut().any(|cookie| cookie.is_secure());
+                        let any_http_only = cookies.iter_mut().any(|cookie| cookie.is_http_only());
+                        let mut names = cookies
+                            .iter_mut()
+                            .filter_map(|cookie| cookie.name())
+                            .map(|name| diagnostic_cookie_name(name.as_str()))
+                            .collect::<Vec<_>>();
+                        names.sort();
+                        names.dedup();
+                        CookieDiagnosticSummary {
+                            available: true,
+                            count,
+                            names,
+                            any_secure: Some(any_secure),
+                            any_http_only: Some(any_http_only),
+                        }
+                    },
+                );
+                let _ = cloudflare_tx.send(summary);
+            },
+        );
+    });
+    if let Err(error) = callback_result {
+        tracing::warn!("[DIAGNOSTIC] failed to inspect WebKit storage: {error}");
+        return ModelWebviewStorageDiagnostics {
+            window_label: Some(window_label),
+            ..Default::default()
+        };
+    }
+
+    let deadline = std::time::Duration::from_secs(2);
+    let metadata = tokio::time::timeout(deadline, metadata_rx)
+        .await
+        .ok()
+        .and_then(Result::ok);
+    let policy = tokio::time::timeout(deadline, policy_rx)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+    let claude = tokio::time::timeout(deadline, claude_rx)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let cloudflare = tokio::time::timeout(deadline, cloudflare_rx)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    ModelWebviewStorageDiagnostics {
+        window_label: Some(window_label),
+        webview_ephemeral: metadata.as_ref().and_then(|(ephemeral, _)| *ephemeral),
+        webkit_itp_enabled: metadata.and_then(|(_, itp_enabled)| itp_enabled),
+        cookie_policy: policy,
+        claude,
+        cloudflare,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn collect_model_webview_storage_diagnostics(
+    window: Option<(WebviewWindow, String)>,
+) -> ModelWebviewStorageDiagnostics {
+    ModelWebviewStorageDiagnostics {
+        window_label: window.map(|(_, label)| label),
+        ..Default::default()
+    }
+}
+
 pub const MAX_CONSOLE_DIAGNOSTICS_PER_AGENT: usize = 20;
 pub const MAX_CONSOLE_MESSAGE_LENGTH: usize = 2048;
 pub const CONSOLE_DEDUP_WINDOW_SECS: u64 = 30;
@@ -159,6 +396,11 @@ pub struct BrowserDiagnosticRecord {
     /// W1-D: best-effort navigator.userAgent captured once per window via
     /// arena://ua. Truncated to 500 chars, never contains cookies/tokens.
     pub user_agent: Option<String>,
+    /// Full Arena runtime is intentionally installed only after a provider
+    /// document finishes loading. This distinguishes browser-owned login and
+    /// challenge pages from documents Arena has begun to automate.
+    pub automation_activation: String,
+    pub automation_activation_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -199,6 +441,14 @@ pub struct BrowserDiagnostics {
     pub action_records: Arc<Mutex<HashMap<String, std::collections::VecDeque<ActionRecord>>>>,
     pub safe_dom_snapshots:
         Arc<Mutex<HashMap<String, std::collections::VecDeque<SafeDomForensics>>>>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DiagnosticBriefRetentionCounts {
+    pub lifecycle: usize,
+    pub navigation_intents: usize,
+    pub actions: usize,
+    pub dom_snapshots: usize,
 }
 
 impl BrowserDiagnostics {
@@ -564,6 +814,157 @@ impl BrowserDiagnostics {
         records
     }
 
+    /// Append compact, selected state directly from retained diagnostic rings.
+    /// The brief deliberately does not call `snapshot()` and does not clone the
+    /// diagnostic records or their nested arrays.
+    pub fn append_diagnostic_brief(
+        &self,
+        writer: &mut crate::browser_harness::DiagnosticBriefWriter,
+    ) -> DiagnosticBriefRetentionCounts {
+        use crate::browser_harness::diagnostic_brief_short;
+
+        let mut affected = Vec::new();
+        writer.push("\n## Per-agent state\n");
+        {
+            let records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+            let mut sorted: Vec<&BrowserDiagnosticRecord> = records.values().collect();
+            sorted.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+            for record in sorted {
+                let is_affected = record.last_error.is_some()
+                    || record.last_blocker != "none"
+                    || record
+                        .page_state_hint
+                        .as_deref()
+                        .is_some_and(|hint| hint.contains("empty_shell"));
+                if is_affected {
+                    affected.push(record.agent_id.clone());
+                }
+                writer.push(&format!(
+                    "\n### {} ({})\nphase: {}\nurl: {}\nblocker: {}\nautomation_activation: {}\nautomation_activation_at: {}\npage_state_hint: {}\npage_health_hint: {}\nready_at: {}\nchallenge_at: {}\nresume_attempts: {}\nlast_signal: {} (expected: {}; actual: {})\nconsole: {} errors, {} warnings\nlast_error: {}\nlast_navigation: {}\neffective_user_agent: {}\n",
+                    record.display_name,
+                    record.agent_id,
+                    record.current_phase,
+                    diagnostic_brief_short(record.last_navigation_url.as_deref().unwrap_or(&record.intended_url), 180),
+                    record.last_blocker,
+                    record.automation_activation,
+                    record.automation_activation_at.as_deref().unwrap_or("none"),
+                    record.page_state_hint.as_deref().unwrap_or("none"),
+                    record.page_health_hint.as_deref().unwrap_or("none"),
+                    record.last_ready_at.as_deref().unwrap_or("none"),
+                    record.last_challenge_detected_at.as_deref().unwrap_or("none"),
+                    record.resume_attempt_count,
+                    record.last_signal_type.as_deref().unwrap_or("none"),
+                    record.expected_agent_id.as_deref().unwrap_or("none"),
+                    record.last_signal_agent_id.as_deref().unwrap_or("none"),
+                    record.browser_console_error_count,
+                    record.browser_console_warning_count,
+                    diagnostic_brief_short(record.last_error.as_deref().unwrap_or("none"), 300),
+                    record.last_navigation.as_ref().map(|navigation| format!(
+                        "{} | {} -> {} | {}",
+                        navigation.cause,
+                        diagnostic_brief_short(&navigation.from_url, 90),
+                        diagnostic_brief_short(&navigation.to_url, 90),
+                        navigation.timestamp
+                    )).unwrap_or_else(|| "none".to_string()),
+                    diagnostic_brief_short(record.user_agent.as_deref().unwrap_or("unavailable"), 240),
+                ));
+                let mut console_count = 0usize;
+                for console in record.console_diagnostics.iter().rev() {
+                    if console_count == 3 {
+                        break;
+                    }
+                    if console.severity == "error" || console.severity == "warning" {
+                        writer.push(&format!(
+                            "console_{}: {} | {}\n",
+                            console.severity,
+                            console.timestamp,
+                            diagnostic_brief_short(&console.message, 280)
+                        ));
+                        console_count += 1;
+                    }
+                }
+                let mut flags = Vec::new();
+                if record
+                    .page_state_hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("empty_shell"))
+                {
+                    flags.push("empty_shell");
+                }
+                if record.last_challenge_detected_at.is_some() && record.last_ready_at.is_none() {
+                    flags.push("challenge_pending");
+                }
+                if record.last_ready_at.is_some() {
+                    flags.push("composer_ready");
+                }
+                if record.browser_console_error_count > 0 {
+                    flags.push("console_fatal_present");
+                }
+                if !flags.is_empty() {
+                    writer.push(&format!("flags: {}\n", flags.join(", ")));
+                }
+            }
+        }
+
+        if !affected.is_empty() {
+            affected.sort();
+            affected.dedup();
+            let snapshots = self
+                .safe_dom_snapshots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            writer.push("\n## Relevant DOM summaries\n");
+            for agent_id in affected {
+                if let Some(snapshot) = snapshots.get(&agent_id).and_then(|ring| ring.back()) {
+                    writer.push(&format!(
+                        "{} | {} | inputs={} | send_candidates={} | active={} {}\n",
+                        agent_id,
+                        snapshot.timestamp,
+                        snapshot.input_types.len(),
+                        snapshot.candidate_send_buttons.len(),
+                        diagnostic_brief_short(&snapshot.active_element.tag, 40),
+                        diagnostic_brief_short(&snapshot.active_element.role, 60),
+                    ));
+                }
+            }
+        }
+
+        let lifecycle = self
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|ring| ring.len())
+            .sum();
+        let navigation_intents = self
+            .navigation_intents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|ring| ring.len())
+            .sum();
+        let actions = self
+            .action_records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|ring| ring.len())
+            .sum();
+        let dom_snapshots = self
+            .safe_dom_snapshots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|ring| ring.len())
+            .sum();
+        DiagnosticBriefRetentionCounts {
+            lifecycle,
+            navigation_intents,
+            actions,
+            dom_snapshots,
+        }
+    }
+
     pub fn begin_setup_run(&self, metadata: BrowserSetupMetadata) {
         self.records
             .lock()
@@ -706,6 +1107,8 @@ impl BrowserDiagnostics {
                     setup_navigation_recovery_count: 0,
                     last_navigation: None,
                     user_agent: None,
+                    automation_activation: "not_installed".to_string(),
+                    automation_activation_at: None,
                 });
         record.display_name = display_name_for(agent_id).to_string();
         record.setup_generation = metadata.setup_generation;
@@ -2257,6 +2660,14 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 record.readiness_timeout_ms = *readiness_timeout_ms;
                 record.page_state_hint = page_state_hint.clone();
                 record.page_health_hint = page_health_hint.clone();
+                // A probe-level challenge signal is real diagnostic evidence
+                // even when the provider never emits the explicit bridge URL.
+                if probe_indicates_challenge(
+                    page_state_hint.as_deref(),
+                    page_health_hint.as_deref(),
+                ) {
+                    record.last_challenge_detected_at = Some(timestamp.clone());
+                }
                 if record.current_phase == "real_url_loaded"
                     || record.current_phase == "navigation_started"
                 {
@@ -3312,6 +3723,112 @@ fn set_window_identity(window: &WebviewWindow, agent_id: &str) -> Result<(), Age
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomationActivationPolicy {
+    Install,
+    Deferred,
+}
+
+/// Browser-owned authentication and security documents must not receive the
+/// Arena runtime. Provider application documents are activated only after the
+/// native Finished event, never at document start.
+fn automation_activation_policy(agent_id: &str, url: &str) -> AutomationActivationPolicy {
+    let Ok(parsed) = url.parse::<tauri::Url>() else {
+        return AutomationActivationPolicy::Deferred;
+    };
+    let Some(host) = parsed.host_str() else {
+        return AutomationActivationPolicy::Deferred;
+    };
+    let Some(config) = get_agent_config(agent_id) else {
+        // A custom provider has no audited application-origin policy yet.
+        return AutomationActivationPolicy::Deferred;
+    };
+    let Ok(provider_url) = config.base_url.parse::<tauri::Url>() else {
+        return AutomationActivationPolicy::Deferred;
+    };
+    let Some(provider_host) = provider_url.host_str() else {
+        return AutomationActivationPolicy::Deferred;
+    };
+    let provider_origin = host == provider_host || host.ends_with(&format!(".{provider_host}"));
+    if !provider_origin {
+        return AutomationActivationPolicy::Deferred;
+    }
+
+    let path = parsed.path().to_ascii_lowercase();
+    let browser_owned_path = [
+        "/login",
+        "/signin",
+        "/sign-in",
+        "/auth",
+        "/oauth",
+        "/challenge",
+        "/captcha",
+        "/verify",
+        "/security",
+    ]
+    .iter()
+    .any(|segment| path.starts_with(segment));
+    if browser_owned_path {
+        AutomationActivationPolicy::Deferred
+    } else {
+        AutomationActivationPolicy::Install
+    }
+}
+
+fn record_automation_activation(
+    diagnostics: &BrowserDiagnostics,
+    agent_id: &str,
+    activation: &str,
+) {
+    let _ = update_diagnostic(diagnostics, agent_id, |record| {
+        record.automation_activation = activation.to_string();
+        record.automation_activation_at = if activation == "installed" {
+            Some(now_timestamp())
+        } else {
+            None
+        };
+    });
+}
+
+fn activate_automation_after_page_load(
+    window: &WebviewWindow,
+    diagnostics: &BrowserDiagnostics,
+    agent_id: &str,
+    url: &str,
+) {
+    if automation_activation_policy(agent_id, url) == AutomationActivationPolicy::Deferred {
+        record_automation_activation(diagnostics, agent_id, "deferred");
+        tracing::debug!("[AUTOMATION] deferred for browser-owned document: {url}");
+        return;
+    }
+    // The shared nav can be reassigned while it is navigating. Resolve and
+    // verify ownership at activation time, immediately before identity and
+    // generic-runtime eval, rather than capturing an agent in its callback.
+    if !diagnostics.is_active(window.label(), agent_id) {
+        return;
+    }
+    if let Err(error) = set_window_identity(window, agent_id) {
+        record_browser_error(
+            &window.app_handle(),
+            diagnostics,
+            agent_id,
+            &error.to_string(),
+        );
+        return;
+    }
+    if let Err(error) = window.eval(GENERIC_INIT_SCRIPT) {
+        record_browser_error(
+            &window.app_handle(),
+            diagnostics,
+            agent_id,
+            &format!("post-load automation activation failed: {error}"),
+        );
+        return;
+    }
+    record_automation_activation(diagnostics, agent_id, "installed");
+    tracing::debug!("[AUTOMATION] installed after provider page load: {url}");
+}
+
 pub fn navigate_agent_window(
     app: &AppHandle,
     diagnostics: &BrowserDiagnostics,
@@ -3365,6 +3882,8 @@ pub fn navigate_agent_window(
         record.window_kind = window_kind.to_string();
         record.last_error = None;
         record.current_phase = "creating".to_string();
+        record.automation_activation = "not_installed".to_string();
+        record.automation_activation_at = None;
     }) {
         emit_browser_diagnostic(app, &record, "Preparing model window");
     }
@@ -3422,11 +3941,6 @@ fn handle_page_load(
         return;
     };
     let app = window.app_handle().clone();
-
-    if let Err(error) = set_window_identity(&window, &agent_id) {
-        record_browser_error(&app, diagnostics, &agent_id, &error.to_string());
-        return;
-    }
 
     let url = sanitized_url(payload.url().as_str());
     let event = payload.event();
@@ -3525,9 +4039,12 @@ fn handle_page_load(
             emit_browser_diagnostic(
                 &app,
                 &record,
-                "Page load finished; waiting for ready signal",
+                "Page load finished; evaluating post-load automation activation",
             );
         }
+    }
+    if event == PageLoadEvent::Finished {
+        activate_automation_after_page_load(&window, diagnostics, &agent_id, &url);
     }
 }
 
@@ -3539,13 +4056,11 @@ fn make_new_window_handler(
 + 'static {
     move |url, _features| {
         let url_str = url.as_str();
-        // OAuth popup handling (Issue A): Claude login via Google uses
-        // accounts.google.com. Previously all popups were denied to preserve
-        // the two-WebView limit, which made the "Maybe blocked by the browser"
-        // message appear and left the session unauthenticated (403 on
-        // /api/auth/login_methods etc). Allowing the OAuth popup is the
-        // smallest safe fix: it is a temporary window that closes after auth,
-        // not a third persistent WebView. All other popups remain denied.
+        // OAuth popup handling: allowlisted provider authentication popups are
+        // temporary, not a third persistent Arena WebView. This permits the
+        // provider to attempt its native flow; it does not make Google sign-in
+        // supported or reliable inside an embedded WebView. All other popups
+        // remain denied to preserve the two-WebView architecture.
         if is_allowed_oauth_popup(&url) {
             send_nav_event(
                 &tx,
@@ -5622,29 +6137,49 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_model_webview_user_agent_is_engine_consistent() {
-        let user_agent = super::LINUX_MODEL_WEBVIEW_USER_AGENT;
-        for required in [
-            "X11",
-            "Linux x86_64",
-            "AppleWebKit/605.1.15",
-            "Version/17.0",
-            "Safari/605.1.15",
-        ] {
-            assert!(user_agent.contains(required), "missing {required}");
-        }
-        for forbidden in ["Windows NT", "Chrome/", "Edg/"] {
-            assert!(!user_agent.contains(forbidden), "forbidden {forbidden}");
-        }
+    fn webkit_context_mode_remains_opt_in_without_user_agent_override() {
+        assert_eq!(
+            super::linux_webkit_context_mode_for_mode(None),
+            super::LinuxWebkitContextMode::Default
+        );
+        assert_eq!(
+            super::linux_webkit_context_mode_for_mode(Some("epiphany-like")),
+            super::LinuxWebkitContextMode::EpiphanyLike
+        );
+        assert_eq!(
+            super::linux_webkit_context_mode_for_mode(Some("unknown")),
+            super::LinuxWebkitContextMode::Default
+        );
+        let user_agent_call = [".", "user_agent("].concat();
+        assert!(!include_str!("browser_backend.rs").contains(&user_agent_call));
     }
 
     #[test]
-    fn model_builders_apply_linux_compatibility_ua_without_destructive_reuse() {
+    fn cookie_diagnostic_names_are_value_free_and_probe_challenges_are_timestamped() {
+        assert_eq!(
+            super::diagnostic_cookie_name("cf_clearance"),
+            "cf_clearance"
+        );
+        assert_eq!(super::diagnostic_cookie_name("bad name!"), "badname");
+        assert!(!super::diagnostic_cookie_name("cf_clearance").contains("value"));
+        assert!(super::probe_indicates_challenge(
+            Some("possible_challenge_or_security"),
+            None
+        ));
+        assert!(super::probe_indicates_challenge(
+            None,
+            Some("cloudflare_waiting")
+        ));
+        assert!(!super::probe_indicates_challenge(
+            Some("composer_detected"),
+            Some("healthy")
+        ));
+    }
+
+    #[test]
+    fn model_builders_have_no_document_start_runtime_or_user_agent_override() {
         let source = include_str!("browser_backend.rs");
         let destructive_call = [".", "destroy()"].concat();
-        let old_user_agent_constant = ["CHROME", "_USER_AGENT"].concat();
-        let old_windows_identity = ["Windows", " NT 10.0"].concat();
-        let old_chrome_identity = ["Chrome", "/126"].concat();
         let leader_builder = source
             .rfind("fn ensure_leader_window")
             .and_then(|start| {
@@ -5657,14 +6192,69 @@ mod tests {
             .rfind("pub fn ensure_nav_window")
             .and_then(|start| source[start..].split("/// Re-run the submit ACTION").next())
             .unwrap_or_default();
-        assert!(source.contains("#[cfg(target_os = \"linux\")]"));
-        assert!(source.contains("LINUX_MODEL_WEBVIEW_USER_AGENT"));
-        assert!(leader_builder.contains(".user_agent(LINUX_MODEL_WEBVIEW_USER_AGENT)"));
-        assert!(nav_builder.contains(".user_agent(LINUX_MODEL_WEBVIEW_USER_AGENT)"));
-        assert!(!source.contains(&old_user_agent_constant));
-        assert!(!source.contains(&old_windows_identity));
-        assert!(!source.contains(&old_chrome_identity));
+        assert!(!leader_builder.contains(".initialization_script("));
+        assert!(!nav_builder.contains(".initialization_script("));
+        let user_agent_call = [".", "user_agent("].concat();
+        assert!(!leader_builder.contains(&user_agent_call));
+        assert!(!nav_builder.contains(&user_agent_call));
+        assert!(leader_builder.contains(".on_page_load("));
+        assert!(nav_builder.contains(".on_page_load("));
         assert!(!source.contains(&destructive_call));
+    }
+
+    #[test]
+    fn post_load_activation_defers_browser_owned_origins_and_login_pages() {
+        use super::AutomationActivationPolicy::{Deferred, Install};
+
+        assert_eq!(
+            super::automation_activation_policy(
+                "claude",
+                "https://accounts.google.com/o/oauth2/auth"
+            ),
+            Deferred
+        );
+        assert_eq!(
+            super::automation_activation_policy(
+                "claude",
+                "https://challenges.cloudflare.com/turnstile"
+            ),
+            Deferred
+        );
+        assert_eq!(
+            super::automation_activation_policy("claude", "https://claude.ai/login"),
+            Deferred
+        );
+        assert_eq!(
+            super::automation_activation_policy("claude", "https://claude.ai/new"),
+            Install
+        );
+    }
+
+    #[test]
+    fn generic_runtime_is_document_idempotent_and_activation_uses_current_identity() {
+        assert!(super::GENERIC_INIT_SCRIPT.contains("window.__caAutomationInstalled"));
+        assert!(super::GENERIC_INIT_SCRIPT.contains("if (window.__caAutomationInstalled) return;"));
+        let claude = super::identity_script("claude").unwrap();
+        let kimi = super::identity_script("kimi").unwrap();
+        assert!(claude.contains("\"claude\""));
+        assert!(kimi.contains("\"kimi\""));
+        assert_ne!(
+            claude, kimi,
+            "the shared nav identity is resolved at activation time"
+        );
+    }
+
+    #[test]
+    fn diagnostic_brief_reports_post_load_activation_state() {
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.register("claude", super::NAV_WINDOW_LABEL, "nav");
+        super::record_automation_activation(&diagnostics, "claude", "deferred");
+        assert_eq!(diagnostics.snapshot()[0].automation_activation, "deferred");
+        super::record_automation_activation(&diagnostics, "claude", "installed");
+        let mut records = diagnostics.snapshot();
+        let record = records.remove(0);
+        assert_eq!(record.automation_activation, "installed");
+        assert!(record.automation_activation_at.is_some());
     }
 
     #[test]
@@ -5768,6 +6358,12 @@ mod tests {
 //   appear, while continuing to emit secret-free readiness/send probes.
 
 pub const GENERIC_INIT_SCRIPT: &str = r#"
+// This runtime is eval'd only after a provider document has finished loading.
+// One document receives at most one installation, even if a provider emits
+// repeated Finished events or performs SPA route changes.
+(function() {
+if (window.__caAutomationInstalled) return;
+window.__caAutomationInstalled = true;
 // D-040 Tier 2 + Console diagnostics bridge: bounded, classified, idempotent.
 // Captures console.error / console.warn / window.onerror / unhandledrejection
 // and forwards via arena://console/<agent_id>/<category>/<severity>/<source>/<msg>/<url>
@@ -7009,6 +7605,7 @@ pub const GENERIC_INIT_SCRIPT: &str = r#"
         } catch (e) {}
     };
 })();
+})();
 "#;
 
 // ── create_windows ────────────────────────────────────────────────────────────
@@ -7129,7 +7726,6 @@ fn ensure_leader_window(
     .title("Consensus Arena — Leader")
     .inner_size(1200.0, 800.0)
     .visible(false)
-    .initialization_script(GENERIC_INIT_SCRIPT)
     .on_navigation(make_nav_closure(leader_tx, LEADER_WINDOW_LABEL))
     .on_new_window(make_new_window_handler(
         leader_popup_tx,
@@ -7138,11 +7734,10 @@ fn ensure_leader_window(
     .on_page_load(move |window, payload| {
         handle_page_load(window, payload, &leader_diagnostics);
     });
-    #[cfg(target_os = "linux")]
-    let builder = builder.user_agent(LINUX_MODEL_WEBVIEW_USER_AGENT);
     let window = builder
         .build()
         .map_err(|e| AgentError::NavigationFailed(format!("leader window build failed: {e}")))?;
+    configure_linux_model_webview_context(&window);
     tracing::info!("[WEBVIEW] created persistent {}", LEADER_WINDOW_LABEL);
     state.leader_window = Some(window.clone());
     Ok(window)
@@ -7160,7 +7755,11 @@ pub fn ensure_nav_window(
         state.nav_window = Some(window.clone());
         return Ok(window);
     }
+    // The Tauri registry is authoritative. A manually destroyed nav window
+    // can leave a cached handle and Connected Accounts lease behind; neither
+    // may delay reconstruction of the one shared participant window.
     state.nav_window = None;
+    state.connected_account_busy_until = None;
 
     let nav_tx = state.nav_tx.clone();
     let nav_popup_tx = state.nav_tx.clone();
@@ -7177,17 +7776,15 @@ pub fn ensure_nav_window(
     .title("Consensus Arena — Agent")
     .inner_size(1200.0, 800.0)
     .visible(false)
-    .initialization_script(GENERIC_INIT_SCRIPT)
     .on_navigation(make_nav_closure(nav_tx, NAV_WINDOW_LABEL))
     .on_new_window(make_new_window_handler(nav_popup_tx, NAV_WINDOW_LABEL))
     .on_page_load(move |window, payload| {
         handle_page_load(window, payload, &nav_diagnostics);
     });
-    #[cfg(target_os = "linux")]
-    let builder = builder.user_agent(LINUX_MODEL_WEBVIEW_USER_AGENT);
     let window = builder
         .build()
         .map_err(|e| AgentError::NavigationFailed(format!("nav window recreate failed: {e}")))?;
+    configure_linux_model_webview_context(&window);
     tracing::info!("[WEBVIEW] created persistent {}", NAV_WINDOW_LABEL);
     state.nav_window = Some(window.clone());
     Ok(window)

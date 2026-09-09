@@ -210,7 +210,13 @@ invoke('get_diagnostic_snapshot')
  // captcha_or_challenge | navigation_error | unshowable_url | error |
  // unknown. last_blocker is none | captcha_or_challenge | unsupported_url |
  // navigation_error | timeout. URLs and console messages are redacted;
- // no keys, prompts, cookies, tokens, or model responses are included.
+// no keys, prompts, cookies, tokens, or model responses are included.
+
+invoke('get_diagnostic_brief')
+// Returns: Promise<string> (plain Markdown — DO NOT JSON.parse)
+// Maintenance-mode-gated compact human/AI artifact, hard-capped at 12,000
+// Unicode characters. It contains selected redacted state, bounded evidence,
+// retention accounting, and never builds the raw snapshot/timeline clone.
 
 invoke('get_browser_timeline')
 // Returns: Promise<string> (JSON array of BrowserEvent — parse it)
@@ -224,7 +230,7 @@ invoke('get_browser_reliability_report')
 invoke('export_browser_diagnostics')
 // Returns: Promise<string> (JSON: {export_dir, report, events, browser_diagnostics, navigation_history, console_errors})
 // Writes bundle to app_data_dir/diagnostics_export_YYYYMMDD_HHMMSS/ containing
-// BROWSER_RELIABILITY_REPORT.md, events.json, browser-diagnostics.json, navigation-history.json, console-errors.json
+// DIAGNOSTIC_BRIEF.md, BROWSER_RELIABILITY_REPORT.md, events.json, browser-diagnostics.json, navigation-history.json, console-errors.json
 // All files are secret-free and redacted.
 
 invoke('run_single_model_diagnostic', { agent_id: string })

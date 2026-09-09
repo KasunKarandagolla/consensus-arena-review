@@ -22,5 +22,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Match Tauri/Wry's resolved WebKitGTK crate so the opt-in storage experiment
+# can inspect the native WebView context without changing the runtime stack.
+webkit2gtk = { version = "=2.0.2", features = ["v2_40"] }
+
 [build-dependencies]
 tauri-build = { version = "2.6.1", features = [] }

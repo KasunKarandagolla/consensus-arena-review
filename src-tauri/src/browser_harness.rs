@@ -3,7 +3,7 @@
 //! Satisfies spec sections 3-17, 20-22.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -11,6 +11,84 @@ use std::sync::{Arc, Mutex};
 /// Bounded per-agent timeline. Spec section 14: 500 events per agent default.
 pub const BROWSER_EVENT_RING_BUFFER_LIMIT: usize = 500;
 pub const MAX_HARNESS_DETAILS_BYTES: usize = 4096;
+pub const DIAGNOSTIC_BRIEF_HARD_CAP: usize = 12_000;
+const DIAGNOSTIC_BRIEF_TRUNCATION_NOTICE: &str =
+    "[brief truncated at safety cap — use full forensic export for raw evidence]";
+
+/// Bounded Markdown construction for the human-facing diagnostic brief. This
+/// counts Unicode scalar values rather than bytes, so UTF-8 is never sliced in
+/// the middle of a character.
+pub struct DiagnosticBriefWriter {
+    value: String,
+    truncated: bool,
+}
+
+impl DiagnosticBriefWriter {
+    pub fn new() -> Self {
+        Self {
+            value: String::new(),
+            truncated: false,
+        }
+    }
+
+    pub fn push(&mut self, text: &str) {
+        if self.truncated {
+            return;
+        }
+        let reserve = DIAGNOSTIC_BRIEF_TRUNCATION_NOTICE.chars().count() + 1;
+        let available = DIAGNOSTIC_BRIEF_HARD_CAP
+            .saturating_sub(self.value.chars().count())
+            .saturating_sub(reserve);
+        let text_len = text.chars().count();
+        if text_len <= available {
+            self.value.push_str(text);
+            return;
+        }
+        self.value.extend(text.chars().take(available));
+        self.truncated = true;
+    }
+
+    pub fn finish(mut self) -> String {
+        if self.truncated {
+            if !self.value.ends_with('\n') {
+                self.value.push('\n');
+            }
+            self.value.push_str(DIAGNOSTIC_BRIEF_TRUNCATION_NOTICE);
+        }
+        self.value
+    }
+}
+
+pub fn diagnostic_brief_short(value: &str, max_chars: usize) -> String {
+    let lower = value.to_ascii_lowercase();
+    if [
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer ",
+        "cookie",
+        "set-cookie",
+        "prompt_text",
+        "model_response",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return "[REDACTED]".to_string();
+    }
+    let sanitized = sanitize_details_value(value);
+    if sanitized.chars().count() <= max_chars {
+        sanitized
+    } else {
+        format!(
+            "{}…",
+            sanitized
+                .chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
+        )
+    }
+}
 
 // ── Phase ───────────────────────────────────────────────────────────────────
 
@@ -880,6 +958,164 @@ impl BrowserTimeline {
             .cloned()
             .collect()
     }
+
+    /// Write only selected high-signal events while holding the retained rings.
+    /// This intentionally avoids `all_events_sorted()` and never clones the
+    /// full event corpus for the compact diagnostic path.
+    pub fn append_diagnostic_brief_events(
+        &self,
+        writer: &mut DiagnosticBriefWriter,
+    ) -> (usize, usize) {
+        let map = self.per_agent.lock().unwrap_or_else(|p| p.into_inner());
+        let mut events: Vec<&BrowserEvent> =
+            map.values().flat_map(|ring| ring.events.iter()).collect();
+        events.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        let retained = events.len();
+        let mut ranked: Vec<(usize, u8)> = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| (index, diagnostic_brief_priority(event)))
+            .filter(|(_, priority)| *priority > 0)
+            .collect();
+        ranked.sort_by(
+            |(left_index, left_priority), (right_index, right_priority)| {
+                right_priority.cmp(left_priority).then_with(|| {
+                    events[*right_index]
+                        .timestamp
+                        .cmp(&events[*left_index].timestamp)
+                })
+            },
+        );
+
+        let mut chosen = std::collections::BTreeSet::new();
+        for (index, _) in ranked.into_iter().take(24) {
+            chosen.insert(index);
+        }
+        // Preserve the final transition for each agent so a healthy operation
+        // has enough context even when it has no failure-shaped events.
+        for agent_id in map.keys() {
+            if chosen.len() >= 30 {
+                break;
+            }
+            if let Some((index, _)) = events
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, event)| event.agent_id == *agent_id)
+            {
+                chosen.insert(index);
+            }
+        }
+        let mut represented = 0usize;
+        if !chosen.is_empty() {
+            writer.push("\n## High-signal evidence\n\n");
+            let mut emitted_challenge_groups = HashSet::new();
+            for index in chosen {
+                let event = events[index];
+                if let Some(group_key) = diagnostic_brief_challenge_group_key(event) {
+                    if !emitted_challenge_groups.insert(group_key.clone()) {
+                        continue;
+                    }
+                    let group = events
+                        .iter()
+                        .copied()
+                        .filter(|candidate| {
+                            diagnostic_brief_challenge_group_key(candidate).as_deref()
+                                == Some(group_key.as_str())
+                        })
+                        .collect::<Vec<_>>();
+                    represented = represented.saturating_add(group.len());
+                    if let (Some(first), Some(last)) = (group.first(), group.last()) {
+                        let probes = group
+                            .iter()
+                            .filter_map(|candidate| {
+                                candidate
+                                    .details
+                                    .get("readiness_probe_count")
+                                    .and_then(serde_json::Value::as_u64)
+                            })
+                            .collect::<Vec<_>>();
+                        let probe_summary = match (probes.first(), probes.last()) {
+                            (Some(first), Some(last)) => format!(" | probes {first}→{last}"),
+                            _ => String::new(),
+                        };
+                        let details = diagnostic_brief_short(&last.details.to_string(), 260);
+                        writer.push(&format!(
+                            "{}–{} | {} | {} | {} × {} | {} | {} | {}{}\n",
+                            first.timestamp,
+                            last.timestamp,
+                            last.agent_id,
+                            last.phase,
+                            last.event_type,
+                            group.len(),
+                            last.operation_id,
+                            diagnostic_brief_short(&redact_url(&last.url), 140),
+                            details,
+                            probe_summary,
+                        ));
+                    }
+                    continue;
+                }
+                represented = represented.saturating_add(1);
+                let details = diagnostic_brief_short(&event.details.to_string(), 300);
+                writer.push(&format!(
+                    "{} | {} | {} | {} | {} | {} | {}\n",
+                    event.timestamp,
+                    event.agent_id,
+                    event.phase,
+                    event.event_type,
+                    event.operation_id,
+                    diagnostic_brief_short(&redact_url(&event.url), 140),
+                    details
+                ));
+            }
+        }
+        (retained, represented)
+    }
+}
+
+fn diagnostic_brief_challenge_group_key(event: &BrowserEvent) -> Option<String> {
+    let searchable = format!("{} {}", event.event_type, event.details).to_ascii_lowercase();
+    if ["challenge", "captcha", "cloudflare"]
+        .iter()
+        .any(|needle| searchable.contains(needle))
+    {
+        Some(format!(
+            "{}\u{1f}{}\u{1f}{}",
+            event.agent_id, event.operation_id, event.event_type
+        ))
+    } else {
+        None
+    }
+}
+
+fn diagnostic_brief_priority(event: &BrowserEvent) -> u8 {
+    let searchable =
+        format!("{} {} {}", event.event_type, event.phase, event.details).to_ascii_lowercase();
+    if [
+        "error",
+        "failed",
+        "blocked",
+        "missing",
+        "timeout",
+        "challenge",
+        "captcha",
+        "unshowable",
+        "empty_shell",
+        "page_health",
+    ]
+    .iter()
+    .any(|needle| searchable.contains(needle))
+    {
+        3
+    } else if ["login", "ready", "navigation", "composer"]
+        .iter()
+        .any(|needle| searchable.contains(needle))
+    {
+        1
+    } else {
+        0
+    }
 }
 
 // ── Helper to build BrowserEvent ────────────────────────────────────────────
@@ -1675,6 +1911,8 @@ mod tests {
             setup_navigation_recovery_count: 0,
             last_navigation: None,
             user_agent: None,
+            automation_activation: "installed".to_string(),
+            automation_activation_at: Some(chrono::Utc::now().to_rfc3339()),
         };
         let md = generate_reliability_report_markdown(&tl, &[diag]);
         assert!(md.contains("ChatGPT"));
@@ -1822,5 +2060,151 @@ mod tests {
         let json2 = serde_json::to_string(&target).expect("serialize target");
         let de2: ActionTarget = serde_json::from_str(&json2).expect("deserialize target");
         assert_eq!(de2.classification, "Send");
+    }
+
+    #[test]
+    fn diagnostic_brief_cap_is_unicode_safe() {
+        let mut writer = DiagnosticBriefWriter::new();
+        writer.push(&"界".repeat(DIAGNOSTIC_BRIEF_HARD_CAP * 2));
+        let brief = writer.finish();
+        assert!(brief.chars().count() <= DIAGNOSTIC_BRIEF_HARD_CAP);
+        assert!(brief.ends_with(DIAGNOSTIC_BRIEF_TRUNCATION_NOTICE));
+        assert!(std::str::from_utf8(brief.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn diagnostic_brief_redacts_sensitive_urls_and_console_text() {
+        assert_eq!(
+            redact_url("https://example.com/callback?code=secret&state=opaque"),
+            "https://example.com/callback?code=%5BREDACTED%5D&state=%5BREDACTED%5D"
+        );
+        assert_eq!(
+            diagnostic_brief_short("console api_key=not-for-brief", 200),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            diagnostic_brief_short("Bearer secret-value", 200),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            diagnostic_brief_short("cookie=session-value", 200),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            diagnostic_brief_short("prompt_text=private request", 200),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            diagnostic_brief_short("model_response=private answer", 200),
+            "[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn diagnostic_brief_keeps_high_signal_failure_over_noisy_events() {
+        let timeline = BrowserTimeline::new();
+        for sequence in 0..40 {
+            timeline.record(build_browser_event(
+                "session",
+                "claude",
+                "Claude",
+                "arena-nav",
+                "nav",
+                1,
+                "loading",
+                "op",
+                "state_changed",
+                "https://claude.ai/",
+                serde_json::json!({ "sequence": sequence }),
+                None,
+            ));
+        }
+        timeline.record(build_browser_event(
+            "session",
+            "claude",
+            "Claude",
+            "arena-nav",
+            "nav",
+            1,
+            "failed",
+            "op",
+            "page_health_blocked",
+            "https://claude.ai/?token=secret",
+            serde_json::json!({ "message": "Root element #root not found" }),
+            None,
+        ));
+        let mut writer = DiagnosticBriefWriter::new();
+        let (retained, selected) = timeline.append_diagnostic_brief_events(&mut writer);
+        let brief = writer.finish();
+        assert_eq!(retained, 41);
+        assert!(selected < retained);
+        assert!(brief.contains("page_health_blocked"));
+        assert!(brief.contains("Root element #root not found"));
+        assert!(!brief.contains("token=secret"));
+    }
+
+    #[test]
+    fn diagnostic_brief_aggregates_repeated_challenge_probe_evidence() {
+        let timeline = BrowserTimeline::new();
+        for probe in 170..184 {
+            timeline.record(build_browser_event(
+                "session",
+                "claude",
+                "Claude",
+                "arena-nav",
+                "nav",
+                1,
+                "captcha_or_challenge",
+                "op",
+                "challenge_detected",
+                "https://claude.ai/",
+                serde_json::json!({ "readiness_probe_count": probe }),
+                None,
+            ));
+        }
+        let mut writer = DiagnosticBriefWriter::new();
+        let (retained, represented) = timeline.append_diagnostic_brief_events(&mut writer);
+        let brief = writer.finish();
+        assert_eq!(retained, 14);
+        assert_eq!(represented, 14);
+        assert!(brief.contains("challenge_detected × 14"));
+        assert!(brief.contains("probes 170→183"));
+        assert_eq!(brief.matches("challenge_detected ×").count(), 1);
+    }
+
+    #[test]
+    fn diagnostic_brief_timeline_stays_bounded_for_seven_agents_and_empty_data() {
+        let empty = BrowserTimeline::new();
+        let mut empty_writer = DiagnosticBriefWriter::new();
+        assert_eq!(
+            empty.append_diagnostic_brief_events(&mut empty_writer),
+            (0, 0)
+        );
+        for agent in [
+            "chatgpt", "claude", "gemini", "deepseek", "qwen", "glm", "kimi",
+        ] {
+            let timeline = &empty;
+            for sequence in 0..BROWSER_EVENT_RING_BUFFER_LIMIT {
+                timeline.record(build_browser_event(
+                    "session",
+                    agent,
+                    agent,
+                    "arena-nav",
+                    "nav",
+                    1,
+                    "ready",
+                    "op",
+                    "composer_detected",
+                    "https://example.com/",
+                    serde_json::json!({ "sequence": sequence }),
+                    None,
+                ));
+            }
+        }
+        let mut writer = DiagnosticBriefWriter::new();
+        let (_, selected) = empty.append_diagnostic_brief_events(&mut writer);
+        let brief = writer.finish();
+        assert!(selected <= 30);
+        assert!(brief.chars().count() <= DIAGNOSTIC_BRIEF_HARD_CAP);
     }
 }

@@ -378,6 +378,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid",
+ "webkit2gtk",
 ]
 
 [[package]]

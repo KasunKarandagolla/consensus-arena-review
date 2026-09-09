@@ -126,6 +126,7 @@ fn main() {
             commands::get_prompt_template,
             commands::get_maintenance_mode,
             commands::set_maintenance_mode,
+            commands::get_diagnostic_brief,
             commands::get_diagnostic_snapshot,
             commands::get_browser_timeline,
             commands::get_browser_reliability_report,

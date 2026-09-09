@@ -1822,6 +1822,167 @@ pub async fn get_diagnostic_snapshot(
         .map_err(|e| settings_command_error("Failed to serialize diagnostic snapshot", e))
 }
 
+/// Compact, secret-free human/AI-facing diagnostic artifact. This is plain
+/// Markdown by design; callers must not JSON.parse it.
+#[tauri::command]
+pub async fn get_diagnostic_brief(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    // Gate before any database or retained-diagnostics collection.
+    require_maintenance_enabled(&state).await?;
+    build_diagnostic_brief(&state, &app).await
+}
+
+async fn build_diagnostic_brief(state: &AppState, app: &AppHandle) -> Result<String, String> {
+    let (primary_configured, fallback_present, secondary_configured) = {
+        let store = state.settings_store.lock().await;
+        let primary = store
+            .get_agent_brain_config()
+            .map_err(|e| settings_command_error("Failed to read diagnostic settings", e))?;
+        let fallback = store
+            .get_fallback_brain_config()
+            .map_err(|e| settings_command_error("Failed to read diagnostic settings", e))?;
+        let secondary = store
+            .get_secondary_brain_config()
+            .map_err(|e| settings_command_error("Failed to read diagnostic settings", e))?;
+        (
+            !primary.base_url.trim().is_empty() && !primary.model.trim().is_empty(),
+            !fallback.api_key.trim().is_empty()
+                && !fallback.base_url.trim().is_empty()
+                && !fallback.model.trim().is_empty(),
+            !secondary.base_url.trim().is_empty() && !secondary.model.trim().is_empty(),
+        )
+    };
+    let memory_store = state.memory_store.clone();
+    let memory_health = crate::db_helpers::run_blocking(move || {
+        let memory = memory_store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("memory store lock poisoned".to_string()))?;
+        Ok(memory.check_health())
+    })
+    .await
+    .map_err(|e| settings_command_error("Failed to read memory health", e))?;
+
+    let leader_exists = app
+        .get_webview_window(crate::browser_backend::LEADER_WINDOW_LABEL)
+        .is_some();
+    let nav_exists = app
+        .get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL)
+        .is_some();
+    // The nav window is the active shared model surface when present; fall
+    // back to leader without creating either window for diagnostics.
+    let active_model_window = app
+        .get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL)
+        .map(|window| (window, crate::browser_backend::NAV_WINDOW_LABEL.to_string()))
+        .or_else(|| {
+            app.get_webview_window(crate::browser_backend::LEADER_WINDOW_LABEL)
+                .map(|window| {
+                    (
+                        window,
+                        crate::browser_backend::LEADER_WINDOW_LABEL.to_string(),
+                    )
+                })
+        });
+    let storage =
+        crate::browser_backend::collect_model_webview_storage_diagnostics(active_model_window)
+            .await;
+    let diagnostic_bool = |value: Option<bool>| match value {
+        Some(value) => value.to_string(),
+        None => "unknown".to_string(),
+    };
+    let diagnostic_cookies = |cookies: &crate::browser_backend::CookieDiagnosticSummary| {
+        if cookies.available {
+            format!(
+                "count: {}\nnames: [{}]\nany_secure: {}\nany_http_only: {}",
+                cookies.count,
+                cookies.names.join(", "),
+                diagnostic_bool(cookies.any_secure),
+                diagnostic_bool(cookies.any_http_only),
+            )
+        } else {
+            "count: unknown\nnames: unknown\nany_secure: unknown\nany_http_only: unknown"
+                .to_string()
+        }
+    };
+    let mut writer = crate::browser_harness::DiagnosticBriefWriter::new();
+    writer.push("# Consensus Arena Diagnostic Brief\n\n");
+    writer.push(&format!(
+        "timestamp: {}\nos_arch: {}/{}\napp_version: {}\nwebview_engine: {}\nsession_active: {}\nleader_registry_window: {}\nnav_registry_window: {}\n",
+        chrono::Utc::now().to_rfc3339(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        env!("CARGO_PKG_VERSION"),
+        tauri::webview_version().unwrap_or_else(|_| "unavailable".to_string()),
+        state.session_active.load(Ordering::SeqCst),
+        leader_exists,
+        nav_exists,
+    ));
+    writer.push(&format!(
+        "\n## Active model WebView storage\n\nactive_model_window: {}\nwebview_ephemeral: {}\nwebkit_itp_enabled: {}\ncookie_policy: {}\nclaude_cookie_{}\ncloudflare_cookie_{}\n",
+        storage.window_label.as_deref().unwrap_or("none"),
+        diagnostic_bool(storage.webview_ephemeral),
+        diagnostic_bool(storage.webkit_itp_enabled),
+        storage.cookie_policy.as_deref().unwrap_or("unknown"),
+        diagnostic_cookies(&storage.claude).replace('\n', "\nclaude_cookie_"),
+        diagnostic_cookies(&storage.cloudflare).replace('\n', "\ncloudflare_cookie_"),
+    ));
+
+    let (retention, timeline_retained, timeline_selected, dropped) = {
+        let browser = state.browser_state.lock().await;
+        let leader_cached = browser.leader_window.is_some();
+        let nav_cached = browser.nav_window.is_some();
+        writer.push(&format!(
+            "leader_cached_handle: {}\nnav_cached_handle: {}\nbrain_configured: primary={}, fallback={}, secondary={}\nmemory_health: healthy={}, warnings={}, issues={}\n",
+            leader_cached,
+            nav_cached,
+            primary_configured,
+            fallback_present,
+            secondary_configured,
+            memory_health.is_healthy,
+            memory_health.warnings.len(),
+            memory_health.issues.len(),
+        ));
+        if leader_exists != leader_cached || nav_exists != nav_cached {
+            writer.push("flags: registry/cache mismatch\n");
+        }
+        let mut dropped = Vec::new();
+        let mut agents = browser.diagnostics.timeline.agent_ids();
+        agents.sort();
+        for agent in agents {
+            dropped.push((
+                agent.clone(),
+                browser.diagnostics.timeline.events_dropped(&agent),
+            ));
+        }
+        let retention = browser.diagnostics.append_diagnostic_brief(&mut writer);
+        let (retained, selected) = browser
+            .diagnostics
+            .timeline
+            .append_diagnostic_brief_events(&mut writer);
+        (retention, retained, selected, dropped)
+    };
+    writer.push("\n## Evidence accounting\n\n");
+    writer.push(&format!(
+        "raw_timeline_retained: {}\nevents_included_in_brief: {}\nevents_omitted: {}\nlifecycle_retained: {}\nnavigation_intent_retained: {}\naction_retained: {}\ndom_snapshot_retained: {}\n",
+        timeline_retained,
+        timeline_selected,
+        timeline_retained.saturating_sub(timeline_selected),
+        retention.lifecycle,
+        retention.navigation_intents,
+        retention.actions,
+        retention.dom_snapshots,
+    ));
+    if dropped.is_empty() {
+        writer.push("per_agent_dropped_events: none\n");
+    } else {
+        for (agent, count) in dropped {
+            writer.push(&format!("dropped_events.{}: {}\n", agent, count));
+        }
+    }
+    Ok(writer.finish())
+}
+
 /// Harness: return chronological timeline events as JSON string (spec 3-15)
 #[tauri::command]
 pub async fn get_browser_timeline(state: tauri::State<'_, AppState>) -> Result<String, String> {
@@ -1861,6 +2022,9 @@ pub async fn export_browser_diagnostics(
         chrono::Utc::now().format("%Y%m%d_%H%M%S")
     ));
     std::fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
+    let brief_path = export_dir.join("DIAGNOSTIC_BRIEF.md");
+    let brief = build_diagnostic_brief(&state, &app).await?;
+    std::fs::write(&brief_path, brief).map_err(|e| e.to_string())?;
     let (timeline, diagnostics, browser_diagnostics) = {
         let browser = state.browser_state.lock().await;
         (
@@ -1994,6 +2158,7 @@ pub async fn export_browser_diagnostics(
     std::fs::write(&report_path, &report).map_err(|e| e.to_string())?;
     let result = serde_json::json!({
         "export_dir": export_dir.to_string_lossy(),
+        "diagnostic_brief": brief_path.to_string_lossy(),
         "report": report_path.to_string_lossy(),
         "events": events_path.to_string_lossy(),
         "browser_diagnostics": diag_path.to_string_lossy(),
@@ -2032,20 +2197,9 @@ pub async fn run_single_model_diagnostic(
         .ok_or_else(|| format!("Unknown participant: {agent_id}"))?;
     let window = {
         let mut browser = state.browser_state.lock().await;
-        match browser.nav_window.clone() {
-            Some(w) => w,
-            None => {
-                if let Some(existing) =
-                    app.get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL)
-                {
-                    browser.nav_window = Some(existing.clone());
-                    existing
-                } else {
-                    crate::browser_backend::ensure_nav_window(&app, &mut browser)
-                        .map_err(|e| e.to_string())?
-                }
-            }
-        }
+        // This externally initiated diagnostic shares the same registry-
+        // authoritative lifecycle rule as Connected Accounts.
+        crate::browser_backend::ensure_nav_window(&app, &mut browser).map_err(|e| e.to_string())?
     };
     let diagnostics = {
         let browser = state.browser_state.lock().await;
@@ -2560,7 +2714,6 @@ pub async fn recover_session(
 enum ConnectedAccountOutcome {
     ComposerReady,
     LoginRequired,
-    ChallengePending,
     EmptyShell,
 }
 
@@ -2572,9 +2725,6 @@ fn connected_account_outcome(
         NavEvent::Ready(agent_id) if agent_id == expected_agent_id => {
             Some(ConnectedAccountOutcome::ComposerReady)
         }
-        NavEvent::ChallengeDetected(agent_id, _) if agent_id == expected_agent_id => {
-            Some(ConnectedAccountOutcome::ChallengePending)
-        }
         NavEvent::SendProbe {
             agent_id,
             page_state_hint: Some(hint),
@@ -2585,6 +2735,56 @@ fn connected_account_outcome(
             _ => None,
         },
         _ => None,
+    }
+}
+
+async fn wait_for_connected_account_readiness<F>(
+    expected_agent_id: &str,
+    display_name: &str,
+    diagnostics: &crate::browser_backend::BrowserDiagnostics,
+    nav_rx: &mut crate::browser_backend::AsyncNavReceiver<NavEvent>,
+    mut emit_challenge: F,
+) -> Result<ConnectedAccountOutcome, String>
+where
+    F: FnMut(),
+{
+    let mut verification_ui_emitted = false;
+    loop {
+        match nav_rx.recv().await {
+            Some(event) => {
+                if let Some(outcome) = connected_account_outcome(&event, expected_agent_id) {
+                    return Ok(outcome);
+                }
+                match event {
+                    // A challenge is a non-terminal state. The user may
+                    // complete it in the existing page; do not reload,
+                    // navigate, reinject, release ownership, or turn a
+                    // resume request into fake composer readiness.
+                    NavEvent::ChallengeDetected(id, _) if id == expected_agent_id => {
+                        if !verification_ui_emitted {
+                            emit_challenge();
+                            verification_ui_emitted = true;
+                        }
+                    }
+                    NavEvent::ResumeRequested(id) if id == expected_agent_id => {}
+                    NavEvent::Error(id) if id == expected_agent_id => {
+                        return Err(format!(
+                            "Page did not become ready: {}",
+                            diagnostics.readiness_timeout_message(&id, display_name)
+                        ));
+                    }
+                    NavEvent::UnshowableUrl(id, url) if id == expected_agent_id => {
+                        return Err(format!(
+                            "{} navigated to an unshowable URL: {}",
+                            display_name, url
+                        ));
+                    }
+                    NavEvent::SessionAborted => return Err("Session aborted".to_string()),
+                    _ => {}
+                }
+            }
+            None => return Err("Navigation channel closed".to_string()),
+        }
     }
 }
 
@@ -2614,6 +2814,16 @@ pub async fn launch_connected_account(
     let participant = resolve_participant(&agent_id, &custom)
         .ok_or_else(|| format!("Unknown participant: {agent_id}"))?;
 
+    // The named Tauri registry is authoritative. Do this before consulting the
+    // Connected Accounts lease: a manually destroyed arena-nav can otherwise
+    // leave a stale cached handle and 20–120 second lease that blocks its one
+    // legitimate replacement.
+    let window = {
+        let mut browser = state.browser_state.lock().await;
+        ensure_nav_window(&app, &mut browser)
+            .map_err(|e| format!("Failed to create model window: {e}"))?
+    };
+
     // R1.3: shared-window busy guard — prevents rapid successive launches
     // from yanking the same WebView between models while navigation is still
     // in flight. Uses the existing BrowserState lock so frontend and backend
@@ -2639,28 +2849,6 @@ pub async fn launch_connected_account(
         let mut browser = state.browser_state.lock().await;
         let nav_rx = browser.attach_nav_receiver();
         (browser.diagnostics.clone(), nav_rx)
-    };
-
-    // Always use the shared nav window for Connected Accounts — it is the
-    // single navigating participant window. Using the leader window would
-    // split cookies and require recreating that window as well; the nav window
-    // is the canonical account window outside a session.
-    let window = {
-        let mut browser = state.browser_state.lock().await;
-        match browser.nav_window.clone() {
-            Some(w) => w,
-            None => {
-                if let Some(existing) =
-                    app.get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL)
-                {
-                    browser.nav_window = Some(existing.clone());
-                    existing
-                } else {
-                    ensure_nav_window(&app, &mut browser)
-                        .map_err(|e| format!("Failed to create model window: {e}"))?
-                }
-            }
-        }
     };
 
     // A healthy same-agent/same-origin composer is already the desired account
@@ -2727,39 +2915,19 @@ pub async fn launch_connected_account(
         let diagnostics_wait = diagnostics.clone();
         let app_wait = app.clone();
         tokio::time::timeout(timeout, async move {
-            loop {
-                match tokio_rx.recv().await {
-                    Some(event) => {
-                        if let Some(outcome) = connected_account_outcome(&event, &agent_id_wait) {
-                            if outcome == ConnectedAccountOutcome::ChallengePending {
-                                let _ = app_wait.emit(
-                                    "captcha-detected",
-                                    serde_json::json!({ "agent_id": agent_id_wait }),
-                                );
-                            }
-                            break Ok(outcome);
-                        }
-                        match event {
-                            NavEvent::Error(id) if id == agent_id_wait => {
-                                break Err(format!(
-                                    "Page did not become ready: {}",
-                                    diagnostics_wait
-                                        .readiness_timeout_message(&id, &display_name_wait)
-                                ));
-                            }
-                            NavEvent::UnshowableUrl(id, url) if id == agent_id_wait => {
-                                break Err(format!(
-                                    "{} navigated to an unshowable URL: {}",
-                                    display_name_wait, url
-                                ));
-                            }
-                            NavEvent::SessionAborted => break Err("Session aborted".to_string()),
-                            _ => continue,
-                        }
-                    }
-                    None => break Err("Navigation channel closed".to_string()),
-                }
-            }
+            wait_for_connected_account_readiness(
+                &agent_id_wait,
+                &display_name_wait,
+                &diagnostics_wait,
+                &mut tokio_rx,
+                || {
+                    let _ = app_wait.emit(
+                        "captcha-detected",
+                        serde_json::json!({ "agent_id": agent_id_wait }),
+                    );
+                },
+            )
+            .await
         })
         .await
     };
@@ -2801,19 +2969,6 @@ pub async fn launch_connected_account(
                 "boss-message",
                 serde_json::json!({
                     "text": format!("{} is showing a login page at {}. Please log in in the window.", participant.display_name, participant.base_url),
-                    "message_type": "status"
-                }),
-            );
-        }
-        Ok(Ok(ConnectedAccountOutcome::ChallengePending)) => {
-            let mut browser = state.browser_state.lock().await;
-            browser.connected_account_busy_until =
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
-            drop(browser);
-            let _ = app.emit(
-                "boss-message",
-                serde_json::json!({
-                    "text": format!("{} is waiting for verification in the model window. Complete the check there; it has not been announced as ready.", participant.display_name),
                     "message_type": "status"
                 }),
             );
@@ -4006,7 +4161,8 @@ mod tests {
                 &NavEvent::ChallengeDetected("chatgpt".to_string(), "captcha".to_string()),
                 "chatgpt"
             ),
-            Some(ConnectedAccountOutcome::ChallengePending)
+            None,
+            "a challenge must not be classified as a terminal outcome"
         );
         assert_eq!(
             connected_account_outcome(
@@ -4021,7 +4177,6 @@ mod tests {
         ));
         for outcome in [
             ConnectedAccountOutcome::LoginRequired,
-            ConnectedAccountOutcome::ChallengePending,
             ConnectedAccountOutcome::EmptyShell,
         ] {
             assert!(
@@ -4029,5 +4184,134 @@ mod tests {
                 "only ComposerReady may announce ready"
             );
         }
+    }
+
+    fn readiness_waiter(
+        rx: crate::browser_backend::AsyncNavReceiver<NavEvent>,
+    ) -> tokio::task::JoinHandle<(Result<ConnectedAccountOutcome, String>, usize)> {
+        tokio::spawn(async move {
+            let diagnostics = crate::browser_backend::BrowserDiagnostics::new();
+            let mut rx = rx;
+            let mut challenge_emits = 0usize;
+            let result = wait_for_connected_account_readiness(
+                "claude",
+                "Claude",
+                &diagnostics,
+                &mut rx,
+                || challenge_emits += 1,
+            )
+            .await;
+            (result, challenge_emits)
+        })
+    }
+
+    #[tokio::test]
+    async fn connected_account_challenge_resume_stays_waiting() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut handle = readiness_waiter(rx);
+        tx.send(NavEvent::ChallengeDetected(
+            "claude".to_string(),
+            "captcha".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(NavEvent::ResumeRequested("claude".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut handle)
+                .await
+                .is_err()
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn connected_account_repeated_challenge_stays_waiting_and_emits_once() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut handle = readiness_waiter(rx);
+        for indicator in ["captcha", "still-captcha"] {
+            tx.send(NavEvent::ChallengeDetected(
+                "claude".to_string(),
+                indicator.to_string(),
+            ))
+            .await
+            .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut handle)
+                .await
+                .is_err()
+        );
+        tx.send(NavEvent::Ready("claude".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.await.unwrap(),
+            (Ok(ConnectedAccountOutcome::ComposerReady), 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_account_resume_then_ready_succeeds_and_wrong_agent_ready_is_ignored() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut handle = readiness_waiter(rx);
+        tx.send(NavEvent::ChallengeDetected(
+            "claude".to_string(),
+            "captcha".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(NavEvent::ResumeRequested("claude".to_string()))
+            .await
+            .unwrap();
+        tx.send(NavEvent::Ready("other".to_string())).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut handle)
+                .await
+                .is_err()
+        );
+        tx.send(NavEvent::Ready("claude".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.await.unwrap(),
+            (Ok(ConnectedAccountOutcome::ComposerReady), 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_account_challenge_then_error_fails() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let handle = readiness_waiter(rx);
+        tx.send(NavEvent::ChallengeDetected(
+            "claude".to_string(),
+            "captcha".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(NavEvent::Error("claude".to_string()))
+            .await
+            .unwrap();
+        assert!(handle.await.unwrap().0.is_err());
+    }
+
+    #[tokio::test]
+    async fn connected_account_challenge_then_unshowable_fails() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let handle = readiness_waiter(rx);
+        tx.send(NavEvent::ChallengeDetected(
+            "claude".to_string(),
+            "captcha".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(NavEvent::UnshowableUrl(
+            "claude".to_string(),
+            "intent://blocked".to_string(),
+        ))
+        .await
+        .unwrap();
+        assert!(handle.await.unwrap().0.is_err());
     }
 }

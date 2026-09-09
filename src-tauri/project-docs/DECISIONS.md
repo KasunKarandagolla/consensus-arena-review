@@ -151,13 +151,14 @@ consumer to its dispatcher. The ingress receiver is never dropped while the
 app is running, and changing consumers never replaces the sender captured by a
 WebView. Tokio mpsc remains outside `on_navigation`.
 
-Linux model WebViews use an engine-consistent WebKit compatibility UA because
-live runtime testing showed WebKitGTK's native `Version/60.5` identity caused
-all supported provider pages to load as unusable empty shells. The compatibility
-UA remains Linux/WebKit/Safari (`Version/17.0`); it is not Windows or Chromium
-impersonation. Non-Linux model WebViews retain their native identity unless
-future runtime evidence requires otherwise. Passive `navigator.userAgent`
-diagnostics remain. No navigator/client-hint spoofing is permitted.
+The native WebKitGTK `Version/60.5` identity was not proven to cause the
+empty-shell regression. Runtime evidence on the same persistent Arena profile
+instead isolated the failure boundary to Arena's document-start automation:
+Claude rendered, completed Cloudflare and Google OAuth, and reached chat when
+the same environment ran without that initialization script. Production uses
+the native WebKit UA (no forced `user_agent(...)`) and installs the static,
+generic Arena runtime only after a provider document finishes loading. Login,
+OAuth, and known external challenge documents remain browser-owned.
 
 Human-verification invariants: repeated challenge signals are idempotent;
 Resume requests another check but is not readiness evidence; only a genuine
