@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tauri::AppHandle;
@@ -25,10 +26,9 @@ struct PendingAdoptionCheck {
 
 const RESPONSE_TIMEOUT_SECS: u64 = 300;
 
-/// Maximum number of submit-action retries before falling back to manual
-/// recovery. Attempt 0 is the initial auto-submit; attempts 1..=N re-invoke
-/// `window.__caRetrySubmit` with a freshly discovered composer.
-const MAX_SUBMIT_ACTION_RETRIES: u32 = 3;
+/// A proven submit is irreversible. Pre-submit discovery/injection can retry,
+/// but an acknowledgement timeout must never click Send a second time.
+const MAX_SUBMIT_ACTION_RETRIES: u32 = 0;
 /// Timeout awaiting a fresh `ActiveSubmitReport` ack for each submit attempt.
 const SUBMIT_ACK_TIMEOUT_SECS: u64 = 30;
 
@@ -136,16 +136,65 @@ fn looks_like_blueprint(response: &str) -> bool {
         || (response.contains("architecture") && response.contains("implementation"))
 }
 
+async fn first_task_envelope(
+    state: &AppState,
+    config: &SessionConfig,
+    agent_id: &str,
+    task: &str,
+) -> String {
+    let is_leader = agent_id == config.leader_agent_id;
+    let template = {
+        let store = state.settings_store.lock().await;
+        let key = if is_leader {
+            "prompt_leader_priming"
+        } else {
+            "prompt_participant_priming"
+        };
+        store
+            .get_prompt_template_with_default(key)
+            .unwrap_or_else(|_| {
+                if is_leader {
+                    crate::settings_store::default_leader_priming()
+                } else {
+                    crate::settings_store::default_participant_priming()
+                }
+            })
+    };
+    let names = config
+        .agent_ids
+        .iter()
+        .map(|id| crate::browser_backend::display_name_for(id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let others = config
+        .agent_ids
+        .iter()
+        .filter(|id| *id != &config.leader_agent_id)
+        .map(|id| crate::browser_backend::display_name_for(id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let role = if is_leader { "Leader" } else { "Participant" };
+    let priming = template
+        .replace(
+            "{{participant_count}}",
+            &config.agent_ids.len().saturating_sub(1).to_string(),
+        )
+        .replace("{{participant_list_with_display_names}}", &others)
+        .replace(
+            "{{leader_display_name}}",
+            crate::browser_backend::display_name_for(&config.leader_agent_id),
+        )
+        .replace("{{full_participant_list_including_leader}}", &names)
+        .replace("{{project_brief}}", &config.project_brief)
+        .replace("{{role}}", role);
+    format!("{priming}\n\n--- CURRENT ARENA TASK ---\n\n{task}")
+}
+
 fn drain_stale_active_events(nav_rx: &mut Receiver<NavEvent>) -> usize {
-    let mut drained = 0usize;
-    while let Ok(event) = nav_rx.try_recv() {
-        drained = drained.saturating_add(1);
-        tracing::warn!(
-            "[ACTIVE] Drained pre-turn stale navigation event: {:?}",
-            event
-        );
-    }
-    drained
+    // Identity is checked by consumers. Draining here could discard an exact
+    // current submit acknowledgement, Response, or Done event.
+    let _ = nav_rx;
+    0
 }
 
 fn take_queued_response_for_turn(
@@ -292,11 +341,7 @@ async fn confirm_active_submit(
             }
         }
 
-        if attempt < MAX_SUBMIT_ACTION_RETRIES {
-            if let Err(e) = crate::browser_backend::retry_active_submit(window, agent_id, turn) {
-                tracing::warn!("[SUBMIT] retry eval for {agent_id} turn {turn} failed: {e}");
-            }
-        }
+        let _ = window;
     }
 
     let detail = last_error.unwrap_or_else(|| "unknown submit failure".to_string());
@@ -513,6 +558,9 @@ pub async fn run_agent_loop(
         .contains("consult deepseek once");
     let mut deepseek_consulted = false;
     let mut unclassified_count = 0u32;
+    // This is deliberately in-memory and advances only after a useful
+    // response, which implies the first envelope was actually submitted.
+    let mut first_envelope_submitted: HashSet<String> = HashSet::new();
 
     // IMP-10: Once brain_fail_count >= 3, this flips to true permanently for
     // the rest of this session.  It never flips back — we keep using brain2.
@@ -565,10 +613,11 @@ pub async fn run_agent_loop(
                 )
             })?
         };
-        let first_prompt = format!(
+        let first_task = format!(
             "Consensus Arena active turn 1 (session {}).\n\nProject brief:\n{}\n\nConstraints: work as the panel leader, keep the first draft practical and concise, and identify decisions or questions worth consulting another model on. Produce the first short proposal/blueprint draft now. Do not answer only CONSENSUS on this active turn. Respond now with the requested draft/proposal.",
             config.session_id, config.project_brief
         );
+        let first_prompt = first_task_envelope(state, config, &leader_id, &first_task).await;
         let early_turn1 = match inject_active_prompt(
             leader_window.clone(),
             &leader_id,
@@ -1165,9 +1214,14 @@ pub async fn run_agent_loop(
                 // R1.2: participant failure is recoverable — do NOT propagate with `?`.
                 // A failed participant is reported to the leader so the session can
                 // continue with other models or with the leader alone.
+                let routed_prompt = if first_envelope_submitted.contains(&target_model) {
+                    prompt.clone()
+                } else {
+                    first_task_envelope(state, config, &target_model, &prompt).await
+                };
                 let participant_result = inject_and_wait_with_retry(
                     &target_model,
-                    &prompt,
+                    &routed_prompt,
                     iteration,
                     state,
                     nav_rx,
@@ -1176,6 +1230,7 @@ pub async fn run_agent_loop(
                 .await;
                 let participant_response = match participant_result {
                     Ok(response) => {
+                        first_envelope_submitted.insert(target_model.clone());
                         if target_model == "deepseek" {
                             deepseek_consulted = true;
                         }
@@ -1348,9 +1403,14 @@ pub async fn run_agent_loop(
                     // R1.2: per-participant failure is NOT session-fatal.
                     // Preserve successful responses and explicitly report failures.
                     // R1.8: SessionAborted is clean cancellation — propagate.
+                    let routed_prompt = if first_envelope_submitted.contains(target_model) {
+                        prompt.clone()
+                    } else {
+                        first_task_envelope(state, config, target_model, &prompt).await
+                    };
                     match inject_and_wait_with_retry(
                         target_model,
-                        &prompt,
+                        &routed_prompt,
                         iteration,
                         state,
                         nav_rx,
@@ -1359,6 +1419,7 @@ pub async fn run_agent_loop(
                     .await
                     {
                         Ok(response) => {
+                            first_envelope_submitted.insert(target_model.clone());
                             combined
                                 .push_str(&format!("[{} said]:\n{}\n\n", target_model, response));
                             compare_succeeded.push(target_model.clone());
@@ -2152,6 +2213,7 @@ async fn inject_and_wait_with_retry(
     } // lock drops
 
     let mut last_err: Option<AgentError> = None;
+    let mut submit_confirmed = false;
 
     // P1: load the persisted custom participants once so the navigation-URL
     // fallback can resolve a custom participant's base URL through the merged
@@ -2410,6 +2472,7 @@ async fn inject_and_wait_with_retry(
                         );
                     }
                     SubmitOutcome::Confirmed => {
+                        submit_confirmed = true;
                         let browser = state.browser_state.lock().await;
                         browser.mark_active_waiting(target_model, turn);
                         let _ = app.emit(
@@ -2482,6 +2545,10 @@ async fn inject_and_wait_with_retry(
                 if kind == ErrorKind::RateLimit {
                     let mut browser = state.browser_state.lock().await;
                     browser.set_cooldown(target_model, 60);
+                }
+                if submit_confirmed {
+                    update_model_health(state, target_model, false, Some(e.to_string())).await;
+                    return Err(e);
                 }
                 // W1-C: empty-shell should not trigger repeated full navigation.
                 if !should_retry_after_failure(&e, &diagnostics, target_model, turn, attempt) {
@@ -2861,7 +2928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_stale_active_events_consumes_pending_signals() {
+    async fn drain_stale_active_events_preserves_pending_critical_signals() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         tx.send(active_submit_report("chatgpt", 1, false, None))
             .await
@@ -2877,10 +2944,10 @@ mod tests {
         .await
         .unwrap();
         let drained = drain_stale_active_events(&mut rx);
-        assert_eq!(drained, 3);
+        assert_eq!(drained, 0);
         assert!(
-            rx.try_recv().is_err(),
-            "channel should be empty after drain"
+            matches!(rx.try_recv(), Ok(NavEvent::ActiveSubmitReport { .. })),
+            "current critical evidence must not be discarded before correlation"
         );
     }
 

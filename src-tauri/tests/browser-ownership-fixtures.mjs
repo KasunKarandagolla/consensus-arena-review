@@ -704,6 +704,7 @@ function fixture9() {
   renderedLogin.document.body.innerText = 'Welcome back. Log in with your email address and password to continue.';
   const loginButton = new FakeNode('button', { 'aria-label': 'Log in' });
   attach(renderedLogin.document.body, loginButton);
+  attach(renderedLogin.document.body, new FakeNode('input', { type: 'password' }));
   driveInitialReadinessProbe(renderedLogin);
   assert(renderedLogin.window.__ca_pageStateHint === 'possible_login_required',
     'rendered login page is classified as login required');

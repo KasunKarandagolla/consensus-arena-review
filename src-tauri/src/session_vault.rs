@@ -26,6 +26,9 @@ pub struct SessionVault {
 }
 
 impl SessionVault {
+    /// Test/fallback constructor. Production startup uses `open()` with the
+    /// app-data `session_vault.db` path so conversation continuity survives a
+    /// restart.
     pub fn new() -> Self {
         let conn = Connection::open_in_memory().expect("vault db failed");
         let key_bytes = Self::derive_key();
@@ -182,5 +185,30 @@ impl SessionVault {
             .open_in_place(aead::Aad::empty(), &mut in_out)
             .map_err(|_| AgentError::UnknownError("decryption failed".to_string()))?;
         Ok(decrypted.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionVault;
+
+    #[test]
+    fn conversation_url_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("consensus-arena-vault-{}.db", std::process::id()));
+        let path_string = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut vault = SessionVault::open(&path_string).unwrap();
+            vault
+                .save_conversation_url("session", "claude", "https://claude.ai/chat/1")
+                .unwrap();
+        }
+        let reopened = SessionVault::open(&path_string).unwrap();
+        assert_eq!(
+            reopened.get_conversation_url("session", "claude").unwrap(),
+            Some("https://claude.ai/chat/1".to_string())
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

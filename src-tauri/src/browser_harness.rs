@@ -557,6 +557,8 @@ pub fn classify_console_error(category: &str, message: &str, source: &str) -> Cl
     let automation_markers = [
         "arena://",
         "__ca_",
+        "normalizecomposercandidate",
+        "normalizeinput",
         "prompt_injection",
         "active-submit",
         "send-probe",

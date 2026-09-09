@@ -674,7 +674,24 @@ pub async fn run_setup(
             }
         }
 
-        // Build and inject role-priming prompt into input field (not sent; user sends manually).
+        // Setup is deliberately auth/readiness-only.  The usable composer is
+        // the proof; setup never writes a priming prompt, clicks Send, waits
+        // for a priming response, or saves a speculative conversation URL.
+        record_setup_completion(&diagnostics, agent_id, "composer_ready");
+        {
+            let mut browser = state.browser_state.lock().await;
+            browser.conversation_urls.insert(agent_id.clone(), None);
+        }
+        app.emit(
+            "setup-agent-complete",
+            json!({ "agent_id": agent_id, "conversation_url": "" }),
+        )
+        .ok();
+        continue;
+
+        // Retired setup-only priming path retained below temporarily for source
+        // compatibility; it is unreachable. First useful active envelopes own
+        // priming and submission.
         // Uses hardened templates (leader_priming.md / participant_priming.md) with
         // live placeholder substitution. Falls back to a minimal generic prompt only
         // if the template is unexpectedly empty after substitution.

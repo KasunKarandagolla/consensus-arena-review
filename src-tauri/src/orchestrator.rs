@@ -200,6 +200,7 @@ impl AppState {
         let settings_db_path = format!("{}/settings.db", data_dir);
         let blueprint_db_path = format!("{}/blueprint.db", data_dir);
         let transcript_db_path = format!("{}/transcript.db", data_dir);
+        let session_vault_db_path = format!("{}/session_vault.db", data_dir);
         let memory_db_path = PathBuf::from(data_dir).join("memory.db");
 
         let memory_store = MemoryStore::new(memory_db_path.to_string_lossy().as_ref())
@@ -215,15 +216,14 @@ impl AppState {
                 TranscriptStore::open(&transcript_db_path).expect("transcript store init failed"),
             )),
             token_budget: Arc::new(Mutex::new(TokenBudget::new())),
-            // NOTE: SessionVault::new() is in-memory, exactly as before this
-            // batch. Task 9 only changes the *lock type* (tokio::Mutex →
-            // std::sync::Mutex) so its rusqlite calls can run inside
-            // spawn_blocking — it does not change SessionVault's storage
-            // backend. SessionVault's own in-memory-vs-file-backed status
-            // was never flagged in the triage audit and is out of scope for
-            // this batch; flagging it separately rather than silently
-            // "fixing" an unrequested behaviour change.
-            session_vault: Arc::new(std::sync::Mutex::new(SessionVault::new())),
+            session_vault: Arc::new(std::sync::Mutex::new(
+                SessionVault::open(&session_vault_db_path).unwrap_or_else(|error| {
+                    eprintln!(
+                        "[VAULT] file-backed init failed ({error}); using transient fallback"
+                    );
+                    SessionVault::new()
+                }),
+            )),
             browser_state: Arc::new(Mutex::new(BrowserState::new_live(app))),
             context_manager: Arc::new(Mutex::new(ContextManager::new(
                 String::new(),

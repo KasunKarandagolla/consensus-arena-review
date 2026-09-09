@@ -4086,12 +4086,8 @@ fn make_new_window_handler(
 }
 
 fn is_allowed_oauth_popup(url: &tauri::Url) -> bool {
-    let url_str = url.as_str();
-    let host = url.host_str().unwrap_or("");
-    host == "accounts.google.com"
-        || host.ends_with(".accounts.google.com")
-        || (host.contains("google") && url_str.contains("oauth"))
-        || (host.contains("claude.ai") && url_str.contains("oauth"))
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    host == "accounts.google.com" || host.ends_with(".accounts.google.com")
 }
 
 // ── inject_to_window (lock-safe — caller drops BrowserState lock first) ───────
@@ -6267,7 +6263,8 @@ mod tests {
             .unwrap();
         let ordinary = "https://example.com/help".parse::<tauri::Url>().unwrap();
         assert!(super::is_allowed_oauth_popup(&google));
-        assert!(super::is_allowed_oauth_popup(&claude));
+        // Exact-host policy rejects suffix lookalikes and unrelated provider popups.
+        assert!(!super::is_allowed_oauth_popup(&claude));
         assert!(!super::is_allowed_oauth_popup(&ordinary));
         assert!(super::is_allowed_oauth_notice(
             "OAuth popup allowed (temporary)"
@@ -6719,28 +6716,26 @@ window.__caAutomationInstalled = true;
     }
 
     function normalizeComposerCandidate(el) {
+        // This is intentionally iterative.  A placeholder can itself match
+        // role=textbox/contenteditable, so closest() may return the same node.
+        // Never recurse through that edge (or parent/child pairs) again.
         if (!el || !(el instanceof Element)) return null;
-        if (el.matches && el.matches('p[data-placeholder]')) {
-            const placeholderAncestor = el.closest('[contenteditable="true"],[role="textbox"],[aria-multiline="true"],div.ProseMirror');
-            if (placeholderAncestor) return normalizeComposerCandidate(placeholderAncestor);
-        }
-        if (el.matches && el.matches('[data-testid*="composer" i],[data-testid*="textbox" i],[data-testid*="input" i],form,footer,main,[role="form"]')) {
-            const nestedEditable = el.querySelector('textarea,[contenteditable="true"],[role="textbox"],[aria-multiline="true"],div.ProseMirror,p[data-placeholder]');
-            if (nestedEditable) return normalizeComposerCandidate(nestedEditable);
-        }
-        if (el.matches && el.matches('div.ProseMirror') && el.getAttribute('contenteditable') !== 'true') {
-            const proseEditable = el.querySelector('[contenteditable="true"],[role="textbox"],[aria-multiline="true"],textarea');
-            if (proseEditable) return normalizeComposerCandidate(proseEditable);
-        }
-        if (isEditableSurface(el)) {
-            const editableAncestor = el.closest('[contenteditable="true"]');
-            if (editableAncestor && editableAncestor !== el && el.getAttribute('contenteditable') !== 'true' && el.tagName !== 'TEXTAREA') {
-                return editableAncestor;
+        const pending = [el];
+        const visited = [];
+        const editableSelector = 'textarea,[contenteditable="true"],[role="textbox"],[aria-multiline="true"],div.ProseMirror,p[data-placeholder]';
+        while (pending.length && visited.length < 32) {
+            const current = pending.shift();
+            if (!current || visited.indexOf(current) !== -1) continue;
+            visited.push(current);
+            if (isEditableSurface(current)) return current;
+            if (current.matches && current.matches('p[data-placeholder]')) {
+                const ancestor = current.closest('[contenteditable="true"],[role="textbox"],[aria-multiline="true"],div.ProseMirror');
+                if (ancestor && ancestor !== current) pending.push(ancestor);
             }
-            return el;
+            const nested = current.querySelector && current.querySelector(editableSelector);
+            if (nested && nested !== current) pending.push(nested);
         }
-        const nested = el.querySelector && el.querySelector('textarea,[contenteditable="true"],[role="textbox"],[aria-multiline="true"],div.ProseMirror,p[data-placeholder]');
-        return nested ? normalizeComposerCandidate(nested) : null;
+        return null;
     }
 
     function collectComposerSnapshot() {
@@ -6845,6 +6840,10 @@ window.__caAutomationInstalled = true;
             path = (window.location && window.location.pathname || '').toLowerCase();
         } catch (e) {}
 
+        // A usable visible composer is decisive: auth/challenge keywords in a
+        // conversation must never downgrade a ready page.
+        if (snapshot.input && isVisible(snapshot.input)) return 'composer_detected';
+
         if (textContainsAny(text, [
             'cloudflare',
             'checking your browser',
@@ -6869,12 +6868,6 @@ window.__caAutomationInstalled = true;
         var interactive = 0;
         try { interactive = document.querySelectorAll('button,a,input,textarea,select,[role="button"],[role="textbox"],[contenteditable="true"]').length; } catch (e) {}
         var completed = document.readyState === 'complete';
-
-        // A completed, effectively empty document is a hydration failure even
-        // when its redirect path happens to include /login or /auth.
-        if (completed && bodyLength < 40 && interactive < 2) {
-            return 'empty_shell_or_hydration_stuck';
-        }
 
         const loginTextEvidence = textContainsAny(text, [
                 'log in',
@@ -6901,16 +6894,17 @@ window.__caAutomationInstalled = true;
             path.indexOf('signin') !== -1 || path.indexOf('auth') !== -1;
         // A login path alone is not a login page. It needs visible text or
         // meaningful rendered/interactive evidence from the completed page.
-        if (loginTextEvidence || (loginPath && (bodyLength >= 40 || interactive > 0))) {
+        const loginForm = !!document.querySelector('input[type="password"],form[action*="login" i],form[action*="signin" i]');
+        if (loginForm && (loginTextEvidence || loginPath)) {
             return 'possible_login_required';
-        }
-
-        if (snapshot.inputCandidateCount > 0) {
-            return 'composer_detected';
         }
 
         if (!completed || hasVisibleProgressIndicators() || textContainsAny(text, ['loading', 'please wait', 'starting'])) {
             return 'still_loading';
+        }
+
+        if (completed && bodyLength < 40 && interactive < 2) {
+            return 'empty_shell_or_hydration_stuck';
         }
 
         // A selector miss is meaningful only after a stable, interactive page.
@@ -7489,9 +7483,10 @@ window.__caAutomationInstalled = true;
         observer.observe(document.documentElement || document.body, { childList: true, subtree: true, characterData: true });
     } catch (e) {}
 
-    setInterval(detectSend, 250);
-    setInterval(attachSendListeners, 1000);
-    setInterval(detectChallengeOrUnshowable, 1500);
+    // Readiness stops once Ready is emitted; keep post-ready health sparse.
+    setInterval(detectSend, 1000);
+    setInterval(attachSendListeners, 5000);
+    setInterval(detectChallengeOrUnshowable, 5000);
 
     // Active orchestration only calls this helper after the per-turn injector
     // has verified the inserted prompt. Setup never invokes it.
@@ -7865,7 +7860,7 @@ pub fn monitor_existing_response(
         _stable = 0;
       }} else {{
         _stable++;
-        if (_stable >= 4) {{
+        if (_stable >= 18) {{ // conservative 9s fallback when no generation signal exists
           window.__ca_lastResponse = text;
           var encoded = encodeURIComponent(text.substring(0, 8000));
           try {{ window.location.href = 'arena://response/' + AGENT_ID + '/' + TURN + '/' + encoded; }} catch (e) {{}}
@@ -7981,25 +7976,21 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
 
   function normalizeInput(el) {{
     if (!el || !(el instanceof Element)) return null;
-    if (el.matches && el.matches('p[data-placeholder]')) {{
-      var placeholderAncestor = el.closest('[contenteditable="true"],[role="textbox"],[aria-multiline="true"],div.ProseMirror');
-      if (placeholderAncestor) return normalizeInput(placeholderAncestor);
+    var pending = [el], visited = [];
+    var selector = 'textarea,[contenteditable="true"],[role="textbox"],[aria-multiline="true"],div.ProseMirror,p[data-placeholder]';
+    while (pending.length && visited.length < 32) {{
+      var current = pending.shift();
+      if (!current || visited.indexOf(current) !== -1) continue;
+      visited.push(current);
+      if (current.tagName === 'TEXTAREA' || current.getAttribute('contenteditable') === 'true' || current.getAttribute('role') === 'textbox' || current.getAttribute('aria-multiline') === 'true' || (current.matches && (current.matches('div.ProseMirror') || current.matches('p[data-placeholder]')))) return current;
+      if (current.matches && current.matches('p[data-placeholder]')) {{
+        var ancestor = current.closest('[contenteditable="true"],[role="textbox"],[aria-multiline="true"],div.ProseMirror');
+        if (ancestor && ancestor !== current) pending.push(ancestor);
+      }}
+      var nested = current.querySelector && current.querySelector(selector);
+      if (nested && nested !== current) pending.push(nested);
     }}
-    if (el.matches && el.matches('[data-testid*="composer" i],[data-testid*="textbox" i],[data-testid*="input" i],form,footer,main,[role="form"]')) {{
-      var nestedEditable = el.querySelector('textarea,[contenteditable="true"],[role="textbox"],[aria-multiline="true"],div.ProseMirror,p[data-placeholder]');
-      if (nestedEditable) return normalizeInput(nestedEditable);
-    }}
-    if (el.matches && el.matches('div.ProseMirror') && el.getAttribute('contenteditable') !== 'true') {{
-      var proseEditable = el.querySelector('[contenteditable="true"],[role="textbox"],[aria-multiline="true"],textarea');
-      if (proseEditable) return normalizeInput(proseEditable);
-    }}
-    if (el.tagName === 'TEXTAREA' || el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox' || el.getAttribute('aria-multiline') === 'true' || (el.matches && el.matches('div.ProseMirror'))) {{
-      var editableAncestor = el.closest('[contenteditable="true"]');
-      if (editableAncestor && editableAncestor !== el && el.getAttribute('contenteditable') !== 'true' && el.tagName !== 'TEXTAREA') return editableAncestor;
-      return el;
-    }}
-    var nested = el.querySelector && el.querySelector('textarea,[contenteditable="true"],[role="textbox"],[aria-multiline="true"],div.ProseMirror,p[data-placeholder]');
-    return nested ? normalizeInput(nested) : null;
+    return null;
   }}
 
   function findInput() {{
@@ -8082,7 +8073,7 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
     }} else {{
       if (txt === _last) {{
         _stable++;
-        if (_stable >= 4) {{ // 4 × 500 ms = 2 s stable → response complete
+        if (_stable >= 18) {{ // 18 × 500 ms = 9 s stable → conservative fallback
           _done = true;
           window.__ca_lastResponse = txt;
           var enc = encodeURIComponent(txt.substring(0, 8000));
