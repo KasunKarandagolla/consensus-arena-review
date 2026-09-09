@@ -1,751 +1,469 @@
 # Consensus Arena — IPC Contract
 
-## IMPORTANT
-This file is the single source of truth for all frontend↔backend communication.
-Every event name, command name, and payload field name is authoritative.
-Backend and frontend must match this document exactly — no exceptions.
-Verified against implementation via full stress audit — all PASS.
+## Purpose and Authority
+
+This file defines the **stable frontend↔Rust contract and the rules for verifying it**.
+
+It is not proof that every current source call matches the contract.
+
+When auditing:
+
+1. `commands.rs` defines real Tauri command signatures/return types.
+2. `main.rs` defines which commands are actually registered/reachable.
+3. backend `app.emit(...)` call sites define emitted event names/payloads.
+4. frontend `invoke`/`listen` call sites define what the UI actually sends/expects.
+5. This file records intended stable semantics and must be corrected if source intentionally changed.
+
+The old statement “full stress audit — all PASS” is removed. It created false confidence.
 
 ---
 
-## Commands (Frontend → Backend)
+## Two Different IPC Layers
 
-### Session Management
+Do not mix them.
 
-```typescript
-invoke('start_session', {
-    project_brief: string,
-    session_type: string,        // 'architecture' | 'mvp' | 'api' | 'security' | 'custom'
-    agent_ids: string[],         // ['claude', 'deepseek', 'gemini']
-    leader_agent_id: string,     // 'claude'
-})
-// Returns: Promise<void>
-// Returns Err if a session is already active (IMP-3 concurrency guard).
+### 1. Tauri application IPC
 
-invoke('pause_session')
-// Returns: Promise<void>
+Frontend ↔ Rust commands/events.
 
-invoke('resume_session')
-// Returns: Promise<void>
+Examples:
 
-invoke('abort_session')
-// Returns: Promise<void>
-// Called by Stop button in frontend
-```
+- `invoke('start_session', ...)`
+- `listen('agent-ask-user', ...)`
 
-### User Interaction
+### 2. Browser-internal `arena://` protocol
 
-```typescript
-invoke('user_input', {
-    text: string,
-})
-// Returns: Promise<void>
+Injected model-page JavaScript → Rust `on_navigation`.
 
-invoke('captcha_resolved', {
-    agent_id: string,
-})
-// Returns: Promise<void>
+Examples include Ready, submit, response, challenge, diagnostics, and potentially chunked response events depending on current source.
 
-invoke('retry_setup_agent', {
-    agent_id: string,
-})
-// Returns: Promise<void>
-// Re-focuses and re-probes one recoverably failed Phase 1 setup agent without
-// changing the active session, setup_order, or setup_generation.
-
-invoke('confirm_setup_agent', {
-    agent_id: string,
-})
-// Returns: Promise<void>
-// User-confirmed recovery only: marks the current unfinished setup agent as
-// primed after the user visibly verifies a send or response. It does not
-// submit a prompt or fabricate a browser event.
-
-invoke('provide_manual_model_response', {
-    agent_id: string,
-    turn_number: number,
-    response: string,
-})
-// Returns: Promise<void>
-// User-confirmed active-turn recovery. The backend accepts this only while the
-// exact agent_id and turn_number are currently awaiting a response. The text is
-// recorded through the normal transcript/blueprint flow with a manual source;
-// it does not fabricate an arena:// browser event.
-
-invoke('rate_limit_decision', {
-    agent_id: string,
-    decision: string,           // 'wait' | 'continue' | 'lighter' | 'skip'
-})
-// Returns: Promise<void>
-
-invoke('setup_agent_sent', {
-    agent_id: string,
-})
-// Returns: Promise<void>
-// Legacy/manual acknowledgement only. It does not substitute for the real
-// arena://sent browser signal and cannot advance or complete setup.
-
-invoke('provide_user_answer', {
-    answer: string,
-})
-// Returns: Promise<void>
-// Called when user clicks an option in the AskUser popup
-// Resumes the paused agent loop with the user's answer
-// Returns Err if no pending ask_user question exists
-```
-
-### Settings & Configuration
-
-```typescript
-invoke('save_agent_brain_config', {
-    api_key: string,
-    base_url: string,
-    model: string,
-    system_prompt: string,
-})
-// Returns: Promise<void>
-// Also constructs live AgentBrain instance in backend AppState
-
-invoke('get_agent_brain_config')
-// Returns: Promise<string>  (JSON-serialized AgentBrainConfig)
-
-invoke('save_secondary_brain_config', {
-    api_key: string,
-    base_url: string,
-    model: string,
-    system_prompt: string,
-})
-// Returns: Promise<void>
-
-invoke('get_secondary_brain_config')
-// Returns: Promise<string>  (JSON-serialized SecondaryBrainConfig — parse it)
-
-invoke('save_fallback_brain_config', {
-    api_key: string,
-    base_url: string,
-    model: string,
-})
-// Returns: Promise<void>
-// No system_prompt field — the fallback always reuses the primary agent
-// brain's system_prompt. If a primary agent brain is already configured
-// live in AppState, it is updated in place to use the new fallback
-// immediately. Passing all three fields empty clears the fallback.
-
-invoke('get_fallback_brain_config')
-// Returns: Promise<string>  (JSON-serialized FallbackBrainConfig — parse it)
-// FallbackBrainConfig shape: { api_key, base_url, model }
-
-invoke('save_prompt_template', {
-    template_name: string,      // 'leader_priming' | 'participant_priming' | 'agent_system'
-    content: string,
-})
-// Returns: Promise<void>
-
-invoke('get_prompt_template', {
-    template_name: string,      // 'leader_priming' | 'participant_priming' | 'agent_system'
-})
-// Returns: Promise<string>
-// NOTE: this one is a plain string, NOT JSON-wrapped — do not JSON.parse() it.
-
-invoke('get_maintenance_mode')
-// Returns: Promise<string>  (JSON-serialized boolean — parse it)
-
-invoke('set_maintenance_mode', {
-    enabled: boolean,
-})
-// Returns: Promise<void>
-
-invoke('get_diagnostic_snapshot')
-// Returns: Promise<string>  (JSON-serialized DiagnosticSnapshot — parse it)
-// Secret-free snapshot: app_data_dir, settings.db/memory.db/transcript.db/
-// blueprint.db presence, session_active, brain configuration booleans,
-// memory health summary, and command timestamp. Never includes keys, prompts,
-// cookies, transcripts, model responses, or project brief content.
- // Also includes leader_window_exists, nav_window_exists,
- // browser_console_error_count, browser_console_warning_count,
- // browser_console_last_error_at, browser_timeline, browser_timeline_dropped,
- // browser_timeline_count, and browser_diagnostics. Each browser
- // record contains agent_id, display_name, setup_generation, session_id,
- // selected_leader_id, selected_agent_ids, setup_order, intended_url,
- // window_label, window_kind, assigned_window_label, assigned_window_kind,
- // is_selected_leader, created_at, last_navigation_url, last_ready_at,
- // last_send_detected_at, last_response_at, last_error, and current_phase.
- // It also contains last_blocker, last_blocker_url_redacted,
- // last_challenge_detected_at, resume_attempt_count, last_resume_at,
- // input_found, send_button_found, last_send_probe_at,
- // last_user_submit_event_at, last_message_count_seen,
- // sent_signal_emitted, expected_agent_id, last_signal_agent_id,
- // last_signal_type, last_signal_at, stale_signal_count,
- // response_observed_before_send, response_observed_after_injection,
- // setup_completion_reason, prompt_injected_at, prompt_injection_error,
- // readiness_timeout_ms, readiness_probe_count, input_candidate_count,
- // composer_candidate_count, page_state_hint, page_health_hint,
- // active_expected_agent_id, active_turn_number, last_active_prompt_injected_at,
- // last_active_response_at, active_auto_submit_attempted,
- // active_auto_submit_succeeded, active_auto_submit_method,
- // active_send_button_enabled_before_submit, active_submit_error, and
- // active_submit_at. These active-submit diagnostics never include prompt or
- // response text. Each record also contains console_diagnostics: an array
- // of { timestamp, category, severity, message, source, url } with
- // category = javascript_exception | unhandled_rejection | console_error |
- // console_warning | navigation_error | automation_error | injection_error |
- // submission_error | challenge_blocker | login_blocker | diagnostic_bridge_error,
- // severity = error | warning | info, source = window.onerror |
- // window.onunhandledrejection | console.error | console.warn, and
- // per-agent counters browser_console_error_count,
- // browser_console_warning_count, browser_console_last_error_at.
- // Each record also contains navigation_diagnostics: an array of
- // { timestamp, agent_id, window_label, window_kind, from_url, to_url, phase,
- //   setup_generation, cause, arena_requested } with cause = arena_requested |
- //   page_initiated | unknown, plus setup_navigation_recovery_count and
- //   last_navigation (same shape). Navigation history is bounded to 10 per agent.
-//Top-level snapshot also aggregates browser_console_error_count,
- // browser_console_warning_count, browser_console_last_error_at across all agents,
- // plus browser_timeline (sorted BrowserEvent[] with timestamp, session_id, agent_id,
- // display_name, window_label, window_kind, setup_generation, phase, operation_id,
- // event_type, url, details, expected_agent_id; details never contains prompt/response),
- // browser_timeline_dropped (map agent_id→dropped_count) and browser_timeline_count.
-// current_phase is queued | creating |
- // loading | ready | waiting_user_send | consulting |
- // captcha_or_challenge | navigation_error | unshowable_url | error |
- // unknown. last_blocker is none | captcha_or_challenge | unsupported_url |
- // navigation_error | timeout. URLs and console messages are redacted;
-// no keys, prompts, cookies, tokens, or model responses are included.
-
-invoke('get_diagnostic_brief')
-// Returns: Promise<string> (plain Markdown — DO NOT JSON.parse)
-// Maintenance-mode-gated compact human/AI artifact, hard-capped at 12,000
-// Unicode characters. It contains selected redacted state, bounded evidence,
-// retention accounting, and never builds the raw snapshot/timeline clone.
-
-invoke('get_browser_timeline')
-// Returns: Promise<string> (JSON array of BrowserEvent — parse it)
-// BrowserEvent shape: { timestamp, session_id, agent_id, display_name, window_label, window_kind, setup_generation, phase, operation_id, event_type, url, details, expected_agent_id }
-// Sorted chronological, bounded 500 per agent, details never contains prompt/response.
-
-invoke('get_browser_reliability_report')
-// Returns: Promise<string> (plain markdown string — do NOT JSON.parse)
-// Evidence-based report per model: timeline, navigation, console, DOM, priming/submission, diagnosis.
-
-invoke('export_browser_diagnostics')
-// Returns: Promise<string> (JSON: {export_dir, report, events, browser_diagnostics, navigation_history, console_errors})
-// Writes bundle to app_data_dir/diagnostics_export_YYYYMMDD_HHMMSS/ containing
-// DIAGNOSTIC_BRIEF.md, BROWSER_RELIABILITY_REPORT.md, events.json, browser-diagnostics.json, navigation-history.json, console-errors.json
-// All files are secret-free and redacted.
-
-invoke('run_single_model_diagnostic', { agent_id: string })
-// Returns: Promise<string> (JSON: {agent_id, display_name, base_url, operation_id, probe, timeline_dropped, note})
-// Dev-only probe for one model (chatgpt|claude|gemini|deepseek|qwen|glm|kimi). Reuses the shared nav WebView, never creates a third window.
-// Refused while a session is active. Probes create/navigate, readiness, login state, composer/input/send/attachment, injection capability, navigation stability.
-```
-
-### Data Retrieval
-
-```typescript
-invoke('get_transcript')
-// Returns: Promise<string>  (JSON array of TurnRecord — parse it)
-
-invoke('get_session_list')
-// Returns: Promise<string>  (JSON array of SessionSummary — parse it)
-
-invoke('export_blueprint', {
-    format: string,              // 'markdown' | 'txt'
-    session_id?: string,         // optional
-})
-// Returns: Promise<string>  (file path of saved file — plain string, do not parse)
-// Returns Err if format is not 'markdown' or 'txt' (CRIT-6).
-// HIGH-8: if session_id is provided and non-empty, exports that specific
-// session's blueprint (e.g. exporting a past session from sidebar
-// history). If omitted or empty, falls back to the currently active
-// session. Returns Err("No active session") if neither a usable
-// session_id nor an active session is available.
-
-invoke('get_agent_health')
-// Returns: Promise<string>  (JSON map of agent_id → ModelHealth — parse it)
-// ModelHealth shape: { agent_id, is_available, error_count, last_error }
-// Returns {} before any session has run.
-```
-
-### Hackathon Mode
-
-```typescript
-invoke('get_hackathon_config')
-// Returns: Promise<string>  (JSON-serialized HackathonConfigSafe — parse it)
-// HackathonConfigSafe shape: { groups: HackathonGroupSafe[], models: HackathonModelSafe[], max_questions_per_teammate: number|null, enabled: boolean }
-// HackathonGroupSafe: { id, name, model_ids: string[], selected: boolean }
-// HackathonModelSafe: { id, model_name, base_url, group_id } — api_key NEVER returned (redacted)
-// Call on SetupView mount and when opening the Hackathon mini-window
-
-invoke('save_hackathon_config', {
-    config: HackathonConfig,   // full config with api_key per model — backend preserves existing key if empty string sent
-})
-// Returns: Promise<void>
-// HackathonConfig shape: { groups: HackathonGroupConfig[], models: HackathonModelConfig[], max_questions_per_teammate: number|null, enabled: boolean }
-// HackathonGroupConfig: { id, name, model_ids: string[], selected: boolean }
-// HackathonModelConfig: { id, model_name, base_url, api_key, group_id }
-// Validates base_url is http(s), model_name non-empty, api_key non-empty (unless updating existing id with empty => keep prior), group membership consistent
-// Replaces persisted hackathon_config atomically
-
-invoke('get_hackathon_run_state')
-// Returns: Promise<string>  (JSON-serialized HackathonRunSafe|null — parse it; "null" if no run yet)
-// HackathonRunSafe shape: { run_id, task_brief, max_questions_per_teammate: number|null, groups: GroupRunSafe[], cancelled: boolean }
-// GroupRunSafe: { group_id, group_name, model_ids_ordered: string[], participants: ParticipantRunSafe[], leader_id: string|null, history_len: number, status: 'pending'|'running'|'completed'|'failed'|'locked', final_output: string|null }
-// ParticipantRunSafe: { model_id, model_name, base_url, group_id, status: 'pending'|'confirmed'|'failed', consultation_count: number }
-// Never includes api_key or model response histories beyond length
-
-invoke('send_hackathon_invitations')
-// Returns: Promise<string>  (JSON: { run_id: string } — parse it)
-// Concurrent fan-out health-check to every model in every selected group (timeout 15s per model, all in parallel).
-// Returns immediately with run_id; live updates flow via hackathon-invitation-update / hackathon-group-status / hackathon-invitations-complete events.
-// Responders float top preserving order; zero-responder groups become locked (selected becomes inactive in UI).
-// Rejected if an invitation/run is already in progress and not cancelled.
-
-invoke('run_hackathon', {
-    task_brief: string,        // verbatim project brief — same string for every group
-})
-// Returns: Promise<string>  (JSON: { run_id: string, report: string } — parse it)
-// Executes all non-locked groups concurrently, each with private history, leader fallback, per-teammate cap, safety cap 20 rounds.
-// Groups preserve history across leader fallback; zero-live groups produce "(No output — locked)" in report.
-// Fails if no confirmed participants (send invitations first) or if run was cancelled/superseded.
-// On success emits hackathon-group-output per group and hackathon-complete with combined report.
-// Combined report format: [Hackathon Group: <name>]\n<output>\n... === End Hackathon Results === — raw material for main leader, not auto-blueprint.
-
-invoke('cancel_hackathon_run')
-// Returns: Promise<void>
-// Sets cancellation flag for active run; running group loops check flag each iteration and stop gracefully.
-// Does not delete persisted HackathonConfig; a new send_hackathon_invitations creates a fresh run_id.
-```
-
-### Phase 1 Memory
-
-```typescript
-invoke('get_project_memory', { project_brief: string })
-// Returns: Promise<string> (JSON-serialized ProjectMemoryEntry[] — JSON.parse it)
-
-invoke('get_global_memory')
-// Returns: Promise<string> (JSON-serialized GlobalMemoryEntry[] — JSON.parse it)
-
-invoke('clear_project_memory', { project_brief: string })
-// Returns: Promise<void>
-
-invoke('get_open_questions', { project_brief: string })
-// Returns: Promise<string> (JSON-serialized OpenQuestion[] — JSON.parse it)
-
-invoke('get_model_strengths', { project_brief: string })
-// Returns: Promise<string> (JSON-serialized ModelStrength[] — JSON.parse it)
-
-invoke('save_project_config', { project_brief: string, content: string })
-// Returns: Promise<void>
-
-invoke('get_project_config', { project_brief: string })
-// Returns: Promise<string> (plain string — do NOT JSON.parse it)
-
-invoke('get_memory_health')
-// Returns: Promise<string> (JSON-serialized MemoryHealth — JSON.parse it)
-
-invoke('repair_memory_index')
-// Returns: Promise<void>
-
-invoke('get_patterns', { project_brief: string })
-// Returns: Promise<string> (JSON-serialized PatternEntry[] — JSON.parse it)
-
-invoke('export_memory', { destination_path: string })
-// Returns: Promise<void>
-
-invoke('restore_memory', { source_path: string })
-// Returns: Promise<void>
-// Refused while a session is active. Creates a pre-restore backup first.
-```
-
-### Session CRUD
-
-```typescript
-invoke('delete_session', {
-    session_id: string,
-})
-// Returns: Promise<void>
-// Cascades: deletes the session's transcript turns + session row, blueprint
-// sections, and saved conversation URLs. Does NOT delete the agent's saved
-// cookies (cookies are per-agent login state, not per-session).
-// Returns Err if session_id is currently the active session
-// (stop it first), or if no session with that id exists.
-
-invoke('rename_session', {
-    session_id: string,
-    title: string,
-})
-// Returns: Promise<void>
-// Updates the session's project_brief (the field already shown, truncated,
-// as the session's title in the sidebar). Returns Err if title is empty
-// (after trimming) or if no session with that id exists.
-
-invoke('get_session_details', {
-    session_id: string,
-})
-// Returns: Promise<string>  (JSON-serialized SessionDetails — parse it)
-// SessionDetails shape: { id, project_brief, session_type, status,
-//   created_at, turn_count, section_count, agent_ids }
-// Strictly more detail than a get_session_list row: turn_count and
-// section_count are computed from the transcript/blueprint stores,
-// agent_ids is the distinct set of agents that actually produced a turn.
-// Returns Err if no session with that id exists.
-```
-
-### Session Recovery (IMP-7)
-
-```typescript
-invoke('get_recovery_state')
-// Returns: Promise<string>  (JSON: { available: boolean, session_id: string } — parse it)
-// Call on app startup to determine whether to offer recovery.
-// available = true only when a previous session was started but never reached Complete.
-// Example: { "available": true, "session_id": "abc123..." }
-
-invoke('recover_session', {
-    session_id: string,
-})
-// Returns: Promise<void>
-// Re-emits blueprint-section-added for every agreed section of the given session.
-// Does NOT re-enter the autonomous session loop — only replays saved blueprint
-// sections so the user can see partial output from a previous incomplete session.
-// Call after get_recovery_state confirms available = true.
-```
+Browser-internal event shapes are **not frontend IPC** and can evolve independently.
 
 ---
 
-## Events (Backend → Frontend)
+## Naming / Serialization Rules
 
-### Session Lifecycle
+### Command arguments
 
-```typescript
-listen('session-status', (event) => {
-    const { status, session_id, setup_generation, selected_leader_id, selected_agent_ids, setup_order } = event.payload
-    // status: 'setup' | 'requirements' | 'running' | 'paused' | 'complete' | 'ended'
-    // During status === 'setup', payload also includes:
-    //   session_id: string
-    //   setup_generation: number
-    //   selected_leader_id: string
-    //   selected_agent_ids: string[]
-    //   setup_order: string[]   // leader first, then non-leaders in selected-agent order
-})
+For multiword public Rust arguments, use the explicit snake-case Tauri contract where required:
 
-listen('setup-agent-ready', (event) => {
-    const { agent_id } = event.payload
-    // Model window is open and ready for user to press Send
-})
+`#[tauri::command(rename_all = "snake_case")]`
 
-listen('setup-agent-complete', (event) => {
-    const { agent_id, conversation_url } = event.payload
-    // Browser proof or explicit user confirmation primed this one agent.
-    // A manual confirmation records setup_completion_reason:
-    // 'user_confirmed_manual'.
-})
+Frontend keys must match the effective command wrapper exactly.
 
-listen('setup-agent-failed', (event) => {
-    const { agent_id, recoverable } = event.payload
-    // recoverable is true for browser/login/loading/security readiness failures.
-    // Keep setup visible; tell the user to complete the check in the model
-    // window and invoke retry_setup_agent. This is not session completion.
-})
+### JSON-string return convention
 
-listen('setup-complete', (event) => {
-    // All selected agents emitted real browser send detection and completed
-    // priming — autonomous session loop is starting
-    // No payload
-})
+Many commands return:
 
-listen('active-turn-state', (event) => {
-    const { event, agent_id, turn_number } = event.payload
-    // event: 'active_turn_started' | 'active_prompt_injected' |
-    //        'active_prompt_submitted' | 'active_submit_failed' |
-    //        'active_waiting_for_response' | 'active_response_captured' |
-    //        'active_turn_timeout'
-    // Safe progress only: contains no prompt or response text.
-})
-```
+`Result<String, String>`
 
-### Agent State
+where the success String is actually:
 
-```typescript
-listen('agent-state-change', (event) => {
-    const { agent_id, state, response, tokens } = event.payload
-    // state: 'consulting' | 'responded' | 'idle' | 'captcha' | 'rate-limited' | 'error'
-    // Used for live status label ONLY — never shown as message in main window
-})
+`serde_json::to_string(&value)`.
 
-listen('browser-diagnostic', (event) => {
-    const { agent_id, window_label, phase, url, message, error } = event.payload
-    // Secret-free AI WebView lifecycle/status event.
-    // phase: 'queued' | 'creating' | 'navigation_started' | 'real_url_loaded' |
-    //        'page_script_active' | 'composer_detected' | 'prompt_injected' |
-    //        'waiting_user_send' | 'send_detected' | 'response_observed_after_injection' |
-    //        'setup_agent_complete' | 'primed' | 'setup_failed_recoverable' |
-    //        'active_prompt_injected' | 'active_prompt_submitted' |
-    //        'active_submit_failed' | 'active_waiting_for_response' |
-    //        'active_response_captured' |
-    //        'consulting' | 'captcha_or_challenge' | 'navigation_error' |
-    //        'unshowable_url' | 'error' | 'unknown'
-    // error: string | null
-    // Important errors/challenges may be shown as a toast; loading updates
-    // should not produce repetitive toasts. A captcha_or_challenge phase must
-    // show the existing CAPTCHA overlay; the user completes verification in
-    // the model window and invokes captcha_resolved via Resume.
-})
-```
+Frontend must parse that string before treating it as a struct/list.
 
-### Blueprint (Primary UI Content)
+Do not infer from `invoke<T>()` generic types.
 
-```typescript
-listen('blueprint-update', (event) => {
-    const { section_id, title, content, status } = event.payload
-    // status: 'draft' | 'agreed' | 'negotiation' | 'disputed'
-    // Upsert this section in main content area
-})
+Before adding/changing any caller:
 
-listen('blueprint-section-added', (event) => {
-    const { section_id, title, content } = event.payload
-    // New finalized section from agent brain Blueprint decision
-    // Append to main content area — this is the primary content event
-    // Also emitted by recover_session when replaying a previous incomplete session
-})
+- inspect the real Rust return type;
+- inspect whether it calls `serde_json::to_string`;
+- parse exactly once.
 
-listen('agent_brain_decision_started', (event) => {
-    const { iteration, response_length } = event.payload
-    // Secret-free decision lifecycle diagnostic; no response text is included.
-})
+### Plain-string exceptions
 
-listen('agent_brain_decision_failed', (event) => {
-    const { iteration, error, unclassified_count } = event.payload
-    // Parsing/API failure diagnostic. error is redacted and contains no prompt text.
-})
+Known patterns such as prompt-template contents or exported path/Markdown strings may be plain strings.
+Never JSON.parse a command solely because other commands do.
 
-listen('agent_brain_decision_fallback', (event) => {
-    const { kind, target_agent_id, unclassified_count } = event.payload
-    // Deterministic fallback selected route, blueprint, or one bounded continue.
-})
+---
 
-listen('route_started', (event) => {
-    const { iteration, route_target_agent_id } = event.payload
-    // Canonical selected participant ID used for the shared nav WebView.
-})
+## Registered Command Surface — Source Baseline `0cc76c9`
 
-listen('blueprint_emitted', (event) => {
-    const { iteration, section_title } = event.payload
-    // Confirms that a blueprint section was persisted and emitted.
-})
-```
+This list is provided to prevent omission, not to replace reading `main.rs`.
+Current HEAD may contain additions.
 
-### Live Status
+### Session management
 
-```typescript
-listen('agent-routing', (event) => {
-    const { from_model, to_model, reason } = event.payload
-    // Update live status label
-    // Display: "Routing from [from_model] to [to_model]..."
-})
+- `start_session`
+- `pause_session`
+- `resume_session`
+- `abort_session`
+- `request_pause`
+- `get_session_checkpoint`
+- `get_recovery_state`
+- `recover_session`
 
-listen('boss-message', (event) => {
-    const { text, message_type } = event.payload
-    // message_type: 'phase' | 'interruption' | 'status' | 'question'
-    // Update live status label with text
-})
-```
+### Active/manual recovery
 
-### Conversation Content
+- `user_input`
+- `captcha_resolved`
+- `retry_setup_agent`
+- `confirm_setup_agent`
+- `provide_manual_model_response`
+- `rate_limit_decision`
+- `setup_agent_sent` — legacy/manual acknowledgement; normal setup is readiness-only
+- `provide_user_answer`
 
-```typescript
-listen('agent-message', (event) => {
-    const { agent_id, role, response, tokens, iteration } = event.payload
-    // NOT shown in main window
-    // Available in expandable status drawer only
-})
+### Brain configuration
 
-listen('requirements-question', (event) => {
-    const { question, question_number, total_questions } = event.payload
-    // Future use — requirements gathering phase
-})
+- `save_agent_brain_config`
+- `get_agent_brain_config`
+- `save_secondary_brain_config`
+- `get_secondary_brain_config`
+- `save_fallback_brain_config`
+- `get_fallback_brain_config`
+- `get_brain_status`
 
-listen('requirements-complete', (event) => {
-    const { charter_summary } = event.payload
-    // Future use
-})
-```
+### Participant configuration
 
-### User Interaction Required
+- `save_custom_participants`
+- `get_custom_participants`
+- `get_participants` — merged built-in + custom registry
 
-```typescript
-listen('agent-ask-user', (event) => {
-    const { question, options, allow_custom } = event.payload
-    // question: string — the question to display
-    // options: string[] — 2–4 button labels
-    // allow_custom: boolean — if true, also show free-text input
-    //
-    // Frontend must:
-    //   1. Show AskUserPopup immediately
-    //   2. Block all other interaction until answered
-    //   3. Call provide_user_answer for option click and custom submit
-    //      (button or Enter)
-    //   4. On Escape or backdrop dismissal, call provide_user_answer
-    //      with answer: "Cancelled" so the backend channel does not hang
-})
-```
+The old IPC document omitted these custom-participant commands even though current source registers them.
 
-### System Events
+### Prompt/settings
 
-```typescript
-listen('captcha-detected', (event) => {
-    const { agent_id } = event.payload
-    // Show CAPTCHA overlay — user must resolve in model window
-})
+- `save_prompt_template`
+- `get_prompt_template`
+- `get_maintenance_mode`
+- `set_maintenance_mode`
 
-listen('rate-limit-reached', (event) => {
-    const { agent_id, estimated_reset_mins } = event.payload
-    // Show inline rate limit notification with options
-    // Also fired automatically by inject_and_wait_with_retry when
-    // an agent is found to be in cooldown (IMP-4)
-})
+### Browser/account diagnostics
 
-listen('session-checkpoint', (event) => {
-    const { checkpoint_id, phase } = event.payload
-    // Show brief toast: "Progress saved"
-})
+- `launch_connected_account`
+- `get_diagnostic_brief`
+- `get_diagnostic_snapshot`
+- `get_browser_timeline`
+- `get_browser_reliability_report`
+- `export_browser_diagnostics`
+- `run_single_model_diagnostic`
 
-listen('session-complete', (event) => {
-    const { stats } = event.payload
-    // stats: { duration_mins, total_turns, sections_agreed, consensus }
-    // Show completion state — enable download, revert Stop to inactive
-})
+### Session/data retrieval
 
-listen('memory-updated', (event) => {
-    const { memory_type, trigger } = event.payload
-    // memory_type: 'session' | 'project' | 'global'
-    // trigger: 'routing' | 'route_compare' | 'blueprint' | 'user_answer' | 'session_complete'
-})
+- `get_transcript`
+- `get_session_list`
+- `export_blueprint`
+- `get_agent_health`
+- `delete_session`
+- `rename_session`
+- `get_session_details`
+- `get_session_transcript`
+- `get_blueprint_sections`
 
-listen('memory-health-warning', (event) => {
-    const { text, fts_needs_repair } = event.payload
-    // text: string
-    // fts_needs_repair: boolean
-})
+### Memory
+
+- `get_project_memory`
+- `get_global_memory`
+- `clear_project_memory`
+- `get_open_questions`
+- `get_model_strengths`
+- `save_project_config`
+- `get_project_config`
+- `get_memory_health`
+- `repair_memory_index`
+- `get_patterns`
+- `export_memory`
+- `restore_memory`
 
 ### Hackathon
 
-```typescript
-listen('hackathon-run-started', (event) => {
-    const { run_id, task_brief, group_ids, max_questions, group_count } = event.payload
-    // Emitted when send_hackathon_invitations or run_hackathon begins
-})
+- `get_hackathon_config`
+- `save_hackathon_config`
+- `get_hackathon_run_state`
+- `cancel_hackathon_run`
+- `send_hackathon_invitations`
+- `run_hackathon`
 
-listen('hackathon-invitation-update', (event) => {
-    const { run_id, group_id, model_id, status, error } = event.payload
-    // status: 'confirmed' | 'failed'
-    // Live per-model health-check result; update UI row state immediately
-})
-
-listen('hackathon-group-status', (event) => {
-    const { run_id, group_id, status } = event.payload
-    // status: 'pending' | 'locked'
-    // Emitted after all invitations complete — zero-responder groups become locked
-})
-
-listen('hackathon-invitations-complete', (event) => {
-    const { run_id } = event.payload
-    // All invitation fan-out tasks finished; refresh get_hackathon_run_state for final sorted participants
-})
-
-listen('hackathon-group-output', (event) => {
-    const { run_id, group_id, group_name, status, final_output } = event.payload
-    // status: 'completed' | 'failed' | 'locked'
-    // Per-group completion during run_hackathon concurrency — groups complete at different times
-})
-
-listen('hackathon-complete', (event) => {
-    const { run_id, report, group_count } = event.payload
-    // Combined delimited report is raw material for main leader — do not auto-promote to blueprint
-})
-```
-```
+**Audit rule:** compare every current `#[tauri::command]` against `generate_handler!` instead of trusting this list.
 
 ---
 
-## Field Reference
+## Pipeline-Critical Command Semantics
 
-### agent_id values
-`'chatgpt'` | `'claude'` | `'gemini'` | `'deepseek'` | `'qwen'` | `'glm'` | `'kimi'`
+### `start_session`
 
-### session_type values
-`'architecture'` | `'mvp'` | `'api'` | `'security'` | `'custom'`
+Starts one session if concurrency guard permits.
 
-### Blueprint section status values
-`'draft'` | `'agreed'` | `'negotiation'` | `'disputed'`
+Inputs include project/session/participant/leader configuration according to current source.
+Custom participants must resolve through the merged participant registry.
 
-### Agent state values
-`'consulting'` | `'responded'` | `'idle'` | `'captcha'` | `'rate-limited'` | `'error'`
+### `abort_session`
 
-### template_name values
-`'leader_priming'` | `'participant_priming'` | `'agent_system'`
+Stop path. Must terminate/mark the active loop and clear safety-critical ownership/waits without leaving a duplicate-resumable side effect.
 
-### rate_limit_decision values
-`'wait'` | `'continue'` | `'lighter'` | `'skip'`
+### `pause_session` / `request_pause`
+
+Pause is intended to occur at a safe checkpoint boundary, not by freezing arbitrary browser side effects mid-flight.
+
+Audit current frontend usage because both names exist in source baseline.
+
+### `resume_session`
+
+Checkpoint-based paused-session resume.
+This is **not the same mechanism** as `recover_session`.
+
+### `get_recovery_state` / `recover_session`
+
+Historical incomplete-session recovery path that replays persisted Blueprint sections.
+At checkpoint `0cc76c9`, `recover_session` does not itself restart the autonomous loop.
+
+### `retry_setup_agent`
+
+Re-probes/retries setup readiness for the selected setup agent.
+Normal setup semantics are readiness/authentication only, not setup-time role priming.
+
+### `confirm_setup_agent`
+
+Explicit manual recovery path for an unfinished setup agent.
+Do not let it fabricate active-turn response/submission state.
+
+### `setup_agent_sent`
+
+Legacy/manual acknowledgement command.
+It must not be treated as the normal current priming mechanism.
+
+### `provide_manual_model_response`
+
+Manual active-turn recovery.
+Must validate against the exact currently awaited active operation.
+
+Current generation-safety must be audited; agent+turn alone is not sufficient for stale-page protection.
+
+### `provide_user_answer`
+
+Resolves the current AskUser oneshot.
+
+Required behavior:
+
+- fail if no pending AskUser exists;
+- sender consumed with `.take()`;
+- every UI dismiss path calls it, including Escape/backdrop cancellation.
+
+### `captcha_resolved`
+
+Signals that the user completed a verification step and requests re-evaluation.
+It must not fabricate Ready itself.
+
+### `rate_limit_decision`
+
+Carries user-selected recovery policy for a rate-limited participant.
+A retry decision must never duplicate a side effect already physically accepted by a model.
+
+### `launch_connected_account`
+
+Uses the shared browser architecture to open/focus a provider account flow.
+Registry state must be authoritative over stale cached handles.
+OAuth/new-window behavior must remain provider/domain-safe.
 
 ---
 
-## Frontend State Shape
+## Important Return-Type Families
 
-```typescript
-interface AgentBrainConfig {
-    api_key: string
-    base_url: string
-    model: string
-    system_prompt: string
-}
+These families reflect the established project convention, but the audit must still inspect source.
 
-interface BlueprintSection {
-    id: string
-    title: string
-    content: string
-    status: 'draft' | 'agreed' | 'negotiation' | 'disputed'
-}
+### JSON-serialized values — frontend parses
 
-interface AskUserPayload {
-    question: string
-    options: string[]
-    allow_custom: boolean
-}
+Typical examples:
 
-// IMP-5: per-agent health record returned by get_agent_health
-interface ModelHealth {
-    agent_id: string
-    is_available: boolean
-    error_count: number
-    last_error: string | null
-}
+- brain config getters;
+- participant list getters;
+- session list/details/transcript/sections;
+- recovery/checkpoint state;
+- agent health;
+- memory collection/health getters;
+- structured Hackathon state;
+- diagnostic snapshot/timeline/export metadata where source serializes JSON.
 
-interface AppState {
-    sessionStatus: 'idle' | 'setup' | 'priming' | 'running' | 'paused' | 'complete' | 'ended'
-    setupProgress: string[]          // agent_ids that have completed priming
-    blueprintSections: BlueprintSection[]
-    liveStatusText: string           // current status label text
-    liveStatusExpanded: boolean      // is the status drawer open
-    agentBrainConfig: AgentBrainConfig | null
-    selectedSessionId: string | null
-    askUserPending: AskUserPayload | null  // non-null when agent-ask-user fires
-}
-```
+### Plain strings — frontend does not JSON.parse
+
+Typical examples:
+
+- prompt template content;
+- Markdown diagnostic brief/report;
+- exported file paths/content where command source returns a literal String.
+
+Do not maintain a giant hand-copied type table here; it becomes stale. Verify each changed call against `commands.rs`.
+
+---
+
+## Backend → Frontend Event Families
+
+The following names exist in the uploaded/current documentation baseline and are pipeline-relevant. Current source must be compared against them.
+
+### Session/setup lifecycle
+
+- `session-status`
+- `setup-agent-ready`
+- `setup-agent-complete`
+- `setup-agent-failed`
+- `setup-complete`
+- `session-checkpoint`
+- `session-complete`
+
+**Semantic correction:** `setup-agent-complete` means setup/readiness complete; it no longer guarantees a priming message was sent.
+
+### Agent/browser state
+
+- `agent-state-change`
+- `active-turn-state`
+- `browser-diagnostic`
+- `agent-routing`
+- `route_started`
+- `boss-message`
+
+### Brain lifecycle
+
+- `agent_brain_decision_started`
+- `agent_brain_decision_failed`
+- `agent_brain_decision_fallback`
+
+A fallback event is diagnostic; fallback behavior must still respect Blueprint/Complete/review guards.
+
+### Blueprint
+
+- `blueprint-update`
+- `blueprint-section-added`
+- `blueprint_emitted`
+
+The UI receiving a Blueprint event is not proof that reviewer/process invariants were satisfied. That must be enforced before emit/persist.
+
+### User intervention
+
+- `agent-ask-user`
+- `captcha-detected`
+- `rate-limit-reached`
+
+### Conversation/status
+
+- `agent-message`
+- `requirements-question`
+- `requirements-complete`
+
+### Memory
+
+- `memory-updated`
+- `memory-health-warning`
+
+### Hackathon
+
+- `hackathon-run-started`
+- `hackathon-invitation-update`
+- `hackathon-group-status`
+- `hackathon-invitations-complete`
+- `hackathon-group-output`
+- `hackathon-complete`
+
+---
+
+## AskUser Event Contract
+
+`agent-ask-user` carries the current question/options/custom-input semantics.
+
+Frontend requirement:
+
+- display immediately;
+- block incompatible interaction;
+- option/custom submit calls `provide_user_answer`;
+- Escape/backdrop/close resolves with a cancellation answer rather than abandoning the backend sender.
+
+Audit listener mount/unmount and duplicate-event behavior.
+
+---
+
+## Browser Diagnostic Contract
+
+Routine debugging should prefer:
+
+`get_diagnostic_brief`
+
+because it is compact/redacted and avoids cloning/rendering giant raw diagnostics.
+
+Full snapshot/timeline/export commands are advanced forensic tools.
+
+Do not maintain field-by-field copies of the entire internal diagnostic structs in IPC.md; those structs evolve rapidly and are not normal frontend business-state contracts.
+
+Security requirements:
+
+- no cookie values;
+- no OAuth codes/tokens/query secrets;
+- no API keys;
+- browser forensic details redacted/bounded.
+
+---
+
+## Browser-Internal `arena://` Contract
+
+### Architectural invariants
+
+- intercepted in `on_navigation`;
+- callback remains synchronous/non-blocking;
+- no Tokio mpsc inside callback;
+- agent identity must not come from a captured closure value;
+- messages that cause/confirm model side effects require exact active identity;
+- diagnostic traffic may be lossy, critical active traffic must not silently disappear.
+
+### Event evolution warning
+
+Do **not** copy the old five-variant protocol from historical docs.
+At checkpoint `0cc76c9`, `NavEvent` already includes Ready, Error, Response, Done, SendDetected, manual/setup events, submit reports, probes, challenge/navigation events, console/lifecycle/DOM/action diagnostics, and UA telemetry.
+
+A later local transport patch was reported to add response start/chunk/end semantics.
+
+The Astra audit must read current `NavEvent`, parser, and JS emitter code directly.
+
+### Required active correlation
+
+Desired identity:
+
+`agent_id + turn + setup/document generation`
+
+At checkpoint `0cc76c9`, core automatic active event variants are not uniformly generation-bearing. Do not state otherwise.
+
+---
+
+## Frontend State Semantics
+
+Avoid preserving stale semantic names as architectural truth.
+
+For example, frontend state/view names may still contain `priming` because of historical UI wiring even though backend setup no longer sends priming messages.
+
+When auditing state transitions, distinguish:
+
+- UI label/name;
+- backend state;
+- physical browser state.
 
 ---
 
 ## Wiring Rules
 
-1. Every `listen()` call must use exact event name strings from this document
-2. Every `invoke()` call must use exact command name strings from this document
-3. Payload field names must match exactly — case-sensitive
-4. No mock data in production — all state from real backend events
-5. All `listen()` calls must be cleaned up on component unmount
-6. Individual model responses are NOT displayed in main window
-7. Main window content comes ONLY from `blueprint-update` and `blueprint-section-added`
-8. Live status label content comes from `agent-state-change`, `agent-routing`, `boss-message`
-9. `agent-ask-user` must be handled at App root level — not inside a view component
-10. `provide_user_answer` must always be called when popup closes — even on dismiss
-11. `debug-log` is a development-only event — NOT listed here, NOT in production IPC
-12. `get_recovery_state` must be called on app startup before rendering the main view
-13. `recover_session` replays blueprint sections only — it does NOT restart the session loop
+1. Every backend event name/payload must match frontend listeners.
+2. Every frontend invoke name/argument casing must match command wrappers.
+3. Structured JSON strings must be parsed exactly once.
+4. Plain strings must not be JSON-parsed.
+5. Listener cleanup is mandatory on unmount/remount.
+6. AskUser dismissal must resolve the backend channel.
+7. Main UI shows Blueprint, not raw model chats.
+8. `debug-log` remains development-only and is not promoted to production IPC merely for convenience.
+9. Browser-internal `arena://` events are not frontend events.
+10. Any command/event changed by a reliability repair must be audited end to end: Rust producer/handler ↔ registration ↔ IPC doc ↔ frontend caller/listener.
+
+---
+
+## Astra Audit Priorities for IPC
+
+Do not waste time retyping every payload.
+Prioritize these failure classes:
+
+- command defined but not registered;
+- frontend invokes wrong argument case;
+- JSON-string/object parsing mismatch;
+- event name/payload mismatch;
+- duplicate listeners / missing cleanup;
+- Stop/AskUser/CAPTCHA/rate-limit command races;
+- stale manual response acceptance;
+- browser critical event identity/drop behavior;
+- checkpoint/resume command semantics;
+- provider auth popup/new-window handoff.

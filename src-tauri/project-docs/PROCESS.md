@@ -1,308 +1,357 @@
 # Consensus Arena — Development Process
 
-## The Core Rule
+## Purpose
 
-**Never write code without a complete audit first. Never integrate code without
-a complete audit after.**
+This file describes the **current efficient workflow** for audits and implementation.
+Legacy Cline/complete-file-delivery procedures are removed from the active process because they consumed context and no longer describe how this project is worked on.
 
-Mini surgery loops — fix one bug, create another, fix that, create another —
-are the primary failure mode of this project. They happen when code is written
-without understanding the full state of the system. This process eliminates them.
+Historical process details remain available in Git history/audits if needed.
 
 ---
 
-## How Tasks Are Executed
+## Core Principle
 
-**CURRENT PROCESS:** Codex CLI is the execution and independent verification
-tool. It reads the real worktree, plans scoped edits, applies them directly,
-and runs the relevant checks. Claude may provide planning/review context,
-but documents and hand-written specifications never override current source.
-Cline and complete-file delivery sections below are retained only as process
-history; they are not the default workflow.
+**Understand the connected mechanism before changing it. Then verify the real result.**
 
-### Current Codex Workflow
+Avoid the project's historical failure pattern:
 
-1. Confirm the working directory and read root `AGENTS.md`.
-2. Read every affected source/document completely and inspect the dirty
-   worktree before editing.
-3. State a scoped plan. Preserve unrelated user changes.
-4. Apply the smallest coherent edit; do not add dependencies or delete files
-   without approval.
-5. Run the task's real checks (`npm run build`, `cargo check`, targeted
-   audits, and always `git diff --check` as applicable).
-6. Report the diff and exact verification output. The user decides whether
-   to create a git checkpoint.
+`patch symptom → create new interaction bug → patch again → lose architectural understanding`
 
-Audit-before-edit and post-change verification remain non-negotiable.
-
-Phase 1 Memory used this current Codex flow end to end: pre-audit,
-implementation, real verification, post-audit, and checkpoint (`f0847c0`).
-
-### Legacy Model Roles (historical Cline infrastructure workflow)
-
-| Role | Who | Does What |
-|------|-----|-----------|
-| Design & code authorship | Claude | Writes all code, designs all specs, authors all Cline prompts |
-| File execution | Cline | Receives Claude's complete code, writes files to disk, runs cargo check |
-| Audits | Capable model via Cline | Reads files, reports findings — never writes code, never edits files |
-| User | Human | Says go/stop at major decision points only |
-
-**The user never manually edits files. Claude never asks the user to paste code.
-Cline writes everything directly.**
-
-### Legacy Cline Model Requirements
-
-Cline requires a model capable of reliable agentic tool-calling with correct
-parameter schemas. Not all models are suitable. Confirmed working:
-- Claude Sonnet (via Anthropic API) — best
-- Gemini 2.5 Pro (via Google AI Studio) — very good, free
-- Mistral-Nemotron (via NVIDIA NIM, model: mistralai/mistral-nemotron) — working
-
-Confirmed incompatible:
-- Nemotron Super (nvidia/nemotron-3-super-120b-a12b) — thinking mode breaks
-  tool-call parser causing infinite retry loops. If using NVIDIA API, switch
-  model to mistralai/mistral-nemotron.
-- Any reasoning/thinking model without thinking mode explicitly disabled
-
-If Cline enters an infinite retry loop on simple commands, the model is
-incompatible. Switch models — do not attempt to fix with prompts.
+For reliability work, treat the pipeline as one state machine rather than a collection of isolated files.
 
 ---
 
-## Legacy Cline Task Structure
+## Source Hierarchy
 
-Every implementation task follows this structure. Steps are combined into one
-comprehensive Cline prompt where possible to minimise round trips — but the
-logical sequence never changes.
+1. Current worktree/source and current runtime evidence.
+2. `DECISIONS.md`.
+3. Relevant current project docs.
+4. Historical audits/comments.
 
-### Step 1 — Pre-Implementation Audit
-
-Before any code is written, the relevant files are read completely.
-The audit model reads and reports. It does not suggest fixes or write code.
-
-Audit prompt must specify:
-- Exact files to read (absolute paths)
-- Exact things to report (struct fields, function signatures, event names, etc.)
-- Named risks to check (see Named Risks section below)
-- Output saved to: project-docs/audits/[task-name]-pre.md
-
-### Step 2 — Implementation Design (Claude)
-
-Using the pre-audit findings, Claude produces the complete implementation:
-- Every function signature
-- Every struct definition
-- Every channel type
-- Every event name verified against IPC.md
-- Every constraint from project docs verified
-
-The design is complete — not sketched. Cline executes exactly what Claude specifies.
-
-### Step 3 — Implementation (Cline with Claude's code)
-
-Claude provides the **complete file content** inside the Cline prompt.
-Cline writes the file using the absolute path, then immediately runs cargo check.
-If errors appear, Cline reads them, applies the fix, and re-runs.
-Cline does not return until: file written + cargo check 0 errors.
-
-### Step 4 — Post-Implementation Audit
-
-Audit model reads the newly written code against the spec and named risk checklist.
-Output saved to: project-docs/audits/[task-name]-post.md
-Every item is PASS or FAIL with exact file and line numbers.
-
-### Step 5 — Integration and Optional Git Checkpoint
-
-Code is integrated only when post-audit is clean.
-If any FAIL items exist, they go back to Step 3 with specific failures listed.
-After clean integration and explicit user approval, run:
-  git add -A && git commit -m "checkpoint: [task description]"
-The user is never asked to debug.
+If docs conflict with source, source wins and docs should be corrected after the work stabilizes.
 
 ---
 
-## Comprehensive Prompt Strategy
+## Two Work Modes
 
-For straightforward tasks, Steps 1–5 are combined into a single Cline prompt:
+### Mode A — Read-only forensic audit
 
+Use when the goal is to discover bugs/weaknesses, not implement fixes.
+
+Rules:
+
+- no source edits;
+- no dependency changes;
+- no speculative patches;
+- record exact HEAD/worktree first;
+- reconstruct call/state graph;
+- derive invariants;
+- adversarially simulate failure paths;
+- prove findings with exact source evidence;
+- separate `PROVEN`, `HIGH`, `MEDIUM`, and `NEEDS_RUNTIME` findings;
+- create one concise durable audit report;
+- do not spend time on full builds unless a targeted check resolves a real uncertainty.
+
+For the Astra pipeline audit, only the requested audit Markdown file may be created.
+
+### Mode B — Implementation/repair
+
+Use only after the bug set/invariants are sufficiently understood.
+
+Rules:
+
+1. Record HEAD/dirty worktree.
+2. Read every file to be edited completely.
+3. Read directly connected code required to preserve contracts.
+4. Implement one coherent reliability unit.
+5. Add deterministic regression/stress tests.
+6. Run real verification.
+7. Review diff.
+8. User decides whether to checkpoint/push.
+
+Do not use one Codex session per symptom when several symptoms share one root state-machine defect.
+
+---
+
+## Token / Quota Discipline
+
+High-capability model quota is scarce.
+
+### Spend tokens on
+
+- cross-module control flow;
+- concurrency/event ordering;
+- side-effect idempotency;
+- response integrity;
+- recovery boundaries;
+- reviewer/Blueprint/Complete guarantees;
+- AskUser/Hackathon races;
+- deterministic stress simulations;
+- exact source evidence.
+
+### Do not spend tokens on
+
+- repeating historical batch narratives;
+- command/module/AppState counts unless directly relevant;
+- reading old audits before independent findings are frozen;
+- frontend pixel polish during a backend pipeline audit;
+- re-auditing unrelated Memory CRUD/Skills/stub modules;
+- long internal-reasoning transcripts;
+- giant build logs;
+- full-file echoing;
+- speculative implementation during a read-only audit;
+- duplicating the same root cause as many findings.
+
+### Audit priority under quota pressure
+
+1. P0/P1 physical active-turn correctness.
+2. Event/concurrency/recovery.
+3. Panel review/Blueprint/Complete correctness.
+4. AskUser/Hackathon/OAuth.
+5. Performance/security/prompt behavior that affects pipeline reliability.
+6. P2/P3 cleanup only if budget remains.
+
+If time/quota becomes tight, finish a high-quality partial P0/P1 report rather than burning the budget on low-value breadth.
+
+---
+
+## Efficient Source-Reading Strategy
+
+### First pass
+
+Read canonical docs once:
+
+1. `DECISIONS.md`
+2. `ARCHITECTURE.md`
+3. `BACKEND.md`
+4. `IPC.md`
+5. `PROCESS.md`
+6. `AGENTS.md`
+
+Then discover the real call graph from source.
+
+### Core pipeline files
+
+Read each large core file completely once:
+
+- `response_router.rs`
+- `browser_backend.rs`
+- `browser_harness.rs`
+- `session_runner.rs`
+- `orchestrator.rs`
+- `agent_brain.rs`
+- `checkpoint.rs`
+- `session_vault.rs`
+- `hackathon.rs` when Hackathon is in scope.
+
+After the complete first read, revisit by function/line range rather than rereading entire large files repeatedly.
+
+Read frontend/memory/support modules only when the call graph reaches them.
+
+---
+
+## Reliability Audit Method
+
+### Step 1 — Reconstruct state ownership
+
+For every state variable/event/channel answer:
+
+- who creates it?
+- who mutates it?
+- who consumes it?
+- what identity correlates it?
+- what persists across navigation?
+- what persists across restart?
+- what happens if it is late/duplicate/dropped?
+
+### Step 2 — Define invariants
+
+Examples:
+
+- after physical SubmitConfirmed, no automatic duplicate Send;
+- critical Response cannot be dropped behind telemetry;
+- hard timeout is absolute;
+- old generation cannot satisfy current turn;
+- successful response is fully intact before brain use;
+- attempted consultation is not successful review;
+- Blueprint/Complete cannot bypass backend-known required work;
+- AskUser close cannot leave an orphan waiter;
+- restart cannot repeat an already-confirmed side effect.
+
+### Step 3 — Trace every violation path
+
+Search all call sites capable of:
+
+- Send/injection/navigation;
+- response completion;
+- queue draining;
+- retry;
+- Blueprint/Complete;
+- checkpoint save/resume;
+- AskUser/Hackathon creation/cleanup;
+- OAuth popup/new-window decisions.
+
+### Step 4 — Simulate adversarial timing
+
+Do not require a human runtime reproduction when source deterministically permits failure.
+
+Use compact branch simulations such as:
+
+- ACK lost after successful Send;
+- queue full when Response arrives;
+- unrelated events near timeout;
+- late old-generation response;
+- 15-second streaming pause;
+- provider `/new → /chat/id` after Send;
+- restart after SubmitConfirmed;
+- reviewer rate-limited before Blueprint;
+- Stop while AskUser waits.
+
+### Step 5 — Classify findings
+
+`PROVEN` — deterministic source violation.
+
+`HIGH` — strong cross-module failure path.
+
+`MEDIUM` — credible weakness needing more evidence.
+
+`NEEDS_RUNTIME` — cannot responsibly establish from static source.
+
+Do not present hypotheses as proven bugs.
+
+---
+
+## Named Risks
+
+Every relevant audit/implementation should consider:
+
+- **BLOCKING** — blocking lock/work in async/browser callback.
+- **CHANNEL** — wrong channel type/location or lossy critical traffic.
+- **EVENTMATCH** — frontend/backend command/event mismatch.
+- **IPCPARSE** — JSON-string vs plain-string mismatch.
+- **UNWRAP** — production panic path.
+- **ACTIVEKEY** — missing generation/stale event acceptance.
+- **CRITICALDROP** — result/submit event lost behind diagnostics.
+- **SUBMITIDEMPOTENCY** — duplicate Send after successful side effect.
+- **TIMEOUT** — event traffic resets overall deadline.
+- **RESPONSEINTEGRITY** — old/partial/truncated/corrupt response accepted.
+- **CONTINUITY** — unnecessary navigation/lost conversation URL.
+- **REVIEWGUARD** — attempted review counted as successful / early Blueprint.
+- **CHECKPOINT** — resume repeats or forgets safety-critical state.
+- **ASKCHANNEL / ASKDISMISS** — stranded/double AskUser.
+- **OAUTH** — unsafe host trust or broken provider callback flow.
+- **INITSCRIPT** — document-start/provider-specific model runtime regression.
+- **NAVCLOSURE** — stale agent captured in long-lived callback.
+
+---
+
+## Implementation Safety Pattern
+
+### Before side effects
+
+Establish exact operation identity and baseline.
+
+### After side effects
+
+Record physical evidence immediately.
+
+### Retry rule
+
+Before retrying any side effect, ask:
+
+**Could the previous attempt already have succeeded?**
+
+If yes, do not repeat unless source has strong proof it did not happen.
+
+### Post-submit rule
+
+After SubmitConfirmed, retries may observe/recover the response but may not automatically re-submit the same turn.
+
+---
+
+## Verification
+
+For backend/pipeline changes, typical full checks:
+
+```bash
+cd /home/kasun/Music/arena/consensus-arena/src-tauri && cargo fmt --check
+cd /home/kasun/Music/arena/consensus-arena/src-tauri && cargo check
+cd /home/kasun/Music/arena/consensus-arena/src-tauri && cargo test
+cd /home/kasun/Music/arena/consensus-arena && npm run build
+cd /home/kasun/Music/arena/consensus-arena && git diff --check
 ```
-STEP 1 — READ: [files to read — use absolute paths]
-STEP 2 — PRE-AUDIT: [create pre-audit file with findings]
-STEP 3 — WRITE: [complete file content provided by Claude]
-STEP 4 — VERIFY: [cargo check — fix errors and re-run until clean]
-STEP 5 — POST-AUDIT: [create post-audit file — PASS/FAIL each item with line numbers]
-Report: all steps in one output.
-```
 
-**Prompt quality is critical.** Every Cline prompt must be:
-- Structured as numbered steps — one action per step
-- Using absolute paths for all file operations
-- Providing complete file content inline — never partial code or diffs
-- Unambiguous — no room for the model to infer intent
+If infrastructure prevents a check:
 
-Vague prompts produce vague implementations. Complete inline code produces
-correct implementations regardless of model capability.
+- report exactly which check did not run;
+- do not transfer a PASS from an earlier commit;
+- do not call the new work fully verified.
+
+A compile/test PASS does not replace the seven-provider GUI acceptance matrix for browser behavior.
 
 ---
 
-## Critical Prompt Rules — Learned From Experience
+## Git Checkpoints
 
-### Rule 1: Always use absolute paths
-Relative paths cause files to be written to wrong directories when Cline's
-working directory differs from expected. Every file path in every Cline prompt
-must be absolute:
-  /home/kasun/Music/arena/consensus-arena/src-tauri/src/filename.rs
+Before a risky reliability batch, create/push a clean checkpoint when the user asks.
 
-Never: src-tauri/src/filename.rs
-Always: /home/kasun/Music/arena/consensus-arena/src-tauri/src/filename.rs
+Do not use `git add .` blindly in a large development tree.
+Prefer staging known tracked changes and intentional audit files.
 
-### Rule 2: Provide complete file content inline
-Never ask Cline to modify specific lines or apply diffs. Always provide the
-complete corrected file content for Cline to write. This eliminates ambiguity
-and prevents partial writes.
-
-### Rule 3: Git checkpoint after review and user approval
-After checks pass and the user approves the diff, run:
-  cd /home/kasun/Music/arena/consensus-arena && git add -A && git commit -m "checkpoint: [description]"
-This provides rollback points. Absence of checkpoints enables codebase collapse.
-
-### Rule 4: Stop immediately if Cline loops
-If Cline repeats the same tool call more than 3 times without progress,
-stop the task immediately. Do not let it continue. The model is incompatible
-or the prompt is malformed. Paste the error output to Claude for diagnosis.
-
-### Rule 5: One file write per Cline step
-Each WRITE step should target one file. Multiple file writes in a single step
-increases the chance of a partial write leaving the codebase in an inconsistent
-state. If multiple files must change, write them in sequential steps.
+No commit/push from an audit/implementation session unless explicitly authorized.
 
 ---
 
-## Task Sizing Rules
+## Documentation Updates
 
-Each task must:
-- Touch the **minimum number of files** necessary to produce one working unit
-- Have a **single clear completion condition** (cargo check 0 errors + post-audit clean)
-- Be **independent** — completing it must not require another task to be done first
+Update docs **after** source/checks stabilize.
 
-Split tasks when they touch logically unrelated files.
-Combine tasks when they are a single atomic unit of work.
+Do not copy transient implementation details such as command counts or exact large enums unless they are long-lived public contracts.
 
----
+When a doc claims something is DONE, it should mean current source/tests/runtime support that claim—not merely that an implementation exists.
 
-## Named Risks — Check Every Audit
-
-These specific patterns must be checked in every audit:
-
-**RISK-BLOCKING:** `blocking_lock()` inside `on_navigation` closure or any async fn.
-Causes UI freeze on WebKitGTK. Zero tolerance.
-
-**RISK-CHANNEL:** Using `tokio::sync::mpsc` inside `on_navigation` closure.
-Must use `std::sync::mpsc` because `on_navigation` is synchronous.
-
-**RISK-EVENTMATCH:** Backend emits field named X, frontend listens for field named Y.
-Check every `app.emit()` call against IPC.md. Field names must match exactly.
-
-**RISK-UNWRAP:** `unwrap()` or `expect()` in any path reachable during a session.
-Silent panic crashes the session. Only permitted in: test code, compile-time
-constants, .setup() closure startup (acceptable for unrecoverable init failures).
-`unwrap_or_default()` is acceptable when empty string is a safe fallback.
-
-**RISK-STALERESPONSE:** Response from turn N captured as turn N+1 response.
-wait_for_response() must check BOTH agent_id AND turn number before accepting.
-
-**RISK-INITSCRIPT:** `initialization_script` hardcoded for specific agent.
-GENERIC_INIT_SCRIPT must remain a static constant, generic across all services.
-
-**RISK-NAVCLOSURE:** `on_navigation` closure captures agent-specific variables by value.
-Agent identity must come from URL or `window.__ca_agentId` — never from closure capture.
+Historical audits remain preserved; canonical docs should describe current reality.
 
 ---
 
-## Audit File Structure
+## Astra Read-Only Audit Efficiency Plan
 
-```
-src-tauri/project-docs/
-└── audits/
-    ├── fix1-settings-path-pre.md
-    ├── fix1-settings-path-post.md
-    ├── fix2-browser-backend-pre.md
-    ├── fix2-browser-backend-pre-v2.md
-    ├── fix2-browser-backend-post.md
-    ├── fix3-agent-brain-pre.md
-    ├── fix3-agent-brain-post.md
-    ├── fix4-atomic-save-pre.md
-    ├── fix4-atomic-save-post.md
-    ├── fix5-response-router-pre.md
-    ├── fix5-response-router-post.md
-    ├── fix5-verification.md
-    ├── fix5-corrective-post.md
-    ├── fix5-final-post.md
-    ├── full-compliance-audit.md
-    ├── cleanup-post.md
-    ├── final-absolute-audit.md     ← comprehensive final audit (to be created)
-    └── [future audits...]
-```
+For a five-hour/high-capability audit window, target roughly:
 
-Every audit file is preserved permanently. Never deleted.
-Audit files form a permanent history of what was verified and when.
+### ~55% — core physical pipeline
 
----
+- browser/event state;
+- Submit/response;
+- timeouts/retries;
+- transport;
+- continuity;
+- recovery.
 
-## User Intermediation Points
+### ~25% — logical orchestration
 
-The user decides at exactly these points:
+- brain decisions;
+- review accounting;
+- Blueprint/Complete;
+- AskUser;
+- Hackathon;
+- checkpoint behavior.
 
-1. **Major architecture decisions** — if something fundamental changes
-2. **Go/stop at task completion** — review audit results, say integrate or revise
-3. **Design approval** — approve Google Stitch UI design before frontend implementation
+### ~10% — OAuth/performance/security/prompt interactions
 
-The user is never asked to:
-- Edit files manually
-- Paste code
-- Debug errors
-- Judge whether code is correct
-- Make technical implementation decisions
+Only where they affect pipeline reliability.
+
+### ~10% — independent contradiction pass + concise report
+
+Do not use the final 10% generating a long narrative.
+
+If earlier phases uncover many P0/P1 issues, reduce P2/P3 breadth rather than truncating the evidence/report.
 
 ---
 
-## Chat Session Management
+## Audit Deliverable
 
-At significant milestones, Claude notifies the user to start a new chat in the
-same Claude project. Before starting the new chat, Claude identifies which
-project files need updating and produces updated versions. This prevents hitting
-context limits mid-task and ensures the new chat has accurate project state.
+Preferred durable audit format:
 
-Significant milestones:
-- Major feature complete (e.g. entire backend done)
-- Full audit completed
-- Frontend phase complete
-- Any time context is approaching limits
+`ID | severity | confidence | invariant | evidence | failure simulation | impact | minimal repair | preferred repair | regression test | dependencies`
 
-Before starting a new chat:
-1. Update all relevant project files (DECISIONS.md, BACKEND.md, etc.)
-2. If the user approves, commit: git add -A && git commit -m "checkpoint: [milestone]"
-3. Notify user to start new chat in same Claude project
-
----
-
-## The Setup-Send Detection Special Case
-
-During setup phase, detecting that the user pressed Send requires ALL four conditions:
-
-1. Input field was not empty before send
-2. Message count in conversation increased by exactly 1
-3. Input field is now empty
-4. No page reload occurred (document.readyState check)
-
-Fires `arena://sent/{agent_id}` only. Never fires `arena://response`.
-
-False trigger test cases that must pass:
-- User types then deletes text and presses Enter → must NOT trigger
-- User refreshes the page → must NOT trigger
-- User presses Enter on empty input → must NOT trigger
-- User sends actual message → MUST trigger within 2 seconds
-
-Note: Current GENERIC_INIT_SCRIPT implements send detection via a polling
-interval that checks input field value changes. The four conditions above
-are the specification — verify the implementation matches during the
-GENERIC_INIT_SCRIPT deep review.
+One concise Markdown report is more valuable than a verbose terminal conversation or hidden reasoning transcript.

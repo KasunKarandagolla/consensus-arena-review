@@ -1,460 +1,503 @@
 # Consensus Arena — Architecture
 
+## Purpose
+
+This document describes the **current intended architecture and reliability boundaries**.
+It deliberately avoids fragile counts and historical batch narratives.
+
+If this document conflicts with current source/runtime, source/runtime wins.
+
+---
+
 ## Product Identity
 
-A native Tauri 2.0 desktop application that orchestrates an expert panel of AI
-models to produce verified, stress-tested project blueprints. The user describes
-a project. A designated leader model runs the meeting autonomously, consulting
-other models as it decides, until a complete blueprint is produced section by section.
+Consensus Arena is a native Tauri 2.x desktop application that orchestrates multiple AI web models as an autonomous expert panel to produce project blueprints.
 
-**Not a round-robin debate tool. Not a monitoring dashboard. An autonomous
-consulting engagement run by AI.**
+The leader model runs the meeting. A separate OpenAI-compatible agent brain interprets the leader's decisions and controls routing, Blueprint, AskUser, Hackathon, Continue, and Complete actions.
 
-Zero paid API keys for model participation — all AI via the user's personal
-free web accounts, automated through browser injection.
+Participant models use the user's personal web accounts; no paid participant-model API keys are required.
+
+This is not a round-robin debate UI and not a multi-column chat monitor.
 
 ---
 
-## Core Concept
+## Reliability Goal
 
-The leader model runs the meeting like a senior consultant. It decides:
-- When to consult another model
-- What to ask them
-- When a section is finalized
-- When the blueprint is complete
-- When to ask the user a clarifying question (AskUser)
+The core architecture must remain correct under:
 
-A separate AI agent brain (not a participant) watches every leader response
-and acts on those decisions. The user watches the blueprint being built in
-real time. They do not watch the models argue.
+- slow SPA hydration;
+- provider DOM changes;
+- provider redirects and `/new → /chat/...` route changes;
+- Cloudflare/login/OAuth flows;
+- rate limits and server-busy states;
+- dropped/late/duplicate browser signals;
+- long model generations and temporary generation pauses;
+- response extraction failure after a successful Send;
+- user Stop/pause/recovery races;
+- participant failure or unavailability;
+- app restart.
+
+The system must prefer **safe failure/manual recovery** over duplicate model side effects.
 
 ---
 
-## The Agent Brain
+## Major Components
 
-A separate AI model accessed via OpenAI-compatible HTTP API.
-This is NOT one of the meeting participants. This is the orchestration intelligence.
+### React/Tauri main window
 
-**Configured by user:**
-- API key
-- Base URL (OpenAI-compatible — works with DeepSeek, Gemini, Ollama, any compatible endpoint)
-- Model name
-- System prompt (fully customizable — this defines all agent behaviour)
-- Optional fallback model (D-038 — retries once on failure; implemented,
-  including a UI section in SettingsPanel.tsx)
-- Optional secondary brain (D-039 — alternative orchestrator, switched to
-  automatically after 3 consecutive primary failures — implemented)
+Owns the user-facing workflow:
 
-**What the agent brain does:**
-Reads every leader response using its own AI intelligence and decides:
-1. Does the leader want input from another model? → Who? What exact prompt?
-2. Does the leader want side-by-side responses from multiple models? (RouteCompare)
-3. Has the leader finalized a section? → Extract title + content, push to blueprint
-4. Does the session need user input to continue? (AskUser)
-5. Is the meeting complete? → Signal session end
+- setup;
+- live status;
+- Blueprint rendering;
+- session history;
+- Connected Accounts;
+- AskUser;
+- CAPTCHA/rate-limit recovery;
+- diagnostics;
+- settings/memory.
 
-No pattern matching. No rigid output format required from the leader.
-The brain reads natural language and acts.
+Raw model conversations remain in model WebViews and are not the main product UI.
 
-**AgentDecision enum — all 7 variants implemented, none pending (beta-final 2026-09-07 — prompts hardened, Hackathon first-class, runtime authoritative):**
-```rust
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum AgentDecision {
-    Route { target_model: String, prompt: String },
-    Blueprint { section_title: String, section_content: String },
-    Continue,
-    Complete,
-    RouteCompare { models: Vec<String>, prompt: String },
-    AskUser { question: String, options: Vec<String>, allow_custom: bool },
-    Hackathon { task_brief: String },
-}
+### Rust backend
+
+Owns:
+
+- session configuration/lifecycle;
+- browser ownership/navigation;
+- JS→Rust event handling;
+- active-turn orchestration;
+- agent-brain decisions;
+- participant routing;
+- Blueprint persistence;
+- AskUser/Hackathon state;
+- checkpoints/recovery;
+- transcript/session/memory stores;
+- diagnostics.
+
+### Agent brain
+
+A user-configured OpenAI-compatible model, separate from the meeting participants.
+
+Current decision family:
+
+- Route
+- RouteCompare
+- Blueprint
+- Continue
+- Complete
+- AskUser
+- Hackathon
+
+Prompt rules help the brain behave well, but important correctness guarantees must be enforced by Rust state, not only by prompt obedience.
+
+### Model WebViews
+
+Two long-lived Arena-managed browsing contexts:
+
+- `arena-leader` — persistent leader context;
+- `arena-nav` — shared participant context.
+
+The shared nav window navigates/reuses conversations for non-leaders.
+
+---
+
+## Browser Architecture
+
+### Hard rule: browser first, automation second
+
+The provider document must bootstrap without the full Arena automation runtime executing at document start.
+
+Current intended lifecycle:
+
+```text
+create/reuse named WebView
+→ navigate provider
+→ provider/login/challenge/OAuth bootstrap naturally
+→ PageLoadEvent::Finished
+→ validate current provider/origin/state
+→ set current runtime identity
+→ post-load eval of static GENERIC_INIT_SCRIPT
+→ composer/readiness detection
 ```
-*Three production prompt templates (`leader_priming.md`, `participant_priming.md`, `agent_system.md` at repo root) were reviewed and hardened 2026-09-07. `agent_system` lists exactly 7 actions with strict field contracts: `Continue` and `Complete` carry no extra fields, `Route` needs `target_model`+`prompt`, `RouteCompare` needs `models`+`prompt`, `Blueprint` needs `section_title`+`section_content`, `AskUser` needs `question`+`options`(2-4)+`allow_custom:true`, `Hackathon` needs `task_brief`(1-2000, must contain PROBLEM STATEMENT/CONSTRAINTS/REQUIRED REPORT STRUCTURE). Roster from runtime is authoritative; Continue never carries a prompt; malformed decisions fall back safely. No timeout or Kimi-domain change.*
 
-Note: `rename_all = "snake_case"` — an earlier version of this document
-said `"lowercase"`. This matters specifically for `RouteCompare` (→
-`"route_compare"`) and `AskUser` (→ `"ask_user"`), which need snake_case
-word-splitting behaviour, not simple lowercasing of an already-single word.
+The static runtime remains generic across providers and is installed idempotently per document.
 
-**Default agent system prompt (stored in settings_store, fully customizable, seeded from `agent_system.md` at repo root):**
-```
-You are an orchestration agent managing an expert panel discussion.
-Your job is to read the leader's responses and decide what action to take next.
+Do not reintroduce `.initialization_script(GENERIC_INIT_SCRIPT)` on model builders without explicit new evidence and approval.
 
-You must respond in JSON with this structure (example roster — runtime Context roster is authoritative):
-{
-  "action": "route" | "route_compare" | "blueprint" | "ask_user" | "continue" | "complete" | "hackathon",
-  "target_model": "deepseek" (only if action is route — canonical ID, not display name),
-  "models": ["deepseek","claude"] (only if action is route_compare),
-  "prompt": "exact prompt to inject" (only if action is route or route_compare),
-  "section_title": "title" (only if action is blueprint),
-  "section_content": "exact finalized text" (only if action is blueprint),
-  "question": "short question for user" (only if action is ask_user),
-  "options": ["option1", "option2"] (only if action is ask_user, 2-4 panel-derived items),
-  "allow_custom": true (only if action is ask_user, always true),
-  "task_brief": "PROBLEM STATEMENT:\n...\nCONSTRAINTS:\n...\nREQUIRED REPORT STRUCTURE:\n..." (only if action is hackathon, 1-2000 chars)
-}
-Strict contracts: Continue = {"action":"continue"} alone, no prompt; Complete = global blueprint done, not one section; Blueprint needs exact finalized content, not paraphrase; AskUser gate is product-vision only; Hackathon brief must contain all three labeled sections or will be rejected.
-```
+### Linux browser identity
+
+Production uses WebKitGTK's native UA; no forced Safari/Chrome compatibility UA should be assumed.
+
+Native `Version/60.5` was exonerated as the root cause of the Claude blank-shell failure by runtime testing.
+
+### Linux WebKit context
+
+Current code can enable an `epiphany-like` WebKit context mode for diagnostics/compatibility, including ITP behavior. The provider bootstrap repair, not UA spoofing, was the decisive Claude fix.
+
+Astra should inspect the exact current default/context switch behavior rather than assuming the environment variable is production-required forever.
+
+### OAuth/new-window tension
+
+Current browser code contains narrow new-window/OAuth handling.
+
+The product constraint remains two Arena-managed model browsing contexts. A transient provider-created popup may or may not create a third physical WebView/resource context depending on Tauri/Wry behavior. This is an **audit question**, not a resolved exemption.
+
+### arena:// protocol
+
+The JS runtime communicates with Rust by pseudo-navigation intercepted in `on_navigation`.
+
+The architectural decision is to retain this bridge.
+
+However, individual event formats are implementation details and have evolved. At checkpoint `0cc76c9`, core active events still used agent+turn without a uniformly generation-bearing event key. A later local batch may add chunked response transport.
+
+Audit current source before documenting exact wire variants.
+
+### on_navigation rules
+
+- Synchronous callback.
+- Standard-library mpsc ingress, not Tokio mpsc inside the callback.
+- No async lock / `blocking_lock()` inside callback.
+- Do not capture agent identity by value.
+- Identity is derived from runtime state / URL signal contents.
+- Critical session events must not be silently lost because telemetry filled a bounded queue.
 
 ---
 
 ## Session Flow
 
-### Phase 1 — Session Setup (Frontend)
+### Phase 1 — User configuration
 
-User configures via the Setup screen:
-- Project brief (free text)
-- Session type (Architecture / MVP / API Design / Security Review / Custom)
-- Leader model (selected from authenticated models)
-- Participating models (toggled on/off) — includes GLM and Kimi (both fully
-  implemented, not pending)
-- Agent brain (API key, base URL, model name, system prompt — collapsible section)
+User selects:
 
-Start Session button disabled until: brief entered + 2+ models + leader chosen + brain configured.
+- project brief;
+- session type;
+- leader;
+- at least one participant / supported roster according to UI validation;
+- brain configuration.
 
-### Phase 2 — Model Priming (run_setup in session_runner.rs)
+Built-ins currently include ChatGPT, Claude, Gemini, DeepSeek, Qwen, GLM, and Kimi.
+Current source also supports persisted custom participants through a merged registry.
 
-App opens each selected model's window one at a time.
-For each model:
-1. Inject role-priming prompt into input field via eval()
-2. User reviews prompt in the model window and presses Send
-3. App detects Send via arena://sent/{agent_id} signal
-4. Saves conversation URL (via db_helpers::run_blocking, since SessionVault
-   is now Arc<std::sync::Mutex<_>> — see Task 9 in BACKEND.md), emits
-   setup-agent-complete, moves to next model
+### Phase 2 — Browser setup/readiness
 
-All priming prompts are fully customizable via settings.
+Setup is **not a priming conversation**.
 
-### Phase 3 — Autonomous Session Loop (run_agent_loop in response_router.rs)
+For each selected model:
 
-```
-Leader speaks freely in leader window
-        ↓
-wait_for_response() captures response
-        ↓
-brain.decide(leader_response, context, memory_context) → AgentDecision
-   (or agent_brain_2.decide() if 3+ consecutive primary failures — IMP-10)
-        ↓
-Route        → emit agent-routing
-               inject to participant → wait for response
-               inject "[Response from X]: ..." to leader
-               loop continues
-        ↓
-RouteCompare → route to each model in sequence
-               collect all responses
-               inject combined "[X said: ...][Y said: ...]" to leader
-               loop continues
-        ↓
-Blueprint    → save section to blueprint_store (via db_helpers::run_blocking)
-               emit blueprint-section-added to frontend
-               inject acknowledgement to leader
-               loop continues
-        ↓
-AskUser      → store oneshot tx in ask_user_tx
-               emit agent-ask-user to frontend
-               await rx (loop suspended — no spin)
-               receive answer from provide_user_answer command
-               inject answer as context to leader
-               loop continues
-        ↓
-Continue     → emit boss-message status
-               inject "Please continue." to leader
-               loop continues
-        ↓
-Complete     → mark session_complete=true in settings_store (for recovery)
-               emit session-complete
-               return Ok(()) — loop exits
-        ↓
-User Stop    → abort_session command → loop exits
+```text
+resolve provider
+→ create/reuse correct named WebView
+→ navigate/reuse provider page
+→ allow login/challenge/OAuth if needed
+→ post-load automation activation
+→ detect stable usable composer
+→ setup-agent-complete
 ```
 
-When memory context is available, `AgentBrain::decide` appends it to the
-effective system prompt used by primary, fallback, and secondary brains. The
-context is injected into the orchestration brain only, never directly into a
-participant WebView model. Project Context is hard-pinned so it is always
-included within the bounded memory context.
+No role-priming message should be sent in setup.
 
-### Phase 4 — Blueprint Export
+Historical commands/events such as `setup_agent_sent` may remain for legacy/manual recovery compatibility; they must not redefine the current setup semantics.
 
-User downloads complete blueprint as markdown file, from the shared Topbar's
-`right` slot (during an active session) or from a specific past session via
-the Sidebar's three-dot menu (export_blueprint now accepts an optional
-session_id — HIGH-8 — so exporting a past session actually exports that
-session, not whatever happens to be currently active).
-Copy button per section. Download button for full document.
+### Phase 3 — First real leader turn
 
-### Phase 5 — Session Recovery (on app startup)
+The leader's first useful submitted message contains:
 
-get_recovery_state checks whether a previous session was started but never
-reached Complete. If so, the frontend shows a recovery banner; clicking
-Recover calls recover_session, which re-emits blueprint-section-added for
-every already-agreed section of that session — it does NOT restart the
-autonomous session loop, only replays the partial blueprint so the user can
-see what existed before the interruption.
+```text
+[rendered leader priming]
+
+--- CURRENT ARENA TASK ---
+
+[real first task/project brief]
+```
+
+The first envelope is not considered committed merely because text appears in the composer.
+It should become committed when physical submission is proven.
+
+### Phase 4 — Active leader response
+
+Intended physical turn state:
+
+```text
+Ready
+→ PromptPrepared
+→ PromptInjected
+→ SubmitConfirmed
+→ WaitingForResponse
+→ ResponseCaptured
+→ ConversationUrlPersisted
+→ TurnCommitted
+```
+
+After `SubmitConfirmed`, the same active turn must not automatically be resubmitted or restarted.
+
+The exact active identity should be at least:
+
+`agent_id + turn + setup/document generation`
+
+If current source carries less identity, that is a reliability defect to audit.
+
+### Phase 5 — Agent-brain decision
+
+Only after a leader response is captured does the backend call the orchestration brain.
+
+Therefore a participant not receiving a routed prompt can be a downstream effect of a missing leader response, not necessarily a brain-routing failure.
+
+The brain returns one of the seven actions.
+
+### Phase 6 — Participant route
+
+For a participant's first real consultation:
+
+```text
+[rendered participant priming]
+
+--- CURRENT ARENA TASK ---
+
+[real routed question]
+```
+
+Later consultations omit priming.
+
+A healthy already-loaded same-agent nav page should be reusable without an unnecessary navigation.
+After a successful response, the real provider conversation URL should be persisted before the shared window is reused.
+
+### Phase 7 — Leader synthesis
+
+Participant findings are returned to the leader.
+The leader decides what to adopt or reject.
+
+### Phase 8 — Blueprint / review
+
+Prompt design expects review and synthesis before final Blueprint sections.
+
+Backend correctness must distinguish:
+
+- consultation attempted;
+- participant response successfully captured;
+- reviewer successfully counted;
+- section eligible to commit.
+
+Do not treat prompt rules as proof that Rust already enforces review coverage.
+
+### Phase 9 — Complete
+
+Complete should end the autonomous loop only when deterministic backend-known work is finished.
+
+A robust implementation should guard against early Complete when known required review/AskUser/Hackathon/process state remains.
 
 ---
 
-## Memory Model
+## AskUser Architecture
 
-| Component | RAM |
-|-----------|-----|
-| OS baseline (Linux Lite) | ~800MB |
-| Tauri app + React UI | ~150MB |
-| Leader WebView (always alive) | ~350MB |
-| One non-leader WebView (active turn) | ~350MB |
-| SQLite + Rust state | ~30MB |
-| **Total** | **~1.68GB** |
+AskUser is backend-owned:
 
-Maximum 2 WebViews active simultaneously. Hard constraint — never exceeded.
-Leader window never closed during session.
-Non-leader models share one navigating window using saved conversation URLs.
+```text
+brain decides AskUser
+→ backend stores oneshot sender
+→ emits agent-ask-user
+→ orchestration loop awaits receiver
+→ frontend answers or dismisses
+→ provide_user_answer takes sender
+→ answer returned to leader context
+```
 
-The named windows are also stable across Connected Accounts and session
-boundaries. `AppState` owns a process-lifetime standard-channel navigation
-ingress. WebView callbacks keep that sender for their lifetime; a small bridge
-records diagnostics and forwards to the one currently attached bounded async
-receiver. Starting or resuming a session swaps only that receiver, not the
-callback channel or browser window. If the user closes a named window, the next
-operation recreates that missing window; healthy windows are reused.
+Every UI close path must resolve the backend wait.
 
-Authentication relies on the native WebView profile and does not copy cookies
-through `SessionVault`, use incognito, or use a custom data directory. Linux
-model WebViews use an engine-consistent WebKit compatibility UA because live
-testing established that WebKitGTK's native `Version/60.5` identity rendered all
-supported provider pages as unusable empty shells. This is Linux/WebKit/Safari
-compatibility, not Windows/Chromium impersonation; non-Linux model WebViews
-remain native unless future runtime evidence says otherwise. Passive UA
-diagnostics remain, with no navigator or client-hint spoofing. A narrowly
-allowlisted temporary Claude/Google OAuth popup remains permitted; it is
-provider-driven and is not a third persistent Arena window.
-
-Challenge state is evidence-driven: Challenge remains pending across repeated
-signals, and Resume is only a request to inspect again. A same-agent Ready
-signal from the model page is required before setup/readiness continues. Setup
-does not replay navigation after human verification; bounded on-page priming
-verification is used instead. Active retries check exact agent, turn,
-generation, current window ownership, navigation cause, and page health before
-reusing state.
+Audit Stop/abort/restart races and stale/duplicate answers.
 
 ---
 
-## Browser Automation Mechanism
+## Hackathon Architecture
 
-### arena:// Protocol
+Hackathon is a first-class optional advisory workflow.
 
-JavaScript → Rust communication via fake URL navigation intercepted by
-Tauri's on_navigation callback. Operates below CSP enforcement — works
-on all AI web interfaces without modification.
+Core properties:
 
-```
-Ready signal:    arena://ready/{agent_id}
-Error signal:    arena://ready/error-{agent_id}
-Response signal: arena://response/{agent_id}/{turn}/{url-encoded-text}
-Done signal:     arena://done/{agent_id}/{turn}
-Send detected:   arena://sent/{agent_id}
-Log signal:      arena://log/{level}/{url-encoded-message}
-                 STATUS UNCONFIRMED — this was spec'd as part of D-040
-                 Tier 2 but was not directly re-confirmed present in the
-                 most recent read of browser_backend.rs/on_navigation.
-                 Verify directly against the real file before assuming
-                 either way; don't treat this doc's "implemented" claims
-                 elsewhere as covering this specific piece.
-```
+- invitation/run state exists separately from normal Route/RouteCompare;
+- group outputs are advisory material, not automatic Blueprint sections;
+- partial failure, cancellation, pause/resume, nested requests, and restart must fail deterministically;
+- the normal two-WebView/resource architecture still applies to participant access.
 
-### Window Architecture
-
-**Leader window:** Created at session start. Never navigated away. Always loaded.
-Receives prompts via inject_to_window with wait_ready=false (already loaded).
-
-**Nav window:** One shared window. Navigates to each non-leader model as needed.
-Receives prompts via inject_to_window with wait_ready=true.
-Returns to existing conversations using saved conversation URLs.
-
-### Injection Architecture
-
-Two injection functions in browser_backend.rs:
-
-**inject_to_agent(&BrowserState, agent_id, is_leader, prompt, turn, nav_rx)**
-- Used by session_runner.rs setup phase only
-
-**inject_to_window(WebviewWindow, agent_id, prompt, turn, nav_rx, wait_ready)**
-- Used by response_router.rs — takes cloned WebviewWindow handle, no lock required
-
-### GENERIC_INIT_SCRIPT
-
-- pub const &str in browser_backend.rs — static, never modified, never agent-specific
-- Generic across ALL agents including GLM and Kimi
-- Detects input type at runtime: textarea (value injection) vs contenteditable
-  (execCommand injection for Kimi/Lexical) — both paths in same script
-- Polls for input field, signals arena://ready/{agent_id} when found
-- Implements send detection via polling
-- Sets window.__ca_lastResponse for long response capture
-- console.error override / window.onerror → arena://log/error/... —
-  STATUS UNCONFIRMED, see arena:// Protocol section above
-- NEVER captures agent_id by closure value — always reads window.__ca_agentId
-
-### on_navigation Closure Rules (NEVER VIOLATE)
-
-- Captures ONLY tx: std::sync::mpsc::SyncSender<NavEvent>
-- Uses std::sync::mpsc — NOT tokio::sync::mpsc
-- Uses tx.clone() inside closure
-- No blocking_lock() calls anywhere
-- Agent identity always from URL path segments
+Do not assume all of these properties are currently enforced; they are pipeline-audit targets.
 
 ---
 
-## State Architecture
+## Review / Blueprint Reliability Boundary
 
-### AppState — 16 fields, all implemented
+Important product rule:
 
-```rust
-pub struct AppState {
-    pub orchestrator:     Arc<Mutex<Orchestrator>>,
-    // Task 9: std::sync::Mutex, not tokio::sync::Mutex — see BACKEND.md
-    pub transcript_store: Arc<std::sync::Mutex<TranscriptStore>>,
-    pub token_budget:     Arc<Mutex<TokenBudget>>,
-    pub session_vault:    Arc<std::sync::Mutex<SessionVault>>,
-    pub browser_state:    Arc<Mutex<BrowserState>>,
-    pub context_manager:  Arc<Mutex<ContextManager>>,
-    pub blueprint_store:  Arc<std::sync::Mutex<BlueprintStore>>,
-    pub settings_store:   Arc<Mutex<SettingsStore>>,  // NOT converted, see BACKEND.md
-    pub agent_brain:      Arc<Mutex<Option<AgentBrain>>>,
-    pub ask_user_tx:      Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
-    pub agent_brain_2:    Arc<Mutex<Option<AgentBrain>>>,
-    pub session_active:   Arc<AtomicBool>,   // IMP-3 concurrency guard
-    pub model_health:     Arc<Mutex<HashMap<String, ModelHealth>>>,  // IMP-5
-    pub brain_fail_count: Arc<AtomicU32>,    // IMP-10
-    pub memory_store:     Arc<std::sync::Mutex<MemoryStore>>,
-    pub last_memory_health: MemoryHealth,
-}
-```
+**The leader remains the decision-maker, but the backend must enforce process invariants that cannot safely depend on LLM memory/obedience.**
 
-See BACKEND.md's AppState section for the full field-by-field rationale,
-including which three fields' lock TYPE changed (not their storage
-backend) as part of Task 9.
+Recommended minimal backend-owned review state includes:
 
-### Lock Safety Rules
+- required reviewers for current review cycle/section;
+- successful reviewers;
+- failed/unavailable reviewers;
+- current cycle;
+- pending section/proposal;
+- committed Blueprint progress.
 
-All async functions that acquire AppState locks must follow this pattern:
+The brain should receive this authoritative state rather than inventing it.
 
-```rust
-// CORRECT — lock dropped before await
-let data = {
-    let guard = state.some_field.lock().await;
-    guard.clone_needed_data()
-}; // lock drops at closing brace
-async_function(data).await?; // no lock held here
-```
+---
 
-For the four `std::sync::Mutex`-wrapped fields (transcript_store,
-blueprint_store, session_vault, memory_store), the equivalent-but-different correct
-pattern is to route the whole lock+call sequence through
-`db_helpers::run_blocking()`, which executes entirely inside
-`tokio::task::spawn_blocking` — see BACKEND.md's db_helpers.rs section.
+## Response Capture / Transport
+
+### Baseline requirement
+
+Response detection should compare post-submit DOM/message changes against a pre-submit baseline so an old visible answer is not returned as the new answer.
+
+Selectors are hints, not the sole definition of a response.
+
+### Completion requirement
+
+Stable text alone is not always proof generation finished.
+Prefer generation-state evidence plus stable response; otherwise use a conservative bounded fallback.
+
+### Long responses
+
+The old architecture encoded a response into one URL and truncated to ~8k characters. That is not acceptable for long technical outputs.
+
+A later local transport batch was reported to implement bounded `response-start` / `response-chunk` / `response-end` reassembly with length/checksum validation. Treat this as **candidate current source**, not an assumed verified fact, until the audit confirms current HEAD and tests.
+
+---
+
+## State and Persistence
+
+### Persistent stores
+
+Current architecture includes local SQLite-backed persistence for:
+
+- settings;
+- transcripts;
+- Blueprint sections;
+- memory;
+- SessionVault conversation URL/cookie metadata.
+
+Checkpoint source at `0cc76c9` opens `session_vault.db` under the app data directory, with fallback behavior if file opening fails.
+
+### Conversation continuity
+
+Persistent storage only helps if active turns write the real current conversation URL after provider-created chat navigation.
+
+The audit must verify:
+
+- URL validation;
+- post-response save;
+- same-agent reuse;
+- restoration after switching participants;
+- login/challenge/OAuth URLs never becoming saved chat URLs.
+
+### Recovery concepts are distinct
+
+- `recover_session` historically replays existing Blueprint sections for an incomplete session.
+- `pause_session` / `resume_session` use a checkpoint-based flow for paused sessions.
+
+Do not conflate Blueprint replay with deterministic active-loop resume.
+
+Checkpoint data must contain enough safety-critical state to avoid duplicate model side effects after restart.
+
+---
+
+## Memory
+
+Phase 1 Memory is implemented as a local SQLite system with bounded context selection and provenance/reliability records.
+
+Memory must remain **non-fatal to the live session**: memory DB degradation should not corrupt or abort the core orchestration loop.
+
+For pipeline auditing, focus only on:
+
+- when memory is read/written;
+- retry duplication of durable memory effects;
+- context size/truncation;
+- recovery consistency.
+
+Do not spend the Astra audit budget re-auditing unrelated memory CRUD internals.
 
 ---
 
 ## Frontend Architecture
 
-React + TypeScript + Tailwind CSS + Zustand + Lucide icons. shadcn/ui was
-scaffolded early on but is not the actual styling approach in current use
-(see FRONTEND.md's Tech Stack section).
+Current UI ground truth: `src-tauri/project-docs/mockup/preview.html`.
 
-Current implemented design reference:
-`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/mockup/preview.html`.
-The production React frontend ports that design's shell, Blue/Light/Dark
-themes, collapsible sidebar, Empty/Setup/Priming/Active views, settings,
-overlays, toasts, live-status drawer, and hello path. The previous visual
-implementation has been replaced; existing backend command/event wiring is
-preserved. Do not replace this design without explicit approval.
+Relevant pipeline surfaces:
 
-Main window shows blueprint sections only — no model responses.
-Live status label at bottom (expandable drawer).
-Left sidebar: session history + three-dot menus (rename/export/details/
-delete, all backed by real commands), collapsible via a shared Topbar
-component.
-Settings via account icon popover, including primary, fallback, and
-secondary brain sections plus all-seven-model health rows.
-AskUser popup: modal overlay, appears when agent-ask-user fires, blocks all
-interaction, and invokes `provide_user_answer` for option click, custom
-submit, Escape, and backdrop dismissal.
-Priming renders the selected `sessionAgentIds`, not a hardcoded model list.
-The mockup's Templates input button is intentionally absent.
+- Setup view;
+- active status / Stop;
+- AskUser modal;
+- CAPTCHA/rate-limit overlays;
+- Connected Accounts;
+- recovery/pause controls;
+- Diagnostic Brief / maintenance diagnostics;
+- Blueprint rendering.
 
-The hello is a dependency-free SVG/CSS port of preview.html's actual Bézier
-path and transforms. It does not load Lottie at runtime and simplifies the
-source's variable stroke width and full gradient-stop set.
-
-See FRONTEND.md for complete specification.
+Visual styling is not part of the pipeline reliability audit unless a UI path can strand or duplicate backend state.
 
 ---
 
-## Supported Models
+## Supported Participants
 
-| agent_id | Display Name | Base URL | Input Type | Notes |
-|----------|-------------|----------|------------|-------|
-| chatgpt  | ChatGPT     | https://chatgpt.com | textarea | Original 5 |
-| claude   | Claude      | https://claude.ai | contenteditable | |
-| gemini   | Gemini      | https://gemini.google.com | textarea | |
-| deepseek | DeepSeek    | https://chat.deepseek.com | textarea | |
-| qwen     | Qwen        | https://chat.qwen.ai | textarea | |
-| glm      | GLM         | https://chat.z.ai/ | textarea (#chat-input) | Implemented (D-036) |
-| kimi     | Kimi        | https://kimi.ai/ | Lexical contenteditable | Implemented (D-042) — canonical 2026-09-07 |
+Built-in source baseline:
 
-All 7 models are fully implemented — none are pending. An earlier version
-of this table said "Pending D-036"/"Pending D-042" for GLM/Kimi
-respectively.
+| ID | Name | Base URL |
+|---|---|---|
+| chatgpt | ChatGPT | `https://chatgpt.com` |
+| claude | Claude | `https://claude.ai` |
+| gemini | Gemini | `https://gemini.google.com` |
+| deepseek | DeepSeek | `https://chat.deepseek.com` |
+| qwen | Qwen | `https://chat.qwen.ai` |
+| glm | GLM | `https://chat.z.ai/` |
+| kimi | Kimi | `https://kimi.ai/` |
+
+Current source also has a merged custom-participant registry. Built-in IDs remain reserved.
+
+Provider-specific DOM selectors are not architectural truth; they can change at any time.
 
 ---
 
-## Memory System
+## Resource Constraints
 
-Phase 1 is implemented as a low-RAM local SQLite system at
-`app_data_dir/memory.db`. It carries cross-session decisions, facts, open
-questions, model strengths/reliability, and reusable patterns. Six normal
-tables plus an external-content FTS5 table provide bounded retrieval without a
-separate service. Records retain provenance through `source_agent` and
-`source_type`; selection prioritizes pinned, important, and relevant context.
-Project Context is hard-pinned. Router reads and writes
-handle memory errors locally, so memory degradation does not abort a session.
+Target machine is low-end (~4GB RAM), with an app budget around 2GB.
 
-## Future Extensibility and Roadmap
+Design implications:
 
-### Phase 1 — Memory
+- no extra persistent model WebViews;
+- bounded queues/diagnostics;
+- bounded response assembly;
+- bounded history/context;
+- no expensive whole-DOM polling when event-driven/debounced observation is sufficient;
+- no unbounded maps/vectors tied to turns/sessions;
+- avoid repeated provider reloads.
 
-Implemented. The agent remembers decisions from previous sessions, what worked,
-what failed, and what each model is good at. Before this, every session started
-blank.
+---
 
-### Phase 2 — Skills
+## Current High-Risk Architecture Questions
 
-Planned. The agent loads a specialist role depending on what is needed —
-Security Auditor, Database Designer, MVP Scope Cutter, and others. Inspired by
-gstack-style `SKILL.md` architecture and systems like OpenClaw, the brain
-becomes the relevant specialist instead of using one flat prompt.
+A read-only pipeline audit must answer these from current source:
 
-### Phase 3 — Tools + MCP
+1. Are active events generation-safe end to end?
+2. Can critical Submit/Response/Done events be dropped behind telemetry?
+3. Is physical Send truth independent of a single bridge ACK?
+4. Is response extraction provider-neutral enough for Qwen and future DOM changes?
+5. Are long responses exact and bounded?
+6. Can post-submit recovery ever duplicate a Send?
+7. Does a hard timeout stay absolute under event traffic?
+8. Are healthy participant pages reused without unnecessary reload?
+9. Are real conversation URLs saved after active responses?
+10. Is OAuth provider-aware and domain-safe?
+11. Are review coverage, Blueprint, and Complete mechanically guarded?
+12. Does checkpoint/resume preserve enough state for idempotent recovery?
+13. Can AskUser/Hackathon/Stop races strand the loop?
+14. Can passive polling/diagnostics overwhelm the low-resource system?
+15. Do custom participants receive correct runtime origin/identity handling?
 
-Planned. The agent can search the web, read project files, and fetch
-documentation. MCP servers can connect it to GitHub, Slack, the filesystem, and
-other services.
+---
 
-### Phase 4 — OpenCode Integration
+## Roadmap Priority
 
-Planned. Once the expert panel agrees on a blueprint section, the agent
-delegates implementation to OpenCode CLI. OpenCode writes code, runs tests,
-commits, and returns results to the leader, which decides the next step. The app
-then both designs and builds.
-
-### Phase 5 — Better System Prompts
-
-Planned. Structured, layered prompts make the brain more reliable and
-predictable through examples, trigger words, and XML structure.
-
-### Phase 6 — Self-Improvement
-
-Planned. After every session, the agent records what it learned. Skills improve
-over time, and a weekly curator reviews and promotes patterns. The system gets
-smarter with use, similar to Hermes-style learning.
+1. Pipeline reliability audit and consolidated repair.
+2. Deterministic stress tests.
+3. Seven-provider manual acceptance matrix.
+4. Beta reliability checkpoint.
+5. Only then resume Skills/tools/self-improvement roadmap work.
