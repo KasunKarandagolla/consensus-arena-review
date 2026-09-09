@@ -5,7 +5,7 @@ use tauri::AppHandle;
 use tauri::Emitter;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 use crate::agent_brain::{AgentBrain, AgentDecision, BrainSource};
 use crate::blueprint_store::{BlueprintSection, SectionStatus};
@@ -40,6 +40,70 @@ const MAX_RETRIES: u32 = 3;
 /// Attempt 1 → 2 s, attempt 2 → 4 s, attempt 3 → 8 s (all < 60 s cap).
 const BACKOFF_BASE_SECS: u64 = 2;
 const MAX_UNCLASSIFIED_CONTINUES: u32 = 1;
+
+#[derive(Default)]
+struct ResponseAssembly {
+    byte_length: usize,
+    chunk_count: u32,
+    checksum: String,
+    chunks: Vec<Option<String>>,
+}
+
+fn response_checksum(text: &str) -> String {
+    let mut hash: u32 = 2_166_136_261;
+    for byte in text.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    format!("{hash:x}")
+}
+
+impl ResponseAssembly {
+    fn start(byte_length: usize, chunk_count: u32, checksum: String) -> Result<Self, AgentError> {
+        const MAX_RESPONSE_CHUNKS: u32 = 20_000;
+        if chunk_count > MAX_RESPONSE_CHUNKS {
+            return Err(AgentError::ExtractionFailed(
+                "response transport declared too many chunks".to_string(),
+            ));
+        }
+        Ok(Self {
+            byte_length,
+            chunk_count,
+            checksum,
+            chunks: vec![None; chunk_count as usize],
+        })
+    }
+
+    fn insert(&mut self, sequence: u32, text: String) -> Result<(), AgentError> {
+        let Some(slot) = self.chunks.get_mut(sequence as usize) else {
+            return Err(AgentError::ExtractionFailed(
+                "response chunk sequence out of range".to_string(),
+            ));
+        };
+        if slot.as_ref().is_some_and(|existing| existing != &text) {
+            return Err(AgentError::ExtractionFailed(
+                "conflicting response chunk".to_string(),
+            ));
+        }
+        *slot = Some(text);
+        Ok(())
+    }
+
+    fn finish(self, checksum: &str) -> Result<String, AgentError> {
+        if checksum != self.checksum || self.chunks.iter().any(Option::is_none) {
+            return Err(AgentError::ExtractionFailed(
+                "response transport incomplete or checksum mismatch".to_string(),
+            ));
+        }
+        let text = self.chunks.into_iter().flatten().collect::<String>();
+        if text.len() != self.byte_length || response_checksum(&text) != self.checksum {
+            return Err(AgentError::ExtractionFailed(
+                "response transport integrity check failed".to_string(),
+            ));
+        }
+        Ok(text)
+    }
+}
 
 /// RC1-F3: total retry accounting — the outer `inject_and_wait_with_retry`
 /// loop (MAX_RETRIES=3 → up to 4 attempts) and the inner
@@ -2608,10 +2672,27 @@ async fn wait_for_response(
     turn: u32,
     nav_rx: &mut Receiver<NavEvent>,
 ) -> Result<String, AgentError> {
-    let deadline = Duration::from_secs(RESPONSE_TIMEOUT_SECS);
+    wait_for_response_until(
+        agent_id,
+        turn,
+        nav_rx,
+        Instant::now() + Duration::from_secs(RESPONSE_TIMEOUT_SECS),
+    )
+    .await
+}
 
+/// The response deadline belongs to the turn, not to a receive operation.
+/// In particular, passive diagnostics and stale events must never buy an
+/// unresponsive provider another full timeout window.
+async fn wait_for_response_until(
+    agent_id: &str,
+    turn: u32,
+    nav_rx: &mut Receiver<NavEvent>,
+    deadline: Instant,
+) -> Result<String, AgentError> {
+    let mut assembly: Option<ResponseAssembly> = None;
     loop {
-        match timeout(deadline, nav_rx.recv()).await {
+        match tokio::time::timeout_at(deadline, nav_rx.recv()).await {
             Ok(Some(event)) => {
                 // D-040 [NAV]
                 tracing::debug!("[NAV] {:?}", event);
@@ -2620,6 +2701,41 @@ async fn wait_for_response(
                         if ev_agent == agent_id && ev_turn == turn {
                             return Ok(text);
                         }
+                    }
+                    NavEvent::ResponseStart {
+                        agent_id: ev_agent,
+                        turn: ev_turn,
+                        byte_length,
+                        chunk_count,
+                        checksum,
+                    } if ev_agent == agent_id && ev_turn == turn => {
+                        assembly =
+                            Some(ResponseAssembly::start(byte_length, chunk_count, checksum)?);
+                    }
+                    NavEvent::ResponseChunk {
+                        agent_id: ev_agent,
+                        turn: ev_turn,
+                        sequence,
+                        text,
+                    } if ev_agent == agent_id && ev_turn == turn => {
+                        let Some(active) = assembly.as_mut() else {
+                            return Err(AgentError::ExtractionFailed(
+                                "response chunk received before response start".to_string(),
+                            ));
+                        };
+                        active.insert(sequence, text)?;
+                    }
+                    NavEvent::ResponseEnd {
+                        agent_id: ev_agent,
+                        turn: ev_turn,
+                        checksum,
+                    } if ev_agent == agent_id && ev_turn == turn => {
+                        let Some(active) = assembly.take() else {
+                            return Err(AgentError::ExtractionFailed(
+                                "response end received before response start".to_string(),
+                            ));
+                        };
+                        return active.finish(&checksum);
                     }
                     NavEvent::Done(ev_agent, ev_turn) => {
                         if ev_agent == agent_id && ev_turn == turn {
@@ -3311,5 +3427,57 @@ mod tests {
             super::should_retry_after_failure(&timeout, &diagnostics, "claude", 7, 0),
             "response from another generation must not suppress retry"
         );
+    }
+
+    #[tokio::test]
+    async fn response_timeout_is_absolute_despite_irrelevant_traffic() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let producer = tokio::spawn(async move {
+            for _ in 0..12 {
+                let _ = tx.send(NavEvent::Ready("other".to_string())).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let started = Instant::now();
+        let result = super::wait_for_response_until(
+            "chatgpt",
+            1,
+            &mut rx,
+            started + Duration::from_millis(55),
+        )
+        .await;
+        let _ = producer.await;
+        assert!(matches!(result, Err(AgentError::Timeout(_))));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn response_chunks_reassemble_large_unicode_exactly() {
+        let text = "🧠設計✓".repeat(12_000);
+        let checksum = super::response_checksum(&text);
+        let points = text.chars().collect::<Vec<_>>();
+        let chunk_count = points.chunks(1_000).count() as u32;
+        let mut assembly =
+            super::ResponseAssembly::start(text.len(), chunk_count, checksum.clone())
+                .expect("valid bounded assembly");
+        for (index, chunk) in points.chunks(1_000).enumerate() {
+            assembly
+                .insert(index as u32, chunk.iter().collect())
+                .expect("valid chunk");
+        }
+        assert_eq!(assembly.finish(&checksum).expect("verified response"), text);
+    }
+
+    #[test]
+    fn response_chunks_never_return_partial_or_corrupt_text() {
+        let mut assembly =
+            super::ResponseAssembly::start(6, 2, "deadbeef".to_string()).expect("valid assembly");
+        assembly
+            .insert(0, "hello".to_string())
+            .expect("first chunk");
+        assert!(matches!(
+            assembly.finish("deadbeef"),
+            Err(AgentError::ExtractionFailed(_))
+        ));
     }
 }

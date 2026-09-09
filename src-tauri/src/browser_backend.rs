@@ -2076,6 +2076,9 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
         NavEvent::Ready(agent_id) => Some((agent_id.as_str(), "ready")),
         NavEvent::Error(agent_id) => Some((agent_id.as_str(), "error")),
         NavEvent::Response(agent_id, _, _) => Some((agent_id.as_str(), "response")),
+        NavEvent::ResponseStart { agent_id, .. }
+        | NavEvent::ResponseChunk { agent_id, .. }
+        | NavEvent::ResponseEnd { agent_id, .. } => Some((agent_id.as_str(), "response")),
         NavEvent::Done(agent_id, _) => Some((agent_id.as_str(), "done")),
         NavEvent::SetupResponseObserved(agent_id) => Some((agent_id.as_str(), "setup-response")),
         NavEvent::SendDetected(agent_id, _) => Some((agent_id.as_str(), "sent")),
@@ -2114,7 +2117,12 @@ fn record_signal_metadata(diagnostics: &BrowserDiagnostics, event: &NavEvent) {
         }
         if matches!(
             event,
-            NavEvent::Response(_, _, _) | NavEvent::Done(_, _) | NavEvent::SetupResponseObserved(_)
+            NavEvent::Response(_, _, _)
+                | NavEvent::ResponseStart { .. }
+                | NavEvent::ResponseChunk { .. }
+                | NavEvent::ResponseEnd { .. }
+                | NavEvent::Done(_, _)
+                | NavEvent::SetupResponseObserved(_)
         ) && record.last_send_detected_at.is_none()
         {
             record.response_observed_before_send = true;
@@ -2732,6 +2740,9 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             },
         ),
         NavEvent::Response(agent_id, _, _) => (agent_id, "ready", "Model response detected"),
+        NavEvent::ResponseStart { agent_id, .. }
+        | NavEvent::ResponseChunk { agent_id, .. }
+        | NavEvent::ResponseEnd { agent_id, .. } => (agent_id, "ready", "Model response detected"),
         NavEvent::Done(agent_id, _) => (agent_id, "ready", "Model response completed"),
         NavEvent::ChallengeDetected(_, _)
         | NavEvent::UnshowableUrl(_, _)
@@ -2763,6 +2774,10 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             }
             NavEvent::SetupResponseObserved(_) => EventType::ResponseObserved,
             NavEvent::Response(_, _, _) => EventType::ResponseObserved,
+            NavEvent::ResponseStart { .. } | NavEvent::ResponseChunk { .. } => {
+                EventType::ResponseObserved
+            }
+            NavEvent::ResponseEnd { .. } => EventType::ResponseCompleted,
             NavEvent::Done(_, _) => EventType::ResponseCompleted,
             _ => EventType::Unknown,
         };
@@ -2796,6 +2811,18 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             NavEvent::Response(_, turn, text) => {
                 serde_json::json!({ "turn": turn, "text_length": text.len() })
             }
+            NavEvent::ResponseStart {
+                turn,
+                byte_length,
+                chunk_count,
+                ..
+            } => {
+                serde_json::json!({ "turn": turn, "text_length": byte_length, "chunks": chunk_count })
+            }
+            NavEvent::ResponseChunk { turn, sequence, .. } => {
+                serde_json::json!({ "turn": turn, "chunk": sequence })
+            }
+            NavEvent::ResponseEnd { turn, .. } => serde_json::json!({ "turn": turn }),
             NavEvent::Done(_, turn) => serde_json::json!({ "turn": turn }),
             NavEvent::ManualResponse { turn, .. } => serde_json::json!({ "turn": turn }),
             _ => serde_json::json!({}),
@@ -2831,7 +2858,9 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                     serde_json::json!({}),
                 );
             }
-            NavEvent::SetupResponseObserved(_) | NavEvent::Response(_, _, _) => {
+            NavEvent::SetupResponseObserved(_)
+            | NavEvent::Response(_, _, _)
+            | NavEvent::ResponseStart { .. } => {
                 diagnostics.emit_harness_event(
                     agent_id,
                     EventType::ResponseStarted,
@@ -2853,6 +2882,9 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             NavEvent::Ready(_)
                 | NavEvent::SendDetected(_, _)
                 | NavEvent::Response(_, _, _)
+                | NavEvent::ResponseStart { .. }
+                | NavEvent::ResponseChunk { .. }
+                | NavEvent::ResponseEnd { .. }
                 | NavEvent::Done(_, _)
                 | NavEvent::SetupResponseObserved(_)
         ) {
@@ -2916,7 +2948,17 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 record.active_submit_error = error.clone();
                 record.active_submit_at = Some(timestamp.clone());
             }
-            NavEvent::Response(_, event_turn, _) | NavEvent::Done(_, event_turn) => {
+            NavEvent::Response(_, event_turn, _)
+            | NavEvent::ResponseStart {
+                turn: event_turn, ..
+            }
+            | NavEvent::ResponseChunk {
+                turn: event_turn, ..
+            }
+            | NavEvent::ResponseEnd {
+                turn: event_turn, ..
+            }
+            | NavEvent::Done(_, event_turn) => {
                 record.last_response_at = Some(timestamp.clone());
                 if record.active_expected_agent_id.as_deref() == Some(record.agent_id.as_str())
                     && record.active_turn_number == Some(*event_turn)
@@ -3384,6 +3426,26 @@ pub enum NavEvent {
     Ready(String),
     Error(String),
     Response(String, u32, String),
+    /// Bounded response transport.  Browser URLs never carry a whole model
+    /// answer; receivers accept it only after every numbered chunk verifies.
+    ResponseStart {
+        agent_id: String,
+        turn: u32,
+        byte_length: usize,
+        chunk_count: u32,
+        checksum: String,
+    },
+    ResponseChunk {
+        agent_id: String,
+        turn: u32,
+        sequence: u32,
+        text: String,
+    },
+    ResponseEnd {
+        agent_id: String,
+        turn: u32,
+        checksum: String,
+    },
     Done(String, u32),
     SetupResponseObserved(String),
     SendDetected(String, Option<String>),
@@ -4299,6 +4361,52 @@ fn handle_arena_url(
                     .unwrap_or_default()
                     .into_owned();
                 send_nav_event(&tx, NavEvent::Response(agent_id.to_string(), turn, text));
+            }
+        }
+        ("response-start", [agent_id, turn_str, bytes, chunks, checksum]) => {
+            if let (Ok(turn), Ok(byte_length), Ok(chunk_count)) = (
+                turn_str.parse::<u32>(),
+                bytes.parse::<usize>(),
+                chunks.parse::<u32>(),
+            ) {
+                send_nav_event(
+                    &tx,
+                    NavEvent::ResponseStart {
+                        agent_id: agent_id.to_string(),
+                        turn,
+                        byte_length,
+                        chunk_count,
+                        checksum: checksum.to_string(),
+                    },
+                );
+            }
+        }
+        ("response-chunk", [agent_id, turn_str, sequence, encoded]) => {
+            if let (Ok(turn), Ok(sequence)) = (turn_str.parse::<u32>(), sequence.parse::<u32>()) {
+                let text = urlencoding::decode(encoded)
+                    .unwrap_or_default()
+                    .into_owned();
+                send_nav_event(
+                    &tx,
+                    NavEvent::ResponseChunk {
+                        agent_id: agent_id.to_string(),
+                        turn,
+                        sequence,
+                        text,
+                    },
+                );
+            }
+        }
+        ("response-end", [agent_id, turn_str, checksum]) => {
+            if let Ok(turn) = turn_str.parse::<u32>() {
+                send_nav_event(
+                    &tx,
+                    NavEvent::ResponseEnd {
+                        agent_id: agent_id.to_string(),
+                        turn,
+                        checksum: checksum.to_string(),
+                    },
+                );
             }
         }
         ("done", [agent_id, turn_str]) => {
@@ -7531,8 +7639,14 @@ window.__caAutomationInstalled = true;
         function submitWhenReady() {
             try {
                 if (getAgentId() !== expectedAgentId) { error = 'agent_mismatch'; report(false); return; }
-                var page = safeVisibleText();
-                if (textContainsAny(page, ['cloudflare', 'captcha', 'challenge', 'verify you are human', 'log in', 'sign in'])) {
+                // A connected, visible composer is stronger evidence than a
+                // keyword quoted in a conversation.  Block only when the
+                // shared readiness classifier has already found a real
+                // challenge/login surface rather than duplicating a weak body
+                // text heuristic in the active submit path.
+                var snapshot = collectComposerSnapshot();
+                var pageState = classifyPageState(snapshot);
+                if (pageState === 'possible_challenge_or_security' || pageState === 'possible_login_required') {
                     attempts++;
                     if (attempts < MAX_SUBMIT_ATTEMPTS) { setTimeout(submitWhenReady, 300); return; }
                     error = 'page_health_blocked';
@@ -7578,9 +7692,45 @@ window.__caAutomationInstalled = true;
                     report(false);
                     return;
                 }
+                var valueBeforeClick = inputValue(found.input);
+                var messagesBeforeClick = 0;
+                try { messagesBeforeClick = document.querySelectorAll('[data-message-author-role], [data-message-id], article, [role="article"]').length; } catch (e) {}
+                var reported = false;
+                var clickedAt = Date.now();
+                function hasPhysicalSubmitEvidence() {
+                    var live = currentComposerRoot().input;
+                    // The provider consumed the exact prompt, or a new visible
+                    // conversation region/generation control appeared after the
+                    // click.  A successful click alone is deliberately not an
+                    // acknowledgement.
+                    if (live && valueBeforeClick && inputValue(live).trim() !== valueBeforeClick.trim()) return true;
+                    try {
+                        if (document.querySelector('[aria-label*="Stop" i],[title*="Stop" i],[data-testid*="stop" i],[aria-label*="Cancel" i]')) return true;
+                        return document.querySelectorAll('[data-message-author-role], [data-message-id], article, [role="article"]').length > messagesBeforeClick;
+                    } catch (e) { return false; }
+                }
+                function confirmPhysicalSubmit() {
+                    if (reported) return;
+                    if (hasPhysicalSubmitEvidence()) {
+                        reported = true;
+                        try { observer.disconnect(); } catch (e) {}
+                        report(true);
+                        return;
+                    }
+                    if (Date.now() - clickedAt >= 12000) {
+                        reported = true;
+                        try { observer.disconnect(); } catch (e) {}
+                        error = 'click_without_physical_submit_evidence';
+                        report(false);
+                        return;
+                    }
+                    setTimeout(confirmPhysicalSubmit, 250);
+                }
+                var observer = new MutationObserver(confirmPhysicalSubmit);
+                try { observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true }); } catch (e) {}
                 button.click();
                 method = 'button_click';
-                report(true);
+                confirmPhysicalSubmit();
             } catch (e) {
                 error = 'submit_exception';
                 report(false);
@@ -8039,19 +8189,36 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
     return null;
   }}
 
-  function getLatestResponse() {{
-    for (var i = 0; i < RESP_SELECTORS.length; i++) {{
-      var els = document.querySelectorAll(RESP_SELECTORS[i]);
-      if (els.length > 0) {{
-        var t = (els[els.length - 1].innerText || '').trim();
-        if (t.length > 0) return t;
+  function responseCandidates() {{
+    var result = [];
+    var selectors = RESP_SELECTORS.concat(['[data-message-id]','[data-message-author-role]','article','[role="article"]','[class*="message" i]']);
+    for (var i = 0; i < selectors.length; i++) {{
+      var nodes = [];
+      try {{ nodes = document.querySelectorAll(selectors[i]); }} catch (e) {{}}
+      for (var j = 0; j < nodes.length; j++) {{
+        var node = nodes[j];
+        if (!isVisible(node) || result.indexOf(node) !== -1) continue;
+        var role = (node.getAttribute('data-message-author-role') || node.getAttribute('data-author-role') || '').toLowerCase();
+        var klass = (node.className && String(node.className) || '').toLowerCase();
+        if (role === 'user' || klass.indexOf('user-message') !== -1) continue;
+        result.push(node);
       }}
     }}
-    return '';
+    return result;
+  }}
+  function getLatestResponse(baselineNodes) {{
+    var nodes = responseCandidates();
+    for (var i = nodes.length - 1; i >= 0; i--) {{
+      var node = nodes[i], value = (node.innerText || node.textContent || '').trim();
+      if (!value || value === text || value.indexOf(text.slice(0, Math.min(48, text.length))) === 0) continue;
+      if (!baselineNodes || baselineNodes.indexOf(node) === -1 || value !== (node.__caBaselineText || '')) return {{ node: node, text: value }};
+    }}
+    return {{ node: null, text: '' }};
   }}
 
   // ── Response monitoring ───────────────────────────────────────────────────
-  var _baseline = getLatestResponse();
+  var _baselineNodes = responseCandidates();
+  for (var _bi = 0; _bi < _baselineNodes.length; _bi++) {{ _baselineNodes[_bi].__caBaselineText = (_baselineNodes[_bi].innerText || _baselineNodes[_bi].textContent || '').trim(); }}
   var _gotNew   = false;
   var _last     = '';
   var _stable   = 0;
@@ -8063,10 +8230,11 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
     _checks++;
     if (_checks > 720) return; // ~6 minute hard cap
 
-    var txt = getLatestResponse();
+    var candidate = getLatestResponse(_baselineNodes);
+    var txt = candidate.text;
 
     if (!_gotNew) {{
-      if (txt !== _baseline) {{
+      if (candidate.node) {{
         _gotNew = true;
         _last   = txt;
       }}
@@ -8076,11 +8244,25 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
         if (_stable >= 18) {{ // 18 × 500 ms = 9 s stable → conservative fallback
           _done = true;
           window.__ca_lastResponse = txt;
-          var enc = encodeURIComponent(txt.substring(0, 8000));
-          try {{ window.location.href = 'arena://response/' + AGENT_ID + '/' + TURN + '/' + enc; }} catch (e) {{}}
-          setTimeout(function() {{
-            try {{ window.location.href = 'arena://done/' + AGENT_ID + '/' + TURN; }} catch (e) {{}}
-          }}, 200);
+          // Navigation URLs have a deliberately small bounded payload.  Send
+          // the completed UTF-8 response as numbered chunks; Rust verifies the
+          // complete byte length and checksum before the brain ever sees it.
+          var points = Array.from(txt), chunkSize = 1000, chunks = [];
+          for (var ci = 0; ci < points.length; ci += chunkSize) chunks.push(points.slice(ci, ci + chunkSize).join(''));
+          var bytes = new TextEncoder().encode(txt);
+          var hash = 2166136261;
+          for (var bi = 0; bi < bytes.length; bi++) {{ hash ^= bytes[bi]; hash = Math.imul(hash, 16777619) >>> 0; }}
+          var checksum = hash.toString(16);
+          try {{ window.location.href = 'arena://response-start/' + AGENT_ID + '/' + TURN + '/' + bytes.length + '/' + chunks.length + '/' + checksum; }} catch (e) {{}}
+          (function sendChunk(index) {{
+            if (index >= chunks.length) {{
+              try {{ window.location.href = 'arena://response-end/' + AGENT_ID + '/' + TURN + '/' + checksum; }} catch (e) {{}}
+              setTimeout(function() {{ try {{ window.location.href = 'arena://done/' + AGENT_ID + '/' + TURN; }} catch (e) {{}} }}, 100);
+              return;
+            }}
+            try {{ window.location.href = 'arena://response-chunk/' + AGENT_ID + '/' + TURN + '/' + index + '/' + encodeURIComponent(chunks[index]); }} catch (e) {{}}
+            setTimeout(function() {{ sendChunk(index + 1); }}, 15);
+          }})(0);
           return;
         }}
       }} else {{
