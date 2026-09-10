@@ -20,6 +20,7 @@ mod proxy_manager;
 mod resource_monitor;
 mod response_router;
 mod session_runner;
+mod session_runtime;
 mod session_vault;
 mod settings_store;
 mod signals;

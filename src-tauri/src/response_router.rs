@@ -873,6 +873,9 @@ pub async fn run_agent_loop(
                 let mut orch = state.orchestrator.lock().await;
                 orch.status = crate::orchestrator::OrchestratorStatus::Paused;
             }
+            if let Some(owner) = state.session_runtime.current_owner() {
+                state.session_runtime.mark_paused(&owner);
+            }
             let _ = app.emit(
                 "session-status",
                 serde_json::json!({ "status": "paused", "session_id": config.session_id }),
@@ -885,12 +888,15 @@ pub async fn run_agent_loop(
                 if !state.pause_requested.load(Ordering::SeqCst) {
                     let status = state.orchestrator.lock().await.status.clone();
                     if status == crate::orchestrator::OrchestratorStatus::Running {
+                        if let Some(owner) = state.session_runtime.current_owner() {
+                            state.session_runtime.mark_running(&owner);
+                        }
                         let _ = app.emit("session-status", serde_json::json!({ "status": "running", "session_id": config.session_id }));
                         break;
                     }
                 }
                 // If abort requested, exit loop
-                if !state.session_active.load(Ordering::SeqCst) {
+                if !state.session_runtime.is_active() {
                     return Ok(());
                 }
                 let orch_status = state.orchestrator.lock().await.status.clone();

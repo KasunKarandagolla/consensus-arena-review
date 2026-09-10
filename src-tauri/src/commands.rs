@@ -146,15 +146,6 @@ pub async fn start_session(
         .map_err(|e| settings_command_error("Failed to read custom participants", e))?;
     validate_session_agents(&agent_ids, &leader_agent_id, &custom)?;
 
-    // IMP-3: Concurrency guard — prevent two sessions from running simultaneously.
-    // compare_exchange(false → true): if already true, return error immediately.
-    state
-        .session_active
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .map_err(|_| {
-            "A session is already active. Use Stop to end it before starting a new one.".to_string()
-        })?;
-
     let stype = match session_type.as_str() {
         "architecture" => SessionType::Architecture,
         "mvp" => SessionType::Mvp,
@@ -170,6 +161,14 @@ pub async fn start_session(
         agent_ids: agent_ids.clone(),
         leader_agent_id: leader_agent_id.clone(),
     };
+    // SessionRuntime ownership: acquire STARTING permit before any fallible setup.
+    // The permit's Drop provides owner-checked rollback if we return before handoff.
+    let start_permit = state
+        .session_runtime
+        .try_acquire_start(config.session_id.clone())
+        .map_err(|e| e.to_string())?;
+    let start_owner = start_permit.owner();
+
     let setup_order = config.setup_order();
     let setup_generation = state
         .setup_generation
@@ -261,7 +260,6 @@ pub async fn start_session(
             &setup_order,
             &custom,
         ) {
-            state.session_active.store(false, Ordering::SeqCst);
             {
                 let mut orch = state.orchestrator.lock().await;
                 orch.status = OrchestratorStatus::Ended;
@@ -299,8 +297,8 @@ pub async fn start_session(
     let ab_clone = state.agent_brain.clone();
     let aut_clone = state.ask_user_tx.clone();
     let ab2_clone = state.agent_brain_2.clone();
-    // IMP-3 / IMP-5 / IMP-10: new fields
-    let sa_clone = state.session_active.clone();
+    // SessionRuntime ownership handles concurrency; former session_active/resuming removed
+    let rt_clone = state.session_runtime.clone();
     let mh_clone = state.model_health.clone();
     let bfc_clone = state.brain_fail_count.clone();
     let mem_clone = state.memory_store.clone();
@@ -313,9 +311,9 @@ pub async fn start_session(
     let hk_cancel_clone = state.hackathon_cancel.clone();
     let pause_req_clone = state.pause_requested.clone();
     let checkpoint_clone = state.checkpoint.clone();
-    let resuming_clone = state.resuming.clone();
 
-    tokio::spawn(async move {
+    let owner_for_task = start_owner.clone();
+    let handle = tokio::spawn(async move {
         let state_ref = AppState {
             orchestrator: orch_clone.clone(),
             transcript_store: ts_clone,
@@ -328,7 +326,7 @@ pub async fn start_session(
             agent_brain: ab_clone,
             ask_user_tx: aut_clone,
             agent_brain_2: ab2_clone,
-            session_active: sa_clone.clone(),
+            session_runtime: rt_clone.clone(),
             model_health: mh_clone,
             brain_fail_count: bfc_clone,
             memory_store: mem_clone,
@@ -340,7 +338,6 @@ pub async fn start_session(
             hackathon_cancel: hk_cancel_clone,
             pause_requested: pause_req_clone,
             checkpoint: checkpoint_clone,
-            resuming: resuming_clone,
         };
 
         let mut nav_rx = tokio_rx;
@@ -389,12 +386,20 @@ pub async fn start_session(
                             continue;
                         }
                         Some(NavEvent::SessionAborted) | None => {
-                            let mut orch = orch_clone.lock().await;
-                            orch.status = OrchestratorStatus::Ended;
-                            app_clone
-                                .emit("session-status", json!({ "status": "ended" }))
-                                .ok();
-                            sa_clone.store(false, Ordering::SeqCst);
+                            // Owner-checked terminal cleanup: only the live owner may mutate status/runtime.
+                            let is_owner = state_ref
+                                .session_runtime
+                                .current_owner()
+                                .map(|o| o == owner_for_task)
+                                .unwrap_or(false);
+                            if is_owner {
+                                let mut orch = orch_clone.lock().await;
+                                orch.status = OrchestratorStatus::Ended;
+                                app_clone
+                                    .emit("session-status", json!({ "status": "ended" }))
+                                    .ok();
+                                state_ref.session_runtime.mark_completed(&owner_for_task);
+                            }
                             return;
                         }
                         Some(_) => continue,
@@ -403,15 +408,26 @@ pub async fn start_session(
             }
         }
 
-        // Transition to running
+        // Transition to running (owner-checked: only if still live owner)
         {
-            let mut orch = state_ref.orchestrator.lock().await;
-            orch.status = OrchestratorStatus::Running;
+            let is_owner = state_ref
+                .session_runtime
+                .current_owner()
+                .map(|o| o == owner_for_task)
+                .unwrap_or(false);
+            if is_owner {
+                let mut orch = state_ref.orchestrator.lock().await;
+                orch.status = OrchestratorStatus::Running;
+            }
         }
 
-        // IMP-3: sa_clone stays accessible after state_ref is moved into run_debate.
-        // Debate / autonomous loop phase
-        if let Err(e) = run_debate(config_clone, state_ref, app_clone.clone(), nav_rx).await {
+        // Debate / autonomous loop phase — preserve runtime owner for terminal checks
+        let runtime_for_terminal = state_ref.session_runtime.clone();
+        let orch_for_terminal = orch_clone.clone();
+        let owner_for_terminal = owner_for_task.clone();
+        let debate_result =
+            run_debate(config_clone.clone(), state_ref, app_clone.clone(), nav_rx).await;
+        if let Err(e) = &debate_result {
             app_clone
                 .emit(
                     "boss-message",
@@ -421,25 +437,51 @@ pub async fn start_session(
                     }),
                 )
                 .ok();
-            {
-                let mut orch = orch_clone.lock().await;
+            // Owner-checked: only live owner may set orchestrator to Ended
+            let is_owner = runtime_for_terminal
+                .current_owner()
+                .map(|o| o == owner_for_terminal)
+                .unwrap_or(false);
+            if is_owner {
+                let mut orch = orch_for_terminal.lock().await;
                 orch.status = OrchestratorStatus::Ended;
+                app_clone
+                    .emit("session-status", json!({ "status": "ended" }))
+                    .ok();
             }
-            app_clone
-                .emit("session-status", json!({ "status": "ended" }))
-                .ok();
         }
 
-        // IMP-3: reset flag in ALL remaining exit paths — exit paths 2 and 3.
-        // run_debate either completed successfully (Ok) or errored (Err);
-        // either way the session loop is over. If paused, keep active so resume can continue.
+        // Owner-checked terminal cleanup: only live owner may mark Finished.
+        // If paused, keep runtime active so resume can continue; do not mark completed.
         {
-            let orch = orch_clone.lock().await;
+            let orch = orch_for_terminal.lock().await;
             if orch.status != OrchestratorStatus::Paused {
-                sa_clone.store(false, Ordering::SeqCst);
+                let is_owner = runtime_for_terminal
+                    .current_owner()
+                    .map(|o| o == owner_for_terminal)
+                    .unwrap_or(false);
+                if is_owner {
+                    runtime_for_terminal.mark_completed(&owner_for_terminal);
+                }
             }
         }
     });
+    // Handoff ownership to SessionRuntime with task handle.
+    // This must be owner-checked: if Stop won the race during STARTING, handoff is rejected and task aborted.
+    if let Err(e) = start_permit.commit(handle) {
+        tracing::warn!("[RUNTIME] start handoff rejected: {}", e);
+        // Ensure orchestrator reflects ended if we never reached Running
+        let mut orch = state.orchestrator.lock().await;
+        if orch
+            .current_session
+            .as_ref()
+            .map(|c| c.session_id == config.session_id)
+            .unwrap_or(false)
+        {
+            orch.status = OrchestratorStatus::Ended;
+        }
+        let _ = app.emit("session-status", json!({ "status": "ended" }));
+    }
 
     Ok(())
 }
@@ -466,13 +508,6 @@ pub async fn resume_session(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    if state
-        .resuming
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Err("Resume already in progress".to_string());
-    }
     // Determine target session_id: explicit param wins, else current orchestrator session
     let target_sid = if let Some(s) = session_id {
         let trimmed = s.trim().to_string();
@@ -493,7 +528,6 @@ pub async fn resume_session(
             .unwrap_or_default()
     };
     if target_sid.is_empty() {
-        state.resuming.store(false, Ordering::SeqCst);
         return Err("No session to resume — open a paused session first".to_string());
     }
     let cp_key = crate::checkpoint::SessionCheckpoint::key_for(&target_sid);
@@ -501,95 +535,66 @@ pub async fn resume_session(
         let store = state.settings_store.lock().await;
         store
             .get(&cp_key)
-            .map_err(|e| {
-                state.resuming.store(false, Ordering::SeqCst);
-                e.to_string()
-            })?
+            .map_err(|e| e.to_string())?
             .unwrap_or_default()
     };
     if cp_json.is_empty() {
-        state.resuming.store(false, Ordering::SeqCst);
         return Err("No checkpoint found for this session".to_string());
     }
-    let cp: crate::checkpoint::SessionCheckpoint = serde_json::from_str(&cp_json).map_err(|e| {
-        state.resuming.store(false, Ordering::SeqCst);
-        format!("Checkpoint parse failed: {}", e)
-    })?;
+    let cp: crate::checkpoint::SessionCheckpoint =
+        serde_json::from_str(&cp_json).map_err(|e| format!("Checkpoint parse failed: {}", e))?;
     if let Err(e) = cp.validate() {
-        state.resuming.store(false, Ordering::SeqCst);
         return Err(format!("Checkpoint invalid: {}", e));
     }
     if cp.session_id != target_sid {
-        state.resuming.store(false, Ordering::SeqCst);
         return Err("Checkpoint does not belong to this session".to_string());
     }
     if !cp.paused {
-        state.resuming.store(false, Ordering::SeqCst);
         return Err("Session is not paused".to_string());
     }
-    // In-process case: session_active true means loop is still alive via wait loop
-    let is_in_process = state.session_active.load(Ordering::SeqCst);
+    // In-process case: a live task owns the runtime
+    let is_in_process = state.session_runtime.is_active();
     if is_in_process {
-        // Check that orchestrator still has this session (or will be reconstructed)
-        let orch_sid = {
-            let orch = state.orchestrator.lock().await;
-            orch.current_session
-                .as_ref()
-                .map(|c| c.session_id.clone())
-                .unwrap_or_default()
-        };
-        // If orchestrator sid differs (e.g., user switched), we still allow resume for target_sid if checkpoint matches
-        // but we must ensure we are resuming the correct session — set orchestrator to target
-        if orch_sid != target_sid && !cp.agent_ids.is_empty() {
-            // Reconstruct orchestrator current_session from checkpoint for in-process switch
-            let stype = match cp.session_type.as_str() {
-                "Architecture" => crate::orchestrator::SessionType::Architecture,
-                "Mvp" => crate::orchestrator::SessionType::Mvp,
-                "Api" => crate::orchestrator::SessionType::Api,
-                "Security" => crate::orchestrator::SessionType::Security,
-                _ => crate::orchestrator::SessionType::Custom,
-            };
-            let mut orch = state.orchestrator.lock().await;
-            orch.current_session = Some(crate::orchestrator::SessionConfig {
-                session_id: cp.session_id.clone(),
-                project_brief: cp.project_brief.clone(),
-                session_type: stype.clone(),
-                agent_ids: cp.agent_ids.clone(),
-                leader_agent_id: cp.leader_id.clone(),
-            });
-            orch.status = OrchestratorStatus::Running;
-            // Restore context_manager project_brief
-            let mut ctx = state.context_manager.lock().await;
-            *ctx = crate::context_manager::ContextManager::new(cp.project_brief.clone(), stype);
-            // Restore pending messages if any
-            for msg in &cp.pending_user_messages {
-                ctx.set_pending_user_input_for_session(msg.clone(), cp.session_id.clone());
-            }
-        } else {
+        let live_owner = state
+            .session_runtime
+            .current_owner()
+            .ok_or_else(|| "No live session owner".to_string())?;
+        if live_owner.session_id != target_sid {
+            return Err(format!(
+                "Cannot resume session {} while session {} is still active — stop the current session first",
+                target_sid, live_owner.session_id
+            ));
+        }
+        // Same-session in-process resume: no second task, just wake the paused loop.
+        // Do not reconstruct orchestrator to a different session (owner check already passed).
+        {
             let mut orch = state.orchestrator.lock().await;
             orch.status = OrchestratorStatus::Running;
         }
         state.pause_requested.store(false, Ordering::SeqCst);
-        state.resuming.store(false, Ordering::SeqCst);
+        // If runtime was Paused, transition to Running
+        state.session_runtime.mark_running(&live_owner);
         app.emit(
             "session-status",
             json!({ "status": "running", "session_id": cp.session_id.clone(), "resume_from": format!("{:?}", cp.next_step) }),
         )
-        .map_err(|e| {
-            state.resuming.store(false, Ordering::SeqCst);
-            e.to_string()
-        })?;
+        .map_err(|e| e.to_string())?;
         let _ = app.emit(
             "session-checkpoint",
             json!({ "checkpoint_id": cp.session_id, "phase": "resumed", "next_step": format!("{:?}", cp.next_step) }),
         );
         return Ok(());
     }
-    // Restart case: session_active false (app closed, loop dead) — reconstruct and spawn new orchestration task
+    // Restart case: no live owner — acquire fresh runtime ownership with new generation.
     if cp.agent_ids.is_empty() {
-        state.resuming.store(false, Ordering::SeqCst);
         return Err("Checkpoint missing session config — cannot reconstruct after restart (old checkpoint version)".to_string());
     }
+    // Acquire resume ownership before any fallible window creation.
+    let resume_permit = state
+        .session_runtime
+        .try_acquire_resume(target_sid.clone())
+        .map_err(|e| e.to_string())?;
+    let resume_owner = resume_permit.owner();
     // Reconstruct SessionConfig from checkpoint
     let stype = match cp.session_type.as_str() {
         "Architecture" => crate::orchestrator::SessionType::Architecture,
@@ -620,7 +625,6 @@ pub async fn resume_session(
     // Validate agent_ids still known
     for aid in &config.agent_ids {
         if crate::browser_backend::resolve_participant(aid, &custom).is_none() {
-            state.resuming.store(false, Ordering::SeqCst);
             return Err(format!(
                 "Cannot resume — participant {} no longer configured",
                 aid
@@ -643,7 +647,6 @@ pub async fn resume_session(
             &setup_order,
             &custom,
         ) {
-            state.resuming.store(false, Ordering::SeqCst);
             return Err(format!("Failed to recreate windows for resume: {}", e));
         }
         nav_rx
@@ -662,14 +665,6 @@ pub async fn resume_session(
             ctx.set_pending_user_input_for_session(msg.clone(), cp.session_id.clone());
         }
     }
-    // Mark session_active true so new session cannot be started concurrently
-    state
-        .session_active
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .map_err(|_| {
-            state.resuming.store(false, Ordering::SeqCst);
-            "A session is already active".to_string()
-        })?;
     state.pause_requested.store(false, Ordering::SeqCst);
     // Persist that we are resuming (keep checkpoint for audit, not deleted)
     {
@@ -688,10 +683,7 @@ pub async fn resume_session(
             "resume_from": format!("{:?}", cp.next_step)
         }),
     )
-    .map_err(|e| {
-        state.resuming.store(false, Ordering::SeqCst);
-        e.to_string()
-    })?;
+    .map_err(|e| e.to_string())?;
     let _ = app.emit(
         "session-checkpoint",
         json!({ "checkpoint_id": cp.session_id, "phase": "resumed", "next_step": format!("{:?}", cp.next_step) }),
@@ -710,7 +702,7 @@ pub async fn resume_session(
     let ab_clone = state.agent_brain.clone();
     let aut_clone = state.ask_user_tx.clone();
     let ab2_clone = state.agent_brain_2.clone();
-    let sa_clone = state.session_active.clone();
+    let rt_clone = state.session_runtime.clone();
     let mh_clone = state.model_health.clone();
     let bfc_clone = state.brain_fail_count.clone();
     let mem_clone = state.memory_store.clone();
@@ -722,10 +714,8 @@ pub async fn resume_session(
     let hk_cancel_clone = state.hackathon_cancel.clone();
     let pause_req_clone = state.pause_requested.clone();
     let checkpoint_clone = state.checkpoint.clone();
-    let resuming_clone = state.resuming.clone();
     // Spawn resumed loop — skip setup, go directly to debate loop
-    // For now we reuse run_setup's success path: we already created windows, so directly run_debate
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let state_ref = crate::orchestrator::AppState {
             orchestrator: orch_clone.clone(),
             transcript_store: ts_clone,
@@ -738,7 +728,7 @@ pub async fn resume_session(
             agent_brain: ab_clone,
             ask_user_tx: aut_clone,
             agent_brain_2: ab2_clone,
-            session_active: sa_clone.clone(),
+            session_runtime: rt_clone.clone(),
             model_health: mh_clone,
             brain_fail_count: bfc_clone,
             memory_store: mem_clone,
@@ -750,10 +740,11 @@ pub async fn resume_session(
             hackathon_cancel: hk_cancel_clone,
             pause_requested: pause_req_clone,
             checkpoint: checkpoint_clone,
-            resuming: resuming_clone,
         };
+        let runtime_for_terminal = state_ref.session_runtime.clone();
+        let owner_for_terminal = resume_owner.clone();
+        let orch_for_terminal = orch_clone.clone();
         let mut nav_rx = tokio_rx;
-        // Mark running already done; directly run debate loop
         // Clone brain out of lock before loop (DEF-001)
         let brain = {
             let guard = state_ref.agent_brain.lock().await;
@@ -765,17 +756,21 @@ pub async fn resume_session(
                 "boss-message",
                 serde_json::json!({"text":"Cannot resume — agent brain not configured","message_type":"status"}),
             );
-            let mut orch = orch_clone.lock().await;
-            orch.status = OrchestratorStatus::Paused;
-            let _ = app_clone.emit(
-                "session-status",
-                serde_json::json!({"status":"paused","session_id": config_clone.session_id}),
-            );
-            sa_clone.store(false, Ordering::SeqCst);
+            let is_owner = runtime_for_terminal
+                .current_owner()
+                .map(|o| o == owner_for_terminal)
+                .unwrap_or(false);
+            if is_owner {
+                let mut orch = orch_clone.lock().await;
+                orch.status = OrchestratorStatus::Paused;
+                let _ = app_clone.emit(
+                    "session-status",
+                    serde_json::json!({"status":"paused","session_id": config_clone.session_id}),
+                );
+                runtime_for_terminal.mark_completed(&owner_for_terminal);
+            }
             return;
         }
-        // Run the agent loop from checkpoint next_step — for now we start fresh loop
-        // The loop will handle checkpoint next_step via state.checkpoint check at top (see response_router)
         if let Err(e) = crate::response_router::run_agent_loop(
             &config_clone,
             &brain.unwrap(),
@@ -786,26 +781,42 @@ pub async fn resume_session(
         .await
         {
             let _ = app_clone.emit("boss-message", serde_json::json!({"text": format!("Resumed debate error: {}", e),"message_type":"status"}));
-            let mut orch = orch_clone.lock().await;
-            if orch.status != OrchestratorStatus::Paused {
-                orch.status = OrchestratorStatus::Ended;
-                let _ = app_clone.emit(
-                    "session-status",
-                    serde_json::json!({"status":"ended","session_id": config_clone.session_id}),
-                );
+            let is_owner = runtime_for_terminal
+                .current_owner()
+                .map(|o| o == owner_for_terminal)
+                .unwrap_or(false);
+            if is_owner {
+                let mut orch = orch_clone.lock().await;
+                if orch.status != OrchestratorStatus::Paused {
+                    orch.status = OrchestratorStatus::Ended;
+                    let _ = app_clone.emit(
+                        "session-status",
+                        serde_json::json!({"status":"ended","session_id": config_clone.session_id}),
+                    );
+                }
             }
         }
-        // Clear resuming flag and session_active if not paused
+        // Terminal cleanup: only live owner may mark completed
         {
-            let orch = orch_clone.lock().await;
+            let orch = orch_for_terminal.lock().await;
             if orch.status != OrchestratorStatus::Paused {
-                sa_clone.store(false, Ordering::SeqCst);
+                let is_owner = runtime_for_terminal
+                    .current_owner()
+                    .map(|o| o == owner_for_terminal)
+                    .unwrap_or(false);
+                if is_owner {
+                    runtime_for_terminal.mark_completed(&owner_for_terminal);
+                }
             }
         }
-        // Clear resuming
-        state_ref.resuming.store(false, Ordering::SeqCst);
     });
-    state.resuming.store(false, Ordering::SeqCst);
+    if let Err(e) = resume_permit.commit(handle) {
+        tracing::warn!("[RUNTIME] resume handoff rejected: {}", e);
+        let mut orch = state.orchestrator.lock().await;
+        orch.status = OrchestratorStatus::Ended;
+        let _ = app.emit("session-status", json!({ "status": "ended" }));
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -814,11 +825,7 @@ pub async fn abort_session(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    // IMP-3: Reset session_active so a new session can be started.
-    state.session_active.store(false, Ordering::SeqCst);
-    state.pause_requested.store(false, Ordering::SeqCst);
-    state.resuming.store(false, Ordering::SeqCst);
-    // Hackathon: cancel any active run
+    // Cooperative cancellation flags before runtime stop (no async lock held across await)
     state.hackathon_cancel.store(true, Ordering::SeqCst);
     {
         let run = state.hackathon_run.lock().await;
@@ -837,6 +844,13 @@ pub async fn abort_session(
         let _ = browser.nav_tx.try_send(NavEvent::SessionAborted);
     }
 
+    // SessionRuntime stop: abort owned task, await proof of termination, then Idle.
+    // Do not hold any async lock across this await.
+    let rt = state.session_runtime.clone();
+    rt.stop().await.map_err(|e| e.to_string())?;
+
+    state.pause_requested.store(false, Ordering::SeqCst);
+
     {
         let mut orch = state.orchestrator.lock().await;
         orch.status = OrchestratorStatus::Ended;
@@ -850,7 +864,7 @@ pub async fn abort_session(
 
 #[tauri::command]
 pub async fn user_input(text: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if !state.session_active.load(Ordering::SeqCst) {
+    if !state.session_runtime.is_active() {
         return Err("No active session — start a session before sending context".to_string());
     }
     let session_id_check = {
@@ -1211,7 +1225,7 @@ pub async fn confirm_setup_agent(
     agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if !state.session_active.load(Ordering::SeqCst) {
+    if !state.session_runtime.is_active() {
         return Err("No active setup session".to_string());
     }
     let setup_order = {
@@ -1252,7 +1266,7 @@ pub async fn provide_manual_model_response(
     response: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if !state.session_active.load(Ordering::SeqCst) {
+    if !state.session_runtime.is_active() {
         return Err("No active session".to_string());
     }
     if response.trim().is_empty() {
@@ -1788,7 +1802,7 @@ pub async fn get_diagnostic_snapshot(
         memory_db_exists: app_data_dir.join("memory.db").is_file(),
         transcript_db_exists: app_data_dir.join("transcript.db").is_file(),
         blueprint_db_exists: app_data_dir.join("blueprint.db").is_file(),
-        session_active: state.session_active.load(Ordering::SeqCst),
+        session_active: state.session_runtime.is_active(),
         primary_agent_brain_configured: primary_configured,
         fallback_brain_settings_present: fallback_present,
         secondary_brain_configured: secondary_configured,
@@ -1914,7 +1928,7 @@ async fn build_diagnostic_brief(state: &AppState, app: &AppHandle) -> Result<Str
         std::env::consts::ARCH,
         env!("CARGO_PKG_VERSION"),
         tauri::webview_version().unwrap_or_else(|_| "unavailable".to_string()),
-        state.session_active.load(Ordering::SeqCst),
+        state.session_runtime.is_active(),
         leader_exists,
         nav_exists,
     ));
@@ -2181,7 +2195,7 @@ pub async fn run_single_model_diagnostic(
     app: AppHandle,
 ) -> Result<String, String> {
     require_maintenance_enabled(&state).await?;
-    if state.session_active.load(Ordering::SeqCst) {
+    if state.session_runtime.is_active() {
         return Err(
             "Cannot run single-model diagnostic while a session is active. Stop the session first."
                 .to_string(),
@@ -2434,7 +2448,7 @@ pub async fn delete_session(
     session_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if state.session_active.load(Ordering::SeqCst) {
+    if state.session_runtime.is_active() {
         let orch = state.orchestrator.lock().await;
         if let Some(current) = orch.current_session.as_ref() {
             if current.session_id == session_id {
@@ -2799,7 +2813,7 @@ pub async fn launch_connected_account(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    if state.session_active.load(Ordering::SeqCst) {
+    if state.session_runtime.is_active() {
         return Err(
             "Cannot launch a model window while a session is active. Stop the session first."
                 .to_string(),
@@ -3213,7 +3227,7 @@ pub async fn restore_memory(
     app: AppHandle,
     source_path: String,
 ) -> Result<(), String> {
-    if state.session_active.load(Ordering::SeqCst) {
+    if state.session_runtime.is_active() {
         return Err(
             "Cannot restore memory while a session is active. Stop the session first.".to_string(),
         );

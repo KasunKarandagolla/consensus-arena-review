@@ -3,6 +3,7 @@ use crate::blueprint_store::BlueprintStore;
 use crate::browser_backend::BrowserState;
 use crate::context_manager::ContextManager;
 use crate::memory_store::{MemoryHealth, MemoryStore};
+use crate::session_runtime::SessionRuntime;
 use crate::session_vault::SessionVault;
 use crate::settings_store::SettingsStore;
 use crate::token_budget::TokenBudget;
@@ -154,10 +155,9 @@ pub struct AppState {
     pub ask_user_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     /// D-039: optional secondary (alternative) orchestration brain.
     pub agent_brain_2: Arc<Mutex<Option<AgentBrain>>>,
-    /// IMP-3: concurrency guard — only one session loop may run at a time.
-    /// compare_exchange(false → true) in start_session; store(false) in every
-    /// exit path of the spawned task and in abort_session.
-    pub session_active: Arc<AtomicBool>,
+    /// SessionRuntime is the single concurrency/task ownership authority (reliability).
+    /// Replaces the former `session_active` + `resuming` atomics as independent authorities.
+    pub session_runtime: Arc<SessionRuntime>,
     /// IMP-5: per-agent health map updated on every Route/RouteCompare cycle.
     pub model_health: Arc<Mutex<HashMap<String, ModelHealth>>>,
     /// IMP-10: consecutive decide() failure counter.  Increments when the full
@@ -179,8 +179,6 @@ pub struct AppState {
     pub pause_requested: Arc<AtomicBool>,
     /// Last persisted checkpoint (mirrors settings_store key checkpoint:<session_id>, cached).
     pub checkpoint: Arc<Mutex<Option<crate::checkpoint::SessionCheckpoint>>>,
-    /// Resume idempotency guard — true while a resume is in flight.
-    pub resuming: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -238,7 +236,7 @@ impl AppState {
             agent_brain: Arc::new(Mutex::new(None)),
             ask_user_tx: Arc::new(Mutex::new(None)),
             agent_brain_2: Arc::new(Mutex::new(None)),
-            session_active: Arc::new(AtomicBool::new(false)),
+            session_runtime: Arc::new(SessionRuntime::new()),
             model_health: Arc::new(Mutex::new(HashMap::new())),
             brain_fail_count: Arc::new(AtomicU32::new(0)),
             memory_store: Arc::new(std::sync::Mutex::new(memory_store)),
@@ -250,7 +248,6 @@ impl AppState {
             hackathon_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pause_requested: Arc::new(AtomicBool::new(false)),
             checkpoint: Arc::new(Mutex::new(None)),
-            resuming: Arc::new(AtomicBool::new(false)),
         }
     }
 }
