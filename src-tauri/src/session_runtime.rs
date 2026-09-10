@@ -269,7 +269,7 @@ impl SessionRuntime {
             return false;
         }
         match &inner.phase {
-            RuntimePhase::Running(_) | RuntimePhase::Paused(_) => {
+            RuntimePhase::Running(_) => {
                 inner.phase = RuntimePhase::Finished(owner.clone());
                 // Keep handle for lazy reap; do not clear.
                 true
@@ -589,7 +589,6 @@ impl SessionStartPermit {
             } else {
                 drop(inner);
                 handle.abort();
-                let _ = activate.send(());
                 // Actually still abort, but we already aborted handle
                 Err("Session start cancelled — stop requested before task became live".to_string())
             }
@@ -1387,5 +1386,69 @@ mod tests {
         assert!(rt.try_acquire_start("sess-b".to_string()).is_ok());
         test_hooks::clear_hook();
         rt.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn paused_owner_cannot_be_marked_completed_and_can_resume() {
+        let rt = test_runtime();
+        let permit = rt.try_acquire_start("sess-a".to_string()).unwrap();
+        let owner = permit.owner();
+        let (activate_tx, activate_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle: JoinHandle<()> = tokio::spawn(async move {
+            let _ = activate_rx.await;
+        });
+        permit.commit(handle, activate_tx).unwrap();
+
+        assert!(rt.mark_paused(&owner));
+        assert!(!rt.mark_completed(&owner));
+        assert_eq!(
+            rt.inner.lock().unwrap_or_else(|e| e.into_inner()).phase,
+            RuntimePhase::Paused(owner.clone())
+        );
+        assert_eq!(rt.resume_paused_session("sess-a").unwrap(), owner);
+
+        rt.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_handoff_never_enters_gated_task_body() {
+        let rt = test_runtime();
+        let permit = rt.try_acquire_start("sess-a".to_string()).unwrap();
+        let owner = permit.owner();
+        let observed = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+        test_hooks::set_hook(observed.clone(), proceed.clone());
+
+        let rt_for_stop = Arc::clone(&rt);
+        let owner_for_stop = owner.clone();
+        let stop_handle = tokio::spawn(async move {
+            let guard = rt_for_stop
+                .stop_owner(&owner_for_stop)
+                .await
+                .unwrap()
+                .unwrap();
+            guard.finish();
+        });
+        observed.notified().await;
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_for_task = Arc::clone(&entered);
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (activate_tx, activate_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle: JoinHandle<()> = tokio::spawn(async move {
+            if activate_rx.await.is_err() {
+                let _ = closed_tx.send(());
+                return;
+            }
+            entered_for_task.store(true, Ordering::SeqCst);
+        });
+
+        assert!(permit.commit(handle, activate_tx).is_err());
+        closed_rx.await.unwrap();
+        assert!(!entered.load(Ordering::SeqCst));
+
+        proceed.notify_one();
+        stop_handle.await.unwrap();
+        test_hooks::clear_hook();
     }
 }

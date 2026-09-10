@@ -801,9 +801,6 @@ pub async fn resume_session(
     });
     if let Err(e) = resume_permit.commit(handle, activate_tx) {
         tracing::warn!("[RUNTIME] resume handoff rejected: {}", e);
-        let mut orch = state.orchestrator.lock().await;
-        orch.status = OrchestratorStatus::Ended;
-        let _ = app.emit("session-status", json!({ "status": "ended" }));
         return Err(e);
     }
     Ok(())
@@ -816,12 +813,17 @@ pub async fn abort_session(
 ) -> Result<(), String> {
     // Capture current exact owner before mutating shared state
     let Some(expected) = state.session_runtime.current_owner() else {
-        // No live session — controlled Ok without writing shared session state for unknown owner
-        // Still best-effort try to wake any lingering browser wait
-        let browser = state.browser_state.lock().await;
-        let _ = browser.nav_tx.try_send(NavEvent::SessionAborted);
         return Ok(());
     };
+
+    // SessionRuntime stop_owner: abort owned task, await proof, keep Stopping until final cleanup
+    let rt = state.session_runtime.clone();
+    let stop_guard_opt = rt.stop_owner(&expected).await.map_err(|e| e.to_string())?;
+    let Some(stop_guard) = stop_guard_opt else {
+        // Stale owner already gone
+        return Ok(());
+    };
+    // Exact owned task now dead; runtime still Stopping(expected) — admission still reserved
 
     // Cooperative cancellation flags for that owner/current run (no async lock held across stop await for these atomics)
     state.hackathon_cancel.store(true, Ordering::SeqCst);
@@ -836,20 +838,6 @@ pub async fn abort_session(
         let mut ask = state.ask_user_tx.lock().await;
         *ask = None;
     }
-
-    {
-        let browser = state.browser_state.lock().await;
-        let _ = browser.nav_tx.try_send(NavEvent::SessionAborted);
-    }
-
-    // SessionRuntime stop_owner: abort owned task, await proof, keep Stopping until final cleanup
-    let rt = state.session_runtime.clone();
-    let stop_guard_opt = rt.stop_owner(&expected).await.map_err(|e| e.to_string())?;
-    let Some(stop_guard) = stop_guard_opt else {
-        // Stale owner already gone
-        return Ok(());
-    };
-    // Exact owned task now dead; runtime still Stopping(expected) — admission still reserved
 
     // Perform final cleanup ONLY for expected owner while admission still reserved
     state.pause_requested.store(false, Ordering::SeqCst);
