@@ -6,8 +6,8 @@ use tokio::sync::Notify;
 pub const MAX_RESIDENT_OPERATIONS: usize = 2;
 pub const MAX_OPERATION_CRITICAL_EVENTS: usize = 2_100;
 pub const MAX_OPERATION_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
-pub const CRITICAL_INGRESS_CAPACITY: usize =
-    MAX_RESIDENT_OPERATIONS * MAX_OPERATION_CRITICAL_EVENTS;
+pub const MAX_CRITICAL_EVENT_BYTES: usize = 64 * 1024;
+pub const CRITICAL_INGRESS_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CriticalTransportError {
@@ -196,6 +196,22 @@ impl<T> CriticalEventHub<T> {
             }
         }
     }
+
+    /// Exact retirement: remove the mailbox for `operation_id` if present,
+    /// wake any waiting `recv`, and free the resident slot. Stale or
+    /// already-retired IDs are ignored and never affect another operation.
+    pub fn retire_exact(&self, operation_id: &OperationId) {
+        let notify_opt = {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            inner
+                .operations
+                .remove(operation_id)
+                .map(|state| state.notify)
+        };
+        if let Some(notify) = notify_opt {
+            notify.notify_one();
+        }
+    }
 }
 
 impl<T> Default for CriticalEventHub<T> {
@@ -237,6 +253,12 @@ impl<T> OperationInbox<T> {
     pub fn close(self) {
         self.hub.close_exact(&self.operation_id);
         self.hub.remove_if_closed_and_empty(&self.operation_id);
+    }
+}
+
+impl<T> Drop for OperationInbox<T> {
+    fn drop(&mut self) {
+        self.hub.retire_exact(&self.operation_id);
     }
 }
 
@@ -412,5 +434,143 @@ mod tests {
             res,
             Err(CriticalTransportError::IngressUnavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn ct_retire_sequential_reuse_beyond_limit() {
+        // FIX A: sequential normal use with retire must not leak resident slots.
+        // With MAX_RESIDENT_OPERATIONS=2, 12 sequential operations must all succeed.
+        let hub: CriticalEventHub<String> = CriticalEventHub::new();
+        for i in 0..12u32 {
+            let op = crate::pipeline_ids::OperationId::new();
+            let mut inbox = hub.register(op.clone(), i as u64, true).unwrap();
+            hub.dispatch(op.clone(), format!("msg-{i}"), 5);
+            let v = inbox.recv().await.unwrap();
+            assert_eq!(v, format!("msg-{i}"));
+            // Normal finish retires exact mailbox (simulating BrowserState::finish_active_operation)
+            hub.retire_exact(&op);
+            // Drop also retires (idempotent) — explicitly drop to exercise Drop
+            drop(inbox);
+            // Verify slot freed: we can register next immediately without hitting limit
+        }
+        // Final check: after 12 retires, we can still register 2 concurrent
+        let op_a = crate::pipeline_ids::OperationId::new();
+        let op_b = crate::pipeline_ids::OperationId::new();
+        let _a = hub.register(op_a, 100, true).unwrap();
+        let _b = hub.register(op_b, 100, true).unwrap();
+        let op_c = crate::pipeline_ids::OperationId::new();
+        assert!(
+            hub.register(op_c, 100, true).is_err(),
+            "third concurrent should still be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn ct_hundred_sequential_operations() {
+        let hub: CriticalEventHub<String> = CriticalEventHub::new();
+        for i in 0..100u32 {
+            let op = crate::pipeline_ids::OperationId::new();
+            let mut inbox = hub.register(op.clone(), i as u64, true).unwrap();
+            hub.dispatch(op.clone(), format!("seq-{i}"), 6);
+            let v = tokio::time::timeout(std::time::Duration::from_millis(100), inbox.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(v, format!("seq-{i}"));
+            hub.retire_exact(&op);
+            drop(inbox);
+        }
+    }
+
+    #[tokio::test]
+    async fn ct_inbox_drop_without_explicit_close_frees_slot() {
+        let hub: CriticalEventHub<String> = CriticalEventHub::new();
+        let op1 = crate::pipeline_ids::OperationId::new();
+        let op2 = crate::pipeline_ids::OperationId::new();
+        let op3 = crate::pipeline_ids::OperationId::new();
+        let inbox1 = hub.register(op1.clone(), 0, true).unwrap();
+        let _inbox2 = hub.register(op2.clone(), 0, true).unwrap();
+        // inbox1 dropped without explicit retire/close — Drop must retire
+        drop(inbox1);
+        // Give Drop a moment (sync retire, no await needed)
+        tokio::task::yield_now().await;
+        let res = hub.register(op3.clone(), 0, true);
+        assert!(res.is_ok(), "slot should be freed by Drop");
+        // cleanup
+        hub.retire_exact(&op2);
+        hub.retire_exact(&op3);
+    }
+
+    #[tokio::test]
+    async fn ct_reset_while_recv_waits_wakes_with_closed() {
+        let hub: CriticalEventHub<String> = CriticalEventHub::new();
+        let op = crate::pipeline_ids::OperationId::new();
+        let mut inbox = hub.register(op.clone(), 0, true).unwrap();
+        let mut recv_handle = tokio::spawn(async move { inbox.recv().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Simulate reset_for_session: retire exact wakes waiter
+        hub.retire_exact(&op);
+        let res = tokio::time::timeout(std::time::Duration::from_millis(500), recv_handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(res.unwrap_err(), CriticalTransportError::Closed);
+    }
+
+    #[tokio::test]
+    async fn ct_late_event_after_retirement_ignored() {
+        let hub: CriticalEventHub<String> = CriticalEventHub::new();
+        let op = crate::pipeline_ids::OperationId::new();
+        let mut inbox = hub.register(op.clone(), 0, true).unwrap();
+        hub.dispatch(op.clone(), "first".to_string(), 5);
+        assert_eq!(inbox.recv().await.unwrap(), "first");
+        hub.retire_exact(&op);
+        // Late dispatch for retired id must be ignored, not panic, and not affect new op
+        hub.dispatch(op.clone(), "late".to_string(), 4);
+        // New operation with same ID after retirement should be registerable (IDs are UUIDs, but we test same ID reuse is allowed after retire)
+        let mut inbox2 = hub.register(op.clone(), 1, true).unwrap();
+        hub.dispatch(op.clone(), "new".to_string(), 3);
+        assert_eq!(inbox2.recv().await.unwrap(), "new");
+        hub.retire_exact(&op);
+    }
+
+    #[tokio::test]
+    async fn ct_stale_id_cannot_retire_other() {
+        let hub: CriticalEventHub<String> = CriticalEventHub::new();
+        let op1 = crate::pipeline_ids::OperationId::new();
+        let op2 = crate::pipeline_ids::OperationId::new();
+        let mut inbox1 = hub.register(op1.clone(), 0, true).unwrap();
+        let mut inbox2 = hub.register(op2.clone(), 0, true).unwrap();
+        // Retire stale op1 should not affect op2
+        let stale = crate::pipeline_ids::OperationId::new();
+        hub.retire_exact(&stale);
+        // op2 should still be alive
+        hub.dispatch(op2.clone(), "alive".to_string(), 5);
+        assert_eq!(inbox2.recv().await.unwrap(), "alive");
+        // Retire op1, op2 still alive
+        hub.retire_exact(&op1);
+        hub.dispatch(op2.clone(), "still".to_string(), 5);
+        assert_eq!(inbox2.recv().await.unwrap(), "still");
+        // op1's inbox should now get Closed on next recv
+        let res = inbox1.recv().await;
+        assert_eq!(res.unwrap_err(), CriticalTransportError::Closed);
+        hub.retire_exact(&op2);
+    }
+
+    #[test]
+    fn ct_capacity_finite_bound() {
+        assert_eq!(CRITICAL_INGRESS_CAPACITY, 256);
+        assert_eq!(MAX_CRITICAL_EVENT_BYTES, 64 * 1024);
+        // Formal worst-case ingress payload bound:
+        // queue (256 slots) * 64 KiB per event = 16 MiB
+        // hub per-operation payload (2 MiB * 2 ops) = 4 MiB
+        // total bounded < 20 MiB + overhead, well within 2 GB target
+        let worst_queue = CRITICAL_INGRESS_CAPACITY * MAX_CRITICAL_EVENT_BYTES;
+        let worst_hub = MAX_RESIDENT_OPERATIONS * MAX_OPERATION_PAYLOAD_BYTES;
+        let total = worst_queue + worst_hub;
+        assert_eq!(worst_queue, 16 * 1024 * 1024);
+        assert_eq!(worst_hub, 4 * 1024 * 1024);
+        assert_eq!(total, 20 * 1024 * 1024);
+        assert!(total < 2 * 1024 * 1024 * 1024);
     }
 }

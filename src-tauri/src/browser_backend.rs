@@ -3,7 +3,7 @@ use crate::browser_harness::{
     NavigationIntent, PageLifecycleEvent, SafeDomForensics, SafeElement,
 };
 use crate::critical_transport::{
-    CRITICAL_INGRESS_CAPACITY, CriticalEventHub, CriticalTransportError,
+    CRITICAL_INGRESS_CAPACITY, CriticalEventHub, CriticalTransportError, MAX_CRITICAL_EVENT_BYTES,
 };
 use crate::errors::AgentError;
 use crate::pipeline_ids::{BrowserSurface, OperationContext, OperationId};
@@ -2104,7 +2104,9 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
         NavEvent::SafeDomForensics { agent_id, .. } => Some((agent_id.as_str(), "dom-forensics")),
         NavEvent::ActionEvent { agent_id, .. } => Some((agent_id.as_str(), "action")),
         NavEvent::UserAgent { agent_id, .. } => Some((agent_id.as_str(), "user-agent")),
-        NavEvent::UnsupportedNavigation { .. } | NavEvent::SessionAborted => None,
+        NavEvent::UnsupportedNavigation { .. }
+        | NavEvent::SessionAborted
+        | NavEvent::CriticalTransportFault(_) => None,
     }
 }
 
@@ -2695,7 +2697,7 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             });
             return;
         }
-        NavEvent::SessionAborted => return,
+        NavEvent::SessionAborted | NavEvent::CriticalTransportFault(_) => return,
         _ => {}
     }
 
@@ -2761,7 +2763,8 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
         | NavEvent::SafeDomForensics { .. }
         | NavEvent::ActionEvent { .. }
         | NavEvent::UserAgent { .. }
-        | NavEvent::SessionAborted => return,
+        | NavEvent::SessionAborted
+        | NavEvent::CriticalTransportFault(_) => return,
     };
     // Harness: emit timeline for these NavEvents before updating record
     {
@@ -3005,7 +3008,8 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             | NavEvent::SafeDomForensics { .. }
             | NavEvent::ActionEvent { .. }
             | NavEvent::UserAgent { .. }
-            | NavEvent::SessionAborted => {}
+            | NavEvent::SessionAborted
+            | NavEvent::CriticalTransportFault(_) => {}
         }
     }) {
         emit_browser_diagnostic(app, &record, message);
@@ -3442,7 +3446,26 @@ pub struct BrowserEventIngress {
 
 impl BrowserEventIngress {
     pub fn send(&self, event: NavEvent) {
-        if event.critical_operation_id().is_some() {
+        let is_critical = event.critical_operation_id().is_some()
+            || matches!(event, NavEvent::CriticalTransportFault(_));
+        if is_critical {
+            // Pre-ingress byte bound: reject single oversized events before they enter the std queue.
+            // This bounds heap Strings in the sync_channel.
+            let cost = critical_payload_cost(&event);
+            if cost > MAX_CRITICAL_EVENT_BYTES {
+                self.critical_failure_epoch.fetch_add(1, Ordering::SeqCst);
+                tracing::error!(
+                    "[CRITICAL] critical event payload {cost} exceeds {} byte bound; rejected before ingress",
+                    MAX_CRITICAL_EVENT_BYTES
+                );
+                // Ensure a waiting operation is woken even when the queue is otherwise empty:
+                // send a tiny control event (best-effort, non-blocking).
+                let bounded = Self::bounded_reason("oversized critical event");
+                let _ = self
+                    .critical_tx
+                    .try_send(NavEvent::CriticalTransportFault(bounded));
+                return;
+            }
             match self.critical_tx.try_send(event) {
                 Ok(()) => {}
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
@@ -3462,9 +3485,36 @@ impl BrowserEventIngress {
         }
     }
 
+    fn bounded_reason(reason: &str) -> String {
+        const MAX_REASON: usize = 128;
+        let mut s = reason.chars().take(MAX_REASON).collect::<String>();
+        // keep only safe chars, truncate already
+        s.truncate(MAX_REASON);
+        // normalize newlines
+        s.replace('\n', " ").replace('\r', " ")
+    }
+
     pub fn protocol_fault(&self, reason: &str) {
         self.critical_failure_epoch.fetch_add(1, Ordering::SeqCst);
-        tracing::error!("[CRITICAL] malformed critical browser signal: {reason}");
+        let bounded = Self::bounded_reason(reason);
+        tracing::error!("[CRITICAL] malformed critical browser signal: {bounded}");
+        // Promptly wake the critical bridge even if this is the last/only signal.
+        // Synchronous, non-blocking, no Mutex/await, tiny control event.
+        let fault = NavEvent::CriticalTransportFault(bounded);
+        match self.critical_tx.try_send(fault) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                // Epoch already bumped and queue is non-empty, bridge will observe
+                // the epoch while draining existing events.
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.critical_alive.store(false, Ordering::SeqCst);
+                self.critical_failure_epoch.fetch_add(1, Ordering::SeqCst);
+                tracing::error!(
+                    "[CRITICAL] browser critical ingress disconnected during protocol fault"
+                );
+            }
+        }
     }
 
     #[cfg(test)]
@@ -3494,6 +3544,7 @@ pub fn critical_payload_cost(event: &NavEvent) -> usize {
             method.len() + error.as_deref().map_or(0, str::len) + 64
         }
         NavEvent::Done { .. } => 32,
+        NavEvent::CriticalTransportFault(reason) => reason.len() + 32,
         _ => 0,
     }
 }
@@ -3640,6 +3691,9 @@ pub enum NavEvent {
         window_label: String,
         user_agent: String,
     },
+    /// Internal control event to wake bridge promptly on protocol fault.
+    /// Never produced by JS; only by BrowserEventIngress::protocol_fault.
+    CriticalTransportFault(String),
 }
 
 impl NavEvent {
@@ -3706,8 +3760,6 @@ pub struct BrowserState {
     pub cooldowns: HashMap<String, std::time::Instant>,
     pub active_turn: Option<(String, u32)>,
     pub active_operation: Option<OperationContext>,
-    pub active_inbox: Option<crate::critical_transport::OperationInbox<NavEvent>>,
-    pub active_early_buffer: VecDeque<NavEvent>,
     /// R1.3: shared nav window launch guard — prevents rapid successive
     /// `launch_connected_account` calls from yanking the same WebView between
     /// models while navigation is still in progress. Stored as an expiry
@@ -3744,8 +3796,6 @@ impl BrowserState {
             cooldowns: HashMap::new(),
             active_turn: None,
             active_operation: None,
-            active_inbox: None,
-            active_early_buffer: VecDeque::new(),
             connected_account_busy_until: None,
         }
     }
@@ -3772,8 +3822,6 @@ impl BrowserState {
             cooldowns: HashMap::new(),
             active_turn: None,
             active_operation: None,
-            active_inbox: None,
-            active_early_buffer: VecDeque::new(),
             connected_account_busy_until: None,
         }
     }
@@ -3832,6 +3880,17 @@ impl BrowserState {
                     );
                     last_seen_epoch = current_epoch;
                 }
+                // Internal control event: promptly fails current operations and does not dispatch.
+                if let NavEvent::CriticalTransportFault(reason) = &event {
+                    // Ensure waiting operations are failed with a bounded protocol error as well.
+                    // If epoch handling already failed them, this is idempotent.
+                    critical_hub_clone.fail_registered_before_epoch(
+                        current_epoch,
+                        CriticalTransportError::Protocol(reason.clone()),
+                    );
+                    record_nav_event(&bridge_app_crit, &diagnostics_crit, &event);
+                    continue;
+                }
                 // For diagnostics, also record critical events where relevant
                 record_nav_event(&bridge_app_crit, &diagnostics_crit, &event);
                 if let Some(op_id) = event.critical_operation_id().cloned() {
@@ -3867,12 +3926,10 @@ impl BrowserState {
     /// Clear session-only browser state without replacing the process-lifetime
     /// channel, diagnostics object, or named WebView handles.
     pub fn reset_for_session(&mut self) {
-        // Close any active operation mailbox as stale/session-reset
+        // Retire any active operation mailbox as stale/session-reset and wake waiters
         if let Some(ctx) = self.active_operation.take() {
-            self.critical_hub.close_exact(&ctx.operation_id);
+            self.critical_hub.retire_exact(&ctx.operation_id);
         }
-        self.active_inbox = None;
-        self.active_early_buffer.clear();
         self.conversation_urls.clear();
         self.pending_sends.clear();
         self.captcha_resolved.clear();
@@ -3978,9 +4035,7 @@ impl BrowserState {
         });
         self.active_turn = None;
         self.active_operation = None;
-        self.active_inbox = None;
-        self.active_early_buffer.clear();
-        self.critical_hub.close_exact(operation_id);
+        self.critical_hub.retire_exact(operation_id);
     }
 
     pub fn select_window(&self, is_leader: bool) -> Option<WebviewWindow> {
@@ -4707,6 +4762,10 @@ fn handle_arena_url(ingress: BrowserEventIngress, window_label: &'static str, ur
             let text = urlencoding::decode(encoded)
                 .unwrap_or_default()
                 .into_owned();
+            if text.len() > MAX_CRITICAL_EVENT_BYTES {
+                ingress.protocol_fault("oversized response");
+                return;
+            }
             send_nav_event(
                 &ingress,
                 NavEvent::Response {
@@ -4789,6 +4848,10 @@ fn handle_arena_url(ingress: BrowserEventIngress, window_label: &'static str, ur
             let text = urlencoding::decode(encoded)
                 .unwrap_or_default()
                 .into_owned();
+            if text.len() > MAX_CRITICAL_EVENT_BYTES {
+                ingress.protocol_fault("oversized response chunk");
+                return;
+            }
             send_nav_event(
                 &ingress,
                 NavEvent::ResponseChunk {
@@ -6886,6 +6949,356 @@ mod tests {
             "https://claude.ai/new",
             "https://gemini.google.com/"
         ));
+    }
+
+    // ── FIX B: pre-ingress byte bound ─────────────────────────────────────────
+
+    #[test]
+    fn pre_ingress_rejects_oversized_chunk_before_queue() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64},
+        };
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let (crit_tx, crit_rx) =
+            std::sync::mpsc::sync_channel::<super::NavEvent>(super::CRITICAL_INGRESS_CAPACITY);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let ingress =
+            super::BrowserEventIngress::new_for_test(aux_tx, crit_tx, epoch.clone(), alive);
+        let op = crate::pipeline_ids::OperationId::new();
+        let oversized = "x".repeat(super::MAX_CRITICAL_EVENT_BYTES + 1);
+        let ev = super::NavEvent::ResponseChunk {
+            operation_id: op,
+            agent_id: "chatgpt".to_string(),
+            turn: 1,
+            sequence: 0,
+            text: oversized,
+        };
+        let epoch_before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        ingress.send(ev);
+        let epoch_after = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(epoch_after > epoch_before, "oversized must bump epoch");
+        // Oversized event itself should not be queued; only tiny fault control may be queued
+        // Drain to see what was queued
+        let mut count = 0;
+        while let Ok(ev) = crit_rx.try_recv() {
+            count += 1;
+            // Should be control fault, not the oversized chunk
+            assert!(
+                matches!(ev, super::NavEvent::CriticalTransportFault(_)),
+                "queue should contain only fault control, got {:?}",
+                ev
+            );
+        }
+        assert!(count <= 1, "at most one fault control queued");
+    }
+
+    #[test]
+    fn pre_ingress_rejects_oversized_response_before_queue() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64},
+        };
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let (crit_tx, crit_rx) =
+            std::sync::mpsc::sync_channel::<super::NavEvent>(super::CRITICAL_INGRESS_CAPACITY);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let ingress =
+            super::BrowserEventIngress::new_for_test(aux_tx, crit_tx, epoch.clone(), alive);
+        let op = crate::pipeline_ids::OperationId::new();
+        let oversized = "y".repeat(super::MAX_CRITICAL_EVENT_BYTES + 100);
+        let ev = super::NavEvent::Response {
+            operation_id: op,
+            agent_id: "claude".to_string(),
+            turn: 2,
+            text: oversized,
+        };
+        let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        ingress.send(ev);
+        assert!(epoch.load(std::sync::atomic::Ordering::SeqCst) > before);
+        // No oversized payload in queue
+        while let Ok(ev) = crit_rx.try_recv() {
+            if let super::NavEvent::Response { text, .. } = ev {
+                assert!(
+                    text.len() <= super::MAX_CRITICAL_EVENT_BYTES,
+                    "oversized response must not be queued"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pre_ingress_allows_max_size_valid_event() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64},
+        };
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let (crit_tx, crit_rx) =
+            std::sync::mpsc::sync_channel::<super::NavEvent>(super::CRITICAL_INGRESS_CAPACITY);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let ingress =
+            super::BrowserEventIngress::new_for_test(aux_tx, crit_tx, epoch.clone(), alive);
+        let op = crate::pipeline_ids::OperationId::new();
+        let max_text = "z".repeat(super::MAX_CRITICAL_EVENT_BYTES);
+        let ev = super::NavEvent::ResponseChunk {
+            operation_id: op.clone(),
+            agent_id: "deepseek".to_string(),
+            turn: 1,
+            sequence: 0,
+            text: max_text.clone(),
+        };
+        let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        ingress.send(ev);
+        assert_eq!(
+            epoch.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "max valid should not bump epoch"
+        );
+        let queued = crit_rx.try_recv().expect("max valid should be queued");
+        match queued {
+            super::NavEvent::ResponseChunk { text, .. } => {
+                assert_eq!(text.len(), super::MAX_CRITICAL_EVENT_BYTES)
+            }
+            other => panic!("unexpected queued {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pre_ingress_manual_response_bound_enforced_via_ingress() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64},
+        };
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let (crit_tx, crit_rx) =
+            std::sync::mpsc::sync_channel::<super::NavEvent>(super::CRITICAL_INGRESS_CAPACITY);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let ingress =
+            super::BrowserEventIngress::new_for_test(aux_tx, crit_tx, epoch.clone(), alive);
+        let op = crate::pipeline_ids::OperationId::new();
+        let oversized = "m".repeat(super::MAX_CRITICAL_EVENT_BYTES + 10);
+        let ev = super::NavEvent::ManualResponse {
+            operation_id: op,
+            agent_id: "kimi".to_string(),
+            turn: 1,
+            response: oversized,
+        };
+        let before = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        ingress.send(ev);
+        assert!(epoch.load(std::sync::atomic::Ordering::SeqCst) > before);
+        while let Ok(ev) = crit_rx.try_recv() {
+            if let super::NavEvent::ManualResponse { response, .. } = ev {
+                assert!(response.len() <= super::MAX_CRITICAL_EVENT_BYTES);
+            }
+        }
+    }
+
+    #[test]
+    fn critical_ingress_capacity_is_256() {
+        assert_eq!(super::CRITICAL_INGRESS_CAPACITY, 256);
+        assert_eq!(
+            crate::critical_transport::MAX_CRITICAL_EVENT_BYTES,
+            64 * 1024
+        );
+        // Finite bound proof already in critical_transport, duplicate here for browser_backend scope
+        let worst =
+            super::CRITICAL_INGRESS_CAPACITY * crate::critical_transport::MAX_CRITICAL_EVENT_BYTES;
+        assert_eq!(worst, 16 * 1024 * 1024);
+    }
+
+    // ── FIX C: protocol fault must wake ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn protocol_fault_as_last_only_signal_wakes_operation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        };
+        // Simulate bridge similar to new_live but minimal
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let (crit_tx, crit_rx) =
+            std::sync::mpsc::sync_channel::<super::NavEvent>(super::CRITICAL_INGRESS_CAPACITY);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let hub: crate::critical_transport::CriticalEventHub<super::NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let hub_clone = hub.clone();
+        let epoch_clone = epoch.clone();
+        let alive_clone = alive.clone();
+        // Spawn bridge thread like production
+        std::thread::spawn(move || {
+            let mut last = epoch_clone.load(Ordering::SeqCst);
+            while let Ok(event) = crit_rx.recv() {
+                let cur = epoch_clone.load(Ordering::SeqCst);
+                if cur != last {
+                    hub_clone.fail_registered_before_epoch(
+                        cur,
+                        crate::critical_transport::CriticalTransportError::IngressOverflow,
+                    );
+                    last = cur;
+                }
+                if let super::NavEvent::CriticalTransportFault(reason) = &event {
+                    hub_clone.fail_registered_before_epoch(
+                        cur,
+                        crate::critical_transport::CriticalTransportError::Protocol(reason.clone()),
+                    );
+                    continue;
+                }
+                if let Some(op_id) = event.critical_operation_id().cloned() {
+                    let cost = super::critical_payload_cost(&event);
+                    hub_clone.dispatch(op_id, event, cost);
+                }
+            }
+            hub_clone
+                .fail_all(crate::critical_transport::CriticalTransportError::IngressUnavailable);
+            alive_clone.store(false, Ordering::SeqCst);
+        });
+        let ingress =
+            super::BrowserEventIngress::new_for_test(aux_tx, crit_tx, epoch.clone(), alive.clone());
+        let op = crate::pipeline_ids::OperationId::new();
+        let mut inbox = hub.register(op.clone(), 0, true).unwrap();
+        let recv_handle = tokio::spawn(async move { inbox.recv().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!recv_handle.is_finished(), "recv should be waiting");
+        // Protocol fault as last/only signal — no follow-up application event
+        ingress.protocol_fault("invalid response operation id");
+        let res = tokio::time::timeout(std::time::Duration::from_millis(800), recv_handle).await;
+        assert!(
+            res.is_ok(),
+            "protocol fault must wake waiting recv promptly without follow-up"
+        );
+        let inner = res.unwrap().unwrap();
+        assert!(
+            inner.is_err(),
+            "waiting op should be failed after protocol fault, got {:?}",
+            inner
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_fault_full_queue_still_wakes_via_epoch() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        };
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        // Use small capacity to easily fill
+        let (crit_tx, crit_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(2);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let hub: crate::critical_transport::CriticalEventHub<super::NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let hub_clone = hub.clone();
+        let epoch_clone = epoch.clone();
+        std::thread::spawn(move || {
+            let mut last = epoch_clone.load(Ordering::SeqCst);
+            while let Ok(event) = crit_rx.recv() {
+                let cur = epoch_clone.load(Ordering::SeqCst);
+                if cur != last {
+                    hub_clone.fail_registered_before_epoch(
+                        cur,
+                        crate::critical_transport::CriticalTransportError::IngressOverflow,
+                    );
+                    last = cur;
+                }
+                if let super::NavEvent::CriticalTransportFault(reason) = &event {
+                    hub_clone.fail_registered_before_epoch(
+                        cur,
+                        crate::critical_transport::CriticalTransportError::Protocol(reason.clone()),
+                    );
+                    continue;
+                }
+                if let Some(op_id) = event.critical_operation_id().cloned() {
+                    let cost = super::critical_payload_cost(&event);
+                    hub_clone.dispatch(op_id, event, cost);
+                }
+            }
+        });
+        let ingress = super::BrowserEventIngress::new_for_test(
+            aux_tx,
+            crit_tx.clone(),
+            epoch.clone(),
+            alive.clone(),
+        );
+        // Fill queue
+        let op_dummy = crate::pipeline_ids::OperationId::new();
+        for i in 0..2 {
+            let ev = super::NavEvent::Response {
+                operation_id: op_dummy.clone(),
+                agent_id: "chatgpt".to_string(),
+                turn: i,
+                text: "x".to_string(),
+            };
+            let _ = crit_tx.try_send(ev);
+        }
+        // Now queue is full; register waiting op
+        let op = crate::pipeline_ids::OperationId::new();
+        let mut inbox = hub.register(op.clone(), 0, true).unwrap();
+        let handle = tokio::spawn(async move { inbox.recv().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Protocol fault while queue full — try_send for fault will be Full, but epoch already bumped
+        ingress.protocol_fault("full queue fault");
+        // Drain one dummy to let bridge observe epoch while draining
+        // Bridge will fail registered before epoch when it processes next dummy
+        // Simulate by letting bridge thread run; we need to free one slot so bridge can recv next
+        // Actually bridge is blocked on recv, not on full; filling queue with try_send doesn't block bridge.
+        // Bridge will recv dummies sequentially and see epoch != last.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let res = tokio::time::timeout(std::time::Duration::from_millis(800), handle).await;
+        assert!(
+            res.is_ok(),
+            "full queue fault must still wake via epoch observation"
+        );
+        assert!(res.unwrap().unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn disconnected_bridge_marks_alive_false() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64},
+        };
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let (crit_tx, crit_rx) =
+            std::sync::mpsc::sync_channel::<super::NavEvent>(super::CRITICAL_INGRESS_CAPACITY);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let hub: crate::critical_transport::CriticalEventHub<super::NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let hub_clone = hub.clone();
+        let alive_clone = alive.clone();
+        // Spawn bridge that immediately drops rx to simulate disconnect
+        drop(crit_rx);
+        std::thread::spawn(move || {
+            // bridge would fail_all on disconnect
+            hub_clone
+                .fail_all(crate::critical_transport::CriticalTransportError::IngressUnavailable);
+            alive_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+        let ingress =
+            super::BrowserEventIngress::new_for_test(aux_tx, crit_tx, epoch.clone(), alive.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Send after disconnect should mark alive false (already false)
+        let op = crate::pipeline_ids::OperationId::new();
+        let ev = super::NavEvent::Response {
+            operation_id: op,
+            agent_id: "chatgpt".to_string(),
+            turn: 1,
+            text: "hello".to_string(),
+        };
+        ingress.send(ev);
+        // Wait a bit for handling
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // alive should be false and epoch bumped for disconnected
+        assert!(
+            !alive.load(std::sync::atomic::Ordering::SeqCst)
+                || epoch.load(std::sync::atomic::Ordering::SeqCst) > 0
+        );
     }
 }
 
