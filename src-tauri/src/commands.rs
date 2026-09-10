@@ -195,19 +195,17 @@ pub async fn start_session(
             .set("session_complete", "false")
             .map_err(|e| e.to_string())?;
     }
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
     // IMP-10: Reset brain fail counter for the new session.
     state.brain_fail_count.store(0, Ordering::SeqCst);
 
     // Task 10 (HIGH-7): reset per-agent token counts at the session boundary.
-    // Previously these accumulated across the entire app process lifetime —
-    // a session starting now must not inherit counts from whatever ran before
-    // it. token_budget stays a plain in-memory tokio::sync::Mutex (no rusqlite
-    // involved), so this is a direct lock + call, not a db_helpers call.
     {
         let mut tb = state.token_budget.lock().await;
         tb.reset_all();
     }
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
     // Update orchestrator
     {
@@ -222,14 +220,9 @@ pub async fn start_session(
         let mut ctx = state.context_manager.lock().await;
         *ctx = ContextManager::new(project_brief, stype);
     }
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
     // Create transcript session.
-    //
-    // Task 9 (HIGH-5/HIGH-6): transcript_store is now Arc<std::sync::Mutex<_>>
-    // (see orchestrator.rs) instead of Arc<tokio::sync::Mutex<_>>, so this
-    // synchronous rusqlite write runs inside db_helpers::run_blocking — off
-    // the async runtime thread, with retry/backoff on transient failure —
-    // instead of directly on it via `.lock().await`.
     {
         let store = state.transcript_store.clone();
         let cfg = config.clone();
@@ -242,6 +235,7 @@ pub async fn start_session(
         .await
         .map_err(|e| e.to_string())?;
     }
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
     // Attach this session to the process-lifetime navigation ingress. Named
     // WebViews keep their original callback sender and can be reused without
@@ -268,6 +262,7 @@ pub async fn start_session(
         }
         nav_rx
     };
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
     app.emit(
         "session-status",
@@ -281,6 +276,7 @@ pub async fn start_session(
         }),
     )
     .map_err(|e| e.to_string())?;
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
     // Clone all Arc fields so the spawned task owns them.
     let config_clone = config.clone();
@@ -312,8 +308,13 @@ pub async fn start_session(
     let pause_req_clone = state.pause_requested.clone();
     let checkpoint_clone = state.checkpoint.clone();
 
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
+    let (activate_tx, activate_rx) = tokio::sync::oneshot::channel::<()>();
     let owner_for_task = start_owner.clone();
     let handle = tokio::spawn(async move {
+        if activate_rx.await.is_err() {
+            return;
+        }
         let state_ref = AppState {
             orchestrator: orch_clone.clone(),
             transcript_store: ts_clone,
@@ -466,21 +467,11 @@ pub async fn start_session(
             }
         }
     });
-    // Handoff ownership to SessionRuntime with task handle.
+    // Handoff ownership to SessionRuntime with task handle and activation gate.
     // This must be owner-checked: if Stop won the race during STARTING, handoff is rejected and task aborted.
-    if let Err(e) = start_permit.commit(handle) {
-        tracing::warn!("[RUNTIME] start handoff rejected: {}", e);
-        // Ensure orchestrator reflects ended if we never reached Running
-        let mut orch = state.orchestrator.lock().await;
-        if orch
-            .current_session
-            .as_ref()
-            .map(|c| c.session_id == config.session_id)
-            .unwrap_or(false)
-        {
-            orch.status = OrchestratorStatus::Ended;
-        }
-        let _ = app.emit("session-status", json!({ "status": "ended" }));
+    // Return Err so the Tauri command reports failure instead of success.
+    if let Err(e) = start_permit.commit(handle, activate_tx) {
+        return Err(e);
     }
 
     Ok(())
@@ -552,28 +543,17 @@ pub async fn resume_session(
     if !cp.paused {
         return Err("Session is not paused".to_string());
     }
-    // In-process case: a live task owns the runtime
-    let is_in_process = state.session_runtime.is_active();
-    if is_in_process {
-        let live_owner = state
+    // In-process case: a live task owns the runtime — require exact Paused -> Running transition
+    if state.session_runtime.is_active() {
+        let _live_owner = state
             .session_runtime
-            .current_owner()
-            .ok_or_else(|| "No live session owner".to_string())?;
-        if live_owner.session_id != target_sid {
-            return Err(format!(
-                "Cannot resume session {} while session {} is still active — stop the current session first",
-                target_sid, live_owner.session_id
-            ));
-        }
-        // Same-session in-process resume: no second task, just wake the paused loop.
-        // Do not reconstruct orchestrator to a different session (owner check already passed).
+            .resume_paused_session(&target_sid)
+            .map_err(|e| e.to_string())?;
         {
             let mut orch = state.orchestrator.lock().await;
             orch.status = OrchestratorStatus::Running;
         }
         state.pause_requested.store(false, Ordering::SeqCst);
-        // If runtime was Paused, transition to Running
-        state.session_runtime.mark_running(&live_owner);
         app.emit(
             "session-status",
             json!({ "status": "running", "session_id": cp.session_id.clone(), "resume_from": format!("{:?}", cp.next_step) }),
@@ -631,6 +611,7 @@ pub async fn resume_session(
             ));
         }
     }
+    resume_permit.ensure_admitted().map_err(|e| e.to_string())?;
     // Reattach the resumed session to the same process-lifetime ingress and
     // reuse healthy named WebViews. Session-only routing state is reset.
     let tokio_rx = {
@@ -651,6 +632,7 @@ pub async fn resume_session(
         }
         nav_rx
     };
+    resume_permit.ensure_admitted().map_err(|e| e.to_string())?;
     // Restore AppState fields
     {
         let mut orch = state.orchestrator.lock().await;
@@ -665,6 +647,7 @@ pub async fn resume_session(
             ctx.set_pending_user_input_for_session(msg.clone(), cp.session_id.clone());
         }
     }
+    resume_permit.ensure_admitted().map_err(|e| e.to_string())?;
     state.pause_requested.store(false, Ordering::SeqCst);
     // Persist that we are resuming (keep checkpoint for audit, not deleted)
     {
@@ -688,6 +671,9 @@ pub async fn resume_session(
         "session-checkpoint",
         json!({ "checkpoint_id": cp.session_id, "phase": "resumed", "next_step": format!("{:?}", cp.next_step) }),
     );
+    resume_permit.ensure_admitted().map_err(|e| e.to_string())?;
+    resume_permit.ensure_admitted().map_err(|e| e.to_string())?;
+    let (activate_tx, activate_rx) = tokio::sync::oneshot::channel::<()>();
     // Clone Arcs for spawned task
     let config_clone = config.clone();
     let app_clone = app.clone();
@@ -714,8 +700,11 @@ pub async fn resume_session(
     let hk_cancel_clone = state.hackathon_cancel.clone();
     let pause_req_clone = state.pause_requested.clone();
     let checkpoint_clone = state.checkpoint.clone();
-    // Spawn resumed loop — skip setup, go directly to debate loop
+    // Spawn resumed loop — skip setup, go directly to debate loop (gated)
     let handle = tokio::spawn(async move {
+        if activate_rx.await.is_err() {
+            return;
+        }
         let state_ref = crate::orchestrator::AppState {
             orchestrator: orch_clone.clone(),
             transcript_store: ts_clone,
@@ -810,7 +799,7 @@ pub async fn resume_session(
             }
         }
     });
-    if let Err(e) = resume_permit.commit(handle) {
+    if let Err(e) = resume_permit.commit(handle, activate_tx) {
         tracing::warn!("[RUNTIME] resume handoff rejected: {}", e);
         let mut orch = state.orchestrator.lock().await;
         orch.status = OrchestratorStatus::Ended;
@@ -825,7 +814,18 @@ pub async fn abort_session(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    // Cooperative cancellation flags before runtime stop (no async lock held across await)
+    // Capture current exact owner before mutating shared state
+    let expected_owner = state.session_runtime.current_owner();
+    if expected_owner.is_none() {
+        // No live session — controlled Ok without writing shared session state for unknown owner
+        // Still best-effort try to wake any lingering browser wait
+        let browser = state.browser_state.lock().await;
+        let _ = browser.nav_tx.try_send(NavEvent::SessionAborted);
+        return Ok(());
+    }
+    let expected = expected_owner.unwrap();
+
+    // Cooperative cancellation flags for that owner/current run (no async lock held across stop await for these atomics)
     state.hackathon_cancel.store(true, Ordering::SeqCst);
     {
         let run = state.hackathon_run.lock().await;
@@ -844,20 +844,39 @@ pub async fn abort_session(
         let _ = browser.nav_tx.try_send(NavEvent::SessionAborted);
     }
 
-    // SessionRuntime stop: abort owned task, await proof of termination, then Idle.
-    // Do not hold any async lock across this await.
+    // SessionRuntime stop_owner: abort owned task, await proof, keep Stopping until final cleanup
     let rt = state.session_runtime.clone();
-    rt.stop().await.map_err(|e| e.to_string())?;
+    let stop_guard_opt = rt.stop_owner(&expected).await.map_err(|e| e.to_string())?;
+    let Some(stop_guard) = stop_guard_opt else {
+        // Stale owner already gone
+        return Ok(());
+    };
+    // Exact owned task now dead; runtime still Stopping(expected) — admission still reserved
 
+    // Perform final cleanup ONLY for expected owner while admission still reserved
     state.pause_requested.store(false, Ordering::SeqCst);
-
     {
         let mut orch = state.orchestrator.lock().await;
-        orch.status = OrchestratorStatus::Ended;
+        if orch
+            .current_session
+            .as_ref()
+            .map(|c| c.session_id == expected.session_id)
+            .unwrap_or(false)
+        {
+            orch.status = OrchestratorStatus::Ended;
+        } else if orch.current_session.is_none() {
+            orch.status = OrchestratorStatus::Ended;
+        }
     }
+    let _ = app.emit(
+        "session-status",
+        json!({ "status": "ended", "session_id": expected.session_id.clone() }),
+    );
 
-    app.emit("session-status", json!({ "status": "ended" }))
-        .map_err(|e| e.to_string())
+    // Now and only now release to Idle / new admission
+    stop_guard.finish();
+
+    Ok(())
 }
 
 // ── User interaction + Checkpoint ─────────────────────────────────────────

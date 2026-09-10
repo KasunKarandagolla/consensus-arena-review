@@ -608,6 +608,17 @@ pub async fn run_agent_loop(
     };
 
     let leader_id = config.leader_agent_id.clone();
+    // Capture exact runtime owner for this loop — all phase transitions must be exact-owner safe
+    let loop_owner = state
+        .session_runtime
+        .current_owner()
+        .ok_or_else(|| AgentError::UnknownError("No runtime owner for loop".to_string()))?;
+    if loop_owner.session_id != config.session_id {
+        return Err(AgentError::UnknownError(format!(
+            "Runtime owner {} does not match loop session {}",
+            loop_owner.session_id, config.session_id
+        )));
+    }
     let mut iteration: u32 = 0;
     let mut pending_adoptions: Vec<PendingAdoptionCheck> = Vec::new();
     let mut models_consulted_since_last_section: Vec<String> = Vec::new();
@@ -873,9 +884,7 @@ pub async fn run_agent_loop(
                 let mut orch = state.orchestrator.lock().await;
                 orch.status = crate::orchestrator::OrchestratorStatus::Paused;
             }
-            if let Some(owner) = state.session_runtime.current_owner() {
-                state.session_runtime.mark_paused(&owner);
-            }
+            state.session_runtime.mark_paused(&loop_owner);
             let _ = app.emit(
                 "session-status",
                 serde_json::json!({ "status": "paused", "session_id": config.session_id }),
@@ -888,9 +897,7 @@ pub async fn run_agent_loop(
                 if !state.pause_requested.load(Ordering::SeqCst) {
                     let status = state.orchestrator.lock().await.status.clone();
                     if status == crate::orchestrator::OrchestratorStatus::Running {
-                        if let Some(owner) = state.session_runtime.current_owner() {
-                            state.session_runtime.mark_running(&owner);
-                        }
+                        state.session_runtime.mark_running(&loop_owner);
                         let _ = app.emit("session-status", serde_json::json!({ "status": "running", "session_id": config.session_id }));
                         break;
                     }
