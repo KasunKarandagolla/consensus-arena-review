@@ -1160,10 +1160,7 @@ pub async fn captcha_resolved(
 ) -> Result<(), String> {
     let mut browser = state.browser_state.lock().await;
     browser.captcha_resolved.insert(agent_id.clone());
-    browser
-        .nav_tx
-        .try_send(NavEvent::ResumeRequested(agent_id))
-        .map_err(|e| format!("Could not resume browser readiness wait: {e}"))?;
+    browser.nav_tx.send(NavEvent::ResumeRequested(agent_id));
     Ok(())
 }
 
@@ -1215,9 +1212,7 @@ pub async fn retry_setup_agent(
         &agent.base_url,
     )
     .map_err(|error| error.to_string())?;
-    nav_tx
-        .try_send(NavEvent::ResumeRequested(agent_id))
-        .map_err(|error| format!("Could not request setup retry: {error}"))?;
+    nav_tx.send(NavEvent::ResumeRequested(agent_id));
     Ok(())
 }
 
@@ -1255,9 +1250,7 @@ pub async fn confirm_setup_agent(
         (browser.diagnostics.clone(), browser.nav_tx.clone())
     };
     record_setup_completion(&diagnostics, &agent_id, "user_confirmed_manual");
-    nav_tx
-        .try_send(NavEvent::SetupManualConfirmed(agent_id))
-        .map_err(|error| format!("Could not deliver manual setup confirmation: {error}"))?;
+    nav_tx.send(NavEvent::SetupManualConfirmed(agent_id));
     Ok(())
 }
 
@@ -1283,20 +1276,31 @@ pub async fn provide_manual_model_response(
             return Err("Manual response is only available while a session is running".to_string());
         }
     }
-    let nav_tx = {
+    let (nav_tx, context) = {
         let browser = state.browser_state.lock().await;
-        if browser.active_turn.as_ref() != Some(&(agent_id.clone(), turn_number)) {
+        let Some(ctx) = browser.active_operation.clone() else {
+            return Err("This model and turn are not currently awaiting a response".to_string());
+        };
+        if ctx.agent_id != agent_id || ctx.turn != turn_number {
             return Err("This model and turn are not currently awaiting a response".to_string());
         }
-        browser.nav_tx.clone()
+        // Validate SessionOwner exactly matches operation's session+ generation
+        if let Some(owner) = state.session_runtime.current_owner() {
+            if owner.session_id != ctx.session_id || owner.run_generation != ctx.run_generation {
+                return Err("Active operation does not belong to current session owner".to_string());
+            }
+        } else {
+            return Err("No active session owner".to_string());
+        }
+        (browser.nav_tx.clone(), ctx)
     };
-    nav_tx
-        .try_send(NavEvent::ManualResponse {
-            agent_id,
-            turn: turn_number,
-            response,
-        })
-        .map_err(|error| format!("Could not deliver manual model response: {error}"))
+    nav_tx.send(NavEvent::ManualResponse {
+        operation_id: context.operation_id.clone(),
+        agent_id,
+        turn: turn_number,
+        response,
+    });
+    Ok(())
 }
 
 #[tauri::command(rename_all = "snake_case")]

@@ -1160,8 +1160,8 @@ pub async fn run_setup(
                                         SetupCompletionProof::ResponseAfterInjection,
                                     );
                                 }
-                                Ok(Some(NavEvent::Response(response_id, _, _)))
-                                | Ok(Some(NavEvent::Done(response_id, _)))
+                                Ok(Some(NavEvent::Response { agent_id: response_id, .. }))
+                                | Ok(Some(NavEvent::Done { agent_id: response_id, .. }))
                                     if response_id == agent_id_clone =>
                                 {
                                     break 'setup_proof Ok(
@@ -1220,7 +1220,7 @@ pub async fn run_setup(
                             agent_config.display_name, url
                         )));
                     }
-                    Some(NavEvent::Response(id, _, _) | NavEvent::Done(id, _))
+                    Some(NavEvent::Response { agent_id: id, .. } | NavEvent::Done { agent_id: id, .. })
                         if id == agent_id_clone =>
                     {
                         break Ok(SetupCompletionProof::ResponseAfterInjection);

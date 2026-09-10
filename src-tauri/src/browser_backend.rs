@@ -2,10 +2,17 @@ use crate::browser_harness::{
     self, ActionRecord, ActionTarget, BoundingRect, BrowserEvent, BrowserTimeline, EventType,
     NavigationIntent, PageLifecycleEvent, SafeDomForensics, SafeElement,
 };
+use crate::critical_transport::{
+    CRITICAL_INGRESS_CAPACITY, CriticalEventHub, CriticalTransportError,
+};
 use crate::errors::AgentError;
+use crate::pipeline_ids::{BrowserSurface, OperationContext, OperationId};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tokio::sync;
@@ -2075,11 +2082,11 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
     match event {
         NavEvent::Ready(agent_id) => Some((agent_id.as_str(), "ready")),
         NavEvent::Error(agent_id) => Some((agent_id.as_str(), "error")),
-        NavEvent::Response(agent_id, _, _) => Some((agent_id.as_str(), "response")),
+        NavEvent::Response { agent_id, .. } => Some((agent_id.as_str(), "response")),
         NavEvent::ResponseStart { agent_id, .. }
         | NavEvent::ResponseChunk { agent_id, .. }
         | NavEvent::ResponseEnd { agent_id, .. } => Some((agent_id.as_str(), "response")),
-        NavEvent::Done(agent_id, _) => Some((agent_id.as_str(), "done")),
+        NavEvent::Done { agent_id, .. } => Some((agent_id.as_str(), "done")),
         NavEvent::SetupResponseObserved(agent_id) => Some((agent_id.as_str(), "setup-response")),
         NavEvent::SendDetected(agent_id, _) => Some((agent_id.as_str(), "sent")),
         NavEvent::SetupManualConfirmed(agent_id) => Some((agent_id.as_str(), "manual_confirm")),
@@ -2117,11 +2124,11 @@ fn record_signal_metadata(diagnostics: &BrowserDiagnostics, event: &NavEvent) {
         }
         if matches!(
             event,
-            NavEvent::Response(_, _, _)
+            NavEvent::Response { .. }
                 | NavEvent::ResponseStart { .. }
                 | NavEvent::ResponseChunk { .. }
                 | NavEvent::ResponseEnd { .. }
-                | NavEvent::Done(_, _)
+                | NavEvent::Done { .. }
                 | NavEvent::SetupResponseObserved(_)
         ) && record.last_send_detected_at.is_none()
         {
@@ -2739,11 +2746,11 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 "Active prompt inserted but was not submitted"
             },
         ),
-        NavEvent::Response(agent_id, _, _) => (agent_id, "ready", "Model response detected"),
+        NavEvent::Response { agent_id, .. } => (agent_id, "ready", "Model response detected"),
         NavEvent::ResponseStart { agent_id, .. }
         | NavEvent::ResponseChunk { agent_id, .. }
         | NavEvent::ResponseEnd { agent_id, .. } => (agent_id, "ready", "Model response detected"),
-        NavEvent::Done(agent_id, _) => (agent_id, "ready", "Model response completed"),
+        NavEvent::Done { agent_id, .. } => (agent_id, "ready", "Model response completed"),
         NavEvent::ChallengeDetected(_, _)
         | NavEvent::UnshowableUrl(_, _)
         | NavEvent::UnsupportedNavigation { .. }
@@ -2773,12 +2780,12 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 }
             }
             NavEvent::SetupResponseObserved(_) => EventType::ResponseObserved,
-            NavEvent::Response(_, _, _) => EventType::ResponseObserved,
+            NavEvent::Response { .. } => EventType::ResponseObserved,
             NavEvent::ResponseStart { .. } | NavEvent::ResponseChunk { .. } => {
                 EventType::ResponseObserved
             }
             NavEvent::ResponseEnd { .. } => EventType::ResponseCompleted,
-            NavEvent::Done(_, _) => EventType::ResponseCompleted,
+            NavEvent::Done { .. } => EventType::ResponseCompleted,
             _ => EventType::Unknown,
         };
         let details = match event {
@@ -2808,7 +2815,7 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             } => {
                 serde_json::json!({ "turn": turn, "succeeded": succeeded, "method": method, "send_enabled": send_enabled, "error": error })
             }
-            NavEvent::Response(_, turn, text) => {
+            NavEvent::Response { turn, text, .. } => {
                 serde_json::json!({ "turn": turn, "text_length": text.len() })
             }
             NavEvent::ResponseStart {
@@ -2823,7 +2830,7 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 serde_json::json!({ "turn": turn, "chunk": sequence })
             }
             NavEvent::ResponseEnd { turn, .. } => serde_json::json!({ "turn": turn }),
-            NavEvent::Done(_, turn) => serde_json::json!({ "turn": turn }),
+            NavEvent::Done { turn, .. } => serde_json::json!({ "turn": turn }),
             NavEvent::ManualResponse { turn, .. } => serde_json::json!({ "turn": turn }),
             _ => serde_json::json!({}),
         };
@@ -2859,7 +2866,7 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 );
             }
             NavEvent::SetupResponseObserved(_)
-            | NavEvent::Response(_, _, _)
+            | NavEvent::Response { .. }
             | NavEvent::ResponseStart { .. } => {
                 diagnostics.emit_harness_event(
                     agent_id,
@@ -2881,11 +2888,11 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             event,
             NavEvent::Ready(_)
                 | NavEvent::SendDetected(_, _)
-                | NavEvent::Response(_, _, _)
+                | NavEvent::Response { .. }
                 | NavEvent::ResponseStart { .. }
                 | NavEvent::ResponseChunk { .. }
                 | NavEvent::ResponseEnd { .. }
-                | NavEvent::Done(_, _)
+                | NavEvent::Done { .. }
                 | NavEvent::SetupResponseObserved(_)
         ) {
             record.last_blocker = "none".to_string();
@@ -2948,7 +2955,9 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
                 record.active_submit_error = error.clone();
                 record.active_submit_at = Some(timestamp.clone());
             }
-            NavEvent::Response(_, event_turn, _)
+            NavEvent::Response {
+                turn: event_turn, ..
+            }
             | NavEvent::ResponseStart {
                 turn: event_turn, ..
             }
@@ -2958,7 +2967,9 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             | NavEvent::ResponseEnd {
                 turn: event_turn, ..
             }
-            | NavEvent::Done(_, event_turn) => {
+            | NavEvent::Done {
+                turn: event_turn, ..
+            } => {
                 record.last_response_at = Some(timestamp.clone());
                 if record.active_expected_agent_id.as_deref() == Some(record.agent_id.as_str())
                     && record.active_turn_number == Some(*event_turn)
@@ -3421,14 +3432,99 @@ pub fn resolve_display_name(
     "Unknown Model".to_string()
 }
 
+#[derive(Clone, Debug)]
+pub struct BrowserEventIngress {
+    auxiliary_tx: std::sync::mpsc::SyncSender<NavEvent>,
+    critical_tx: std::sync::mpsc::SyncSender<NavEvent>,
+    critical_failure_epoch: Arc<AtomicU64>,
+    critical_alive: Arc<AtomicBool>,
+}
+
+impl BrowserEventIngress {
+    pub fn send(&self, event: NavEvent) {
+        if event.critical_operation_id().is_some() {
+            match self.critical_tx.try_send(event) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    self.critical_failure_epoch.fetch_add(1, Ordering::SeqCst);
+                    tracing::error!(
+                        "[CRITICAL] browser critical ingress overflow; active operations fail closed"
+                    );
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    self.critical_alive.store(false, Ordering::SeqCst);
+                    self.critical_failure_epoch.fetch_add(1, Ordering::SeqCst);
+                    tracing::error!("[CRITICAL] browser critical ingress disconnected");
+                }
+            }
+        } else if let Err(error) = self.auxiliary_tx.try_send(event) {
+            tracing::warn!("[NAV] auxiliary event dropped: {error:?}");
+        }
+    }
+
+    pub fn protocol_fault(&self, reason: &str) {
+        self.critical_failure_epoch.fetch_add(1, Ordering::SeqCst);
+        tracing::error!("[CRITICAL] malformed critical browser signal: {reason}");
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(
+        aux_tx: std::sync::mpsc::SyncSender<NavEvent>,
+        crit_tx: std::sync::mpsc::SyncSender<NavEvent>,
+        epoch: Arc<AtomicU64>,
+        alive: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            auxiliary_tx: aux_tx,
+            critical_tx: crit_tx,
+            critical_failure_epoch: epoch,
+            critical_alive: alive,
+        }
+    }
+}
+
+pub fn critical_payload_cost(event: &NavEvent) -> usize {
+    match event {
+        NavEvent::Response { text, .. } => text.len(),
+        NavEvent::ResponseChunk { text, .. } => text.len(),
+        NavEvent::ManualResponse { response, .. } => response.len(),
+        NavEvent::ResponseStart { checksum, .. } => checksum.len() + 64,
+        NavEvent::ResponseEnd { checksum, .. } => checksum.len() + 32,
+        NavEvent::ActiveSubmitReport { method, error, .. } => {
+            method.len() + error.as_deref().map_or(0, str::len) + 64
+        }
+        NavEvent::Done { .. } => 32,
+        _ => 0,
+    }
+}
+
+struct CriticalBridgeGuard<T> {
+    hub: CriticalEventHub<T>,
+    alive: Arc<AtomicBool>,
+}
+
+impl<T> Drop for CriticalBridgeGuard<T> {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.hub
+            .fail_all(CriticalTransportError::IngressUnavailable);
+    }
+}
+
 #[derive(Debug)]
 pub enum NavEvent {
     Ready(String),
     Error(String),
-    Response(String, u32, String),
+    Response {
+        operation_id: OperationId,
+        agent_id: String,
+        turn: u32,
+        text: String,
+    },
     /// Bounded response transport.  Browser URLs never carry a whole model
     /// answer; receivers accept it only after every numbered chunk verifies.
     ResponseStart {
+        operation_id: OperationId,
         agent_id: String,
         turn: u32,
         byte_length: usize,
@@ -3436,23 +3532,30 @@ pub enum NavEvent {
         checksum: String,
     },
     ResponseChunk {
+        operation_id: OperationId,
         agent_id: String,
         turn: u32,
         sequence: u32,
         text: String,
     },
     ResponseEnd {
+        operation_id: OperationId,
         agent_id: String,
         turn: u32,
         checksum: String,
     },
-    Done(String, u32),
+    Done {
+        operation_id: OperationId,
+        agent_id: String,
+        turn: u32,
+    },
     SetupResponseObserved(String),
     SendDetected(String, Option<String>),
     SetupManualConfirmed(String),
     /// Explicit user-entered content for the one active turn currently being
     /// awaited. This is deliberately distinct from a browser response event.
     ManualResponse {
+        operation_id: OperationId,
         agent_id: String,
         turn: u32,
         response: String,
@@ -3470,6 +3573,7 @@ pub enum NavEvent {
         error: Option<String>,
     },
     ActiveSubmitReport {
+        operation_id: OperationId,
         agent_id: String,
         turn: u32,
         succeeded: bool,
@@ -3538,6 +3642,21 @@ pub enum NavEvent {
     },
 }
 
+impl NavEvent {
+    pub fn critical_operation_id(&self) -> Option<&OperationId> {
+        match self {
+            NavEvent::Response { operation_id, .. }
+            | NavEvent::ResponseStart { operation_id, .. }
+            | NavEvent::ResponseChunk { operation_id, .. }
+            | NavEvent::ResponseEnd { operation_id, .. }
+            | NavEvent::Done { operation_id, .. }
+            | NavEvent::ManualResponse { operation_id, .. }
+            | NavEvent::ActiveSubmitReport { operation_id, .. } => Some(operation_id),
+            _ => None,
+        }
+    }
+}
+
 // ── BrowserState ──────────────────────────────────────────────────────────────
 
 type NavEventSink = Arc<Mutex<Option<sync::mpsc::Sender<NavEvent>>>>;
@@ -3574,8 +3693,11 @@ pub struct BrowserState {
     pub leader_agent_id: String,
     pub nav_window: Option<WebviewWindow>,
     pub conversation_urls: HashMap<String, Option<String>>,
-    pub nav_tx: std::sync::mpsc::SyncSender<NavEvent>,
+    pub nav_tx: BrowserEventIngress,
     nav_sink: NavEventSink,
+    pub critical_hub: CriticalEventHub<NavEvent>,
+    critical_failure_epoch: Arc<AtomicU64>,
+    critical_alive: Arc<AtomicBool>,
     pub diagnostics: BrowserDiagnostics,
     pub pending_sends: HashSet<String>,
     pub captcha_resolved: HashSet<String>,
@@ -3583,6 +3705,9 @@ pub struct BrowserState {
     /// Key = agent_id, Value = Instant when the cooldown expires.
     pub cooldowns: HashMap<String, std::time::Instant>,
     pub active_turn: Option<(String, u32)>,
+    pub active_operation: Option<OperationContext>,
+    pub active_inbox: Option<crate::critical_transport::OperationInbox<NavEvent>>,
+    pub active_early_buffer: VecDeque<NavEvent>,
     /// R1.3: shared nav window launch guard — prevents rapid successive
     /// `launch_connected_account` calls from yanking the same WebView between
     /// models while navigation is still in progress. Stored as an expiry
@@ -3592,18 +3717,63 @@ pub struct BrowserState {
 
 impl BrowserState {
     pub fn new(nav_tx: std::sync::mpsc::SyncSender<NavEvent>) -> Self {
+        let (critical_tx, _critical_rx) =
+            std::sync::mpsc::sync_channel::<NavEvent>(CRITICAL_INGRESS_CAPACITY);
+        let critical_failure_epoch = Arc::new(AtomicU64::new(0));
+        let critical_alive = Arc::new(AtomicBool::new(true));
+        let critical_hub = CriticalEventHub::new();
+        let ingress = BrowserEventIngress {
+            auxiliary_tx: nav_tx,
+            critical_tx,
+            critical_failure_epoch: critical_failure_epoch.clone(),
+            critical_alive: critical_alive.clone(),
+        };
         BrowserState {
             leader_window: None,
             leader_agent_id: String::new(),
             nav_window: None,
             conversation_urls: HashMap::new(),
-            nav_tx,
+            nav_tx: ingress,
             nav_sink: Arc::new(Mutex::new(None)),
+            critical_hub,
+            critical_failure_epoch,
+            critical_alive,
             diagnostics: BrowserDiagnostics::new(),
             pending_sends: HashSet::new(),
             captcha_resolved: HashSet::new(),
             cooldowns: HashMap::new(),
             active_turn: None,
+            active_operation: None,
+            active_inbox: None,
+            active_early_buffer: VecDeque::new(),
+            connected_account_busy_until: None,
+        }
+    }
+
+    pub fn new_with_ingress(
+        ingress: BrowserEventIngress,
+        critical_hub: CriticalEventHub<NavEvent>,
+        failure_epoch: Arc<AtomicU64>,
+        alive: Arc<AtomicBool>,
+    ) -> Self {
+        BrowserState {
+            leader_window: None,
+            leader_agent_id: String::new(),
+            nav_window: None,
+            conversation_urls: HashMap::new(),
+            nav_tx: ingress,
+            nav_sink: Arc::new(Mutex::new(None)),
+            critical_hub,
+            critical_failure_epoch: failure_epoch,
+            critical_alive: alive,
+            diagnostics: BrowserDiagnostics::new(),
+            pending_sends: HashSet::new(),
+            captcha_resolved: HashSet::new(),
+            cooldowns: HashMap::new(),
+            active_turn: None,
+            active_operation: None,
+            active_inbox: None,
+            active_early_buffer: VecDeque::new(),
             connected_account_busy_until: None,
         }
     }
@@ -3613,17 +3783,71 @@ impl BrowserState {
     /// for the same lifetime, while commands attach the one current async
     /// consumer through `attach_nav_receiver`.
     pub fn new_live(app: &AppHandle) -> Self {
-        let (nav_tx, nav_rx) = std::sync::mpsc::sync_channel::<NavEvent>(256);
-        let state = Self::new(nav_tx);
-        let diagnostics = state.diagnostics.clone();
+        let (aux_tx, aux_rx) = std::sync::mpsc::sync_channel::<NavEvent>(256);
+        let (critical_tx, critical_rx) =
+            std::sync::mpsc::sync_channel::<NavEvent>(CRITICAL_INGRESS_CAPACITY);
+        let critical_failure_epoch = Arc::new(AtomicU64::new(0));
+        let critical_alive = Arc::new(AtomicBool::new(true));
+        let critical_hub = CriticalEventHub::new();
+        let ingress = BrowserEventIngress {
+            auxiliary_tx: aux_tx,
+            critical_tx,
+            critical_failure_epoch: critical_failure_epoch.clone(),
+            critical_alive: critical_alive.clone(),
+        };
+        let state = Self::new_with_ingress(
+            ingress,
+            critical_hub.clone(),
+            critical_failure_epoch.clone(),
+            critical_alive.clone(),
+        );
+        let diagnostics_aux = state.diagnostics.clone();
+        let diagnostics_crit = state.diagnostics.clone();
         let sink_slot = state.nav_sink.clone();
-        let bridge_app = app.clone();
+        let bridge_app_aux = app.clone();
         std::thread::spawn(move || {
-            while let Ok(event) = nav_rx.recv() {
-                record_nav_event(&bridge_app, &diagnostics, &event);
+            while let Ok(event) = aux_rx.recv() {
+                record_nav_event(&bridge_app_aux, &diagnostics_aux, &event);
                 forward_nav_event(&sink_slot, event);
             }
             tracing::error!("[NAV] process-lifetime navigation ingress disconnected");
+        });
+        // Critical bridge
+        let critical_hub_clone = critical_hub.clone();
+        let bridge_app_crit = app.clone();
+        let alive_clone = critical_alive.clone();
+        let epoch_clone = critical_failure_epoch.clone();
+        std::thread::spawn(move || {
+            let _guard = CriticalBridgeGuard {
+                hub: critical_hub_clone.clone(),
+                alive: alive_clone.clone(),
+            };
+            let mut last_seen_epoch = epoch_clone.load(Ordering::SeqCst);
+            while let Ok(event) = critical_rx.recv() {
+                let current_epoch = epoch_clone.load(Ordering::SeqCst);
+                if current_epoch != last_seen_epoch {
+                    critical_hub_clone.fail_registered_before_epoch(
+                        current_epoch,
+                        CriticalTransportError::IngressOverflow,
+                    );
+                    last_seen_epoch = current_epoch;
+                }
+                // For diagnostics, also record critical events where relevant
+                record_nav_event(&bridge_app_crit, &diagnostics_crit, &event);
+                if let Some(op_id) = event.critical_operation_id().cloned() {
+                    let cost = critical_payload_cost(&event);
+                    critical_hub_clone.dispatch(op_id, event, cost);
+                } else {
+                    tracing::warn!(
+                        "[CRITICAL] received non-critical event on critical ingress: {:?}",
+                        event
+                    );
+                }
+            }
+            // Critical ingress disconnected - fail all
+            tracing::error!("[CRITICAL] critical ingress disconnected; failing all operations");
+            // Drop guard will fail_all via IngressUnavailable, but we also want explicit fail
+            critical_hub_clone.fail_all(CriticalTransportError::IngressUnavailable);
         });
         state
     }
@@ -3643,12 +3867,120 @@ impl BrowserState {
     /// Clear session-only browser state without replacing the process-lifetime
     /// channel, diagnostics object, or named WebView handles.
     pub fn reset_for_session(&mut self) {
+        // Close any active operation mailbox as stale/session-reset
+        if let Some(ctx) = self.active_operation.take() {
+            self.critical_hub.close_exact(&ctx.operation_id);
+        }
+        self.active_inbox = None;
+        self.active_early_buffer.clear();
         self.conversation_urls.clear();
         self.pending_sends.clear();
         self.captcha_resolved.clear();
         self.cooldowns.clear();
         self.active_turn = None;
         self.connected_account_busy_until = None;
+    }
+
+    pub fn begin_active_operation(
+        &mut self,
+        owner: &crate::session_runtime::SessionOwner,
+        agent_id: &str,
+        turn: u32,
+        surface: BrowserSurface,
+    ) -> Result<
+        (
+            OperationContext,
+            crate::critical_transport::OperationInbox<NavEvent>,
+        ),
+        AgentError,
+    > {
+        if self.active_operation.is_some() {
+            return Err(AgentError::UnknownError(
+                "active operation already exists".to_string(),
+            ));
+        }
+        let context = OperationContext::from_owner(owner, agent_id, turn, surface);
+        let alive = self.critical_alive.load(Ordering::SeqCst);
+        if !alive {
+            return Err(AgentError::UnknownError(
+                "critical ingress unavailable".to_string(),
+            ));
+        }
+        let epoch = self.critical_failure_epoch.load(Ordering::SeqCst);
+        let inbox = self
+            .critical_hub
+            .register(context.operation_id.clone(), epoch, alive)
+            .map_err(|e| AgentError::UnknownError(format!("critical hub register failed: {e}")))?;
+        self.active_operation = Some(context.clone());
+        // Preserve diagnostic behavior (legacy active_turn)
+        self.active_turn = Some((agent_id.to_string(), turn));
+        let generation = self.diagnostics.setup_generation();
+        let op_str = browser_harness::operation_id_active_turn(agent_id, generation, turn);
+        self.diagnostics
+            .set_operation(agent_id, &op_str, "submitting");
+        self.diagnostics.emit_harness_event(
+            agent_id,
+            EventType::ActivePromptInjectionStarted,
+            "submitting",
+            &op_str,
+            "",
+            serde_json::json!({ "turn": turn, "operation_id": context.operation_id.as_str() }),
+        );
+        let _ = update_diagnostic(&self.diagnostics, agent_id, |record| {
+            let same_logical_turn = record.active_expected_agent_id.as_deref() == Some(agent_id)
+                && record.active_turn_number == Some(turn)
+                && record.active_turn_generation == Some(record.setup_generation);
+            record.active_expected_agent_id = Some(agent_id.to_string());
+            record.active_turn_number = Some(turn);
+            record.active_turn_generation = Some(record.setup_generation);
+            if !same_logical_turn {
+                record.active_response_observed_turn = None;
+                record.active_response_observed_generation = None;
+                record.last_active_response_at = None;
+            }
+            record.last_active_prompt_injected_at = Some(now_timestamp());
+            record.current_phase = "active_prompt_injected".to_string();
+            record.last_error = None;
+        });
+        Ok((context, inbox))
+    }
+
+    pub fn finish_active_operation(&mut self, operation_id: &OperationId, response_captured: bool) {
+        let Some(current) = self.active_operation.as_ref() else {
+            return;
+        };
+        if &current.operation_id != operation_id {
+            // stale caller; do not clear newer operation
+            return;
+        }
+        let agent_id = current.agent_id.clone();
+        let turn = current.turn;
+        // Preserve diagnostic finalization
+        if response_captured {
+            let op = self.diagnostics.current_operation_id(&agent_id);
+            self.diagnostics.emit_harness_event(
+                &agent_id,
+                EventType::ResponseCompleted,
+                "response_capture",
+                &op,
+                "",
+                serde_json::json!({ "turn": turn }),
+            );
+        }
+        let _ = update_diagnostic(&self.diagnostics, &agent_id, |record| {
+            if record.active_turn_number == Some(turn) {
+                record.current_phase = if response_captured {
+                    "active_response_captured".to_string()
+                } else {
+                    "active_turn_ended_without_response".to_string()
+                };
+            }
+        });
+        self.active_turn = None;
+        self.active_operation = None;
+        self.active_inbox = None;
+        self.active_early_buffer.clear();
+        self.critical_hub.close_exact(operation_id);
     }
 
     pub fn select_window(&self, is_leader: bool) -> Option<WebviewWindow> {
@@ -4111,7 +4443,7 @@ fn handle_page_load(
 }
 
 fn make_new_window_handler(
-    tx: std::sync::mpsc::SyncSender<NavEvent>,
+    ingress: BrowserEventIngress,
     window_label: &'static str,
 ) -> impl Fn(tauri::Url, tauri::webview::NewWindowFeatures) -> NewWindowResponse<tauri::Wry>
 + Send
@@ -4125,7 +4457,7 @@ fn make_new_window_handler(
         // remain denied to preserve the two-WebView architecture.
         if is_allowed_oauth_popup(&url) {
             send_nav_event(
-                &tx,
+                &ingress,
                 NavEvent::UnsupportedNavigation {
                     window_label: window_label.to_string(),
                     url: redacted_url(url_str),
@@ -4135,7 +4467,7 @@ fn make_new_window_handler(
             return NewWindowResponse::Allow;
         }
         send_nav_event(
-            &tx,
+            &ingress,
             NavEvent::UnsupportedNavigation {
                 window_label: window_label.to_string(),
                 url: redacted_url(url_str),
@@ -4165,10 +4497,16 @@ pub async fn inject_to_window(
     agent_id: &str,
     prompt: &str,
     turn: u32,
+    operation_id: Option<&OperationId>,
     nav_rx: &mut AsyncNavReceiver<NavEvent>,
     wait_ready: bool,
     auto_submit: bool,
 ) -> Result<(), AgentError> {
+    if auto_submit && operation_id.is_none() {
+        return Err(AgentError::InjectionFailed(
+            "auto_submit requires operation_id".to_string(),
+        ));
+    }
     if wait_ready {
         let agent_id_owned = agent_id.to_string();
         match tokio::time::timeout(
@@ -4188,7 +4526,7 @@ pub async fn inject_to_window(
         }
     }
 
-    let js = build_inject_js(prompt, agent_id, turn, auto_submit);
+    let js = build_inject_js(prompt, agent_id, turn, operation_id, auto_submit);
     window
         .eval(&js)
         .map_err(|e| AgentError::InjectionFailed(format!("inject eval failed: {}", e)))?;
@@ -4222,7 +4560,7 @@ pub async fn inject_to_agent(
         .select_window(is_leader)
         .ok_or_else(|| AgentError::NavigationFailed("window not initialised".to_string()))?;
 
-    inject_to_window(window, agent_id, prompt, turn, nav_rx, true, false).await
+    inject_to_window(window, agent_id, prompt, turn, None, nav_rx, true, false).await
 }
 
 // ── wait_for_ready ────────────────────────────────────────────────────────────
@@ -4310,18 +4648,18 @@ async fn wait_for_ready(
 // ── on_navigation closure factory ────────────────────────────────────────────
 
 fn make_nav_closure(
-    tx: std::sync::mpsc::SyncSender<NavEvent>,
+    ingress: BrowserEventIngress,
     window_label: &'static str,
 ) -> impl Fn(&tauri::Url) -> bool + Send + 'static {
     move |url| match url.scheme() {
         "arena" => {
-            handle_arena_url(tx.clone(), window_label, url);
+            handle_arena_url(ingress.clone(), window_label, url);
             false
         }
         "http" | "https" | "about" | "blob" | "data" => true,
         scheme => {
             send_nav_event(
-                &tx,
+                &ingress,
                 NavEvent::UnsupportedNavigation {
                     window_label: window_label.to_string(),
                     url: redacted_url(url.as_str()),
@@ -4333,13 +4671,9 @@ fn make_nav_closure(
     }
 }
 
-fn handle_arena_url(
-    tx: std::sync::mpsc::SyncSender<NavEvent>,
-    window_label: &'static str,
-    url: &tauri::Url,
-) {
+fn handle_arena_url(ingress: BrowserEventIngress, window_label: &'static str, url: &tauri::Url) {
     let Some(signal) = parse_arena_signal(url) else {
-        send_unknown_arena_signal(&tx, window_label, url);
+        send_unknown_arena_signal(&ingress, window_label, url);
         return;
     };
 
@@ -4350,79 +4684,183 @@ fn handle_arena_url(
             } else {
                 NavEvent::Ready(agent_id.to_string())
             };
-            send_nav_event(&tx, event);
+            send_nav_event(&ingress, event);
         }
         ("error", [agent_id]) | ("error", [agent_id, _]) => {
-            send_nav_event(&tx, NavEvent::Error(agent_id.to_string()));
+            send_nav_event(&ingress, NavEvent::Error(agent_id.to_string()));
         }
-        ("response", [agent_id, turn_str, encoded]) => {
-            if let Ok(turn) = turn_str.parse::<u32>() {
-                let text = urlencoding::decode(encoded)
-                    .unwrap_or_default()
-                    .into_owned();
-                send_nav_event(&tx, NavEvent::Response(agent_id.to_string(), turn, text));
-            }
+        ("response", [op_str, agent_id, turn_str, encoded]) => {
+            let operation_id = match OperationId::parse(op_str) {
+                Ok(id) => id,
+                Err(_) => {
+                    ingress.protocol_fault("invalid response operation id");
+                    return;
+                }
+            };
+            let turn = match turn_str.parse::<u32>() {
+                Ok(v) => v,
+                Err(_) => {
+                    ingress.protocol_fault("invalid response turn");
+                    return;
+                }
+            };
+            let text = urlencoding::decode(encoded)
+                .unwrap_or_default()
+                .into_owned();
+            send_nav_event(
+                &ingress,
+                NavEvent::Response {
+                    operation_id,
+                    agent_id: agent_id.to_string(),
+                    turn,
+                    text,
+                },
+            );
         }
-        ("response-start", [agent_id, turn_str, bytes, chunks, checksum]) => {
-            if let (Ok(turn), Ok(byte_length), Ok(chunk_count)) = (
-                turn_str.parse::<u32>(),
-                bytes.parse::<usize>(),
-                chunks.parse::<u32>(),
-            ) {
-                send_nav_event(
-                    &tx,
-                    NavEvent::ResponseStart {
-                        agent_id: agent_id.to_string(),
-                        turn,
-                        byte_length,
-                        chunk_count,
-                        checksum: checksum.to_string(),
-                    },
-                );
+        ("response-start", [op_str, agent_id, turn_str, bytes, chunks, checksum]) => {
+            let operation_id = match OperationId::parse(op_str) {
+                Ok(id) => id,
+                Err(_) => {
+                    ingress.protocol_fault("invalid response-start operation id");
+                    return;
+                }
+            };
+            let turn = match turn_str.parse::<u32>() {
+                Ok(v) => v,
+                Err(_) => {
+                    ingress.protocol_fault("invalid response-start turn");
+                    return;
+                }
+            };
+            let byte_length = match bytes.parse::<usize>() {
+                Ok(v) => v,
+                Err(_) => {
+                    ingress.protocol_fault("invalid response-start byte_length");
+                    return;
+                }
+            };
+            let chunk_count = match chunks.parse::<u32>() {
+                Ok(v) => v,
+                Err(_) => {
+                    ingress.protocol_fault("invalid response-start chunk_count");
+                    return;
+                }
+            };
+            if byte_length > crate::critical_transport::MAX_OPERATION_PAYLOAD_BYTES
+                || chunk_count as usize > crate::critical_transport::MAX_OPERATION_CRITICAL_EVENTS
+            {
+                ingress.protocol_fault("response-start exceeds transport limits");
+                return;
             }
+            send_nav_event(
+                &ingress,
+                NavEvent::ResponseStart {
+                    operation_id,
+                    agent_id: agent_id.to_string(),
+                    turn,
+                    byte_length,
+                    chunk_count,
+                    checksum: checksum.to_string(),
+                },
+            );
         }
-        ("response-chunk", [agent_id, turn_str, sequence, encoded]) => {
-            if let (Ok(turn), Ok(sequence)) = (turn_str.parse::<u32>(), sequence.parse::<u32>()) {
-                let text = urlencoding::decode(encoded)
-                    .unwrap_or_default()
-                    .into_owned();
-                send_nav_event(
-                    &tx,
-                    NavEvent::ResponseChunk {
-                        agent_id: agent_id.to_string(),
-                        turn,
-                        sequence,
-                        text,
-                    },
-                );
-            }
+        ("response-chunk", [op_str, agent_id, turn_str, sequence, encoded]) => {
+            let operation_id = match OperationId::parse(op_str) {
+                Ok(id) => id,
+                Err(_) => {
+                    ingress.protocol_fault("invalid response-chunk operation id");
+                    return;
+                }
+            };
+            let turn = match turn_str.parse::<u32>() {
+                Ok(v) => v,
+                Err(_) => {
+                    ingress.protocol_fault("invalid response-chunk turn");
+                    return;
+                }
+            };
+            let sequence = match sequence.parse::<u32>() {
+                Ok(v) => v,
+                Err(_) => {
+                    ingress.protocol_fault("invalid response-chunk sequence");
+                    return;
+                }
+            };
+            let text = urlencoding::decode(encoded)
+                .unwrap_or_default()
+                .into_owned();
+            send_nav_event(
+                &ingress,
+                NavEvent::ResponseChunk {
+                    operation_id,
+                    agent_id: agent_id.to_string(),
+                    turn,
+                    sequence,
+                    text,
+                },
+            );
         }
-        ("response-end", [agent_id, turn_str, checksum]) => {
-            if let Ok(turn) = turn_str.parse::<u32>() {
-                send_nav_event(
-                    &tx,
-                    NavEvent::ResponseEnd {
-                        agent_id: agent_id.to_string(),
-                        turn,
-                        checksum: checksum.to_string(),
-                    },
-                );
-            }
+        ("response-end", [op_str, agent_id, turn_str, checksum]) => {
+            let operation_id = match OperationId::parse(op_str) {
+                Ok(id) => id,
+                Err(_) => {
+                    ingress.protocol_fault("invalid response-end operation id");
+                    return;
+                }
+            };
+            let turn = match turn_str.parse::<u32>() {
+                Ok(v) => v,
+                Err(_) => {
+                    ingress.protocol_fault("invalid response-end turn");
+                    return;
+                }
+            };
+            send_nav_event(
+                &ingress,
+                NavEvent::ResponseEnd {
+                    operation_id,
+                    agent_id: agent_id.to_string(),
+                    turn,
+                    checksum: checksum.to_string(),
+                },
+            );
         }
-        ("done", [agent_id, turn_str]) => {
-            if let Ok(turn) = turn_str.parse::<u32>() {
-                send_nav_event(&tx, NavEvent::Done(agent_id.to_string(), turn));
-            }
+        ("done", [op_str, agent_id, turn_str]) => {
+            let operation_id = match OperationId::parse(op_str) {
+                Ok(id) => id,
+                Err(_) => {
+                    ingress.protocol_fault("invalid done operation id");
+                    return;
+                }
+            };
+            let turn = match turn_str.parse::<u32>() {
+                Ok(v) => v,
+                Err(_) => {
+                    ingress.protocol_fault("invalid done turn");
+                    return;
+                }
+            };
+            send_nav_event(
+                &ingress,
+                NavEvent::Done {
+                    operation_id,
+                    agent_id: agent_id.to_string(),
+                    turn,
+                },
+            );
         }
         ("setup-response", [agent_id]) => {
-            send_nav_event(&tx, NavEvent::SetupResponseObserved(agent_id.to_string()));
+            send_nav_event(
+                &ingress,
+                NavEvent::SetupResponseObserved(agent_id.to_string()),
+            );
         }
         ("sent", [agent_id]) => {
-            send_nav_event(&tx, NavEvent::SendDetected(agent_id.to_string(), None));
+            send_nav_event(&ingress, NavEvent::SendDetected(agent_id.to_string(), None));
         }
         ("sent", [agent_id, reason]) => {
             send_nav_event(
-                &tx,
+                &ingress,
                 NavEvent::SendDetected(agent_id.to_string(), Some(reason.to_string())),
             );
         }
@@ -4445,7 +4883,7 @@ fn handle_arena_url(
                 .unwrap_or_default()
                 .into_owned();
             send_nav_event(
-                &tx,
+                &ingress,
                 NavEvent::PromptInjectionReport {
                     agent_id: agent_id.to_string(),
                     method: method.to_string(),
@@ -4460,15 +4898,41 @@ fn handle_arena_url(
                 },
             );
         }
-        ("active-submit", [agent_id, turn, succeeded, method, enabled, encoded_error]) => {
+        (
+            "active-submit",
+            [
+                op_str,
+                agent_id,
+                turn_str,
+                succeeded,
+                method,
+                enabled,
+                encoded_error,
+            ],
+        ) => {
+            let operation_id = match OperationId::parse(op_str) {
+                Ok(id) => id,
+                Err(_) => {
+                    ingress.protocol_fault("invalid active-submit operation id");
+                    return;
+                }
+            };
+            let turn = match turn_str.parse::<u32>() {
+                Ok(v) => v,
+                Err(_) => {
+                    ingress.protocol_fault("invalid active-submit turn");
+                    return;
+                }
+            };
             let error = urlencoding::decode(encoded_error)
                 .unwrap_or_default()
                 .into_owned();
             send_nav_event(
-                &tx,
+                &ingress,
                 NavEvent::ActiveSubmitReport {
+                    operation_id,
                     agent_id: agent_id.to_string(),
-                    turn: turn.parse::<u32>().unwrap_or_default(),
+                    turn,
                     succeeded: succeeded == "1",
                     method: method.to_string(),
                     send_enabled: enabled == "1",
@@ -4531,15 +4995,15 @@ fn handle_arena_url(
                     ),
                 },
                 _ => {
-                    send_unknown_arena_signal(&tx, window_label, url);
+                    send_unknown_arena_signal(&ingress, window_label, url);
                     return;
                 }
             };
-            send_nav_event(&tx, event);
+            send_nav_event(&ingress, event);
         }
         ("challenge", [agent_id]) | ("captcha", [agent_id]) => {
             send_nav_event(
-                &tx,
+                &ingress,
                 NavEvent::ChallengeDetected(agent_id.to_string(), "challenge".to_string()),
             );
         }
@@ -4549,7 +5013,7 @@ fn handle_arena_url(
                 .unwrap_or_default()
                 .into_owned();
             send_nav_event(
-                &tx,
+                &ingress,
                 NavEvent::ChallengeDetected(agent_id.to_string(), indicator),
             );
         }
@@ -4557,7 +5021,7 @@ fn handle_arena_url(
             let url = urlencoding::decode(encoded_url)
                 .unwrap_or_default()
                 .into_owned();
-            send_nav_event(&tx, NavEvent::UnshowableUrl(agent_id.to_string(), url));
+            send_nav_event(&ingress, NavEvent::UnshowableUrl(agent_id.to_string(), url));
         }
         // D-040 Tier 2: WebView JS errors forwarded via arena://log/{level}/{msg}
         // No async, no lock, no nav_tx capture — tracing macros only per spec.
@@ -4593,7 +5057,7 @@ fn handle_arena_url(
                     String::new()
                 };
                 send_nav_event(
-                    &tx,
+                    &ingress,
                     NavEvent::ConsoleDiagnostic {
                         agent_id,
                         window_label: window_label.to_string(),
@@ -4605,7 +5069,7 @@ fn handle_arena_url(
                     },
                 );
             } else {
-                send_unknown_arena_signal(&tx, window_label, url);
+                send_unknown_arena_signal(&ingress, window_label, url);
             }
         }
         ("lifecycle", args) => {
@@ -4623,7 +5087,7 @@ fn handle_arena_url(
                     String::new()
                 };
                 send_nav_event(
-                    &tx,
+                    &ingress,
                     NavEvent::PageLifecycle {
                         agent_id,
                         window_label: window_label.to_string(),
@@ -4633,7 +5097,7 @@ fn handle_arena_url(
                     },
                 );
             } else {
-                send_unknown_arena_signal(&tx, window_label, url);
+                send_unknown_arena_signal(&ingress, window_label, url);
             }
         }
         ("dom", args) => {
@@ -4647,7 +5111,7 @@ fn handle_arena_url(
                     serde_json::from_str::<crate::browser_harness::SafeDomForensics>(&json_str)
                 {
                     send_nav_event(
-                        &tx,
+                        &ingress,
                         NavEvent::SafeDomForensics {
                             agent_id,
                             window_label: window_label.to_string(),
@@ -4655,10 +5119,10 @@ fn handle_arena_url(
                         },
                     );
                 } else {
-                    send_unknown_arena_signal(&tx, window_label, url);
+                    send_unknown_arena_signal(&ingress, window_label, url);
                 }
             } else {
-                send_unknown_arena_signal(&tx, window_label, url);
+                send_unknown_arena_signal(&ingress, window_label, url);
             }
         }
         ("action", args) => {
@@ -4677,7 +5141,7 @@ fn handle_arena_url(
                     serde_json::from_str::<crate::browser_harness::ActionTarget>(&target_json)
                 {
                     send_nav_event(
-                        &tx,
+                        &ingress,
                         NavEvent::ActionEvent {
                             agent_id,
                             window_label: window_label.to_string(),
@@ -4688,10 +5152,10 @@ fn handle_arena_url(
                         },
                     );
                 } else {
-                    send_unknown_arena_signal(&tx, window_label, url);
+                    send_unknown_arena_signal(&ingress, window_label, url);
                 }
             } else {
-                send_unknown_arena_signal(&tx, window_label, url);
+                send_unknown_arena_signal(&ingress, window_label, url);
             }
         }
         // W1-D: navigator.userAgent captured via arena://ua/<agent>/<encoded>
@@ -4700,7 +5164,7 @@ fn handle_arena_url(
                 .unwrap_or_default()
                 .into_owned();
             send_nav_event(
-                &tx,
+                &ingress,
                 NavEvent::UserAgent {
                     agent_id: agent_id.to_string(),
                     window_label: window_label.to_string(),
@@ -4715,7 +5179,7 @@ fn handle_arena_url(
                 .unwrap_or_default()
                 .into_owned();
             send_nav_event(
-                &tx,
+                &ingress,
                 NavEvent::UserAgent {
                     agent_id,
                     window_label: window_label.to_string(),
@@ -4723,7 +5187,7 @@ fn handle_arena_url(
                 },
             );
         }
-        _ => send_unknown_arena_signal(&tx, window_label, url),
+        _ => send_unknown_arena_signal(&ingress, window_label, url),
     }
 }
 
@@ -4769,12 +5233,12 @@ fn parse_arena_signal(url: &tauri::Url) -> Option<ArenaSignal> {
 }
 
 fn send_unknown_arena_signal(
-    tx: &std::sync::mpsc::SyncSender<NavEvent>,
+    ingress: &BrowserEventIngress,
     window_label: &'static str,
     url: &tauri::Url,
 ) {
     send_nav_event(
-        tx,
+        ingress,
         NavEvent::UnsupportedNavigation {
             window_label: window_label.to_string(),
             url: redacted_url(url.as_str()),
@@ -4783,13 +5247,8 @@ fn send_unknown_arena_signal(
     );
 }
 
-fn send_nav_event(tx: &std::sync::mpsc::SyncSender<NavEvent>, event: NavEvent) {
-    if let Err(e) = tx.try_send(event) {
-        tracing::warn!(
-            "[NAV] NavEvent dropped — channel full or disconnected: {:?}",
-            e
-        );
-    }
+fn send_nav_event(ingress: &BrowserEventIngress, event: NavEvent) {
+    ingress.send(event);
 }
 
 #[cfg(test)]
@@ -5009,7 +5468,7 @@ mod tests {
     fn inject_script_send_discovery_is_composer_rooted() {
         // The per-turn injector's diagnostic send probe must not scan the
         // document for a Send control; it reuses the composer-rooted helper.
-        let inject_js = super::build_inject_js("test prompt", "chatgpt", 1, true);
+        let inject_js = super::build_inject_js("test prompt", "chatgpt", 1, None, true);
         assert!(
             !inject_js.contains("document.querySelector(SEND_SELECTORS"),
             "inject script must not do document-wide Send discovery"
@@ -5168,7 +5627,7 @@ mod tests {
     fn inject_script_stamps_injected_text_for_ownership() {
         // The per-turn injector must stamp the injected prompt so the submit
         // helper and retries can prove they act on the CURRENT composer.
-        let inject_js = super::build_inject_js("test prompt", "chatgpt", 1, true);
+        let inject_js = super::build_inject_js("test prompt", "chatgpt", 1, None, true);
         assert!(
             inject_js.contains("window.__ca_lastInjectedText = text"),
             "inject script must stamp the injected text for current-composer proof"
@@ -7598,7 +8057,7 @@ window.__caAutomationInstalled = true;
 
     // Active orchestration only calls this helper after the per-turn injector
     // has verified the inserted prompt. Setup never invokes it.
-    window.__caSubmitActivePrompt = function(input, expectedAgentId, expectedTurn) {
+    window.__caSubmitActivePrompt = function(input, expectedAgentId, expectedTurn, expectedOperationId) {
         var error = '';
         var method = 'none';
         var enabled = false;
@@ -7606,7 +8065,7 @@ window.__caAutomationInstalled = true;
         var MAX_SUBMIT_ATTEMPTS = 40;
         function report(success) {
             try {
-                window.location.href = 'arena://active-submit/' + expectedAgentId + '/' + expectedTurn + '/' + (success ? '1' : '0') + '/' + encodeURIComponent(method) + '/' + (enabled ? '1' : '0') + '/' + encodeURIComponent(error);
+                window.location.href = 'arena://active-submit/' + expectedOperationId + '/' + expectedAgentId + '/' + expectedTurn + '/' + (success ? '1' : '0') + '/' + encodeURIComponent(method) + '/' + (enabled ? '1' : '0') + '/' + encodeURIComponent(error);
             } catch (e) {}
         }
         // Resolve the CURRENT composer each attempt. The injected input is
@@ -7741,11 +8200,11 @@ window.__caAutomationInstalled = true;
     // Re-runs the submit action from an external eval (used by the backend to
     // retry a failed auto-submit as a fresh action rather than just observing).
     // Re-resolves the live composer and owned Send control on each invocation.
-    window.__caRetrySubmit = function(expectedAgentId, expectedTurn) {
+    window.__caRetrySubmit = function(expectedAgentId, expectedTurn, expectedOperationId) {
         try {
             var input = findInput();
             if (input && typeof window.__caSubmitActivePrompt === 'function') {
-                window.__caSubmitActivePrompt(input, expectedAgentId, expectedTurn);
+                window.__caSubmitActivePrompt(input, expectedAgentId, expectedTurn, expectedOperationId);
             }
         } catch (e) {}
     };
@@ -7944,14 +8403,32 @@ pub fn retry_active_submit(
     agent_id: &str,
     turn: u32,
 ) -> Result<(), AgentError> {
+    retry_active_submit_with_operation(window, agent_id, turn, None)
+}
+
+pub fn retry_active_submit_with_operation(
+    window: &WebviewWindow,
+    agent_id: &str,
+    turn: u32,
+    operation_id: Option<&OperationId>,
+) -> Result<(), AgentError> {
     let agent_json = serde_json::to_string(agent_id).map_err(|error| {
         AgentError::InjectionFailed(format!(
             "retry submit identity serialization failed: {error}"
         ))
     })?;
-    let js = format!(
-        "try {{ if (typeof window.__caRetrySubmit === 'function') {{ window.__caRetrySubmit({agent_json}, {turn}); }} }} catch (e) {{}}"
-    );
+    let op_js = operation_id
+        .map(|op| serde_json::to_string(op.as_str()).unwrap_or_else(|_| "\"\"".to_string()))
+        .unwrap_or_else(|| "\"\"".to_string());
+    let js = if operation_id.is_some() {
+        format!(
+            "try {{ if (typeof window.__caRetrySubmit === 'function') {{ window.__caRetrySubmit({agent_json}, {turn}, {op_js}); }} }} catch (e) {{}}"
+        )
+    } else {
+        format!(
+            "try {{ if (typeof window.__caRetrySubmit === 'function') {{ window.__caRetrySubmit({agent_json}, {turn}); }} }} catch (e) {{}}"
+        )
+    };
     window
         .eval(&js)
         .map_err(|error| AgentError::InjectionFailed(format!("retry submit eval failed: {error}")))
@@ -8047,8 +8524,21 @@ pub fn monitor_existing_response(
 //   arena://done/{AGENT_ID}/{TURN}                         (200 ms later)
 // A _baseline is captured before injection to avoid re-reporting old responses.
 
-fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -> String {
+fn build_inject_js(
+    prompt: &str,
+    agent_id: &str,
+    turn: u32,
+    operation_id: Option<&OperationId>,
+    auto_submit: bool,
+) -> String {
+    if auto_submit && operation_id.is_none() {
+        tracing::error!("[CRITICAL] build_inject_js auto_submit requires operation_id");
+    }
     let prompt_json = serde_json::to_string(prompt).unwrap_or_else(|_| "\"\"".to_string());
+    let op_id_js = operation_id
+        .map(|op| serde_json::to_string(op.as_str()).unwrap_or_else(|_| "\"\"".to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    let _op_id_for_url = operation_id.map(|op| op.as_str().to_string());
 
     format!(
         r#"(function() {{
@@ -8109,6 +8599,7 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
 
   var AGENT_ID = '{}';
   var TURN = {};
+  var OPERATION_ID = {};
   var text = {};
   var AUTO_SUBMIT = {};
 
@@ -8253,14 +8744,14 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
           var hash = 2166136261;
           for (var bi = 0; bi < bytes.length; bi++) {{ hash ^= bytes[bi]; hash = Math.imul(hash, 16777619) >>> 0; }}
           var checksum = hash.toString(16);
-          try {{ window.location.href = 'arena://response-start/' + AGENT_ID + '/' + TURN + '/' + bytes.length + '/' + chunks.length + '/' + checksum; }} catch (e) {{}}
+          if (OPERATION_ID) try {{ window.location.href = 'arena://response-start/' + OPERATION_ID + '/' + AGENT_ID + '/' + TURN + '/' + bytes.length + '/' + chunks.length + '/' + checksum; }} catch (e) {{}}
           (function sendChunk(index) {{
             if (index >= chunks.length) {{
-              try {{ window.location.href = 'arena://response-end/' + AGENT_ID + '/' + TURN + '/' + checksum; }} catch (e) {{}}
-              setTimeout(function() {{ try {{ window.location.href = 'arena://done/' + AGENT_ID + '/' + TURN; }} catch (e) {{}} }}, 100);
+              if (OPERATION_ID) try {{ window.location.href = 'arena://response-end/' + OPERATION_ID + '/' + AGENT_ID + '/' + TURN + '/' + checksum; }} catch (e) {{}}
+              setTimeout(function() {{ if (OPERATION_ID) try {{ window.location.href = 'arena://done/' + OPERATION_ID + '/' + AGENT_ID + '/' + TURN; }} catch (e) {{}} }}, 100);
               return;
             }}
-            try {{ window.location.href = 'arena://response-chunk/' + AGENT_ID + '/' + TURN + '/' + index + '/' + encodeURIComponent(chunks[index]); }} catch (e) {{}}
+            if (OPERATION_ID) try {{ window.location.href = 'arena://response-chunk/' + OPERATION_ID + '/' + AGENT_ID + '/' + TURN + '/' + index + '/' + encodeURIComponent(chunks[index]); }} catch (e) {{}}
             setTimeout(function() {{ sendChunk(index + 1); }}, 15);
           }})(0);
           return;
@@ -8284,7 +8775,7 @@ fn build_inject_js(prompt: &str, agent_id: &str, turn: u32, auto_submit: bool) -
   }}
 
   function reportSubmitOutcome(ok, methodName, err) {{
-    try {{ window.location.href = 'arena://active-submit/' + AGENT_ID + '/' + TURN + '/' + (ok ? '1' : '0') + '/' + encodeURIComponent(methodName) + '/0/' + encodeURIComponent(err || ''); }} catch (e) {{}}
+    if (OPERATION_ID) try {{ window.location.href = 'arena://active-submit/' + OPERATION_ID + '/' + AGENT_ID + '/' + TURN + '/' + (ok ? '1' : '0') + '/' + encodeURIComponent(methodName) + '/0/' + encodeURIComponent(err || ''); }} catch (e) {{}}
   }}
 
 var _injectAttempts = 0;
@@ -8310,7 +8801,7 @@ var _injectAttempts = 0;
       if (AUTO_SUBMIT) {{
         try {{ window.__ca_lastInjectedText = text; }} catch (e) {{}}
         if (typeof window.__caSubmitActivePrompt === 'function') {{
-          window.__caSubmitActivePrompt(input, AGENT_ID, TURN);
+          window.__caSubmitActivePrompt(input, AGENT_ID, TURN, OPERATION_ID);
         }} else {{
           reportSubmitOutcome(false, 'none', 'submit_helper_missing');
         }}
@@ -8370,7 +8861,7 @@ var _injectAttempts = 0;
       if (!integrityOk || methodError) {{
         reportSubmitOutcome(false, method, methodError || 'prompt_integrity_failed');
       }} else if (typeof window.__caSubmitActivePrompt === 'function') {{
-        window.__caSubmitActivePrompt(input, AGENT_ID, TURN);
+        window.__caSubmitActivePrompt(input, AGENT_ID, TURN, OPERATION_ID);
       }} else {{
         reportSubmitOutcome(false, 'none', 'submit_helper_missing');
       }}
@@ -8381,9 +8872,10 @@ var _injectAttempts = 0;
   // Active injection submits only through the phase-gated static helper above;
   // setup injection remains observation-only.
   setTimeout(pollResponse, 1500);
-}})();"#,
+  }})();"#,
         agent_id,
         turn,
+        op_id_js,
         prompt_json,
         if auto_submit { "true" } else { "false" }
     )

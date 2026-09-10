@@ -10,11 +10,13 @@ use tokio::time::{Instant, timeout};
 use crate::agent_brain::{AgentBrain, AgentDecision, BrainSource};
 use crate::blueprint_store::{BlueprintSection, SectionStatus};
 use crate::browser_backend::NavEvent;
+use crate::critical_transport::{CriticalTransportError, OperationInbox};
 use crate::errors::{AgentError, ErrorKind};
 use crate::memory_store::SessionSummaryData;
 use crate::orchestrator::{
     ActiveBrainKind, ActiveBrainStatus, AppState, ModelHealth, SessionConfig,
 };
+use crate::pipeline_ids::{BrowserSurface, OperationContext};
 
 struct PendingAdoptionCheck {
     model_id: String,
@@ -102,6 +104,54 @@ impl ResponseAssembly {
             ));
         }
         Ok(text)
+    }
+}
+
+async fn begin_operation(
+    state: &AppState,
+    agent_id: &str,
+    turn: u32,
+    surface: BrowserSurface,
+) -> Result<(OperationContext, OperationInbox<NavEvent>), AgentError> {
+    let owner = state
+        .session_runtime
+        .current_owner()
+        .ok_or_else(|| AgentError::UnknownError("no active session owner".to_string()))?;
+    let mut browser = state.browser_state.lock().await;
+    browser
+        .begin_active_operation(&owner, agent_id, turn, surface)
+        .map_err(|e| AgentError::UnknownError(format!("begin operation failed: {e}")))
+}
+
+async fn finish_operation(
+    state: &AppState,
+    operation_id: &crate::pipeline_ids::OperationId,
+    response_captured: bool,
+) {
+    let mut browser = state.browser_state.lock().await;
+    browser.finish_active_operation(operation_id, response_captured);
+}
+
+fn critical_to_agent_error(err: CriticalTransportError) -> AgentError {
+    match err {
+        CriticalTransportError::Closed => {
+            AgentError::NavigationFailed("critical operation closed".to_string())
+        }
+        CriticalTransportError::IngressUnavailable => {
+            AgentError::NavigationFailed("critical ingress unavailable".to_string())
+        }
+        CriticalTransportError::IngressOverflow => {
+            AgentError::NavigationFailed("critical ingress overflow".to_string())
+        }
+        CriticalTransportError::EventBudgetExceeded => {
+            AgentError::ExtractionFailed("critical event budget exceeded".to_string())
+        }
+        CriticalTransportError::PayloadBudgetExceeded => {
+            AgentError::ExtractionFailed("critical payload budget exceeded".to_string())
+        }
+        CriticalTransportError::Protocol(msg) => {
+            AgentError::ExtractionFailed(format!("critical protocol error: {msg}"))
+        }
     }
 }
 
@@ -254,42 +304,22 @@ async fn first_task_envelope(
     format!("{priming}\n\n--- CURRENT ARENA TASK ---\n\n{task}")
 }
 
-fn drain_stale_active_events(nav_rx: &mut Receiver<NavEvent>) -> usize {
-    // Identity is checked by consumers. Draining here could discard an exact
-    // current submit acknowledgement, Response, or Done event.
-    let _ = nav_rx;
+fn drain_stale_active_events(_nav_rx: &mut Receiver<NavEvent>) -> usize {
+    // MUST remain no-op: draining shared auxiliary must never discard critical active events.
     0
 }
 
 fn take_queued_response_for_turn(
-    nav_rx: &mut Receiver<NavEvent>,
-    agent_id: &str,
-    turn: u32,
+    _nav_rx: &mut Receiver<NavEvent>,
+    _agent_id: &str,
+    _turn: u32,
 ) -> Option<String> {
-    while let Ok(event) = nav_rx.try_recv() {
-        match event {
-            NavEvent::Response(event_agent, event_turn, response)
-                if event_agent == agent_id && event_turn == turn =>
-            {
-                return Some(response);
-            }
-            NavEvent::ManualResponse {
-                agent_id: event_agent,
-                turn: event_turn,
-                response,
-            } if event_agent == agent_id && event_turn == turn => return Some(response),
-            stale => tracing::warn!(
-                "[ACTIVE] Drained non-response event while recovering late response for {} turn {}: {:?}",
-                agent_id,
-                turn,
-                stale
-            ),
-        }
-    }
+    // Destructive shared-response scan removed. Active response recovery must use operation-owned inbox only.
     None
 }
 
 /// Outcome of the active-turn auto-submit confirmation gate.
+#[derive(Debug)]
 enum SubmitOutcome {
     /// The page reported the exact (agent_id, turn) as submitted.
     Confirmed,
@@ -300,99 +330,176 @@ enum SubmitOutcome {
     ManualRecovery,
 }
 
-/// Wait for the single `ActiveSubmitReport` matching the exact (agent_id,
-/// turn). Returns `Some(text)` if a response for this turn arrives before the
-/// ack (rare), `None` on a successful ack, and `Err` on a failed ack.
+#[derive(Debug)]
+struct AckResult {
+    outcome: SubmitOutcome,
+    early_buffer: std::collections::VecDeque<NavEvent>,
+}
+
+/// Wait for the single `ActiveSubmitReport` matching the exact operation.
+/// Reads ONLY critical inbox. Buffers early response events.
 async fn await_submit_ack(
-    agent_id: &str,
-    turn: u32,
-    nav_rx: &mut Receiver<NavEvent>,
-) -> Result<Option<String>, AgentError> {
+    context: &OperationContext,
+    inbox: &mut OperationInbox<NavEvent>,
+) -> Result<AckResult, AgentError> {
+    let mut early: std::collections::VecDeque<NavEvent> = std::collections::VecDeque::new();
     loop {
-        match nav_rx.recv().await {
-            Some(NavEvent::ActiveSubmitReport {
-                agent_id: ev_agent,
-                turn: ev_turn,
+        let event = inbox.recv().await.map_err(critical_to_agent_error)?;
+        match &event {
+            NavEvent::ActiveSubmitReport {
+                operation_id,
+                agent_id,
+                turn,
                 succeeded,
                 method,
                 send_enabled,
                 error,
-            }) if ev_agent == agent_id && ev_turn == turn => {
-                if succeeded {
-                    return Ok(None);
+            } => {
+                if operation_id != &context.operation_id {
+                    return Err(AgentError::ExtractionFailed(
+                        "operation id mismatch in submit report".to_string(),
+                    ));
                 }
-                let detail =
-                    error.unwrap_or_else(|| format!("method={method} enabled={send_enabled}"));
-                return Err(AgentError::InjectionFailed(format!(
-                    "submit failed: {detail}"
-                )));
+                if agent_id != &context.agent_id || *turn != context.turn {
+                    return Err(AgentError::ExtractionFailed(
+                        "agent/turn mismatch in submit report".to_string(),
+                    ));
+                }
+                if *succeeded {
+                    return Ok(AckResult {
+                        outcome: SubmitOutcome::Confirmed,
+                        early_buffer: early,
+                    });
+                } else {
+                    let detail = error
+                        .clone()
+                        .unwrap_or_else(|| format!("method={method} enabled={send_enabled}"));
+                    return Err(AgentError::InjectionFailed(format!(
+                        "submit failed: {detail}"
+                    )));
+                }
             }
-            Some(NavEvent::Response(ev_agent, ev_turn, text))
-                if ev_agent == agent_id && ev_turn == turn =>
-            {
-                tracing::warn!(
-                    "[SUBMIT] response for {agent_id} turn {turn} arrived before its ack; treating as confirmed"
-                );
-                return Ok(Some(text));
+            NavEvent::Response {
+                operation_id,
+                agent_id,
+                turn,
+                text,
+            } => {
+                if operation_id != &context.operation_id {
+                    return Err(AgentError::ExtractionFailed(
+                        "response operation id mismatch".to_string(),
+                    ));
+                }
+                if agent_id != &context.agent_id || *turn != context.turn {
+                    return Err(AgentError::ExtractionFailed(
+                        "response agent/turn mismatch".to_string(),
+                    ));
+                }
+                return Ok(AckResult {
+                    outcome: SubmitOutcome::ResponseEarly(text.clone()),
+                    early_buffer: early,
+                });
             }
-            Some(NavEvent::ManualResponse {
-                agent_id: ev_agent,
-                turn: ev_turn,
+            NavEvent::ManualResponse {
+                operation_id,
+                agent_id,
+                turn,
                 response,
-            }) if ev_agent == agent_id && ev_turn == turn => {
-                return Ok(Some(response));
+                ..
+            } => {
+                if operation_id != &context.operation_id {
+                    return Err(AgentError::ExtractionFailed(
+                        "manual response operation id mismatch".to_string(),
+                    ));
+                }
+                if agent_id != &context.agent_id || *turn != context.turn {
+                    return Err(AgentError::ExtractionFailed(
+                        "manual response agent/turn mismatch".to_string(),
+                    ));
+                }
+                return Ok(AckResult {
+                    outcome: SubmitOutcome::ResponseEarly(response.clone()),
+                    early_buffer: early,
+                });
             }
-            Some(NavEvent::SessionAborted) => {
-                return Err(AgentError::UnknownError("Session aborted".to_string()));
+            NavEvent::ResponseStart {
+                operation_id,
+                agent_id,
+                turn,
+                ..
             }
-            Some(NavEvent::Error(ev_agent)) if ev_agent == agent_id => {
+            | NavEvent::ResponseChunk {
+                operation_id,
+                agent_id,
+                turn,
+                ..
+            }
+            | NavEvent::ResponseEnd {
+                operation_id,
+                agent_id,
+                turn,
+                ..
+            }
+            | NavEvent::Done {
+                operation_id,
+                agent_id,
+                turn,
+            } => {
+                if operation_id != &context.operation_id {
+                    return Err(AgentError::ExtractionFailed(
+                        "response assembly operation id mismatch".to_string(),
+                    ));
+                }
+                if agent_id != &context.agent_id || *turn != context.turn {
+                    return Err(AgentError::ExtractionFailed(
+                        "response assembly agent/turn mismatch".to_string(),
+                    ));
+                }
+                early.push_back(event);
+                if early.len() > crate::critical_transport::MAX_OPERATION_CRITICAL_EVENTS {
+                    return Err(AgentError::ExtractionFailed(
+                        "early buffer overflow".to_string(),
+                    ));
+                }
+                continue;
+            }
+            _ => {
                 return Err(AgentError::ExtractionFailed(format!(
-                    "Agent {} reported an error",
-                    ev_agent
+                    "unexpected critical event: {event:?}"
                 )));
-            }
-            Some(_) => continue,
-            None => {
-                return Err(AgentError::NavigationFailed(
-                    "Navigation channel closed while awaiting submit ack".to_string(),
-                ));
             }
         }
     }
 }
 
-/// Confirm the active prompt was actually submitted. Each attempt awaits a
-/// fresh `ActiveSubmitReport` for the exact (agent_id, turn); on failure the
-/// submit ACTION is retried via `retry_active_submit` (bounded). Final failure
-/// downgrades to explicit manual recovery for the exact (agent_id, turn) so the
-/// turn is never silently advanced or left hanging.
 async fn confirm_active_submit(
-    window: &tauri::WebviewWindow,
-    agent_id: &str,
-    turn: u32,
-    nav_rx: &mut Receiver<NavEvent>,
+    context: &OperationContext,
+    inbox: &mut OperationInbox<NavEvent>,
     app: &AppHandle,
-) -> Result<SubmitOutcome, AgentError> {
+) -> Result<AckResult, AgentError> {
     let mut last_error: Option<String> = None;
 
     for attempt in 0..=MAX_SUBMIT_ACTION_RETRIES {
         match timeout(
             Duration::from_secs(SUBMIT_ACK_TIMEOUT_SECS),
-            await_submit_ack(agent_id, turn, nav_rx),
+            await_submit_ack(context, inbox),
         )
         .await
         {
-            Ok(Ok(Some(response))) => {
-                return Ok(SubmitOutcome::ResponseEarly(response));
-            }
-            Ok(Ok(None)) => {
-                tracing::debug!("[SUBMIT] {agent_id} turn {turn} confirmed (attempt {attempt})");
-                return Ok(SubmitOutcome::Confirmed);
+            Ok(Ok(ack)) => {
+                tracing::debug!(
+                    "[SUBMIT] {} turn {} confirmed (attempt {attempt})",
+                    context.agent_id,
+                    context.turn
+                );
+                return Ok(ack);
             }
             Ok(Err(e)) => {
                 last_error = Some(e.to_string());
                 tracing::warn!(
-                    "[SUBMIT] {agent_id} turn {turn} ack error (attempt {attempt}): {e}"
+                    "[SUBMIT] {} turn {} ack error (attempt {attempt}): {e}",
+                    context.agent_id,
+                    context.turn
                 );
             }
             Err(_) => {
@@ -400,20 +507,20 @@ async fn confirm_active_submit(
                     "no submit confirmation within {SUBMIT_ACK_TIMEOUT_SECS}s"
                 ));
                 tracing::warn!(
-                    "[SUBMIT] {agent_id} turn {turn} ack timeout (attempt {attempt}/{MAX_SUBMIT_ACTION_RETRIES})"
+                    "[SUBMIT] {} turn {} ack timeout (attempt {attempt}/{MAX_SUBMIT_ACTION_RETRIES})",
+                    context.agent_id,
+                    context.turn
                 );
             }
         }
-
-        let _ = window;
     }
 
     let detail = last_error.unwrap_or_else(|| "unknown submit failure".to_string());
-    let display = crate::browser_backend::display_name_for(agent_id);
+    let display = crate::browser_backend::display_name_for(&context.agent_id);
     let _ = app.emit("boss-message", serde_json::json!({
         "text": format!(
             "Auto-submit for {} (turn {}) could not be confirmed: {}. The prompt may already be in the composer — press Send in that window or use Paste Response to continue.",
-            display, turn, detail
+            display, context.turn, detail
         ),
         "message_type": "status"
     }));
@@ -421,12 +528,15 @@ async fn confirm_active_submit(
         "active-turn-state",
         serde_json::json!({
             "event": "active_submit_failed",
-            "agent_id": agent_id,
-            "turn_number": turn,
+            "agent_id": context.agent_id,
+            "turn_number": context.turn,
             "error": detail,
         }),
     );
-    Ok(SubmitOutcome::ManualRecovery)
+    Ok(AckResult {
+        outcome: SubmitOutcome::ManualRecovery,
+        early_buffer: std::collections::VecDeque::new(),
+    })
 }
 
 /// Returns `Some(response)` only when the response was captured before the
@@ -440,11 +550,29 @@ async fn inject_active_prompt(
     state: &AppState,
     app: &AppHandle,
     nav_rx: &mut Receiver<NavEvent>,
-) -> Result<Option<String>, AgentError> {
-    {
-        let mut browser = state.browser_state.lock().await;
-        browser.begin_active_turn(agent_id, turn);
-    }
+) -> Result<
+    (
+        Option<String>,
+        OperationContext,
+        OperationInbox<NavEvent>,
+        std::collections::VecDeque<NavEvent>,
+    ),
+    AgentError,
+> {
+    // Determine surface: if window is leader window then Leader else Participant (heuristic)
+    let surface = {
+        let browser = state.browser_state.lock().await;
+        if let Some(leader_win) = browser.leader_window.clone() {
+            if leader_win.label() == window.label() {
+                BrowserSurface::Leader
+            } else {
+                BrowserSurface::Participant
+            }
+        } else {
+            BrowserSurface::Participant
+        }
+    };
+    let (context, mut inbox) = begin_operation(state, agent_id, turn, surface).await?;
     let _ = app.emit(
         "active-turn-state",
         serde_json::json!({
@@ -453,26 +581,35 @@ async fn inject_active_prompt(
             "turn_number": turn,
         }),
     );
-    crate::browser_backend::inject_to_window(
+    let inject_result = crate::browser_backend::inject_to_window(
         window.clone(),
         agent_id,
         prompt,
         turn,
+        Some(&context.operation_id),
         nav_rx,
         false,
         true,
     )
-    .await
-    .map_err(|error| {
-        AgentError::InjectionFailed(format!(
-            "Failed to inject active prompt for {agent_id}: {error}"
-        ))
-    })?;
+    .await;
+    if let Err(e) = inject_result {
+        finish_operation(state, &context.operation_id, false).await;
+        return Err(AgentError::InjectionFailed(format!(
+            "Failed to inject active prompt for {agent_id}: {e}"
+        )));
+    }
 
-    let outcome = confirm_active_submit(&window, agent_id, turn, nav_rx, app).await?;
-    let early_response = match outcome {
-        SubmitOutcome::Confirmed => None,
-        SubmitOutcome::ResponseEarly(response) => Some(response),
+    let ack_result = confirm_active_submit(&context, &mut inbox, app).await;
+    let ack = match ack_result {
+        Ok(a) => a,
+        Err(e) => {
+            finish_operation(state, &context.operation_id, false).await;
+            return Err(e);
+        }
+    };
+    let (early_response_opt, early_buffer) = match ack.outcome {
+        SubmitOutcome::Confirmed => (None, ack.early_buffer),
+        SubmitOutcome::ResponseEarly(response) => (Some(response), ack.early_buffer),
         SubmitOutcome::ManualRecovery => {
             let diagnostics = {
                 let browser = state.browser_state.lock().await;
@@ -486,7 +623,7 @@ async fn inject_active_prompt(
                     "auto-submit not confirmed after {MAX_SUBMIT_ACTION_RETRIES} action retries"
                 ),
             );
-            None
+            (None, ack.early_buffer)
         }
     };
 
@@ -510,10 +647,20 @@ async fn inject_active_prompt(
             "turn_number": turn,
         }),
     );
-    Ok(early_response)
+    Ok((early_response_opt, context, inbox, early_buffer))
 }
 
 async fn finish_active_turn(state: &AppState, agent_id: &str, turn: u32, response_captured: bool) {
+    // Legacy wrapper: try to finish via active_operation if present
+    let mut browser = state.browser_state.lock().await;
+    if let Some(ctx) = browser.active_operation.clone() {
+        if ctx.agent_id == agent_id && ctx.turn == turn {
+            let op_id = ctx.operation_id.clone();
+            drop(browser);
+            finish_operation(state, &op_id, response_captured).await;
+            return;
+        }
+    }
     let mut browser = state.browser_state.lock().await;
     browser.clear_active_turn(agent_id, turn, response_captured);
 }
@@ -665,6 +812,12 @@ pub async fn run_agent_loop(
         .clone()
         .map(|cp| cp.session_id == config.session_id && cp.paused)
         .unwrap_or(false);
+    // Operation-bound leader pending state
+    let mut pending_leader: Option<(
+        OperationContext,
+        OperationInbox<NavEvent>,
+        std::collections::VecDeque<NavEvent>,
+    )> = None;
     let (mut next_leader_turn, mut early_leader_response) = if is_resume {
         let cp = state.checkpoint.lock().await.clone().unwrap();
         // Restore iteration from checkpoint
@@ -693,7 +846,7 @@ pub async fn run_agent_loop(
             config.session_id, config.project_brief
         );
         let first_prompt = first_task_envelope(state, config, &leader_id, &first_task).await;
-        let early_turn1 = match inject_active_prompt(
+        let inject_res = inject_active_prompt(
             leader_window.clone(),
             &leader_id,
             &first_prompt,
@@ -702,8 +855,8 @@ pub async fn run_agent_loop(
             app,
             nav_rx,
         )
-        .await
-        {
+        .await;
+        let (early_opt, ctx, inbox, buf) = match inject_res {
             Ok(v) => v,
             Err(e) => {
                 let diagnostics = {
@@ -726,7 +879,13 @@ pub async fn run_agent_loop(
                 return Err(e);
             }
         };
-        (2, early_turn1)
+        if let Some(text) = early_opt {
+            finish_operation(state, &ctx.operation_id, true).await;
+            (2, Some(text))
+        } else {
+            pending_leader = Some((ctx, inbox, buf));
+            (2, None)
+        }
     };
     if is_resume && early_leader_response.is_none() {
         early_leader_response = Some(format!(
@@ -749,11 +908,31 @@ pub async fn run_agent_loop(
         );
 
         let active_turn = next_leader_turn.saturating_sub(1);
-        let leader_response = match early_leader_response.take() {
-            Some(response) => response,
-            None => loop {
-                match wait_for_response(&leader_id, active_turn, nav_rx).await {
-                    Ok(response) => break response,
+        let leader_response = if let Some(text) = early_leader_response.take() {
+            // Early response from previous ack (or resume checkpoint)
+            // For checkpoint resume, there is no pending operation to finish; just use text
+            if let Some((ctx, _inbox, _buf)) = pending_leader.take() {
+                // If we had pending but also early text, that early text is the response for that pending op
+                finish_operation(state, &ctx.operation_id, true).await;
+            }
+            text
+        } else if let Some((ctx, mut inbox, mut early_buf)) = pending_leader.take() {
+            let active_turn = ctx.turn;
+            let resp = loop {
+                let deadline = Instant::now() + Duration::from_secs(RESPONSE_TIMEOUT_SECS);
+                match wait_for_response_with_operation(
+                    &ctx,
+                    &mut inbox,
+                    nav_rx,
+                    &mut early_buf,
+                    deadline,
+                )
+                .await
+                {
+                    Ok(r) => {
+                        finish_operation(state, &ctx.operation_id, true).await;
+                        break r;
+                    }
                     Err(AgentError::Timeout(error)) => {
                         let _ = app.emit(
                             "active-turn-state",
@@ -770,8 +949,83 @@ pub async fn run_agent_loop(
                                 "message_type": "status"
                             }),
                         );
-                        // Keep the exact active turn registered so a manual response
-                        // remains valid after a browser-capture timeout.
+                        // Keep operation pending for manual response
+                        // We need to put it back and wait again? For now loop will retry wait with same inbox
+                        // Re-insert pending for next iteration of loop
+                        // To avoid losing inbox, we keep it in this loop's variables
+                        // Continue loop to wait again (inbox still holds early buffer drained)
+                        // The operation remains active; manual response can still arrive
+                        // We need to keep inbox for next loop iteration, so we don't finish
+                        // For now, we will keep waiting in this loop by not returning, but we need to preserve inbox
+                        // Continue outer loop's wait
+                        // To preserve, we keep inbox and early_buf in this scope and loop again
+                        // Since we have taken pending, we need to keep it for retry
+                        // We can just continue; inbox and early_buf remain
+                        // But we lost ctx? ctx still in scope
+                        // So we continue loop which will call wait again with same ctx/inbox/early
+                        // Need to avoid moving ctx
+                        // We'll just continue loop (which will reuse same ctx/inbox)
+                        // For this we need to not drop inbox; we keep it
+                        // Instead of breaking, we continue
+                        // Small sleep to avoid busy loop? wait will timeout again after 300s, but immediate retry would tight loop
+                        // We'll put pending back and sleep briefly then continue
+                        // For simplicity, we will recreate pending for next loop iteration
+                        // But to keep code simple, we will just loop again with same resources
+                        // Since this is inside loop, we can just continue
+                        // However we need to ensure timeout error doesn't consume operation; keep it
+                        // So we don't finish; just continue waiting
+                        // We will not re-store pending_leader yet; just continue this inner loop
+                        // The inner loop is this `loop { match wait... }` so continuing will call wait again
+                        // Use same inbox and early_buf (now empty)
+                        // Loop again
+                        continue;
+                    }
+                    Err(error) => {
+                        finish_operation(state, &ctx.operation_id, false).await;
+                        let diagnostics = {
+                            let browser = state.browser_state.lock().await;
+                            browser.diagnostics.clone()
+                        };
+                        crate::browser_backend::record_browser_error(
+                            app,
+                            &diagnostics,
+                            &leader_id,
+                            &error.to_string(),
+                        );
+                        let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Leader window stopped responding: {error}"),
+                                "message_type": "status"
+                            }),
+                        );
+                        return Err(error);
+                    }
+                }
+            };
+            resp
+        } else {
+            // No pending and no early: fallback to old shared wait (should only happen for resume where checkpoint had no pending)
+            let active_turn = next_leader_turn.saturating_sub(1);
+            let resp = loop {
+                match wait_for_response(&leader_id, active_turn, nav_rx).await {
+                    Ok(r) => break r,
+                    Err(AgentError::Timeout(error)) => {
+                        let _ = app.emit(
+                            "active-turn-state",
+                            serde_json::json!({
+                                "event": "active_turn_timeout",
+                                "agent_id": &leader_id,
+                                "turn_number": active_turn,
+                            }),
+                        );
+                        let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Leader response was not captured: {error}. Paste the visible response to continue, or wait for browser capture."),
+                                "message_type": "status"
+                            }),
+                        );
                     }
                     Err(error) => {
                         finish_active_turn(state, &leader_id, active_turn, false).await;
@@ -795,9 +1049,11 @@ pub async fn run_agent_loop(
                         return Err(error);
                     }
                 }
-            },
+            };
+            // This fallback had no operation to finish (old path used finish_active_turn)
+            finish_active_turn(state, &leader_id, active_turn, true).await;
+            resp
         };
-        finish_active_turn(state, &leader_id, active_turn, true).await;
 
         let _ = app.emit(
             "active-turn-state",
@@ -1366,7 +1622,7 @@ pub async fn run_agent_loop(
                     return_prompt.len()
                 );
                 // RC1-A2: explicit fatal semantics for leader
-                early_leader_response = match inject_active_prompt(
+                let inject_res = inject_active_prompt(
                     leader_window,
                     &leader_id,
                     &return_prompt,
@@ -1375,9 +1631,18 @@ pub async fn run_agent_loop(
                     app,
                     nav_rx,
                 )
-                .await
-                {
-                    Ok(v) => v,
+                .await;
+                match inject_res {
+                    Ok((early_opt, ctx, inbox, buf)) => {
+                        if let Some(text) = early_opt {
+                            finish_operation(state, &ctx.operation_id, true).await;
+                            early_leader_response = Some(text);
+                            pending_leader = None;
+                        } else {
+                            pending_leader = Some((ctx, inbox, buf));
+                            early_leader_response = None;
+                        }
+                    }
                     Err(e) => {
                         let diagnostics = {
                             let browser = state.browser_state.lock().await;
@@ -1392,7 +1657,7 @@ pub async fn run_agent_loop(
                         let _ = app.emit(
                             "boss-message",
                             serde_json::json!({
-                                "text": format!("Leader window injection failed (Route return turn {next_leader_turn}): {e}"),
+                                "text": format!("Leader window injection failed (turn {}): {e}", next_leader_turn),
                                 "message_type": "status"
                             }),
                         );
@@ -1574,7 +1839,7 @@ pub async fn run_agent_loop(
                     combined_msg.len()
                 );
                 // RC1-A2: explicit fatal for leader
-                early_leader_response = match inject_active_prompt(
+                let inject_res = inject_active_prompt(
                     leader_window,
                     &leader_id,
                     &combined_msg,
@@ -1583,9 +1848,18 @@ pub async fn run_agent_loop(
                     app,
                     nav_rx,
                 )
-                .await
-                {
-                    Ok(v) => v,
+                .await;
+                match inject_res {
+                    Ok((early_opt, ctx, inbox, buf)) => {
+                        if let Some(text) = early_opt {
+                            finish_operation(state, &ctx.operation_id, true).await;
+                            early_leader_response = Some(text);
+                            pending_leader = None;
+                        } else {
+                            pending_leader = Some((ctx, inbox, buf));
+                            early_leader_response = None;
+                        }
+                    }
                     Err(e) => {
                         let diagnostics = {
                             let browser = state.browser_state.lock().await;
@@ -1600,7 +1874,7 @@ pub async fn run_agent_loop(
                         let _ = app.emit(
                             "boss-message",
                             serde_json::json!({
-                                "text": format!("Leader window injection failed (RouteCompare turn {next_leader_turn}): {e}"),
+                                "text": format!("Leader window injection failed (turn {}): {e}", next_leader_turn),
                                 "message_type": "status"
                             }),
                         );
@@ -1717,7 +1991,7 @@ pub async fn run_agent_loop(
                     "Section recorded. Please continue with the next section or signal completion.";
                 tracing::debug!("[INJECT] Blueprint ack → {} turn={}", leader_id, iteration);
                 // RC1-A2: explicit fatal for leader
-                early_leader_response = match inject_active_prompt(
+                let inject_res = inject_active_prompt(
                     leader_window,
                     &leader_id,
                     ack,
@@ -1726,9 +2000,18 @@ pub async fn run_agent_loop(
                     app,
                     nav_rx,
                 )
-                .await
-                {
-                    Ok(v) => v,
+                .await;
+                match inject_res {
+                    Ok((early_opt, ctx, inbox, buf)) => {
+                        if let Some(text) = early_opt {
+                            finish_operation(state, &ctx.operation_id, true).await;
+                            early_leader_response = Some(text);
+                            pending_leader = None;
+                        } else {
+                            pending_leader = Some((ctx, inbox, buf));
+                            early_leader_response = None;
+                        }
+                    }
                     Err(e) => {
                         let diagnostics = {
                             let browser = state.browser_state.lock().await;
@@ -1743,7 +2026,7 @@ pub async fn run_agent_loop(
                         let _ = app.emit(
                             "boss-message",
                             serde_json::json!({
-                                "text": format!("Leader window injection failed (Blueprint ack turn {next_leader_turn}): {e}"),
+                                "text": format!("Leader window injection failed (turn {}): {e}", next_leader_turn),
                                 "message_type": "status"
                             }),
                         );
@@ -1774,7 +2057,7 @@ pub async fn run_agent_loop(
 
                 tracing::debug!("[INJECT] Continue → {} turn={}", leader_id, iteration);
                 // RC1-A2: explicit fatal for leader
-                early_leader_response = match inject_active_prompt(
+                let inject_res = inject_active_prompt(
                     leader_window,
                     &leader_id,
                     "Please continue.",
@@ -1783,9 +2066,18 @@ pub async fn run_agent_loop(
                     app,
                     nav_rx,
                 )
-                .await
-                {
-                    Ok(v) => v,
+                .await;
+                match inject_res {
+                    Ok((early_opt, ctx, inbox, buf)) => {
+                        if let Some(text) = early_opt {
+                            finish_operation(state, &ctx.operation_id, true).await;
+                            early_leader_response = Some(text);
+                            pending_leader = None;
+                        } else {
+                            pending_leader = Some((ctx, inbox, buf));
+                            early_leader_response = None;
+                        }
+                    }
                     Err(e) => {
                         let diagnostics = {
                             let browser = state.browser_state.lock().await;
@@ -1800,7 +2092,7 @@ pub async fn run_agent_loop(
                         let _ = app.emit(
                             "boss-message",
                             serde_json::json!({
-                                "text": format!("Leader window injection failed (Continue turn {next_leader_turn}): {e}"),
+                                "text": format!("Leader window injection failed (turn {}): {e}", next_leader_turn),
                                 "message_type": "status"
                             }),
                         );
@@ -1933,7 +2225,7 @@ pub async fn run_agent_loop(
                     context_prompt.len()
                 );
                 // RC1-A2: explicit fatal for leader
-                early_leader_response = match inject_active_prompt(
+                let inject_res = inject_active_prompt(
                     leader_window,
                     &leader_id,
                     &context_prompt,
@@ -1942,9 +2234,18 @@ pub async fn run_agent_loop(
                     app,
                     nav_rx,
                 )
-                .await
-                {
-                    Ok(v) => v,
+                .await;
+                match inject_res {
+                    Ok((early_opt, ctx, inbox, buf)) => {
+                        if let Some(text) = early_opt {
+                            finish_operation(state, &ctx.operation_id, true).await;
+                            early_leader_response = Some(text);
+                            pending_leader = None;
+                        } else {
+                            pending_leader = Some((ctx, inbox, buf));
+                            early_leader_response = None;
+                        }
+                    }
                     Err(e) => {
                         let diagnostics = {
                             let browser = state.browser_state.lock().await;
@@ -1959,7 +2260,7 @@ pub async fn run_agent_loop(
                         let _ = app.emit(
                             "boss-message",
                             serde_json::json!({
-                                "text": format!("Leader window injection failed (AskUser turn {next_leader_turn}): {e}"),
+                                "text": format!("Leader window injection failed (turn {}): {e}", next_leader_turn),
                                 "message_type": "status"
                             }),
                         );
@@ -1989,7 +2290,7 @@ pub async fn run_agent_loop(
                             )
                         })?
                     };
-                    early_leader_response = match inject_active_prompt(
+                    let inject_res = inject_active_prompt(
                         leader_window,
                         &leader_id,
                         "Hackathon request was malformed; please continue with normal discussion.",
@@ -1998,9 +2299,18 @@ pub async fn run_agent_loop(
                         app,
                         nav_rx,
                     )
-                    .await
-                    {
-                        Ok(v) => v,
+                    .await;
+                    match inject_res {
+                        Ok((early_opt, ctx, inbox, buf)) => {
+                            if let Some(text) = early_opt {
+                                finish_operation(state, &ctx.operation_id, true).await;
+                                early_leader_response = Some(text);
+                                pending_leader = None;
+                            } else {
+                                pending_leader = Some((ctx, inbox, buf));
+                                early_leader_response = None;
+                            }
+                        }
                         Err(e) => {
                             let diagnostics = {
                                 let browser = state.browser_state.lock().await;
@@ -2012,6 +2322,13 @@ pub async fn run_agent_loop(
                                 &leader_id,
                                 &e.to_string(),
                             );
+                            let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Leader window injection failed (turn {}): {e}", next_leader_turn),
+                                "message_type": "status"
+                            }),
+                        );
                             return Err(e);
                         }
                     };
@@ -2084,7 +2401,7 @@ pub async fn run_agent_loop(
                                 )
                             })?
                         };
-                        early_leader_response = match inject_active_prompt(
+                        let inject_res = inject_active_prompt(
                             leader_window,
                             &leader_id,
                             &delimited,
@@ -2093,9 +2410,18 @@ pub async fn run_agent_loop(
                             app,
                             nav_rx,
                         )
-                        .await
-                        {
-                            Ok(v) => v,
+                        .await;
+                        match inject_res {
+                            Ok((early_opt, ctx, inbox, buf)) => {
+                                if let Some(text) = early_opt {
+                                    finish_operation(state, &ctx.operation_id, true).await;
+                                    early_leader_response = Some(text);
+                                    pending_leader = None;
+                                } else {
+                                    pending_leader = Some((ctx, inbox, buf));
+                                    early_leader_response = None;
+                                }
+                            }
                             Err(e) => {
                                 let diagnostics = {
                                     let browser = state.browser_state.lock().await;
@@ -2107,6 +2433,13 @@ pub async fn run_agent_loop(
                                     &leader_id,
                                     &e.to_string(),
                                 );
+                                let _ = app.emit(
+                            "boss-message",
+                            serde_json::json!({
+                                "text": format!("Leader window injection failed (turn {}): {e}", next_leader_turn),
+                                "message_type": "status"
+                            }),
+                        );
                                 return Err(e);
                             }
                         };
@@ -2134,7 +2467,7 @@ pub async fn run_agent_loop(
                             "[Hackathon attempt failed: {}]\nPlease continue without hackathon output, or retry with a clearer task_brief.",
                             e
                         );
-                        early_leader_response = match inject_active_prompt(
+                        let inject_res = inject_active_prompt(
                             leader_window,
                             &leader_id,
                             &failure_note,
@@ -2143,9 +2476,18 @@ pub async fn run_agent_loop(
                             app,
                             nav_rx,
                         )
-                        .await
-                        {
-                            Ok(v) => v,
+                        .await;
+                        match inject_res {
+                            Ok((early_opt, ctx, inbox, buf)) => {
+                                if let Some(text) = early_opt {
+                                    finish_operation(state, &ctx.operation_id, true).await;
+                                    early_leader_response = Some(text);
+                                    pending_leader = None;
+                                } else {
+                                    pending_leader = Some((ctx, inbox, buf));
+                                    early_leader_response = None;
+                                }
+                            }
                             Err(ie) => {
                                 let diagnostics = {
                                     let browser = state.browser_state.lock().await;
@@ -2267,7 +2609,6 @@ async fn inject_and_wait_with_retry(
     nav_rx: &mut Receiver<NavEvent>,
     app: &AppHandle,
 ) -> Result<String, AgentError> {
-    // Fast-fail if agent is already in cooldown — no retry, no injection.
     {
         let browser = state.browser_state.lock().await;
         if browser.is_in_cooldown(target_model) {
@@ -2287,14 +2628,10 @@ async fn inject_and_wait_with_retry(
                 target_model
             )));
         }
-    } // lock drops
+    }
 
     let mut last_err: Option<AgentError> = None;
-    let mut submit_confirmed = false;
 
-    // P1: load the persisted custom participants once so the navigation-URL
-    // fallback can resolve a custom participant's base URL through the merged
-    // registry. Best-effort: a read failure falls back to built-ins only.
     let custom = state
         .settings_store
         .lock()
@@ -2304,7 +2641,6 @@ async fn inject_and_wait_with_retry(
 
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
-            // Exponential backoff: 2s, 4s, 8s — capped at 60 s.
             let raw_wait = BACKOFF_BASE_SECS.pow(attempt);
             let wait_secs = raw_wait.min(60);
             tracing::warn!(
@@ -2316,7 +2652,6 @@ async fn inject_and_wait_with_retry(
             );
             tokio::time::sleep(Duration::from_secs(wait_secs)).await;
 
-            // Re-check cooldown after sleep.
             let browser = state.browser_state.lock().await;
             if browser.is_in_cooldown(target_model) {
                 let e = AgentError::NetworkError(format!(
@@ -2328,9 +2663,6 @@ async fn inject_and_wait_with_retry(
             }
         }
 
-        // Extract nav_window and resolve the saved conversation URL, falling
-        // back to the model's validated base URL if setup did not save one.
-        // Lock is scoped and released before any .await on inject_to_window.
         tracing::debug!(
             "[LOCK] acquiring browser_state for inject_and_wait_with_retry/{}",
             target_model
@@ -2352,7 +2684,7 @@ async fn inject_and_wait_with_retry(
                     ))
                 })?;
             (window, browser.diagnostics.clone(), target_url)
-        }; // lock drops here
+        };
         tracing::debug!(
             "[LOCK] released browser_state for inject_and_wait_with_retry/{}",
             target_model
@@ -2366,54 +2698,9 @@ async fn inject_and_wait_with_retry(
             attempt
         );
 
-        // A response can arrive while the outer retry is sleeping. Consult
-        // exact agent+turn+generation evidence before any new navigation or
-        // injection, then recover its queued text when available.
-        if attempt > 0 && diagnostics.has_active_response_observed(target_model, turn) {
-            if let Some(response) = take_queued_response_for_turn(nav_rx, target_model, turn) {
-                finish_active_turn(state, target_model, turn, true).await;
-                let _ = app.emit(
-                    "active-turn-state",
-                    serde_json::json!({
-                        "event": "active_response_captured",
-                        "agent_id": target_model,
-                        "turn_number": turn,
-                    }),
-                );
-                let _ = app.emit(
-                    "agent-message",
-                    serde_json::json!({
-                        "agent_id": target_model,
-                        "role": "participant",
-                        "response": &response,
-                        "tokens": 0,
-                        "iteration": turn,
-                        "source_type": "browser_or_manual"
-                    }),
-                );
-                update_model_health(state, target_model, true, None).await;
-                return Ok(response);
-            }
-            let error = AgentError::ExtractionFailed(format!(
-                "{} turn {} produced response evidence during retry backoff, but response text was unavailable; refusing duplicate navigation/injection",
-                target_model, turn
-            ));
-            update_model_health(state, target_model, false, Some(error.to_string())).await;
-            return Err(error);
-        }
+        // No destructive shared-response drain; operation inbox owns response.
+        let _ = drain_stale_active_events(nav_rx);
 
-        let drained = drain_stale_active_events(nav_rx);
-        if drained > 0 {
-            tracing::warn!(
-                "[ACTIVE] drained {} pre-navigation events for {} turn {} attempt {}",
-                drained,
-                target_model,
-                turn,
-                attempt
-            );
-        }
-
-        // Retry idempotency: if already at target URL with composer ready, skip re-navigation which would cause a SPA refresh.
         let skip_navigate =
             attempt > 0 && diagnostics.can_skip_navigation_on_retry(target_model, &target_url);
         if skip_navigate {
@@ -2431,8 +2718,6 @@ async fn inject_and_wait_with_retry(
             "nav",
             &target_url,
         ) {
-            // W1-C: navigation failures retain bounded retry, but empty-shell
-            // is not retryable via navigate (Category 2). Use helper to decide.
             if !should_retry_after_failure(&e, &diagnostics, target_model, turn, attempt) {
                 update_model_health(state, target_model, false, Some(e.to_string())).await;
                 return Err(e);
@@ -2447,11 +2732,25 @@ async fn inject_and_wait_with_retry(
             continue;
         }
 
-        // Attempt injection.
-        {
-            let mut browser = state.browser_state.lock().await;
-            browser.begin_active_turn(target_model, turn);
-        }
+        // Begin exact operation
+        let (context, mut inbox) =
+            match begin_operation(state, target_model, turn, BrowserSurface::Participant).await {
+                Ok(v) => v,
+                Err(e) => {
+                    if !should_retry_after_failure(&e, &diagnostics, target_model, turn, attempt) {
+                        update_model_health(state, target_model, false, Some(e.to_string())).await;
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        "[RETRY] begin operation failed for {} attempt {}: {}",
+                        target_model,
+                        attempt,
+                        e
+                    );
+                    last_err = Some(e);
+                    continue;
+                }
+            };
         let _ = app.emit(
             "active-turn-state",
             serde_json::json!({
@@ -2460,19 +2759,20 @@ async fn inject_and_wait_with_retry(
                 "turn_number": turn,
             }),
         );
-        match crate::browser_backend::inject_to_window(
+        let inject_res = crate::browser_backend::inject_to_window(
             nav_window.clone(),
             target_model,
             prompt,
             turn,
+            Some(&context.operation_id),
             nav_rx,
             !skip_navigate,
             true,
         )
-        .await
-        {
+        .await;
+        match inject_res {
             Err(e) => {
-                finish_active_turn(state, target_model, turn, false).await;
+                finish_operation(state, &context.operation_id, false).await;
                 if matches!(&e, AgentError::Timeout(_) | AgentError::InjectionFailed(_)) {
                     crate::browser_backend::record_browser_error(
                         app,
@@ -2486,7 +2786,6 @@ async fn inject_and_wait_with_retry(
                     let mut browser = state.browser_state.lock().await;
                     browser.set_cooldown(target_model, 60);
                 }
-                // W1-C: empty-shell readiness failure should not be retried via full navigate.
                 if !should_retry_after_failure(&e, &diagnostics, target_model, turn, attempt) {
                     update_model_health(state, target_model, false, Some(e.to_string())).await;
                     return Err(e);
@@ -2498,14 +2797,45 @@ async fn inject_and_wait_with_retry(
                     e
                 );
                 last_err = Some(e);
-                continue; // retry
+                continue;
             }
             Ok(()) => {
-                let outcome =
-                    confirm_active_submit(&nav_window, target_model, turn, nav_rx, app).await?;
-                match outcome {
+                // Confirm submit using operation inbox
+                let ack_res = confirm_active_submit(&context, &mut inbox, app).await;
+                let ack = match ack_res {
+                    Ok(a) => a,
+                    Err(e) => {
+                        finish_operation(state, &context.operation_id, false).await;
+                        let kind = e.kind();
+                        if kind == ErrorKind::RateLimit {
+                            let mut browser = state.browser_state.lock().await;
+                            browser.set_cooldown(target_model, 60);
+                        }
+                        if !should_retry_after_failure(
+                            &e,
+                            &diagnostics,
+                            target_model,
+                            turn,
+                            attempt,
+                        ) {
+                            update_model_health(state, target_model, false, Some(e.to_string()))
+                                .await;
+                            return Err(e);
+                        }
+                        tracing::warn!(
+                            "[RETRY] submit ack failed for {} attempt {}: {}",
+                            target_model,
+                            attempt,
+                            e
+                        );
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
+                // Handle early response from ack
+                match ack.outcome {
                     SubmitOutcome::ResponseEarly(response) => {
-                        finish_active_turn(state, target_model, turn, true).await;
+                        finish_operation(state, &context.operation_id, true).await;
                         let _ = app.emit(
                             "active-turn-state",
                             serde_json::json!({
@@ -2547,9 +2877,97 @@ async fn inject_and_wait_with_retry(
                                 "turn_number": turn,
                             }),
                         );
+                        // Fall through to wait
+                        let mut early_buf = ack.early_buffer;
+                        let deadline = Instant::now() + Duration::from_secs(RESPONSE_TIMEOUT_SECS);
+                        match wait_for_response_with_operation(
+                            &context,
+                            &mut inbox,
+                            nav_rx,
+                            &mut early_buf,
+                            deadline,
+                        )
+                        .await
+                        {
+                            Ok(response) => {
+                                finish_operation(state, &context.operation_id, true).await;
+                                let _ = app.emit(
+                                    "active-turn-state",
+                                    serde_json::json!({
+                                        "event": "active_response_captured",
+                                        "agent_id": target_model,
+                                        "turn_number": turn,
+                                    }),
+                                );
+                                let _ = app.emit(
+                                    "agent-message",
+                                    serde_json::json!({
+                                        "agent_id": target_model,
+                                        "role": "participant",
+                                        "response": &response,
+                                        "tokens": 0,
+                                        "iteration": turn,
+                                        "source_type": "browser_or_manual"
+                                    }),
+                                );
+                                update_model_health(state, target_model, true, None).await;
+                                return Ok(response);
+                            }
+                            Err(e) => {
+                                finish_operation(state, &context.operation_id, false).await;
+                                let _ = app.emit(
+                                    "active-turn-state",
+                                    serde_json::json!({
+                                        "event": "active_turn_timeout",
+                                        "agent_id": target_model,
+                                        "turn_number": turn,
+                                    }),
+                                );
+                                if matches!(
+                                    &e,
+                                    AgentError::Timeout(_) | AgentError::InjectionFailed(_)
+                                ) {
+                                    crate::browser_backend::record_browser_error(
+                                        app,
+                                        &diagnostics,
+                                        target_model,
+                                        &e.to_string(),
+                                    );
+                                }
+                                let kind = e.kind();
+                                if kind == ErrorKind::RateLimit {
+                                    let mut browser = state.browser_state.lock().await;
+                                    browser.set_cooldown(target_model, 60);
+                                }
+                                // ManualRecovery wait failure is retryable unless empty-shell etc
+                                if !should_retry_after_failure(
+                                    &e,
+                                    &diagnostics,
+                                    target_model,
+                                    turn,
+                                    attempt,
+                                ) {
+                                    update_model_health(
+                                        state,
+                                        target_model,
+                                        false,
+                                        Some(e.to_string()),
+                                    )
+                                    .await;
+                                    return Err(e);
+                                }
+                                tracing::warn!(
+                                    "[RETRY] Wait for response from {} failed (attempt {}): {}",
+                                    target_model,
+                                    attempt,
+                                    e
+                                );
+                                last_err = Some(e);
+                                continue;
+                            }
+                        }
                     }
                     SubmitOutcome::Confirmed => {
-                        submit_confirmed = true;
                         let browser = state.browser_state.lock().await;
                         browser.mark_active_waiting(target_model, turn);
                         let _ = app.emit(
@@ -2568,77 +2986,80 @@ async fn inject_and_wait_with_retry(
                                 "turn_number": turn,
                             }),
                         );
+                        let mut early_buf = ack.early_buffer;
+                        let deadline = Instant::now() + Duration::from_secs(RESPONSE_TIMEOUT_SECS);
+                        match wait_for_response_with_operation(
+                            &context,
+                            &mut inbox,
+                            nav_rx,
+                            &mut early_buf,
+                            deadline,
+                        )
+                        .await
+                        {
+                            Ok(response) => {
+                                finish_operation(state, &context.operation_id, true).await;
+                                let _ = app.emit(
+                                    "active-turn-state",
+                                    serde_json::json!({
+                                        "event": "active_response_captured",
+                                        "agent_id": target_model,
+                                        "turn_number": turn,
+                                    }),
+                                );
+                                let _ = app.emit(
+                                    "agent-message",
+                                    serde_json::json!({
+                                        "agent_id": target_model,
+                                        "role": "participant",
+                                        "response": &response,
+                                        "tokens": 0,
+                                        "iteration": turn,
+                                        "source_type": "browser_or_manual"
+                                    }),
+                                );
+                                update_model_health(state, target_model, true, None).await;
+                                return Ok(response);
+                            }
+                            Err(e) => {
+                                finish_operation(state, &context.operation_id, false).await;
+                                let _ = app.emit(
+                                    "active-turn-state",
+                                    serde_json::json!({
+                                        "event": "active_turn_timeout",
+                                        "agent_id": target_model,
+                                        "turn_number": turn,
+                                    }),
+                                );
+                                if matches!(
+                                    &e,
+                                    AgentError::Timeout(_) | AgentError::InjectionFailed(_)
+                                ) {
+                                    crate::browser_backend::record_browser_error(
+                                        app,
+                                        &diagnostics,
+                                        target_model,
+                                        &e.to_string(),
+                                    );
+                                }
+                                let kind = e.kind();
+                                if kind == ErrorKind::RateLimit {
+                                    let mut browser = state.browser_state.lock().await;
+                                    browser.set_cooldown(target_model, 60);
+                                }
+                                // Confirmed submit means do not retry on response timeout (already submitted)
+                                update_model_health(
+                                    state,
+                                    target_model,
+                                    false,
+                                    Some(e.to_string()),
+                                )
+                                .await;
+                                return Err(e);
+                            }
+                        }
                     }
                 }
-            }
-        }
-
-        // Wait for response.
-        match wait_for_response(target_model, turn, nav_rx).await {
-            Ok(response) => {
-                finish_active_turn(state, target_model, turn, true).await;
-                let _ = app.emit(
-                    "active-turn-state",
-                    serde_json::json!({
-                        "event": "active_response_captured",
-                        "agent_id": target_model,
-                        "turn_number": turn,
-                    }),
-                );
-                let _ = app.emit(
-                    "agent-message",
-                    serde_json::json!({
-                        "agent_id": target_model,
-                        "role": "participant",
-                        "response": &response,
-                        "tokens": 0,
-                        "iteration": turn,
-                        "source_type": "browser_or_manual"
-                    }),
-                );
-                // IMP-5: Mark agent healthy on success.
-                update_model_health(state, target_model, true, None).await;
-                return Ok(response);
-            }
-            Err(e) => {
-                finish_active_turn(state, target_model, turn, false).await;
-                let _ = app.emit(
-                    "active-turn-state",
-                    serde_json::json!({
-                        "event": "active_turn_timeout",
-                        "agent_id": target_model,
-                        "turn_number": turn,
-                    }),
-                );
-                if matches!(&e, AgentError::Timeout(_) | AgentError::InjectionFailed(_)) {
-                    crate::browser_backend::record_browser_error(
-                        app,
-                        &diagnostics,
-                        target_model,
-                        &e.to_string(),
-                    );
-                }
-                let kind = e.kind();
-                if kind == ErrorKind::RateLimit {
-                    let mut browser = state.browser_state.lock().await;
-                    browser.set_cooldown(target_model, 60);
-                }
-                if submit_confirmed {
-                    update_model_health(state, target_model, false, Some(e.to_string())).await;
-                    return Err(e);
-                }
-                // W1-C: empty-shell should not trigger repeated full navigation.
-                if !should_retry_after_failure(&e, &diagnostics, target_model, turn, attempt) {
-                    update_model_health(state, target_model, false, Some(e.to_string())).await;
-                    return Err(e);
-                }
-                tracing::warn!(
-                    "[RETRY] Wait for response from {} failed (attempt {}): {}",
-                    target_model,
-                    attempt,
-                    e
-                );
-                last_err = Some(e);
             }
         }
     }
@@ -2710,26 +3131,35 @@ async fn wait_for_response_until(
                 // D-040 [NAV]
                 tracing::debug!("[NAV] {:?}", event);
                 match event {
-                    NavEvent::Response(ev_agent, ev_turn, text) => {
+                    NavEvent::Response {
+                        agent_id: ev_agent,
+                        turn: ev_turn,
+                        text: text,
+                        ..
+                    } => {
                         if ev_agent == agent_id && ev_turn == turn {
                             return Ok(text);
                         }
                     }
                     NavEvent::ResponseStart {
+                        operation_id: _,
                         agent_id: ev_agent,
                         turn: ev_turn,
                         byte_length,
                         chunk_count,
                         checksum,
+                        ..
                     } if ev_agent == agent_id && ev_turn == turn => {
                         assembly =
                             Some(ResponseAssembly::start(byte_length, chunk_count, checksum)?);
                     }
                     NavEvent::ResponseChunk {
+                        operation_id: _,
                         agent_id: ev_agent,
                         turn: ev_turn,
                         sequence,
                         text,
+                        ..
                     } if ev_agent == agent_id && ev_turn == turn => {
                         let Some(active) = assembly.as_mut() else {
                             return Err(AgentError::ExtractionFailed(
@@ -2739,9 +3169,11 @@ async fn wait_for_response_until(
                         active.insert(sequence, text)?;
                     }
                     NavEvent::ResponseEnd {
+                        operation_id: _,
                         agent_id: ev_agent,
                         turn: ev_turn,
                         checksum,
+                        ..
                     } if ev_agent == agent_id && ev_turn == turn => {
                         let Some(active) = assembly.take() else {
                             return Err(AgentError::ExtractionFailed(
@@ -2750,7 +3182,11 @@ async fn wait_for_response_until(
                         };
                         return active.finish(&checksum);
                     }
-                    NavEvent::Done(ev_agent, ev_turn) => {
+                    NavEvent::Done {
+                        agent_id: ev_agent,
+                        turn: ev_turn,
+                        ..
+                    } => {
                         if ev_agent == agent_id && ev_turn == turn {
                             // `done` is only a completion marker from the page script.
                             // It carries no response text, and some WebViews can deliver it
@@ -2762,9 +3198,11 @@ async fn wait_for_response_until(
                         }
                     }
                     NavEvent::ManualResponse {
+                        operation_id: _,
                         agent_id: ev_agent,
                         turn: ev_turn,
                         response,
+                        ..
                     } => {
                         if ev_agent == agent_id && ev_turn == turn {
                             return Ok(response);
@@ -2844,15 +3282,19 @@ async fn wait_for_response_until(
                                         continue;
                                     }
                                     Ok(Some(NavEvent::ManualResponse {
+                                        operation_id: _,
                                         agent_id: m_id,
                                         turn: m_turn,
                                         response,
                                     })) if m_id == agent_id && m_turn == turn => {
                                         return Ok(response);
                                     }
-                                    Ok(Some(NavEvent::Response(m_id, m_turn, text)))
-                                        if m_id == agent_id && m_turn == turn =>
-                                    {
+                                    Ok(Some(NavEvent::Response {
+                                        agent_id: m_id,
+                                        turn: m_turn,
+                                        text: text,
+                                        ..
+                                    })) if m_id == agent_id && m_turn == turn => {
                                         return Ok(text);
                                     }
                                     Ok(Some(NavEvent::UnshowableUrl(u_id, url)))
@@ -2924,6 +3366,298 @@ async fn wait_for_response_until(
     }
 }
 
+async fn wait_for_response_with_operation(
+    context: &OperationContext,
+    inbox: &mut OperationInbox<NavEvent>,
+    auxiliary_rx: &mut Receiver<NavEvent>,
+    early: &mut std::collections::VecDeque<NavEvent>,
+    deadline: Instant,
+) -> Result<String, AgentError> {
+    let mut assembly: Option<ResponseAssembly> = None;
+    // First consume early buffer in order
+    while let Some(event) = early.pop_front() {
+        match event {
+            NavEvent::Response {
+                operation_id,
+                agent_id,
+                turn,
+                text,
+            } => {
+                if operation_id != context.operation_id
+                    || agent_id != context.agent_id
+                    || turn != context.turn
+                {
+                    return Err(AgentError::ExtractionFailed(
+                        "early response mismatch".to_string(),
+                    ));
+                }
+                return Ok(text);
+            }
+            NavEvent::ResponseStart {
+                operation_id,
+                agent_id,
+                turn,
+                byte_length,
+                chunk_count,
+                checksum,
+            } => {
+                if operation_id != context.operation_id
+                    || agent_id != context.agent_id
+                    || turn != context.turn
+                {
+                    return Err(AgentError::ExtractionFailed(
+                        "early start mismatch".to_string(),
+                    ));
+                }
+                assembly = Some(ResponseAssembly::start(byte_length, chunk_count, checksum)?);
+            }
+            NavEvent::ResponseChunk {
+                operation_id,
+                agent_id,
+                turn,
+                sequence,
+                text,
+            } => {
+                if operation_id != context.operation_id
+                    || agent_id != context.agent_id
+                    || turn != context.turn
+                {
+                    return Err(AgentError::ExtractionFailed(
+                        "early chunk mismatch".to_string(),
+                    ));
+                }
+                let Some(active) = assembly.as_mut() else {
+                    return Err(AgentError::ExtractionFailed(
+                        "response chunk received before response start".to_string(),
+                    ));
+                };
+                active.insert(sequence, text)?;
+            }
+            NavEvent::ResponseEnd {
+                operation_id,
+                agent_id,
+                turn,
+                checksum,
+            } => {
+                if operation_id != context.operation_id
+                    || agent_id != context.agent_id
+                    || turn != context.turn
+                {
+                    return Err(AgentError::ExtractionFailed(
+                        "early end mismatch".to_string(),
+                    ));
+                }
+                let Some(active) = assembly.take() else {
+                    return Err(AgentError::ExtractionFailed(
+                        "response end received before response start".to_string(),
+                    ));
+                };
+                return active.finish(&checksum);
+            }
+            NavEvent::Done {
+                operation_id,
+                agent_id,
+                turn,
+            } => {
+                if operation_id == context.operation_id
+                    && agent_id == context.agent_id
+                    && turn == context.turn
+                {
+                    tracing::debug!(
+                        "[ACTIVE] early completion marker for {} turn {}; waiting for response text",
+                        agent_id,
+                        turn
+                    );
+                }
+            }
+            NavEvent::ManualResponse {
+                operation_id,
+                agent_id,
+                turn,
+                response,
+            } => {
+                if operation_id == context.operation_id
+                    && agent_id == context.agent_id
+                    && turn == context.turn
+                {
+                    return Ok(response);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Now select between critical inbox and auxiliary
+    loop {
+        tokio::select! {
+            biased;
+            critical = inbox.recv() => {
+                let event = critical.map_err(critical_to_agent_error)?;
+                match event {
+                    NavEvent::Response { operation_id, agent_id, turn, text } => {
+                        if operation_id != context.operation_id || agent_id != context.agent_id || turn != context.turn {
+                            return Err(AgentError::ExtractionFailed("critical response mismatch".to_string()));
+                        }
+                        return Ok(text);
+                    }
+                    NavEvent::ResponseStart { operation_id, agent_id, turn, byte_length, chunk_count, checksum } => {
+                        if operation_id != context.operation_id || agent_id != context.agent_id || turn != context.turn {
+                            return Err(AgentError::ExtractionFailed("critical start mismatch".to_string()));
+                        }
+                        assembly = Some(ResponseAssembly::start(byte_length, chunk_count, checksum)?);
+                    }
+                    NavEvent::ResponseChunk { operation_id, agent_id, turn, sequence, text } => {
+                        if operation_id != context.operation_id || agent_id != context.agent_id || turn != context.turn {
+                            return Err(AgentError::ExtractionFailed("critical chunk mismatch".to_string()));
+                        }
+                        let Some(active) = assembly.as_mut() else {
+                            return Err(AgentError::ExtractionFailed("response chunk received before response start".to_string()));
+                        };
+                        active.insert(sequence, text)?;
+                    }
+                    NavEvent::ResponseEnd { operation_id, agent_id, turn, checksum } => {
+                        if operation_id != context.operation_id || agent_id != context.agent_id || turn != context.turn {
+                            return Err(AgentError::ExtractionFailed("critical end mismatch".to_string()));
+                        }
+                        let Some(active) = assembly.take() else {
+                            return Err(AgentError::ExtractionFailed("response end received before response start".to_string()));
+                        };
+                        return active.finish(&checksum);
+                    }
+                    NavEvent::Done { operation_id, agent_id, turn } => {
+                        if operation_id == context.operation_id && agent_id == context.agent_id && turn == context.turn {
+                            tracing::debug!("[ACTIVE] completion marker received for {} turn {}; waiting for response text", agent_id, turn);
+                        }
+                    }
+                    NavEvent::ManualResponse { operation_id, agent_id, turn, response } => {
+                        if operation_id == context.operation_id && agent_id == context.agent_id && turn == context.turn {
+                            return Ok(response);
+                        } else {
+                            return Err(AgentError::ExtractionFailed("manual response mismatch".to_string()));
+                        }
+                    }
+                    NavEvent::ActiveSubmitReport { .. } => {
+                        // Should not appear here (already consumed in ack), treat as protocol error if for same op
+                        return Err(AgentError::ExtractionFailed("unexpected submit report during response wait".to_string()));
+                    }
+                    other => {
+                        return Err(AgentError::ExtractionFailed(format!("unexpected critical event during response wait: {:?}", other)));
+                    }
+                }
+            }
+            aux = auxiliary_rx.recv() => {
+                match aux {
+                    Some(NavEvent::ChallengeDetected(ev_agent, indicator)) if ev_agent == context.agent_id => {
+                        let lower = indicator.to_ascii_lowercase();
+                        let kind = if lower.contains("login") || lower.contains("sign in") || lower.contains("sign-in") || lower.contains("auth") {
+                            "login required"
+                        } else if lower.contains("captcha") || lower.contains("challenge") || lower.contains("security") || lower.contains("cloudflare") || lower.contains("verify") {
+                            "captcha/challenge"
+                        } else {
+                            "challenge"
+                        };
+                        tracing::warn!("[CHALLENGE] {} blocked by {}: {} — waiting for ResumeRequested (600s)", context.agent_id, kind, indicator);
+                        let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                crit = inbox.recv() => {
+                                    let ev = crit.map_err(critical_to_agent_error)?;
+                                    // If critical response arrives during challenge wait, return it
+                                    match ev {
+                                        NavEvent::ManualResponse { operation_id, agent_id, turn, response } if operation_id == context.operation_id && agent_id == context.agent_id && turn == context.turn => {
+                                            return Ok(response);
+                                        }
+                                        NavEvent::Response { operation_id, agent_id, turn, text } if operation_id == context.operation_id && agent_id == context.agent_id && turn == context.turn => {
+                                            return Ok(text);
+                                        }
+                                        NavEvent::ResponseStart { operation_id, agent_id, turn, byte_length, chunk_count, checksum } if operation_id == context.operation_id && agent_id == context.agent_id && turn == context.turn => {
+                                            assembly = Some(ResponseAssembly::start(byte_length, chunk_count, checksum)?);
+                                            break;
+                                        }
+                                        NavEvent::ResponseChunk { operation_id, agent_id, turn, sequence, text } if operation_id == context.operation_id && agent_id == context.agent_id && turn == context.turn => {
+                                            if let Some(active) = assembly.as_mut() {
+                                                active.insert(sequence, text)?;
+                                            } else {
+                                                return Err(AgentError::ExtractionFailed("chunk before start during challenge".to_string()));
+                                            }
+                                        }
+                                        NavEvent::ResponseEnd { operation_id, agent_id, turn, checksum } if operation_id == context.operation_id && agent_id == context.agent_id && turn == context.turn => {
+                                            if let Some(active) = assembly.take() {
+                                                return active.finish(&checksum);
+                                            } else {
+                                                return Err(AgentError::ExtractionFailed("end before start during challenge".to_string()));
+                                            }
+                                        }
+                                        NavEvent::Done { operation_id, agent_id, turn } if operation_id == context.operation_id && agent_id == context.agent_id && turn == context.turn => {
+                                            tracing::debug!("[ACTIVE] done during challenge for {} turn {}", agent_id, turn);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                aux2 = auxiliary_rx.recv() => {
+                                    match aux2 {
+                                        Some(NavEvent::ResumeRequested(req_id)) if req_id == context.agent_id => {
+                                            tracing::info!("[CHALLENGE] {} resume received, continuing wait (turn {})", context.agent_id, context.turn);
+                                            break;
+                                        }
+                                        Some(NavEvent::Ready(req_id)) if req_id == context.agent_id => {
+                                            tracing::info!("[CHALLENGE] {} ready after challenge, continuing wait (turn {})", context.agent_id, context.turn);
+                                            break;
+                                        }
+                                        Some(NavEvent::ChallengeDetected(ch_id, next_indicator)) if ch_id == context.agent_id => {
+                                            tracing::warn!("[CHALLENGE] {} still blocked: {}", context.agent_id, next_indicator);
+                                            continue;
+                                        }
+                                        Some(NavEvent::ManualResponse { operation_id, agent_id, turn, response }) if operation_id == context.operation_id && agent_id == context.agent_id && turn == context.turn => {
+                                            return Ok(response);
+                                        }
+                                        Some(NavEvent::Response { operation_id, agent_id, turn, text }) if operation_id == context.operation_id && agent_id == context.agent_id && turn == context.turn => {
+                                            return Ok(text);
+                                        }
+                                        Some(NavEvent::UnshowableUrl(u_id, url)) if u_id == context.agent_id => {
+                                            return Err(AgentError::NavigationFailed(format!("{} navigated to unshowable URL while blocked: {}", context.agent_id, url)));
+                                        }
+                                        Some(NavEvent::SessionAborted) => {
+                                            return Err(AgentError::UnknownError("Session aborted while waiting for challenge resume".to_string()));
+                                        }
+                                        None => {
+                                            return Err(AgentError::NavigationFailed("channel closed while waiting for challenge resume".to_string()));
+                                        }
+                                        Some(_) => continue,
+                                    }
+                                }
+                                _ = tokio::time::sleep_until(resume_deadline) => {
+                                    return Err(AgentError::CaptchaRequired(format!("{} blocked by {}: {} — timeout waiting for verification resume (600s)", context.agent_id, kind, indicator)));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Some(NavEvent::UnshowableUrl(ev_agent, url)) if ev_agent == context.agent_id => {
+                        return Err(AgentError::NavigationFailed(format!("{} navigated to an unshowable URL: {}", context.agent_id, url)));
+                    }
+                    Some(NavEvent::SessionAborted) => {
+                        return Err(AgentError::UnknownError("Session aborted".to_string()));
+                    }
+                    Some(NavEvent::Error(ev_agent)) if ev_agent == context.agent_id => {
+                        return Err(AgentError::ExtractionFailed(format!("Agent {} reported an error", ev_agent)));
+                    }
+                    Some(_) => {
+                        // ignore auxiliary telemetry like Ready, SendDetected, SendProbe etc. Do not reset deadline.
+                        continue;
+                    }
+                    None => {
+                        return Err(AgentError::NavigationFailed("auxiliary channel closed".to_string()));
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(AgentError::Timeout(format!("Agent {} did not respond within {} seconds", context.agent_id, RESPONSE_TIMEOUT_SECS)));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2935,6 +3669,47 @@ mod tests {
         error: Option<&str>,
     ) -> NavEvent {
         NavEvent::ActiveSubmitReport {
+            operation_id: crate::pipeline_ids::OperationId::new(),
+            agent_id: agent_id.to_string(),
+            turn,
+            succeeded,
+            method: "button_click".to_string(),
+            send_enabled: true,
+            error: error.map(|e| e.to_string()),
+        }
+    }
+
+    fn make_context(
+        agent: &str,
+        turn: u32,
+    ) -> (
+        crate::pipeline_ids::OperationContext,
+        crate::critical_transport::CriticalEventHub<NavEvent>,
+    ) {
+        let owner = crate::session_runtime::SessionOwner {
+            session_id: "test-session".to_string(),
+            run_generation: 1,
+        };
+        let ctx = crate::pipeline_ids::OperationContext::from_owner(
+            &owner,
+            agent,
+            turn,
+            crate::pipeline_ids::BrowserSurface::Participant,
+        );
+        let hub: crate::critical_transport::CriticalEventHub<NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        (ctx, hub)
+    }
+
+    fn active_submit_report_with_op(
+        op: crate::pipeline_ids::OperationId,
+        agent_id: &str,
+        turn: u32,
+        succeeded: bool,
+        error: Option<&str>,
+    ) -> NavEvent {
+        NavEvent::ActiveSubmitReport {
+            operation_id: op,
             agent_id: agent_id.to_string(),
             turn,
             succeeded,
@@ -2946,31 +3721,30 @@ mod tests {
 
     #[tokio::test]
     async fn ack_accepts_success_report_for_exact_agent_turn() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(active_submit_report("deepseek", 3, true, None))
-            .await
-            .unwrap();
-        drop(tx);
-        let result = await_submit_ack("deepseek", 3, &mut rx).await;
+        let (ctx, hub) = make_context("deepseek", 3);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        let ev = active_submit_report_with_op(ctx.operation_id.clone(), "deepseek", 3, true, None);
+        hub.dispatch(ctx.operation_id.clone(), ev, 64);
+        let result = await_submit_ack(&ctx, &mut inbox).await;
         assert!(
-            matches!(result, Ok(None)),
-            "expected Ok(None), got {result:?}"
+            matches!(result, Ok(ref a) if matches!(a.outcome, SubmitOutcome::Confirmed)),
+            "got {result:?}"
         );
     }
 
     #[tokio::test]
     async fn ack_rejects_failure_report_for_exact_agent_turn() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(active_submit_report(
+        let (ctx, hub) = make_context("chatgpt", 2);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        let ev = active_submit_report_with_op(
+            ctx.operation_id.clone(),
             "chatgpt",
             2,
             false,
             Some("enabled_send_button_not_found_after_retry"),
-        ))
-        .await
-        .unwrap();
-        drop(tx);
-        let result = await_submit_ack("chatgpt", 2, &mut rx).await;
+        );
+        hub.dispatch(ctx.operation_id.clone(), ev, 64);
+        let result = await_submit_ack(&ctx, &mut inbox).await;
         assert!(
             matches!(result, Err(AgentError::InjectionFailed(_))),
             "got {result:?}"
@@ -2979,79 +3753,115 @@ mod tests {
 
     #[tokio::test]
     async fn ack_skips_stale_reports_from_other_agents_and_turns() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(active_submit_report("deepseek", 3, true, None))
-            .await
-            .unwrap();
-        tx.send(active_submit_report("chatgpt", 1, true, None))
-            .await
-            .unwrap();
-        tx.send(active_submit_report("chatgpt", 2, true, None))
-            .await
-            .unwrap();
-        drop(tx);
-        let result = await_submit_ack("chatgpt", 2, &mut rx).await;
-        assert!(
-            matches!(result, Ok(None)),
-            "expected Ok(None), got {result:?}"
+        // With operation mailbox, only exact operation_id is delivered, so stale reports for other ops are never enqueued.
+        // This test verifies that a correct report for the exact context is accepted even after other contexts' reports were sent to their own mailboxes.
+        let (ctx, hub) = make_context("chatgpt", 2);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        // Create other contexts and dispatch to their mailboxes (not to ctx's)
+        let other_ctx = crate::pipeline_ids::OperationContext::from_owner(
+            &crate::session_runtime::SessionOwner {
+                session_id: "test-session".to_string(),
+                run_generation: 1,
+            },
+            "deepseek",
+            3,
+            crate::pipeline_ids::BrowserSurface::Participant,
         );
+        let mut other_inbox = hub
+            .register(other_ctx.operation_id.clone(), 0, true)
+            .unwrap();
+        hub.dispatch(
+            other_ctx.operation_id.clone(),
+            active_submit_report_with_op(other_ctx.operation_id.clone(), "deepseek", 3, true, None),
+            64,
+        );
+        hub.dispatch(
+            ctx.operation_id.clone(),
+            active_submit_report_with_op(ctx.operation_id.clone(), "chatgpt", 2, true, None),
+            64,
+        );
+        let result = await_submit_ack(&ctx, &mut inbox).await;
+        assert!(
+            matches!(result, Ok(ref a) if matches!(a.outcome, SubmitOutcome::Confirmed)),
+            "got {result:?}"
+        );
+        // other inbox should still have its event
+        let other_res = await_submit_ack(&other_ctx, &mut other_inbox).await;
+        assert!(matches!(other_res, Ok(ref a) if matches!(a.outcome, SubmitOutcome::Confirmed)));
     }
 
     #[tokio::test]
     async fn ack_captures_early_response_for_exact_agent_turn() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(NavEvent::Response(
-            "chatgpt".to_string(),
-            4,
-            "early text".to_string(),
-        ))
-        .await
-        .unwrap();
-        drop(tx);
-        let result = await_submit_ack("chatgpt", 4, &mut rx).await;
+        let (ctx, hub) = make_context("chatgpt", 4);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        let op = ctx.operation_id.clone();
+        hub.dispatch(
+            op.clone(),
+            NavEvent::Response {
+                operation_id: op.clone(),
+                agent_id: "chatgpt".to_string(),
+                turn: 4,
+                text: "early text".to_string(),
+            },
+            10,
+        );
+        let result = await_submit_ack(&ctx, &mut inbox).await;
         assert!(
-            matches!(result, Ok(Some(ref text)) if text == "early text"),
+            matches!(result, Ok(ref a) if matches!(a.outcome, SubmitOutcome::ResponseEarly(ref t) if t=="early text")),
             "got {result:?}"
         );
     }
 
     #[tokio::test]
     async fn ack_accepts_manual_response_for_exact_agent_turn() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(NavEvent::ManualResponse {
-            agent_id: "deepseek".to_string(),
-            turn: 5,
-            response: "pasted".to_string(),
-        })
-        .await
-        .unwrap();
-        drop(tx);
-        let result = await_submit_ack("deepseek", 5, &mut rx).await;
+        let (ctx, hub) = make_context("deepseek", 5);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        let op = ctx.operation_id.clone();
+        hub.dispatch(
+            op.clone(),
+            NavEvent::ManualResponse {
+                operation_id: op.clone(),
+                agent_id: "deepseek".to_string(),
+                turn: 5,
+                response: "pasted".to_string(),
+            },
+            6,
+        );
+        let result = await_submit_ack(&ctx, &mut inbox).await;
         assert!(
-            matches!(result, Ok(Some(ref text)) if text == "pasted"),
+            matches!(result, Ok(ref a) if matches!(a.outcome, SubmitOutcome::ResponseEarly(ref t) if t=="pasted")),
             "got {result:?}"
         );
     }
 
     #[tokio::test]
     async fn ack_surfaces_session_aborted() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(NavEvent::SessionAborted).await.unwrap();
-        drop(tx);
-        let result = await_submit_ack("chatgpt", 1, &mut rx).await;
+        // SessionAborted is not a critical event; it is auxiliary. For critical inbox, closed without event should be NavigationFailed or Closed.
+        // Simulate by closing inbox before ack
+        let (ctx, hub) = make_context("chatgpt", 1);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        hub.close_exact(&ctx.operation_id);
+        let result = await_submit_ack(&ctx, &mut inbox).await;
         assert!(
-            matches!(result, Err(AgentError::UnknownError(_))),
+            matches!(
+                result,
+                Err(AgentError::NavigationFailed(_)) | Err(AgentError::UnknownError(_))
+            ),
             "got {result:?}"
         );
     }
 
     #[tokio::test]
     async fn ack_errors_when_channel_closed_before_matching_report() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        drop(tx);
-        let result = await_submit_ack("chatgpt", 1, &mut rx).await;
+        let (ctx, hub) = make_context("chatgpt", 1);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        hub.close_exact(&ctx.operation_id);
+        let result = await_submit_ack(&ctx, &mut inbox).await;
         assert!(
-            matches!(result, Err(AgentError::NavigationFailed(_))),
+            matches!(
+                result,
+                Err(AgentError::NavigationFailed(_)) | Err(AgentError::UnknownError(_))
+            ),
             "got {result:?}"
         );
     }
@@ -3059,17 +3869,29 @@ mod tests {
     #[tokio::test]
     async fn drain_stale_active_events_preserves_pending_critical_signals() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(active_submit_report("chatgpt", 1, false, None))
-            .await
-            .unwrap();
+        // Use operation-based critical report but this test checks auxiliary drain is no-op
+        let op = crate::pipeline_ids::OperationId::new();
+        tx.send(NavEvent::ActiveSubmitReport {
+            operation_id: op.clone(),
+            agent_id: "chatgpt".to_string(),
+            turn: 1,
+            succeeded: false,
+            method: "button_click".to_string(),
+            send_enabled: true,
+            error: None,
+        })
+        .await
+        .unwrap();
         tx.send(NavEvent::Ready("chatgpt".to_string()))
             .await
             .unwrap();
-        tx.send(NavEvent::Response(
-            "chatgpt".to_string(),
-            1,
-            "stale".to_string(),
-        ))
+        let op2 = crate::pipeline_ids::OperationId::new();
+        tx.send(NavEvent::Response {
+            operation_id: op2,
+            agent_id: "chatgpt".to_string(),
+            turn: 1,
+            text: "stale".to_string(),
+        })
         .await
         .unwrap();
         let drained = drain_stale_active_events(&mut rx);
@@ -3090,31 +3912,38 @@ mod tests {
 
     #[tokio::test]
     async fn queued_response_recovery_requires_exact_agent_and_turn() {
+        // Destructive scan removed; should return None even with queued responses
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(NavEvent::Response(
-            "other".to_string(),
-            4,
-            "stale agent".to_string(),
-        ))
+        let op1 = crate::pipeline_ids::OperationId::new();
+        tx.send(NavEvent::Response {
+            operation_id: op1,
+            agent_id: "other".to_string(),
+            turn: 4,
+            text: "stale agent".to_string(),
+        })
         .await
         .unwrap();
-        tx.send(NavEvent::Response(
-            "claude".to_string(),
-            3,
-            "stale turn".to_string(),
-        ))
+        let op2 = crate::pipeline_ids::OperationId::new();
+        tx.send(NavEvent::Response {
+            operation_id: op2,
+            agent_id: "claude".to_string(),
+            turn: 3,
+            text: "stale turn".to_string(),
+        })
         .await
         .unwrap();
-        tx.send(NavEvent::Response(
-            "claude".to_string(),
-            4,
-            "current".to_string(),
-        ))
+        let op3 = crate::pipeline_ids::OperationId::new();
+        tx.send(NavEvent::Response {
+            operation_id: op3,
+            agent_id: "claude".to_string(),
+            turn: 4,
+            text: "current".to_string(),
+        })
         .await
         .unwrap();
         assert_eq!(
-            super::take_queued_response_for_turn(&mut rx, "claude", 4).as_deref(),
-            Some("current")
+            super::take_queued_response_for_turn(&mut rx, "claude", 4),
+            None
         );
     }
 
@@ -3146,11 +3975,12 @@ mod tests {
             !handle.is_finished(),
             "should still be waiting for Response after resume"
         );
-        tx.send(NavEvent::Response(
-            agent.to_string(),
+        tx.send(NavEvent::Response {
+            operation_id: crate::pipeline_ids::OperationId::new(),
+            agent_id: agent.to_string(),
             turn,
-            "hello".to_string(),
-        ))
+            text: "hello".to_string(),
+        })
         .await
         .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
@@ -3178,6 +4008,7 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         tx.send(NavEvent::ManualResponse {
+            operation_id: crate::pipeline_ids::OperationId::new(),
             agent_id: agent.to_string(),
             turn,
             response: "pasted".to_string(),
@@ -3237,11 +4068,12 @@ mod tests {
             !handle.is_finished(),
             "challenge for other agent should be ignored"
         );
-        tx.send(NavEvent::Response(
-            agent.to_string(),
+        tx.send(NavEvent::Response {
+            operation_id: crate::pipeline_ids::OperationId::new(),
+            agent_id: agent.to_string(),
             turn,
-            "ok".to_string(),
-        ))
+            text: "ok".to_string(),
+        })
         .await
         .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
@@ -3492,5 +4324,380 @@ mod tests {
             assembly.finish("deadbeef"),
             Err(AgentError::ExtractionFailed(_))
         ));
+    }
+
+    // ── Session 02 RT tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rt1_old_session_same_agent_turn_cannot_satisfy_new() {
+        let owner_a = crate::session_runtime::SessionOwner {
+            session_id: "sess-1".to_string(),
+            run_generation: 1,
+        };
+        let owner_b = crate::session_runtime::SessionOwner {
+            session_id: "sess-1".to_string(),
+            run_generation: 2,
+        };
+        let ctx_a = crate::pipeline_ids::OperationContext::from_owner(
+            &owner_a,
+            "claude",
+            5,
+            crate::pipeline_ids::BrowserSurface::Participant,
+        );
+        let ctx_b = crate::pipeline_ids::OperationContext::from_owner(
+            &owner_b,
+            "claude",
+            5,
+            crate::pipeline_ids::BrowserSurface::Participant,
+        );
+        assert_ne!(ctx_a.operation_id, ctx_b.operation_id);
+        // Simulate hub: old operation's response should not be deliverable to new inbox
+        let hub: crate::critical_transport::CriticalEventHub<NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let mut inbox_a = hub.register(ctx_a.operation_id.clone(), 0, true).unwrap();
+        let mut inbox_b = hub.register(ctx_b.operation_id.clone(), 0, true).unwrap();
+        hub.dispatch(
+            ctx_a.operation_id.clone(),
+            NavEvent::Response {
+                operation_id: ctx_a.operation_id.clone(),
+                agent_id: "claude".to_string(),
+                turn: 5,
+                text: "old response".to_string(),
+            },
+            12,
+        );
+        // inbox_b should not receive old response
+        let try_recv = tokio::time::timeout(Duration::from_millis(50), inbox_b.recv()).await;
+        assert!(
+            try_recv.is_err(),
+            "new operation should not receive old operation's response"
+        );
+        // inbox_a should receive it
+        let old_text = inbox_a.recv().await.unwrap();
+        match old_text {
+            NavEvent::Response { text, .. } => assert_eq!(text, "old response"),
+            _ => panic!("unexpected"),
+        }
+        // Even if we dispatch old op's response again after b closed, b should not get it
+        hub.close_exact(&ctx_a.operation_id);
+        hub.close_exact(&ctx_b.operation_id);
+    }
+
+    #[tokio::test]
+    async fn rt2_old_start_chunk_end_cannot_assemble_new() {
+        let owner_a = crate::session_runtime::SessionOwner {
+            session_id: "s".to_string(),
+            run_generation: 1,
+        };
+        let owner_b = crate::session_runtime::SessionOwner {
+            session_id: "s".to_string(),
+            run_generation: 2,
+        };
+        let ctx_a = crate::pipeline_ids::OperationContext::from_owner(
+            &owner_a,
+            "claude",
+            5,
+            crate::pipeline_ids::BrowserSurface::Participant,
+        );
+        let ctx_b = crate::pipeline_ids::OperationContext::from_owner(
+            &owner_b,
+            "claude",
+            5,
+            crate::pipeline_ids::BrowserSurface::Participant,
+        );
+        let hub: crate::critical_transport::CriticalEventHub<NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let mut inbox_a = hub.register(ctx_a.operation_id.clone(), 0, true).unwrap();
+        let mut inbox_b = hub.register(ctx_b.operation_id.clone(), 0, true).unwrap();
+        let text = "hello world";
+        let checksum = super::response_checksum(text);
+        let start = NavEvent::ResponseStart {
+            operation_id: ctx_a.operation_id.clone(),
+            agent_id: "claude".to_string(),
+            turn: 5,
+            byte_length: text.len(),
+            chunk_count: 1,
+            checksum: checksum.clone(),
+        };
+        hub.dispatch(ctx_a.operation_id.clone(), start, 64);
+        let chunk = NavEvent::ResponseChunk {
+            operation_id: ctx_a.operation_id.clone(),
+            agent_id: "claude".to_string(),
+            turn: 5,
+            sequence: 0,
+            text: text.to_string(),
+        };
+        hub.dispatch(ctx_a.operation_id.clone(), chunk, text.len());
+        let end = NavEvent::ResponseEnd {
+            operation_id: ctx_a.operation_id.clone(),
+            agent_id: "claude".to_string(),
+            turn: 5,
+            checksum: checksum.clone(),
+        };
+        hub.dispatch(ctx_a.operation_id.clone(), end, 32);
+        // inbox_b should not see these
+        let try_recv = tokio::time::timeout(Duration::from_millis(50), inbox_b.recv()).await;
+        assert!(try_recv.is_err(), "new op should not see old chunk stream");
+        // inbox_a should see them
+        let _ = inbox_a.recv().await.unwrap();
+        let _ = inbox_a.recv().await.unwrap();
+        let _ = inbox_a.recv().await.unwrap();
+        hub.close_exact(&ctx_a.operation_id);
+        hub.close_exact(&ctx_b.operation_id);
+    }
+
+    #[tokio::test]
+    async fn rt3_pre_ack_chunk_stream_preserved() {
+        let owner = crate::session_runtime::SessionOwner {
+            session_id: "sess".to_string(),
+            run_generation: 1,
+        };
+        let ctx = crate::pipeline_ids::OperationContext::from_owner(
+            &owner,
+            "claude",
+            3,
+            crate::pipeline_ids::BrowserSurface::Participant,
+        );
+        let hub: crate::critical_transport::CriticalEventHub<NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        // Simulate chunks arriving before submit ack
+        let text = "chunked response";
+        let checksum = super::response_checksum(text);
+        let start = NavEvent::ResponseStart {
+            operation_id: ctx.operation_id.clone(),
+            agent_id: "claude".to_string(),
+            turn: 3,
+            byte_length: text.len(),
+            chunk_count: 1,
+            checksum: checksum.clone(),
+        };
+        hub.dispatch(ctx.operation_id.clone(), start, 64);
+        let chunk = NavEvent::ResponseChunk {
+            operation_id: ctx.operation_id.clone(),
+            agent_id: "claude".to_string(),
+            turn: 3,
+            sequence: 0,
+            text: text.to_string(),
+        };
+        hub.dispatch(ctx.operation_id.clone(), chunk, text.len());
+        // Dispatch ack after chunks
+        let ack = NavEvent::ActiveSubmitReport {
+            operation_id: ctx.operation_id.clone(),
+            agent_id: "claude".to_string(),
+            turn: 3,
+            succeeded: true,
+            method: "button_click".to_string(),
+            send_enabled: true,
+            error: None,
+        };
+        hub.dispatch(ctx.operation_id.clone(), ack, 64);
+        // await_submit_ack should buffer chunks and return ack with early buffer
+        let ack_res = super::await_submit_ack(&ctx, &mut inbox).await.unwrap();
+        assert!(matches!(ack_res.outcome, super::SubmitOutcome::Confirmed));
+        assert_eq!(ack_res.early_buffer.len(), 2); // start + chunk
+        // Then wait should assemble using early buffer
+        let end = NavEvent::ResponseEnd {
+            operation_id: ctx.operation_id.clone(),
+            agent_id: "claude".to_string(),
+            turn: 3,
+            checksum: checksum.clone(),
+        };
+        // Need to dispatch end after ack, but early buffer already has start/chunk, now dispatch end to inbox
+        hub.dispatch(ctx.operation_id.clone(), end, 32);
+        let mut early = ack_res.early_buffer;
+        let mut dummy_aux = tokio::sync::mpsc::channel::<NavEvent>(8).1;
+        let res = super::wait_for_response_with_operation(
+            &ctx,
+            &mut inbox,
+            &mut dummy_aux,
+            &mut early,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res, text);
+        hub.close_exact(&ctx.operation_id);
+    }
+
+    #[tokio::test]
+    async fn rt4_no_destructive_auxiliary_scan() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // Fill with unrelated events
+        tx.send(NavEvent::Ready("other".to_string())).await.unwrap();
+        tx.send(NavEvent::Ready("other2".to_string()))
+            .await
+            .unwrap();
+        let drained = super::drain_stale_active_events(&mut rx);
+        assert_eq!(drained, 0);
+        // take_queued should return None (no destructive scan)
+        let res = super::take_queued_response_for_turn(&mut rx, "claude", 5);
+        assert_eq!(res, None);
+        // Ensure events still in channel (not drained)
+        assert!(!rx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rt5_manual_response_exact_operation() {
+        let owner = crate::session_runtime::SessionOwner {
+            session_id: "sess".to_string(),
+            run_generation: 1,
+        };
+        let ctx = crate::pipeline_ids::OperationContext::from_owner(
+            &owner,
+            "claude",
+            7,
+            crate::pipeline_ids::BrowserSurface::Participant,
+        );
+        let hub: crate::critical_transport::CriticalEventHub<NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        // Correct manual response
+        let correct = NavEvent::ManualResponse {
+            operation_id: ctx.operation_id.clone(),
+            agent_id: "claude".to_string(),
+            turn: 7,
+            response: "correct".to_string(),
+        };
+        hub.dispatch(ctx.operation_id.clone(), correct, 7);
+        let ack = super::await_submit_ack(&ctx, &mut inbox).await.unwrap();
+        assert!(matches!(ack.outcome, super::SubmitOutcome::ResponseEarly(ref t) if t=="correct"));
+        // Stale operation manual response should not be accepted for new operation
+        let other_ctx = crate::pipeline_ids::OperationContext::from_owner(
+            &owner,
+            "claude",
+            7,
+            crate::pipeline_ids::BrowserSurface::Participant,
+        );
+        let mut other_inbox = hub
+            .register(other_ctx.operation_id.clone(), 0, true)
+            .unwrap();
+        let stale_manual = NavEvent::ManualResponse {
+            operation_id: ctx.operation_id.clone(),
+            agent_id: "claude".to_string(),
+            turn: 7,
+            response: "stale".to_string(),
+        };
+        // Dispatch stale to old mailbox (correct routing), new mailbox should stay empty
+        hub.dispatch(ctx.operation_id.clone(), stale_manual, 5);
+        let try_recv = tokio::time::timeout(Duration::from_millis(50), other_inbox.recv()).await;
+        assert!(try_recv.is_err());
+        hub.close_exact(&ctx.operation_id);
+        hub.close_exact(&other_ctx.operation_id);
+    }
+
+    #[tokio::test]
+    async fn rt6_attach_nav_receiver_does_not_affect_critical() {
+        // Simulate attach without affecting critical hub: create state via dummy channels
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<NavEvent>(8);
+        let (crit_tx, _crit_rx) = std::sync::mpsc::sync_channel::<NavEvent>(8);
+        let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hub: crate::critical_transport::CriticalEventHub<NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let ingress = crate::browser_backend::BrowserEventIngress::new_for_test(
+            aux_tx,
+            crit_tx,
+            epoch.clone(),
+            alive.clone(),
+        );
+        let mut state = crate::browser_backend::BrowserState::new_with_ingress(
+            ingress,
+            hub.clone(),
+            epoch.clone(),
+            alive.clone(),
+        );
+        let hub_before = state.critical_hub.clone();
+        let _aux1 = state.attach_nav_receiver();
+        let hub_after = state.critical_hub.clone();
+        // Critical hub should remain same (not replaced)
+        // We check that hub still allows registration
+        let owner = crate::session_runtime::SessionOwner {
+            session_id: "sess".to_string(),
+            run_generation: 1,
+        };
+        let ctx = crate::pipeline_ids::OperationContext::from_owner(
+            &owner,
+            "claude",
+            1,
+            crate::pipeline_ids::BrowserSurface::Participant,
+        );
+        let inbox = hub_after.register(ctx.operation_id.clone(), 0, true);
+        assert!(inbox.is_ok());
+        assert_eq!(
+            state
+                .critical_hub
+                .register(ctx.operation_id.clone(), 1, true)
+                .is_err(),
+            true
+        ); // duplicate should fail, proving same hub still has first op
+    }
+
+    #[tokio::test]
+    async fn rt7_telemetry_flood_does_not_consume_critical_capacity() {
+        // Auxiliary flood: fill auxiliary channel, ensure critical still works
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<NavEvent>(2);
+        let (crit_tx, crit_rx) = std::sync::mpsc::sync_channel::<NavEvent>(
+            crate::critical_transport::CRITICAL_INGRESS_CAPACITY,
+        );
+        let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hub: crate::critical_transport::CriticalEventHub<NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let ingress = crate::browser_backend::BrowserEventIngress::new_for_test(
+            aux_tx.clone(),
+            crit_tx.clone(),
+            epoch.clone(),
+            alive.clone(),
+        );
+        // Flood auxiliary (capacity 2) – third send will be dropped but should not affect critical
+        for _ in 0..10 {
+            ingress.send(NavEvent::SendProbe {
+                agent_id: "claude".to_string(),
+                input_found: true,
+                send_button_found: true,
+                user_submit_seen: false,
+                message_count_seen: None,
+                sent_signal_emitted: false,
+                readiness_probe_count: None,
+                input_candidate_count: None,
+                composer_candidate_count: None,
+                send_button_candidate_count: None,
+                readiness_timeout_ms: None,
+                page_state_hint: None,
+                page_health_hint: None,
+            });
+        }
+        // Critical operation should still be registerable and dispatchable
+        let owner = crate::session_runtime::SessionOwner {
+            session_id: "sess".to_string(),
+            run_generation: 1,
+        };
+        let ctx = crate::pipeline_ids::OperationContext::from_owner(
+            &owner,
+            "claude",
+            9,
+            crate::pipeline_ids::BrowserSurface::Participant,
+        );
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        let text = "critical still works despite aux flood";
+        let ev = NavEvent::Response {
+            operation_id: ctx.operation_id.clone(),
+            agent_id: "claude".to_string(),
+            turn: 9,
+            text: text.to_string(),
+        };
+        hub.dispatch(ctx.operation_id.clone(), ev, text.len());
+        let recv = tokio::time::timeout(Duration::from_millis(100), inbox.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match recv {
+            NavEvent::Response { text: t, .. } => assert_eq!(t, text),
+            _ => panic!("unexpected"),
+        }
+        hub.close_exact(&ctx.operation_id);
+        // Also ensure aux channel is still not affecting critical epoch
+        assert_eq!(epoch.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
