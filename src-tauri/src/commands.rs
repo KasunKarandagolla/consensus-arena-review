@@ -815,15 +815,13 @@ pub async fn abort_session(
     app: AppHandle,
 ) -> Result<(), String> {
     // Capture current exact owner before mutating shared state
-    let expected_owner = state.session_runtime.current_owner();
-    if expected_owner.is_none() {
+    let Some(expected) = state.session_runtime.current_owner() else {
         // No live session — controlled Ok without writing shared session state for unknown owner
         // Still best-effort try to wake any lingering browser wait
         let browser = state.browser_state.lock().await;
         let _ = browser.nav_tx.try_send(NavEvent::SessionAborted);
         return Ok(());
-    }
-    let expected = expected_owner.unwrap();
+    };
 
     // Cooperative cancellation flags for that owner/current run (no async lock held across stop await for these atomics)
     state.hackathon_cancel.store(true, Ordering::SeqCst);

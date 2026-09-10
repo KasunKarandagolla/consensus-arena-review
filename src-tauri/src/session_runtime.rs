@@ -5,6 +5,22 @@ use std::sync::{
 use tokio::sync::{Notify, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 
+#[cfg(test)]
+pub mod test_hooks {
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+    static HOOK: Mutex<Option<(Arc<Notify>, Arc<Notify>)>> = Mutex::new(None);
+    pub fn set_hook(observed: Arc<Notify>, proceed: Arc<Notify>) {
+        *HOOK.lock().unwrap() = Some((observed, proceed));
+    }
+    pub fn clear_hook() {
+        *HOOK.lock().unwrap() = None;
+    }
+    pub(crate) fn take_hook() -> Option<(Arc<Notify>, Arc<Notify>)> {
+        HOOK.lock().unwrap().take()
+    }
+}
+
 /// Immutable owner identity for a live orchestration run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOwner {
@@ -236,132 +252,6 @@ impl SessionRuntime {
         })
     }
 
-    // ── Handoff ─────────────────────────────────────────────────────────
-
-    fn handoff(
-        &self,
-        owner: &SessionOwner,
-        handle: JoinHandle<()>,
-        activate: Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Result<(), String> {
-        let mut inner = match self.inner.lock() {
-            Ok(g) => g,
-            Err(poison) => poison.into_inner(),
-        };
-        // Check that we are still in Starting/Resuming with same owner.
-        let still_valid = match &inner.phase {
-            RuntimePhase::Starting(o) if o == owner => true,
-            RuntimePhase::Resuming(o) if o == owner => true,
-            _ => false,
-        };
-        let is_stopping = matches!(&inner.phase, RuntimePhase::Stopping(o) if o == owner);
-
-        if still_valid {
-            // Successful handoff: store handle, transition to Running, clear pre_handoff, notify, activate
-            inner.phase = RuntimePhase::Running(owner.clone());
-            inner.handle = Some(handle);
-            // Clear pre_handoff and notify waiter (Stop)
-            inner.pre_handoff = None;
-            // Notify before activation
-            // Clone notify before dropping lock? We have it in permit, but also inner's pre_handoff notify was same Arc
-            // We notify via the permit's notify clone outside? For now, we need to notify.
-            // The permit's notify is same Arc as inner.pre_handoff.notify, so clearing and notifying via permit's notify will wake Stop.
-            // But we cleared inner.pre_handoff, so we should notify via the owner's notify that was stored.
-            // However we don't have that notify here except via the permit's clone. Since we're inside handoff, we can notify by taking the notify from permit? But we don't have it.
-            // Instead, we can notify by notifying all waiters via a separate channel? Simpler: we will notify via the inner's pre_handoff notify before clearing, but we cleared it.
-            // Let's handle notifying in the permit's commit after handoff, not here. But we need to notify Stop that pre_handoff is done.
-            // We'll do: if let Some(ph) = inner.pre_handoff.take() { ph.notify.notify_waiters(); } but we already set to None.
-            // Instead, we should notify via the permit's notify, not inner's. But handoff doesn't have permit's notify.
-            // So we need to pass notify into handoff or notify after.
-            // For now, just clear pre_handoff and rely on permit's Drop to notify? But permit's committed = true will not notify.
-            // We need to ensure Stop is woken. Let's notify here via a new Notify? Actually the Stop is waiting on the same Arc<Notify> that was stored in pre_handoff.
-            // Since we cleared pre_handoff, Stop's loop will see None and break, without needing notify. But if Stop is currently waiting on notified().await, it will hang until notify.
-            // So we need to notify.
-            // We can achieve by keeping the notify Arc before clearing and notifying.
-            // Let's re-implement: save notify clone before clearing, then notify.
-            // But we don't have it now. We need to restructure to keep it.
-            // For now, we will not clear pre_handoff here; instead let the permit's commit handle clearing and notifying.
-            // This handoff method is incomplete for new design. We will handle clearing in permit.
-            // To keep this method simple, we will just set phase and handle, and leave pre_handoff clearing to caller.
-            // But to avoid confusion, we will change this method to not handle pre_handoff; the permit will handle it.
-            // For now, keep this as is and let permit handle notify.
-            drop(inner);
-            if let Some(tx) = activate {
-                let _ = tx.send(());
-            }
-            return Ok(());
-        } else if is_stopping {
-            // Stop won the race — do NOT activate task, make handle available to Stop owner.
-            // Store handle so Stop can take and abort it, even though we are Stopping.
-            // Keep phase as Stopping, but store handle.
-            inner.handle = Some(handle);
-            // Clear pre_handoff and notify Stop waiter
-            // Need to clear pre_handoff: it should be Some with same owner
-            if let Some(ph) = &inner.pre_handoff {
-                if &ph.owner == owner {
-                    // Clone notify before clearing
-                    let notify = ph.notify.clone();
-                    inner.pre_handoff = None;
-                    drop(inner);
-                    notify.notify_waiters();
-                } else {
-                    drop(inner);
-                }
-            } else {
-                drop(inner);
-            }
-            // Do not send activation
-            return Err(
-                "Session start cancelled — stop requested before task became live".to_string(),
-            );
-        } else {
-            // Stale: abort handle and return error
-            drop(inner);
-            handle.abort();
-            // Do not send activation
-            return Err(
-                "Session start cancelled — stop requested before task became live".to_string(),
-            );
-        }
-    }
-
-    // Called by permit Drop/commit to clear pre_handoff and notify
-    fn clear_pre_handoff(&self, owner: &SessionOwner, is_stopping: bool) {
-        let notify_opt = {
-            let mut inner = match self.inner.lock() {
-                Ok(g) => g,
-                Err(poison) => poison.into_inner(),
-            };
-            if let Some(ph) = &inner.pre_handoff {
-                if &ph.owner == owner {
-                    let n = ph.notify.clone();
-                    // Only rollback to Idle if not Stopping
-                    let should_rollback = !is_stopping
-                        && matches!(&inner.phase, RuntimePhase::Starting(o) if o == owner)
-                        || matches!(&inner.phase, RuntimePhase::Resuming(o) if o == owner);
-                    // Actually check: if phase is Starting/Resuming with same owner and not Stopping, rollback
-                    let is_starting =
-                        matches!(&inner.phase, RuntimePhase::Starting(o) if o == owner);
-                    let is_resuming =
-                        matches!(&inner.phase, RuntimePhase::Resuming(o) if o == owner);
-                    if (is_starting || is_resuming) && !is_stopping {
-                        inner.phase = RuntimePhase::Idle;
-                    }
-                    // Always clear pre_handoff if owner matches
-                    inner.pre_handoff = None;
-                    Some(n)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(n) = notify_opt {
-            n.notify_waiters();
-        }
-    }
-
     // ── Completion / stale protection ───────────────────────────────────
 
     /// Mark the given owner terminal (natural completion). Owner-checked including generation.
@@ -528,6 +418,13 @@ impl SessionRuntime {
                 }
             };
             if let Some(notify) = notify_opt {
+                #[cfg(test)]
+                {
+                    if let Some((observed, proceed)) = test_hooks::take_hook() {
+                        observed.notify_one();
+                        proceed.notified().await;
+                    }
+                }
                 notify.notified().await;
             } else {
                 break;
@@ -670,7 +567,7 @@ impl SessionStartPermit {
                 };
                 drop(inner);
                 if let Some(n) = notify {
-                    n.notify_waiters();
+                    n.notify_one();
                 }
                 // Send activation
                 let _ = activate.send(());
@@ -685,7 +582,7 @@ impl SessionStartPermit {
                 };
                 drop(inner);
                 if let Some(n) = notify {
-                    n.notify_waiters();
+                    n.notify_one();
                 }
                 // Do not send activation; task will remain pending until abort
                 Err("Session start cancelled — stop requested before task became live".to_string())
@@ -755,7 +652,7 @@ impl Drop for SessionStartPermit {
             }
         };
         if let Some(n) = notify_opt {
-            n.notify_waiters();
+            n.notify_one();
         }
     }
 }
@@ -1446,6 +1343,49 @@ mod tests {
             rt.inner.lock().unwrap_or_else(|e| e.into_inner()).phase,
             RuntimePhase::Running(_)
         ));
+        rt.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn c11_missed_wakeup_before_wait() {
+        // Deterministically force the notification-before-wait registration race.
+        // A is Starting with live permit, Stop has observed pre_handoff but not yet begun waiting,
+        // then permit resolves and signals, only then Stop proceeds to await.
+        let rt = test_runtime();
+        let permit = rt.try_acquire_start("sess-a".to_string()).unwrap();
+        let owner_a = permit.owner();
+        let observed = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+        test_hooks::set_hook(observed.clone(), proceed.clone());
+        let rt_clone = Arc::clone(&rt);
+        let owner_clone = owner_a.clone();
+        let stop_handle = tokio::spawn(async move {
+            // This will enter Stopping(A) and then hit the test hook before notified().await
+            let guard = rt_clone.stop_owner(&owner_clone).await.unwrap();
+            assert!(
+                guard.is_some(),
+                "Stop should obtain guard for Starting owner"
+            );
+            assert_eq!(rt_clone.phase_name(), "Stopping");
+            // While Stopping, try_acquire must fail
+            assert!(rt_clone.try_acquire_start("sess-b".to_string()).is_err());
+            guard.unwrap().finish();
+            assert_eq!(rt_clone.phase_name(), "Idle");
+        });
+        // Wait for Stop to observe pre_handoff and pause before notified().await
+        observed.notified().await;
+        // Now Stop is paused before waiting, drop permit which does notify_one with no waiter (stored permit)
+        drop(permit);
+        // Allow Stop to proceed to notified().await, which should consume the stored permit and not hang
+        proceed.notify_one();
+        // Stop should complete without deadlock
+        tokio::time::timeout(Duration::from_secs(2), stop_handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!rt.is_active());
+        assert!(rt.try_acquire_start("sess-b".to_string()).is_ok());
+        test_hooks::clear_hook();
         rt.stop().await.unwrap();
     }
 }
