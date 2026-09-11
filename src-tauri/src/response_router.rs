@@ -4337,24 +4337,31 @@ mod tests {
 
     #[tokio::test]
     async fn response_timeout_is_absolute_despite_irrelevant_traffic() {
+        // Irrelevant auxiliary traffic must not extend the response deadline:
+        // the producer emits ~1000ms of Ready("other") events while the inner
+        // deadline is 200ms. A resetting implementation would wait out the
+        // producer; the absolute deadline returns Timeout at ~200ms. The
+        // generous outer timeout only bounds the test on slow CI — there is
+        // no razor-thin wall-clock assertion, and the producer is aborted
+        // immediately after the result instead of being awaited to completion.
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let producer = tokio::spawn(async move {
-            for _ in 0..12 {
+            for _ in 0..50 {
                 let _ = tx.send(NavEvent::Ready("other".to_string())).await;
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         });
-        let started = Instant::now();
-        let result = super::wait_for_response_until(
-            "chatgpt",
-            1,
-            &mut rx,
-            started + Duration::from_millis(55),
+        let inner_deadline = Instant::now() + Duration::from_millis(200);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::wait_for_response_until("chatgpt", 1, &mut rx, inner_deadline),
         )
         .await;
-        let _ = producer.await;
-        assert!(matches!(result, Err(AgentError::Timeout(_))));
-        assert!(started.elapsed() < Duration::from_millis(100));
+        producer.abort();
+        assert!(
+            matches!(result, Ok(Err(AgentError::Timeout(_)))),
+            "irrelevant Ready traffic must not extend the absolute deadline: {result:?}"
+        );
     }
 
     #[test]

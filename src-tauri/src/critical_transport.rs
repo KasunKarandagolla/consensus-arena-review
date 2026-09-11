@@ -78,6 +78,22 @@ impl std::fmt::Display for CriticalTransportError {
 }
 impl std::error::Error for CriticalTransportError {}
 
+/// 02D authority outcome for `CriticalEventHub::dispatch`.
+///
+/// Only `Accepted` means the critical event was admitted to its operation
+/// mailbox and is eligible to affect active-turn diagnostics/UI. All other
+/// outcomes must leave active diagnostics/UI/control evidence untouched.
+/// Returning this value changes no hub-side semantics: lock scope, sticky
+/// failure assignment, monotonic accounting, and notify placement are
+/// identical to the previous unit-returning implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    Accepted,
+    IgnoredUnknownOperation,
+    IgnoredTerminalOperation,
+    Rejected(CriticalTransportError),
+}
+
 struct MailboxState<T> {
     queue: VecDeque<(T, usize)>,
     queued_events: usize,
@@ -188,17 +204,24 @@ impl<T> CriticalEventHub<T> {
 
     /// Dispatch an event to its operation mailbox. Must be called from critical bridge thread only.
     /// `payload_cost` is already computed via `critical_payload_cost`.
-    pub fn dispatch(&self, operation_id: OperationId, event: T, payload_cost: usize) {
+    /// Returns whether the event was actually admitted: only `Accepted`
+    /// authorizes downstream active-turn diagnostic/UI effects.
+    pub fn dispatch(
+        &self,
+        operation_id: OperationId,
+        event: T,
+        payload_cost: usize,
+    ) -> DispatchOutcome {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let max_events = inner.max_events;
         let max_payload_bytes = inner.max_payload_bytes;
         let Some(state) = inner.operations.get_mut(&operation_id) else {
             // stale/unknown operation — ignore (old events)
-            return;
+            return DispatchOutcome::IgnoredUnknownOperation;
         };
         if state.failed.is_some() || state.closed {
-            return;
-        }
+            return DispatchOutcome::IgnoredTerminalOperation;
+        };
         // Cumulative operation-lifetime event budget. Deliberately monotonic:
         // a fast consumer must not be able to evade the cap by recv'ing between
         // sends, so the accounted total is never decremented on recv.
@@ -207,13 +230,13 @@ impl<T> CriticalEventHub<T> {
             None => {
                 state.failed = Some(CriticalTransportError::EventBudgetExceeded);
                 state.notify.notify_one();
-                return;
+                return DispatchOutcome::Rejected(CriticalTransportError::EventBudgetExceeded);
             }
         };
         if next_events > max_events {
             state.failed = Some(CriticalTransportError::EventBudgetExceeded);
             state.notify.notify_one();
-            return;
+            return DispatchOutcome::Rejected(CriticalTransportError::EventBudgetExceeded);
         }
         // Cumulative payload budget with the same monotonic semantics. The
         // ceiling is the 2 MiB response content bound plus a separate bounded
@@ -224,13 +247,13 @@ impl<T> CriticalEventHub<T> {
             None => {
                 state.failed = Some(CriticalTransportError::PayloadBudgetExceeded);
                 state.notify.notify_one();
-                return;
+                return DispatchOutcome::Rejected(CriticalTransportError::PayloadBudgetExceeded);
             }
         };
         if next_payload > max_payload_bytes {
             state.failed = Some(CriticalTransportError::PayloadBudgetExceeded);
             state.notify.notify_one();
-            return;
+            return DispatchOutcome::Rejected(CriticalTransportError::PayloadBudgetExceeded);
         }
         // Only after BOTH cumulative checks pass do we enqueue.
         state.accepted_events_total = next_events;
@@ -239,6 +262,7 @@ impl<T> CriticalEventHub<T> {
         state.queued_events += 1;
         state.queued_payload_bytes += payload_cost;
         state.notify.notify_one();
+        DispatchOutcome::Accepted
     }
 
     pub fn fail_operation(&self, operation_id: &OperationId, error: CriticalTransportError) {
@@ -716,6 +740,123 @@ mod tests {
         let res = inbox1.recv().await;
         assert_eq!(res.unwrap_err(), CriticalTransportError::Closed);
         hub.retire_exact(&op2);
+    }
+
+    // ── 02D D1: dispatch outcome is explicit ──────────────────────────────
+
+    #[tokio::test]
+    async fn d1_live_operation_dispatch_accepted() {
+        let hub: CriticalEventHub<String> = CriticalEventHub::new();
+        let op = crate::pipeline_ids::OperationId::new();
+        let mut inbox = hub.register(op.clone(), 0, true).unwrap();
+        assert_eq!(
+            hub.dispatch(op.clone(), "hello".to_string(), 5),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(inbox.recv().await.unwrap(), "hello");
+        hub.retire_exact(&op);
+    }
+
+    #[tokio::test]
+    async fn d1_unknown_operation_dispatch_ignored() {
+        let hub: CriticalEventHub<String> = CriticalEventHub::new();
+        let live = crate::pipeline_ids::OperationId::new();
+        let mut inbox = hub.register(live.clone(), 0, true).unwrap();
+        let unknown = crate::pipeline_ids::OperationId::new();
+        assert_eq!(
+            hub.dispatch(unknown.clone(), "stale".to_string(), 5),
+            DispatchOutcome::IgnoredUnknownOperation
+        );
+        // Live mailbox unaffected: still usable, no spurious failure.
+        assert_eq!(
+            hub.dispatch(live.clone(), "alive".to_string(), 5),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(inbox.recv().await.unwrap(), "alive");
+        // Retired id is unknown again.
+        hub.retire_exact(&live);
+        assert_eq!(
+            hub.dispatch(live.clone(), "late".to_string(), 4),
+            DispatchOutcome::IgnoredUnknownOperation
+        );
+    }
+
+    #[tokio::test]
+    async fn d1_terminal_operation_dispatch_ignored() {
+        let hub: CriticalEventHub<String> = CriticalEventHub::new();
+        // Closed mailbox.
+        let closed = crate::pipeline_ids::OperationId::new();
+        let mut closed_inbox = hub.register(closed.clone(), 0, true).unwrap();
+        hub.close_exact(&closed);
+        assert_eq!(
+            hub.dispatch(closed.clone(), "after_close".to_string(), 11),
+            DispatchOutcome::IgnoredTerminalOperation
+        );
+        assert_eq!(
+            closed_inbox.recv().await.unwrap_err(),
+            CriticalTransportError::Closed
+        );
+        // Failed mailbox.
+        let failed = crate::pipeline_ids::OperationId::new();
+        let mut failed_inbox = hub.register(failed.clone(), 0, true).unwrap();
+        hub.fail_operation(&failed, CriticalTransportError::IngressOverflow);
+        assert_eq!(
+            hub.dispatch(failed.clone(), "after_fail".to_string(), 10),
+            DispatchOutcome::IgnoredTerminalOperation
+        );
+        assert_eq!(
+            failed_inbox.recv().await.unwrap_err(),
+            CriticalTransportError::IngressOverflow
+        );
+    }
+
+    #[tokio::test]
+    async fn d1_event_budget_overflow_rejected_sticky() {
+        let hub: CriticalEventHub<u32> = CriticalEventHub::new_for_budget_test(3, 1_000_000);
+        let op = crate::pipeline_ids::OperationId::new();
+        let mut inbox = hub.register(op.clone(), 0, true).unwrap();
+        for i in 0..3 {
+            assert_eq!(hub.dispatch(op.clone(), i, 1), DispatchOutcome::Accepted);
+        }
+        assert_eq!(
+            hub.dispatch(op.clone(), 99, 1),
+            DispatchOutcome::Rejected(CriticalTransportError::EventBudgetExceeded)
+        );
+        // Sticky: recv surfaces the failure, and further dispatches stay terminal.
+        assert_eq!(
+            inbox.recv().await.unwrap_err(),
+            CriticalTransportError::EventBudgetExceeded
+        );
+        assert_eq!(
+            hub.dispatch(op.clone(), 100, 1),
+            DispatchOutcome::IgnoredTerminalOperation
+        );
+        hub.retire_exact(&op);
+    }
+
+    #[tokio::test]
+    async fn d1_payload_budget_overflow_rejected_sticky() {
+        let hub: CriticalEventHub<String> = CriticalEventHub::new_for_budget_test(100, 10);
+        let op = crate::pipeline_ids::OperationId::new();
+        let mut inbox = hub.register(op.clone(), 0, true).unwrap();
+        assert_eq!(
+            hub.dispatch(op.clone(), "aaaaaa".to_string(), 6),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(
+            hub.dispatch(op.clone(), "bbbbbb".to_string(), 6),
+            DispatchOutcome::Rejected(CriticalTransportError::PayloadBudgetExceeded)
+        );
+        // Sticky: recv surfaces the failure, and further dispatches stay terminal.
+        assert_eq!(
+            inbox.recv().await.unwrap_err(),
+            CriticalTransportError::PayloadBudgetExceeded
+        );
+        assert_eq!(
+            hub.dispatch(op.clone(), "cccccc".to_string(), 6),
+            DispatchOutcome::IgnoredTerminalOperation
+        );
+        hub.retire_exact(&op);
     }
 
     #[test]

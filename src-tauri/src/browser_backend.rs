@@ -3,8 +3,8 @@ use crate::browser_harness::{
     NavigationIntent, PageLifecycleEvent, SafeDomForensics, SafeElement,
 };
 use crate::critical_transport::{
-    CRITICAL_INGRESS_CAPACITY, CriticalEventHub, CriticalTransportError, MAX_CRITICAL_EVENT_BYTES,
-    MAX_RESPONSE_CHUNK_BYTES,
+    CRITICAL_INGRESS_CAPACITY, CriticalEventHub, CriticalTransportError, DispatchOutcome,
+    MAX_CRITICAL_EVENT_BYTES, MAX_RESPONSE_CHUNK_BYTES,
 };
 use crate::errors::AgentError;
 use crate::pipeline_ids::{BrowserSurface, OperationContext, OperationId};
@@ -652,6 +652,36 @@ impl BrowserDiagnostics {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(agent_id);
+    }
+
+    /// 02D exact active-diagnostic authority: true if and only if
+    /// `operation_id` is still the current diagnostic operation for
+    /// `agent_id`. A matching agent/turn/generation alone is never enough —
+    /// callers must compare the exact `OperationId`. Synthetic setup or
+    /// navigation identifiers never equal a real active `OperationId`
+    /// (UUID), so they safely mismatch here.
+    pub fn is_current_operation(&self, agent_id: &str, operation_id: &OperationId) -> bool {
+        self.current_operation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .is_some_and(|current| current == operation_id.as_str())
+    }
+
+    /// 02D exact clear: removes the diagnostic current operation only when it
+    /// still equals `operation_id`. A stale finish for a retired operation
+    /// can never clear a newer operation installed afterwards.
+    pub fn clear_operation_if(&self, agent_id: &str, operation_id: &OperationId) {
+        let mut map = self
+            .current_operation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if map
+            .get(agent_id)
+            .is_some_and(|current| current == operation_id.as_str())
+        {
+            map.remove(agent_id);
+        }
     }
 
     pub fn current_operation_id(&self, agent_id: &str) -> String {
@@ -2192,6 +2222,15 @@ pub fn record_setup_completion(diagnostics: &BrowserDiagnostics, agent_id: &str,
 }
 
 pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event: &NavEvent) {
+    // 02D defensive authority gate: an operation-critical payload may affect
+    // active diagnostics/UI/control evidence only for its exact, still-current
+    // OperationId. Stale/unknown/retired ids return here before signal
+    // metadata, active UI emission, or record mutation, so no future direct
+    // call site can reintroduce the stale-diagnostic leak. Events without an
+    // active OperationId (setup/auxiliary/system) are exempt.
+    if !accepted_critical_event_is_current(diagnostics, event) {
+        return;
+    }
     record_signal_metadata(diagnostics, event);
 
     if let NavEvent::ConsoleDiagnostic {
@@ -3838,17 +3877,70 @@ pub enum NavEvent {
 }
 
 impl NavEvent {
-    pub fn critical_operation_id(&self) -> Option<&OperationId> {
+    /// 02D exact-operation identity for operation-critical payload events:
+    /// the `(agent_id, OperationId)` pair carried on the wire. Returns `None`
+    /// for setup/auxiliary/transport-system events, which carry no active
+    /// `OperationId` and are exempt from the exact-operation diagnostic gate.
+    /// This is the single match both `critical_operation_id` and the
+    /// diagnostic gate derive from, so a new critical variant cannot update
+    /// one without the other.
+    pub fn critical_identity(&self) -> Option<(&str, &OperationId)> {
         match self {
-            NavEvent::Response { operation_id, .. }
-            | NavEvent::ResponseStart { operation_id, .. }
-            | NavEvent::ResponseChunk { operation_id, .. }
-            | NavEvent::ResponseEnd { operation_id, .. }
-            | NavEvent::Done { operation_id, .. }
-            | NavEvent::ManualResponse { operation_id, .. }
-            | NavEvent::ActiveSubmitReport { operation_id, .. } => Some(operation_id),
+            NavEvent::Response {
+                agent_id,
+                operation_id,
+                ..
+            }
+            | NavEvent::ResponseStart {
+                agent_id,
+                operation_id,
+                ..
+            }
+            | NavEvent::ResponseChunk {
+                agent_id,
+                operation_id,
+                ..
+            }
+            | NavEvent::ResponseEnd {
+                agent_id,
+                operation_id,
+                ..
+            }
+            | NavEvent::Done {
+                agent_id,
+                operation_id,
+                ..
+            }
+            | NavEvent::ManualResponse {
+                agent_id,
+                operation_id,
+                ..
+            }
+            | NavEvent::ActiveSubmitReport {
+                agent_id,
+                operation_id,
+                ..
+            } => Some((agent_id.as_str(), operation_id)),
             _ => None,
         }
+    }
+
+    pub fn critical_operation_id(&self) -> Option<&OperationId> {
+        self.critical_identity()
+            .map(|(_, operation_id)| operation_id)
+    }
+}
+
+/// 02D second gate: an operation-critical payload may affect active
+/// diagnostics/UI only while its exact `OperationId` is still the current
+/// diagnostic operation for its agent. Transport acceptance alone is not
+/// enough: an event accepted for A, superseded by B before diagnostic
+/// recording, must not mutate B's evidence. Events without an active
+/// `OperationId` (setup/auxiliary/system) are exempt and return true.
+fn accepted_critical_event_is_current(diagnostics: &BrowserDiagnostics, event: &NavEvent) -> bool {
+    match event.critical_identity() {
+        Some((agent_id, operation_id)) => diagnostics.is_current_operation(agent_id, operation_id),
+        None => true,
     }
 }
 
@@ -4054,16 +4146,33 @@ impl BrowserState {
                 }
                 let current_epoch = epoch_clone.load(Ordering::SeqCst);
                 account_bridge_epoch(&critical_hub_clone, &mut last_seen_epoch, current_epoch);
-                // For diagnostics, also record critical events where relevant
-                record_nav_event(&bridge_app_crit, &diagnostics_crit, &event);
+                // 02D authority ordering: dispatch FIRST, then record diagnostics
+                // only for accepted, still-current operation payloads. A stale
+                // event rejected by the hub must leave active diagnostics/UI
+                // untouched; an accepted event superseded before recording is
+                // stopped by the second exact-current check.
                 if let Some(op_id) = event.critical_operation_id().cloned() {
                     let cost = critical_payload_cost(&event);
-                    critical_hub_clone.dispatch(op_id, event, cost);
+                    // Bounded transient clone (chunks <= 8 KiB, controls <= 64
+                    // KiB) so the original can move into the hub while
+                    // diagnostics observe only a qualified event. No queue
+                    // redesign.
+                    let diagnostic_event = event.clone();
+                    let outcome = critical_hub_clone.dispatch(op_id, event, cost);
+                    if outcome == DispatchOutcome::Accepted
+                        && accepted_critical_event_is_current(&diagnostics_crit, &diagnostic_event)
+                    {
+                        record_nav_event(&bridge_app_crit, &diagnostics_crit, &diagnostic_event);
+                    }
                 } else {
                     tracing::warn!(
                         "[CRITICAL] received non-critical event on critical ingress: {:?}",
                         event
                     );
+                    // Preserve prior diagnostic observation for non-critical
+                    // payloads on this channel; the exact-operation guard
+                    // exempts events without an OperationId.
+                    record_nav_event(&bridge_app_crit, &diagnostics_crit, &event);
                 }
             }
             // Critical ingress disconnected - fail all
@@ -4163,8 +4272,11 @@ impl BrowserState {
         self.active_operation = Some(context.clone());
         // Preserve diagnostic behavior (legacy active_turn)
         self.active_turn = Some((agent_id.to_string(), turn));
-        let generation = self.diagnostics.setup_generation();
-        let op_str = browser_harness::operation_id_active_turn(agent_id, generation, turn);
+        // 02D: active diagnostics carry the REAL OperationId (exact authority),
+        // not the synthetic agent/generation/turn harness string. A matching
+        // agent+turn is never enough to attribute response/submit evidence.
+        // Setup/navigation diagnostic identifiers elsewhere remain synthetic.
+        let op_str = context.operation_id.as_str().to_string();
         self.diagnostics
             .set_operation(agent_id, &op_str, "submitting");
         self.diagnostics.emit_harness_event(
@@ -4227,6 +4339,10 @@ impl BrowserState {
         });
         self.active_turn = None;
         self.active_operation = None;
+        // 02D exact clear: retire the diagnostic current operation only when
+        // it still equals the finishing id, so a stale finish can never clear
+        // a newer operation installed afterwards.
+        self.diagnostics.clear_operation_if(&agent_id, operation_id);
         self.critical_hub.retire_exact(operation_id);
     }
 
@@ -5892,10 +6008,16 @@ mod tests {
     fn generic_init_page_health_blocked_retries() {
         // Fix 2: page_health_blocked branch must retry with MAX_SUBMIT_ATTEMPTS
         // instead of returning immediately on first detection.
-        // Verify the retry pattern exists in the submitWhenReady function.
+        // The submit path blocks only when the shared readiness classifier
+        // (collectComposerSnapshot + classifyPageState) reports a real
+        // challenge/login surface — not via the old weak body-keyword
+        // heuristic — then retries with MAX_SUBMIT_ATTEMPTS before reporting
+        // page_health_blocked.
         assert!(
-            GENERIC_INIT_SCRIPT.contains("if (textContainsAny(page, ['cloudflare', 'captcha', 'challenge', 'verify you are human', 'log in', 'sign in'])) {"),
-            "page health check block missing"
+            GENERIC_INIT_SCRIPT.contains("var snapshot = collectComposerSnapshot();") &&
+            GENERIC_INIT_SCRIPT.contains("var pageState = classifyPageState(snapshot);") &&
+            GENERIC_INIT_SCRIPT.contains("if (pageState === 'possible_challenge_or_security' || pageState === 'possible_login_required') {"),
+            "page health classifier block missing in submitWhenReady"
         );
         // The fix adds: attempts++; if (attempts < MAX_SUBMIT_ATTEMPTS) { setTimeout(submitWhenReady, 300); return; }
         // followed by error = 'page_health_blocked'; report(false); return;
@@ -8610,6 +8732,186 @@ mod tests {
                 assert_ne!(response, oversized);
             }
         }
+    }
+
+    // ── 02D D2-D6: exact-operation diagnostic authority ────────────────────
+    //
+    // Pure-helper tests: `record_nav_event` needs a live AppHandle for UI
+    // emission, so these drive the exact gate it enforces
+    // (`accepted_critical_event_is_current`) plus the hub outcome directly.
+    // The bridge records only Accepted + still-current events, and
+    // `record_nav_event` re-checks the same helper defensively.
+
+    fn gate_test_ids() -> (
+        crate::pipeline_ids::OperationId,
+        crate::pipeline_ids::OperationId,
+    ) {
+        (
+            crate::pipeline_ids::OperationId::new(),
+            crate::pipeline_ids::OperationId::new(),
+        )
+    }
+
+    fn gate_response(
+        operation_id: crate::pipeline_ids::OperationId,
+        agent_id: &str,
+        turn: u32,
+    ) -> super::NavEvent {
+        super::NavEvent::Response {
+            operation_id,
+            agent_id: agent_id.to_string(),
+            turn,
+            text: "late response".to_string(),
+        }
+    }
+
+    fn gate_submit_report(
+        operation_id: crate::pipeline_ids::OperationId,
+        agent_id: &str,
+        turn: u32,
+    ) -> super::NavEvent {
+        super::NavEvent::ActiveSubmitReport {
+            operation_id,
+            agent_id: agent_id.to_string(),
+            turn,
+            succeeded: true,
+            method: "button_click".to_string(),
+            send_enabled: true,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn d2_stale_same_agent_same_turn_rejected() {
+        // op_A stale (never registered), op_B current; same agent + turn.
+        // An agent/turn match must NOT qualify the event.
+        let (op_a, op_b) = gate_test_ids();
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.set_operation("claude", op_b.as_str(), "submitting");
+        // Transport gate: unknown op is ignored, never Accepted.
+        let hub: crate::critical_transport::CriticalEventHub<super::NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let _inbox_b = hub.register(op_b.clone(), 0, true).unwrap();
+        assert_eq!(
+            hub.dispatch(op_a.clone(), gate_response(op_a.clone(), "claude", 7), 13),
+            crate::critical_transport::DispatchOutcome::IgnoredUnknownOperation
+        );
+        // Diagnostic gate: exact-current mismatch despite agent+turn match.
+        for event in [
+            gate_response(op_a.clone(), "claude", 7),
+            super::NavEvent::Done {
+                operation_id: op_a.clone(),
+                agent_id: "claude".to_string(),
+                turn: 7,
+            },
+            super::NavEvent::ManualResponse {
+                operation_id: op_a.clone(),
+                agent_id: "claude".to_string(),
+                turn: 7,
+                response: "manual".to_string(),
+            },
+            super::NavEvent::ResponseChunk {
+                operation_id: op_a.clone(),
+                agent_id: "claude".to_string(),
+                turn: 7,
+                sequence: 0,
+                text: "x".to_string(),
+            },
+        ] {
+            assert!(
+                !super::accepted_critical_event_is_current(&diagnostics, &event),
+                "stale op must fail the diagnostic current-op gate: {event:?}"
+            );
+        }
+        hub.retire_exact(&op_b);
+    }
+
+    #[test]
+    fn d3_current_operation_accepted() {
+        let op_b = crate::pipeline_ids::OperationId::new();
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.set_operation("claude", op_b.as_str(), "submitting");
+        assert!(diagnostics.is_current_operation("claude", &op_b));
+        assert!(super::accepted_critical_event_is_current(
+            &diagnostics,
+            &gate_response(op_b.clone(), "claude", 7)
+        ));
+        assert!(super::accepted_critical_event_is_current(
+            &diagnostics,
+            &gate_submit_report(op_b.clone(), "claude", 7)
+        ));
+        // Setup/auxiliary events without an OperationId stay exempt.
+        assert!(super::accepted_critical_event_is_current(
+            &diagnostics,
+            &super::NavEvent::Ready("claude".to_string())
+        ));
+    }
+
+    #[tokio::test]
+    async fn d4_accepted_then_superseded_rejected() {
+        // Event A accepted by transport while A is current; B becomes current
+        // before diagnostic recording. The second gate must reject A even
+        // though dispatch returned Accepted.
+        let (op_a, op_b) = gate_test_ids();
+        let hub: crate::critical_transport::CriticalEventHub<super::NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let _inbox_a = hub.register(op_a.clone(), 0, true).unwrap();
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.set_operation("claude", op_a.as_str(), "submitting");
+        let event_a = gate_response(op_a.clone(), "claude", 7);
+        assert_eq!(
+            hub.dispatch(op_a.clone(), event_a.clone(), 13),
+            crate::critical_transport::DispatchOutcome::Accepted
+        );
+        assert!(super::accepted_critical_event_is_current(
+            &diagnostics,
+            &event_a
+        ));
+        // Consumer finishes A, B starts: current switches to B.
+        hub.retire_exact(&op_a);
+        let _inbox_b = hub.register(op_b.clone(), 0, true).unwrap();
+        diagnostics.set_operation("claude", op_b.as_str(), "submitting");
+        // Dispatch acceptance alone must not qualify A anymore.
+        assert!(
+            !super::accepted_critical_event_is_current(&diagnostics, &event_a),
+            "accepted-but-superseded event must fail the second gate"
+        );
+        assert!(super::accepted_critical_event_is_current(
+            &diagnostics,
+            &gate_response(op_b.clone(), "claude", 7)
+        ));
+        hub.retire_exact(&op_b);
+    }
+
+    #[test]
+    fn d5_stale_submit_report_rejected() {
+        // Stale submit ACK from op_A while op_B is current must not qualify
+        // for active-turn-state / active submit diagnostic mutation.
+        let (op_a, op_b) = gate_test_ids();
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.set_operation("claude", op_b.as_str(), "submitting");
+        assert!(!super::accepted_critical_event_is_current(
+            &diagnostics,
+            &gate_submit_report(op_a.clone(), "claude", 7)
+        ));
+        assert!(super::accepted_critical_event_is_current(
+            &diagnostics,
+            &gate_submit_report(op_b.clone(), "claude", 7)
+        ));
+    }
+
+    #[test]
+    fn d6_exact_clear_protects_newer_operation() {
+        let (op_a, op_b) = gate_test_ids();
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.set_operation("claude", op_b.as_str(), "submitting");
+        // Stale clear for A must not clear B.
+        diagnostics.clear_operation_if("claude", &op_a);
+        assert!(diagnostics.is_current_operation("claude", &op_b));
+        assert_eq!(diagnostics.current_operation_id("claude"), op_b.as_str());
+        // Exact clear for B removes it.
+        diagnostics.clear_operation_if("claude", &op_b);
+        assert!(!diagnostics.is_current_operation("claude", &op_b));
     }
 }
 
