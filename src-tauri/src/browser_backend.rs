@@ -4835,6 +4835,18 @@ async fn wait_for_ready(
 
 // ── on_navigation closure factory ────────────────────────────────────────────
 
+/// Transport admission for a declared chunked response (`response-start`).
+/// The byte budget is the per-operation payload bound; the chunk-count budget
+/// is the response-chunk bound — NOT the total operation event bound, because
+/// ResponseStart/End/Done plus a small finite number of operation control
+/// events share the same mailbox (covered by
+/// `MAX_OPERATION_CONTROL_EVENT_HEADROOM`). The 2 MiB payload bound is
+/// unchanged.
+pub fn response_start_within_transport_limits(byte_length: usize, chunk_count: u32) -> bool {
+    byte_length <= crate::critical_transport::MAX_OPERATION_PAYLOAD_BYTES
+        && chunk_count as usize <= crate::critical_transport::MAX_RESPONSE_CHUNKS
+}
+
 fn make_nav_closure(
     ingress: BrowserEventIngress,
     window_label: &'static str,
@@ -4947,9 +4959,7 @@ fn handle_arena_url(ingress: BrowserEventIngress, window_label: &'static str, ur
                     return;
                 }
             };
-            if byte_length > crate::critical_transport::MAX_OPERATION_PAYLOAD_BYTES
-                || chunk_count as usize > crate::critical_transport::MAX_OPERATION_CRITICAL_EVENTS
-            {
+            if !response_start_within_transport_limits(byte_length, chunk_count) {
                 ingress.protocol_fault_with(
                     Some(operation_id.clone()),
                     "response-start exceeds transport limits",
@@ -5590,6 +5600,28 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn response_start_limits_use_response_chunk_bound() {
+        use crate::critical_transport::{MAX_OPERATION_PAYLOAD_BYTES, MAX_RESPONSE_CHUNKS};
+        // Exact declared maximum is admitted.
+        assert!(super::response_start_within_transport_limits(
+            MAX_OPERATION_PAYLOAD_BYTES,
+            MAX_RESPONSE_CHUNKS as u32
+        ));
+        // Declared max + 1 is rejected at response-start validation.
+        assert!(!super::response_start_within_transport_limits(
+            MAX_OPERATION_PAYLOAD_BYTES,
+            MAX_RESPONSE_CHUNKS as u32 + 1
+        ));
+        // The 2 MiB payload bound is unchanged.
+        assert_eq!(MAX_OPERATION_PAYLOAD_BYTES, 2 * 1024 * 1024);
+        assert!(!super::response_start_within_transport_limits(
+            MAX_OPERATION_PAYLOAD_BYTES + 1,
+            1
+        ));
+        assert!(super::response_start_within_transport_limits(0, 0));
     }
 
     #[test]

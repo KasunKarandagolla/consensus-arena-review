@@ -5,7 +5,7 @@ use tauri::AppHandle;
 use tauri::Emitter;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
-use tokio::time::{Instant, timeout};
+use tokio::time::Instant;
 
 use crate::agent_brain::{AgentBrain, AgentDecision, BrainSource};
 use crate::blueprint_store::{BlueprintSection, SectionStatus};
@@ -62,8 +62,13 @@ fn response_checksum(text: &str) -> String {
 
 impl ResponseAssembly {
     fn start(byte_length: usize, chunk_count: u32, checksum: String) -> Result<Self, AgentError> {
-        const MAX_RESPONSE_CHUNKS: u32 = 20_000;
-        if chunk_count > MAX_RESPONSE_CHUNKS {
+        // Aligned with the transport contract: the declared chunk count can
+        // never exceed MAX_RESPONSE_CHUNKS (browser_backend response-start
+        // validation rejects anything larger), so the assembly ceiling must
+        // match it exactly. A second, larger ceiling here would admit no
+        // additional legal response (nothing above the transport bound can
+        // arrive) while suggesting contradictory capacity.
+        if chunk_count as usize > crate::critical_transport::MAX_RESPONSE_CHUNKS {
             return Err(AgentError::ExtractionFailed(
                 "response transport declared too many chunks".to_string(),
             ));
@@ -157,13 +162,14 @@ fn critical_to_agent_error(err: CriticalTransportError) -> AgentError {
 
 /// RC1-F3: total retry accounting — the outer `inject_and_wait_with_retry`
 /// loop (MAX_RETRIES=3 → up to 4 attempts) and the inner
-/// `confirm_active_submit` loop (MAX_SUBMIT_ACTION_RETRIES=3 → up to 4
-/// submit acks per outer attempt) are intentionally separate budgets:
+/// `confirm_active_submit` loop (MAX_SUBMIT_ACTION_RETRIES=0 → exactly 1
+/// submit ack wait per outer attempt) are intentionally separate budgets:
 /// outer = turn-level navigation/injection/response, inner = action-level
-/// submit confirmation. Worst-case per participant turn = 4 outer × 4 inner
-/// = 16 submit actions + 4 navigates, all bounded and capped at 60 s
-/// backoff per outer retry. No retry path is unbounded or infinite; empty-
-/// shell failures bypass both via `should_retry_after_failure`.
+/// submit confirmation. There is intentionally no physical Send retry:
+/// worst-case per participant turn = 4 outer attempts × 1 submit action,
+/// all bounded and capped at 60 s backoff per outer retry. No retry path is
+/// unbounded or infinite; empty-shell failures bypass both via
+/// `should_retry_after_failure`.
 
 /// W1-C: distinguish Category 1 (transient/navigation) vs Category 2
 /// (empty-shell/readiness). Empty-shell failures are page readiness
@@ -336,16 +342,35 @@ struct AckResult {
     early_buffer: std::collections::VecDeque<NavEvent>,
 }
 
+/// Outcome of the submit-ACK deadline wait. The early response buffer is
+/// owned by the caller (`confirm_active_submit`), never by this future, so
+/// deadline expiration cannot destroy already-consumed response events.
+#[derive(Debug)]
+enum SubmitAckWait {
+    Outcome(SubmitOutcome),
+    TimedOut,
+}
+
 /// Wait for the single `ActiveSubmitReport` matching the exact operation.
-/// Reads ONLY critical inbox. Buffers early response events.
-async fn await_submit_ack(
+/// Reads ONLY critical inbox. Buffers early response events into the
+/// caller-owned `early` buffer. The ACK deadline is enforced INSIDE the
+/// receive loop via `timeout_at` around each `OperationInbox::recv()`, so a
+/// deadline return leaves every already-consumed current-operation response
+/// event intact in `early`. Exact OperationId + agent + turn checks apply to
+/// every consumed event.
+async fn await_submit_ack_until(
     context: &OperationContext,
     inbox: &mut OperationInbox<NavEvent>,
-) -> Result<AckResult, AgentError> {
-    let mut early: std::collections::VecDeque<NavEvent> = std::collections::VecDeque::new();
+    early: &mut std::collections::VecDeque<NavEvent>,
+    deadline: Instant,
+) -> Result<SubmitAckWait, AgentError> {
     loop {
-        let event = inbox.recv().await.map_err(critical_to_agent_error)?;
-        match &event {
+        let event = match tokio::time::timeout_at(deadline, inbox.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(error)) => return Err(critical_to_agent_error(error)),
+            Err(_) => return Ok(SubmitAckWait::TimedOut),
+        };
+        match event {
             NavEvent::ActiveSubmitReport {
                 operation_id,
                 agent_id,
@@ -355,21 +380,18 @@ async fn await_submit_ack(
                 send_enabled,
                 error,
             } => {
-                if operation_id != &context.operation_id {
+                if operation_id != context.operation_id {
                     return Err(AgentError::ExtractionFailed(
                         "operation id mismatch in submit report".to_string(),
                     ));
                 }
-                if agent_id != &context.agent_id || *turn != context.turn {
+                if agent_id != context.agent_id || turn != context.turn {
                     return Err(AgentError::ExtractionFailed(
                         "agent/turn mismatch in submit report".to_string(),
                     ));
                 }
-                if *succeeded {
-                    return Ok(AckResult {
-                        outcome: SubmitOutcome::Confirmed,
-                        early_buffer: early,
-                    });
+                if succeeded {
+                    return Ok(SubmitAckWait::Outcome(SubmitOutcome::Confirmed));
                 } else {
                     let detail = error
                         .clone()
@@ -385,20 +407,17 @@ async fn await_submit_ack(
                 turn,
                 text,
             } => {
-                if operation_id != &context.operation_id {
+                if operation_id != context.operation_id {
                     return Err(AgentError::ExtractionFailed(
                         "response operation id mismatch".to_string(),
                     ));
                 }
-                if agent_id != &context.agent_id || *turn != context.turn {
+                if agent_id != context.agent_id || turn != context.turn {
                     return Err(AgentError::ExtractionFailed(
                         "response agent/turn mismatch".to_string(),
                     ));
                 }
-                return Ok(AckResult {
-                    outcome: SubmitOutcome::ResponseEarly(text.clone()),
-                    early_buffer: early,
-                });
+                return Ok(SubmitAckWait::Outcome(SubmitOutcome::ResponseEarly(text)));
             }
             NavEvent::ManualResponse {
                 operation_id,
@@ -407,42 +426,41 @@ async fn await_submit_ack(
                 response,
                 ..
             } => {
-                if operation_id != &context.operation_id {
+                if operation_id != context.operation_id {
                     return Err(AgentError::ExtractionFailed(
                         "manual response operation id mismatch".to_string(),
                     ));
                 }
-                if agent_id != &context.agent_id || *turn != context.turn {
+                if agent_id != context.agent_id || turn != context.turn {
                     return Err(AgentError::ExtractionFailed(
                         "manual response agent/turn mismatch".to_string(),
                     ));
                 }
-                return Ok(AckResult {
-                    outcome: SubmitOutcome::ResponseEarly(response.clone()),
-                    early_buffer: early,
-                });
+                return Ok(SubmitAckWait::Outcome(SubmitOutcome::ResponseEarly(
+                    response,
+                )));
             }
             NavEvent::ResponseStart {
-                operation_id,
-                agent_id,
+                ref operation_id,
+                ref agent_id,
                 turn,
                 ..
             }
             | NavEvent::ResponseChunk {
-                operation_id,
-                agent_id,
+                ref operation_id,
+                ref agent_id,
                 turn,
                 ..
             }
             | NavEvent::ResponseEnd {
-                operation_id,
-                agent_id,
+                ref operation_id,
+                ref agent_id,
                 turn,
                 ..
             }
             | NavEvent::Done {
-                operation_id,
-                agent_id,
+                ref operation_id,
+                ref agent_id,
                 turn,
             } => {
                 if operation_id != &context.operation_id {
@@ -450,7 +468,7 @@ async fn await_submit_ack(
                         "response assembly operation id mismatch".to_string(),
                     ));
                 }
-                if agent_id != &context.agent_id || *turn != context.turn {
+                if agent_id != &context.agent_id || turn != context.turn {
                     return Err(AgentError::ExtractionFailed(
                         "response assembly agent/turn mismatch".to_string(),
                     ));
@@ -477,32 +495,30 @@ async fn confirm_active_submit(
     inbox: &mut OperationInbox<NavEvent>,
     app: &AppHandle,
 ) -> Result<AckResult, AgentError> {
+    // The early response buffer is owned HERE, outside any future subject to
+    // the ACK deadline. `await_submit_ack_until` enforces the deadline inside
+    // its receive loop, so timeout/error returns leave the captured prefix
+    // intact for the later response wait. There is intentionally no
+    // submit-action retry (MAX_SUBMIT_ACTION_RETRIES = 0): a proven submit is
+    // irreversible and must never click Send a second time.
+    let mut early: std::collections::VecDeque<NavEvent> = std::collections::VecDeque::new();
     let mut last_error: Option<String> = None;
 
     for attempt in 0..=MAX_SUBMIT_ACTION_RETRIES {
-        match timeout(
-            Duration::from_secs(SUBMIT_ACK_TIMEOUT_SECS),
-            await_submit_ack(context, inbox),
-        )
-        .await
-        {
-            Ok(Ok(ack)) => {
+        let deadline = Instant::now() + Duration::from_secs(SUBMIT_ACK_TIMEOUT_SECS);
+        match await_submit_ack_until(context, inbox, &mut early, deadline).await {
+            Ok(SubmitAckWait::Outcome(outcome)) => {
                 tracing::debug!(
                     "[SUBMIT] {} turn {} confirmed (attempt {attempt})",
                     context.agent_id,
                     context.turn
                 );
-                return Ok(ack);
+                return Ok(AckResult {
+                    outcome,
+                    early_buffer: early,
+                });
             }
-            Ok(Err(e)) => {
-                last_error = Some(e.to_string());
-                tracing::warn!(
-                    "[SUBMIT] {} turn {} ack error (attempt {attempt}): {e}",
-                    context.agent_id,
-                    context.turn
-                );
-            }
-            Err(_) => {
+            Ok(SubmitAckWait::TimedOut) => {
                 last_error = Some(format!(
                     "no submit confirmation within {SUBMIT_ACK_TIMEOUT_SECS}s"
                 ));
@@ -511,6 +527,21 @@ async fn confirm_active_submit(
                     context.agent_id,
                     context.turn
                 );
+                // DO NOT clear `early`: response events already consumed for
+                // this exact operation survive the deadline.
+            }
+            Err(e) => {
+                last_error = Some(e.to_string());
+                tracing::warn!(
+                    "[SUBMIT] {} turn {} ack error (attempt {attempt}): {e}",
+                    context.agent_id,
+                    context.turn
+                );
+                // DO NOT clear `early` merely because ACK proof failed: a
+                // failed submit report must not destroy a valid response
+                // prefix already captured for this operation. If the error is
+                // an identity mismatch, the prefix cannot be valid anyway
+                // (mismatched events are rejected before buffering).
             }
         }
     }
@@ -535,7 +566,7 @@ async fn confirm_active_submit(
     );
     Ok(AckResult {
         outcome: SubmitOutcome::ManualRecovery,
-        early_buffer: std::collections::VecDeque::new(),
+        early_buffer: early,
     })
 }
 
@@ -3719,15 +3750,23 @@ mod tests {
         }
     }
 
+    /// Short test-only ACK deadline. Production uses SUBMIT_ACK_TIMEOUT_SECS;
+    /// tests must never sleep 30 seconds.
+    fn test_ack_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(2)
+    }
+
     #[tokio::test]
     async fn ack_accepts_success_report_for_exact_agent_turn() {
         let (ctx, hub) = make_context("deepseek", 3);
         let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
         let ev = active_submit_report_with_op(ctx.operation_id.clone(), "deepseek", 3, true, None);
         hub.dispatch(ctx.operation_id.clone(), ev, 64);
-        let result = await_submit_ack(&ctx, &mut inbox).await;
+        let mut early = std::collections::VecDeque::new();
+        let result =
+            await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline()).await;
         assert!(
-            matches!(result, Ok(ref a) if matches!(a.outcome, SubmitOutcome::Confirmed)),
+            matches!(result, Ok(SubmitAckWait::Outcome(SubmitOutcome::Confirmed))),
             "got {result:?}"
         );
     }
@@ -3744,7 +3783,9 @@ mod tests {
             Some("enabled_send_button_not_found_after_retry"),
         );
         hub.dispatch(ctx.operation_id.clone(), ev, 64);
-        let result = await_submit_ack(&ctx, &mut inbox).await;
+        let mut early = std::collections::VecDeque::new();
+        let result =
+            await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline()).await;
         assert!(
             matches!(result, Err(AgentError::InjectionFailed(_))),
             "got {result:?}"
@@ -3780,14 +3821,26 @@ mod tests {
             active_submit_report_with_op(ctx.operation_id.clone(), "chatgpt", 2, true, None),
             64,
         );
-        let result = await_submit_ack(&ctx, &mut inbox).await;
+        let mut early = std::collections::VecDeque::new();
+        let result =
+            await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline()).await;
         assert!(
-            matches!(result, Ok(ref a) if matches!(a.outcome, SubmitOutcome::Confirmed)),
+            matches!(result, Ok(SubmitAckWait::Outcome(SubmitOutcome::Confirmed))),
             "got {result:?}"
         );
         // other inbox should still have its event
-        let other_res = await_submit_ack(&other_ctx, &mut other_inbox).await;
-        assert!(matches!(other_res, Ok(ref a) if matches!(a.outcome, SubmitOutcome::Confirmed)));
+        let mut other_early = std::collections::VecDeque::new();
+        let other_res = await_submit_ack_until(
+            &other_ctx,
+            &mut other_inbox,
+            &mut other_early,
+            test_ack_deadline(),
+        )
+        .await;
+        assert!(matches!(
+            other_res,
+            Ok(SubmitAckWait::Outcome(SubmitOutcome::Confirmed))
+        ));
     }
 
     #[tokio::test]
@@ -3805,9 +3858,11 @@ mod tests {
             },
             10,
         );
-        let result = await_submit_ack(&ctx, &mut inbox).await;
+        let mut early = std::collections::VecDeque::new();
+        let result =
+            await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline()).await;
         assert!(
-            matches!(result, Ok(ref a) if matches!(a.outcome, SubmitOutcome::ResponseEarly(ref t) if t=="early text")),
+            matches!(result, Ok(SubmitAckWait::Outcome(SubmitOutcome::ResponseEarly(ref t))) if t=="early text"),
             "got {result:?}"
         );
     }
@@ -3827,9 +3882,11 @@ mod tests {
             },
             6,
         );
-        let result = await_submit_ack(&ctx, &mut inbox).await;
+        let mut early = std::collections::VecDeque::new();
+        let result =
+            await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline()).await;
         assert!(
-            matches!(result, Ok(ref a) if matches!(a.outcome, SubmitOutcome::ResponseEarly(ref t) if t=="pasted")),
+            matches!(result, Ok(SubmitAckWait::Outcome(SubmitOutcome::ResponseEarly(ref t))) if t=="pasted"),
             "got {result:?}"
         );
     }
@@ -3841,7 +3898,9 @@ mod tests {
         let (ctx, hub) = make_context("chatgpt", 1);
         let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
         hub.close_exact(&ctx.operation_id);
-        let result = await_submit_ack(&ctx, &mut inbox).await;
+        let mut early = std::collections::VecDeque::new();
+        let result =
+            await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline()).await;
         assert!(
             matches!(
                 result,
@@ -3856,7 +3915,9 @@ mod tests {
         let (ctx, hub) = make_context("chatgpt", 1);
         let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
         hub.close_exact(&ctx.operation_id);
-        let result = await_submit_ack(&ctx, &mut inbox).await;
+        let mut early = std::collections::VecDeque::new();
+        let result =
+            await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline()).await;
         assert!(
             matches!(
                 result,
@@ -4492,10 +4553,18 @@ mod tests {
             error: None,
         };
         hub.dispatch(ctx.operation_id.clone(), ack, 64);
-        // await_submit_ack should buffer chunks and return ack with early buffer
-        let ack_res = super::await_submit_ack(&ctx, &mut inbox).await.unwrap();
-        assert!(matches!(ack_res.outcome, super::SubmitOutcome::Confirmed));
-        assert_eq!(ack_res.early_buffer.len(), 2); // start + chunk
+        // await_submit_ack_until should buffer chunks and return Confirmed,
+        // leaving the early prefix in the caller-owned buffer.
+        let mut early = std::collections::VecDeque::new();
+        let ack_res =
+            super::await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline())
+                .await
+                .unwrap();
+        assert!(matches!(
+            ack_res,
+            super::SubmitAckWait::Outcome(super::SubmitOutcome::Confirmed)
+        ));
+        assert_eq!(early.len(), 2); // start + chunk
         // Then wait should assemble using early buffer
         let end = NavEvent::ResponseEnd {
             operation_id: ctx.operation_id.clone(),
@@ -4505,7 +4574,6 @@ mod tests {
         };
         // Need to dispatch end after ack, but early buffer already has start/chunk, now dispatch end to inbox
         hub.dispatch(ctx.operation_id.clone(), end, 32);
-        let mut early = ack_res.early_buffer;
         let mut dummy_aux = tokio::sync::mpsc::channel::<NavEvent>(8).1;
         let res = super::wait_for_response_with_operation(
             &ctx,
@@ -4560,8 +4628,13 @@ mod tests {
             response: "correct".to_string(),
         };
         hub.dispatch(ctx.operation_id.clone(), correct, 7);
-        let ack = super::await_submit_ack(&ctx, &mut inbox).await.unwrap();
-        assert!(matches!(ack.outcome, super::SubmitOutcome::ResponseEarly(ref t) if t=="correct"));
+        let mut early = std::collections::VecDeque::new();
+        let ack = super::await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline())
+            .await
+            .unwrap();
+        assert!(
+            matches!(ack, super::SubmitAckWait::Outcome(super::SubmitOutcome::ResponseEarly(ref t)) if t=="correct")
+        );
         // Stale operation manual response should not be accepted for new operation
         let other_ctx = crate::pipeline_ids::OperationContext::from_owner(
             &owner,
@@ -4699,5 +4772,368 @@ mod tests {
         hub.close_exact(&ctx.operation_id);
         // Also ensure aux channel is still not affecting critical epoch
         assert_eq!(epoch.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // ── Session 02 correction: ACK-deadline preservation ────────────────────
+    //
+    // Regression tests for the defect where `confirm_active_submit` wrapped
+    // the whole ACK wait in `tokio::time::timeout`, cancelling the future
+    // that owned the early response buffer and returning ManualRecovery with
+    // an empty buffer. The deadline is now enforced inside the receive loop
+    // and the buffer is caller-owned, so nothing consumed is lost.
+
+    fn chunked_events(
+        ctx: &crate::pipeline_ids::OperationContext,
+        text: &str,
+        parts: &[&str],
+    ) -> (Vec<NavEvent>, String) {
+        assert_eq!(parts.concat(), text);
+        let checksum = super::response_checksum(text);
+        let mut events = vec![NavEvent::ResponseStart {
+            operation_id: ctx.operation_id.clone(),
+            agent_id: ctx.agent_id.clone(),
+            turn: ctx.turn,
+            byte_length: text.len(),
+            chunk_count: parts.len() as u32,
+            checksum: checksum.clone(),
+        }];
+        for (index, part) in parts.iter().enumerate() {
+            events.push(NavEvent::ResponseChunk {
+                operation_id: ctx.operation_id.clone(),
+                agent_id: ctx.agent_id.clone(),
+                turn: ctx.turn,
+                sequence: index as u32,
+                text: part.to_string(),
+            });
+        }
+        events.push(NavEvent::ResponseEnd {
+            operation_id: ctx.operation_id.clone(),
+            agent_id: ctx.agent_id.clone(),
+            turn: ctx.turn,
+            checksum: checksum.clone(),
+        });
+        events.push(NavEvent::Done {
+            operation_id: ctx.operation_id.clone(),
+            agent_id: ctx.agent_id.clone(),
+            turn: ctx.turn,
+        });
+        (events, checksum)
+    }
+
+    #[tokio::test]
+    async fn ack_timeout_preserves_complete_early_response() {
+        // Complete Start/Chunk/End/Done arrives while the submit ACK never
+        // comes. The deadline must return timed-out/unconfirmed with every
+        // early event intact, and the preserved prefix must reassemble into
+        // the exact response. Uses a short test deadline, never 30 s.
+        // No submit retry exists: MAX_SUBMIT_ACTION_RETRIES is 0.
+        assert_eq!(super::MAX_SUBMIT_ACTION_RETRIES, 0);
+        let (ctx, hub) = make_context("claude", 3);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        let text = "complete early response";
+        let (events, _checksum) = chunked_events(&ctx, text, &["complete ", "early response"]);
+        let event_count = events.len();
+        for event in events {
+            let op = ctx.operation_id.clone();
+            hub.dispatch(op, event, 16);
+        }
+        let mut early = std::collections::VecDeque::new();
+        let deadline = Instant::now() + Duration::from_millis(80);
+        let result = super::await_submit_ack_until(&ctx, &mut inbox, &mut early, deadline).await;
+        assert!(
+            matches!(result, Ok(super::SubmitAckWait::TimedOut)),
+            "ACK wait must time out, got {result:?}"
+        );
+        assert_eq!(
+            early.len(),
+            event_count,
+            "every consumed response event must survive the ACK deadline"
+        );
+        // Feed the preserved buffer into the existing response assembly path.
+        let mut dummy_aux = tokio::sync::mpsc::channel::<NavEvent>(8).1;
+        let assembled = super::wait_for_response_with_operation(
+            &ctx,
+            &mut inbox,
+            &mut dummy_aux,
+            &mut early,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(assembled, text);
+        hub.close_exact(&ctx.operation_id);
+    }
+
+    #[tokio::test]
+    async fn ack_timeout_preserves_prefix_suffix_reconstructs() {
+        // Prefix (Start + first chunk) arrives before the ACK deadline;
+        // suffix (remaining chunk + End + Done) arrives after. The later
+        // response wait must assemble preserved prefix + inbox suffix into
+        // the exact full response — proving a lossless deadline transition.
+        let (ctx, hub) = make_context("deepseek", 4);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        let text = "prefix-suffix response";
+        let (events, _checksum) = chunked_events(&ctx, text, &["prefix-", "suffix response"]);
+        // events = [start, chunk0, chunk1, end, done]; prefix = first two.
+        for event in events.into_iter().take(2) {
+            let op = ctx.operation_id.clone();
+            hub.dispatch(op, event, 16);
+        }
+        let mut early = std::collections::VecDeque::new();
+        let deadline = Instant::now() + Duration::from_millis(80);
+        let result = super::await_submit_ack_until(&ctx, &mut inbox, &mut early, deadline).await;
+        assert!(
+            matches!(result, Ok(super::SubmitAckWait::TimedOut)),
+            "ACK wait must time out, got {result:?}"
+        );
+        assert_eq!(early.len(), 2, "prefix must survive the ACK deadline");
+        // Suffix arrives after the deadline into the same operation inbox.
+        let checksum = super::response_checksum(text);
+        for event in [
+            NavEvent::ResponseChunk {
+                operation_id: ctx.operation_id.clone(),
+                agent_id: ctx.agent_id.clone(),
+                turn: ctx.turn,
+                sequence: 1,
+                text: "suffix response".to_string(),
+            },
+            NavEvent::ResponseEnd {
+                operation_id: ctx.operation_id.clone(),
+                agent_id: ctx.agent_id.clone(),
+                turn: ctx.turn,
+                checksum: checksum.clone(),
+            },
+            NavEvent::Done {
+                operation_id: ctx.operation_id.clone(),
+                agent_id: ctx.agent_id.clone(),
+                turn: ctx.turn,
+            },
+        ] {
+            let op = ctx.operation_id.clone();
+            hub.dispatch(op, event, 16);
+        }
+        let mut dummy_aux = tokio::sync::mpsc::channel::<NavEvent>(8).1;
+        let assembled = super::wait_for_response_with_operation(
+            &ctx,
+            &mut inbox,
+            &mut dummy_aux,
+            &mut early,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(assembled, text);
+        hub.close_exact(&ctx.operation_id);
+    }
+
+    #[tokio::test]
+    async fn ack_early_buffer_rejects_stale_operation_id() {
+        // An event routed to this mailbox whose inner OperationId is stale
+        // must be rejected and must never enter the current operation's
+        // early buffer. (Hub-level exact routing is the primary defense;
+        // this is the waiter's authoritative backstop.)
+        let (ctx, hub) = make_context("chatgpt", 2);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        let stale = crate::pipeline_ids::OperationId::new();
+        hub.dispatch(
+            ctx.operation_id.clone(),
+            NavEvent::ResponseStart {
+                operation_id: stale,
+                agent_id: "chatgpt".to_string(),
+                turn: 2,
+                byte_length: 5,
+                chunk_count: 1,
+                checksum: "deadbeef".to_string(),
+            },
+            16,
+        );
+        let mut early = std::collections::VecDeque::new();
+        let result =
+            super::await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline()).await;
+        assert!(
+            matches!(result, Err(AgentError::ExtractionFailed(_))),
+            "stale OperationId must be rejected, got {result:?}"
+        );
+        assert!(
+            early.is_empty(),
+            "stale events must never enter the early buffer"
+        );
+        hub.close_exact(&ctx.operation_id);
+    }
+
+    #[tokio::test]
+    async fn ack_submit_failure_report_preserves_captured_prefix() {
+        // A failed submit report arriving AFTER early response events must
+        // not discard the prefix already captured. (confirm_active_submit
+        // keeps the caller-owned buffer on error returns.)
+        let (ctx, hub) = make_context("qwen", 6);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        let text = "prefix then failure";
+        let (events, _checksum) = chunked_events(&ctx, text, &["prefix ", "then failure"]);
+        // Prefix only: start + first chunk.
+        for event in events.into_iter().take(2) {
+            let op = ctx.operation_id.clone();
+            hub.dispatch(op, event, 16);
+        }
+        hub.dispatch(
+            ctx.operation_id.clone(),
+            NavEvent::ActiveSubmitReport {
+                operation_id: ctx.operation_id.clone(),
+                agent_id: ctx.agent_id.clone(),
+                turn: ctx.turn,
+                succeeded: false,
+                method: "button_click".to_string(),
+                send_enabled: true,
+                error: Some("click_without_physical_submit_evidence".to_string()),
+            },
+            64,
+        );
+        let mut early = std::collections::VecDeque::new();
+        let result =
+            super::await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline()).await;
+        assert!(
+            matches!(result, Err(AgentError::InjectionFailed(_))),
+            "failed submit report must surface, got {result:?}"
+        );
+        assert_eq!(
+            early.len(),
+            2,
+            "captured prefix must survive a submit-report error"
+        );
+        hub.close_exact(&ctx.operation_id);
+    }
+
+    #[tokio::test]
+    async fn ack_failed_transport_preserves_captured_prefix() {
+        // Critical transport failure while an early prefix exists: the
+        // waiter surfaces the transport error but the already-captured
+        // prefix stays in the caller-owned buffer — never silently lost.
+        let (ctx, hub) = make_context("kimi", 7);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        let text = "prefix then disconnect";
+        let (events, _checksum) = chunked_events(&ctx, text, &["prefix ", "then disconnect"]);
+        for event in events.into_iter().take(2) {
+            let op = ctx.operation_id.clone();
+            hub.dispatch(op, event, 16);
+        }
+        // Fail the transport after the waiter has consumed the queued
+        // prefix (microseconds) but before its deadline (seconds).
+        let hub_clone = hub.clone();
+        let op = ctx.operation_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            hub_clone.fail_operation(
+                &op,
+                crate::critical_transport::CriticalTransportError::IngressUnavailable,
+            );
+        });
+        let mut early = std::collections::VecDeque::new();
+        let result =
+            super::await_submit_ack_until(&ctx, &mut inbox, &mut early, test_ack_deadline()).await;
+        assert!(
+            matches!(result, Err(AgentError::NavigationFailed(_))),
+            "transport failure must surface, got {result:?}"
+        );
+        assert_eq!(
+            early.len(),
+            2,
+            "captured prefix must survive transport failure"
+        );
+        hub.close_exact(&ctx.operation_id);
+    }
+
+    #[test]
+    fn response_chunk_bound_distinct_from_total_event_bound() {
+        use crate::critical_transport::{
+            MAX_OPERATION_CONTROL_EVENT_HEADROOM, MAX_OPERATION_CRITICAL_EVENTS,
+            MAX_OPERATION_PAYLOAD_BYTES, MAX_RESPONSE_CHUNKS,
+        };
+        // Total operation capacity is chunk capacity plus small control headroom.
+        assert_eq!(MAX_RESPONSE_CHUNKS, 2_100);
+        assert_eq!(
+            MAX_OPERATION_CRITICAL_EVENTS,
+            MAX_RESPONSE_CHUNKS + MAX_OPERATION_CONTROL_EVENT_HEADROOM
+        );
+        // A complete legal protocol at the declared maximum fits the mailbox:
+        // Start + MAX chunks + End + Done.
+        assert!(1 + MAX_RESPONSE_CHUNKS + 1 + 1 <= MAX_OPERATION_CRITICAL_EVENTS);
+        // Assembly admits exactly the declared maximum ...
+        let checksum = super::response_checksum("ok");
+        assert!(
+            super::ResponseAssembly::start(2, MAX_RESPONSE_CHUNKS as u32, checksum.clone()).is_ok()
+        );
+        // ... and rejects max + 1, matching response-start validation.
+        assert!(
+            super::ResponseAssembly::start(2, MAX_RESPONSE_CHUNKS as u32 + 1, checksum).is_err()
+        );
+        // The 2 MiB payload bound is unchanged.
+        assert_eq!(MAX_OPERATION_PAYLOAD_BYTES, 2 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn full_max_protocol_does_not_self_fail_event_budget() {
+        // Dispatch a complete max-size legal protocol to a real mailbox and
+        // prove the first recv is not an EventBudgetExceeded failure. (Under
+        // the old shared bound, Start admission at the maximum left no room
+        // for End/Done/control events.)
+        use crate::critical_transport::{MAX_OPERATION_CRITICAL_EVENTS, MAX_RESPONSE_CHUNKS};
+        let (ctx, hub) = make_context("glm", 8);
+        let mut inbox = hub.register(ctx.operation_id.clone(), 0, true).unwrap();
+        let checksum = super::response_checksum("payload");
+        hub.dispatch(
+            ctx.operation_id.clone(),
+            NavEvent::ResponseStart {
+                operation_id: ctx.operation_id.clone(),
+                agent_id: ctx.agent_id.clone(),
+                turn: ctx.turn,
+                byte_length: 7,
+                chunk_count: MAX_RESPONSE_CHUNKS as u32,
+                checksum: checksum.clone(),
+            },
+            64,
+        );
+        for sequence in 0..MAX_RESPONSE_CHUNKS as u32 {
+            hub.dispatch(
+                ctx.operation_id.clone(),
+                NavEvent::ResponseChunk {
+                    operation_id: ctx.operation_id.clone(),
+                    agent_id: ctx.agent_id.clone(),
+                    turn: ctx.turn,
+                    sequence,
+                    text: "c".to_string(),
+                },
+                1,
+            );
+        }
+        hub.dispatch(
+            ctx.operation_id.clone(),
+            NavEvent::ResponseEnd {
+                operation_id: ctx.operation_id.clone(),
+                agent_id: ctx.agent_id.clone(),
+                turn: ctx.turn,
+                checksum: checksum.clone(),
+            },
+            32,
+        );
+        hub.dispatch(
+            ctx.operation_id.clone(),
+            NavEvent::Done {
+                operation_id: ctx.operation_id.clone(),
+                agent_id: ctx.agent_id.clone(),
+                turn: ctx.turn,
+            },
+            0,
+        );
+        let total = 1 + MAX_RESPONSE_CHUNKS + 1 + 1;
+        assert!(total <= MAX_OPERATION_CRITICAL_EVENTS);
+        let first = tokio::time::timeout(Duration::from_secs(2), inbox.recv())
+            .await
+            .expect("mailbox must deliver")
+            .expect("mailbox must not report EventBudgetExceeded");
+        assert!(
+            matches!(first, NavEvent::ResponseStart { .. }),
+            "first event must be ResponseStart, got {first:?}"
+        );
+        hub.close_exact(&ctx.operation_id);
     }
 }

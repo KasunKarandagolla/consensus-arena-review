@@ -39,6 +39,50 @@ function extractInitScript() {
 
 const INIT_SCRIPT = extractInitScript();
 
+// Deterministic 32-hex fixture OperationId for the current submit protocol:
+// __caSubmitActivePrompt(input, agent, turn, operationId) emits
+// arena://active-submit/{operationId}/{agent}/{turn}/...
+const FIXTURE_OPERATION_ID = '0123456789abcdef0123456789abcdef';
+
+// The current submit helper only reports success after observing physical
+// submit evidence (composer cleared, Stop control, or a new message). The
+// fake DOM click alone is deliberately not an acknowledgement, so success
+// fixtures simulate the provider accepting the prompt by appending a new
+// user message AFTER the click and BEFORE flushing the confirm timer.
+function simulateProviderAccepted(state) {
+  const msg = new FakeNode('article', { class: 'message' });
+  msg.textContent = 'submitted user message';
+  attach(state.document.body, msg);
+}
+
+// Flush timers until the submit click fires (or timers exhaust).
+function flushUntilClicked(state, button, maxFlushes = 60) {
+  let guard = 0;
+  while (state.timers().length > 0 && guard < maxFlushes) {
+    if (button._clicked > 0) return guard;
+    flushNextTimer(state);
+    guard++;
+  }
+  return guard;
+}
+
+// After the click, provide physical evidence then flush until the
+// active-submit signal is emitted (or timers exhaust).
+function flushUntilSubmitSignal(state, win, maxFlushes = 60) {
+  simulateProviderAccepted(state);
+  let guard = 0;
+  while (state.timers().length > 0 && guard < maxFlushes) {
+    if (win.location.href.includes('active-submit')) return guard;
+    flushNextTimer(state);
+    guard++;
+  }
+  return guard;
+}
+
+function expectedSubmitPrefix(agent, turn, success) {
+  return '/active-submit/' + FIXTURE_OPERATION_ID + '/' + agent + '/' + turn + '/' + success + '/';
+}
+
 // ── Minimal CSS selector matcher (sufficient for the emitted selectors) ──────
 function splitGroups(sel) {
   return sel.split(',').map((s) => s.trim()).filter(Boolean);
@@ -381,14 +425,14 @@ function fixture1() {
     'sidebar/transcript controls excluded');
 
   // drive a full auto-submit; only the composer-owned button may be clicked
-  win.__caSubmitActivePrompt(input, 'chatgpt', 1);
-  flushNextTimer(state); // initial attempt
-  flushNextTimer(state); // (no retry expected on success; drain in case)
+  win.__caSubmitActivePrompt(input, 'chatgpt', 1, FIXTURE_OPERATION_ID);
+  flushNextTimer(state); // initial attempt (clicks the owned Send)
+  flushUntilSubmitSignal(state, win); // provider accepts -> success report
   assert(ownedSend._clicked === 1, 'composer Send clicked exactly once');
   assert(sidebarSend._clicked === 0 && transcriptSend._clicked === 0 && transcriptSubmit._clicked === 0,
     'no sidebar/transcript control clicked');
   const href = win.location.href;
-  assert(href.includes('/active-submit/chatgpt/1/1/') || href.includes('/1/1/button_click'),
+  assert(href.includes(expectedSubmitPrefix('chatgpt', 1, 1)) && href.includes('/1/button_click'),
     'success ActiveSubmitReport emitted (' + href + ')');
 }
 
@@ -405,7 +449,7 @@ function fixture2() {
   const formA = composer(inputA, sendA);
   attach(body, formA);
 
-  win.__caSubmitActivePrompt(inputA, 'chatgpt', 2);
+  win.__caSubmitActivePrompt(inputA, 'chatgpt', 2, FIXTURE_OPERATION_ID);
   flushNextTimer(state); // attempt 1: no enabled button -> retry scheduled
 
   // React-style replacement: composer A removed, composer B with enabled Send
@@ -415,12 +459,14 @@ function fixture2() {
   const formB = composer(inputB, sendB);
   attach(body, formB);
 
-  flushNextTimer(state); // attempt 2: must resolve composer B + sendB
+  flushNextTimer(state); // attempt 2: must resolve composer B + sendB (clicks)
+  flushUntilSubmitSignal(state, win); // provider accepts -> success report
   assert(sendB._clicked === 1, 'NEW composer Send clicked after replacement');
   assert(sendA._clicked === 0, 'STALE composer Send never clicked');
   assert(inputB.isConnected, 'new composer input live');
   const href = win.location.href;
-  assert(href.includes('1/button_click'), 'success ack after re-resolution (' + href + ')');
+  assert(href.includes(expectedSubmitPrefix('chatgpt', 2, 1)) && href.includes('button_click'),
+    'success ack after re-resolution (' + href + ')');
 }
 
 // ── Fixture 3: no composer root -> composer_not_found, never global fallback ──
@@ -437,13 +483,13 @@ function fixture3() {
   const globalSend = makeSend();
   attach(body, globalSend);
 
-  win.__caSubmitActivePrompt(input, 'chatgpt', 3);
+  win.__caSubmitActivePrompt(input, 'chatgpt', 3, FIXTURE_OPERATION_ID);
   let guard = 0;
   while (state.timers().length > 0 && guard < 60) { flushNextTimer(state); guard++; }
   assert(globalSend._clicked === 0, 'no global fallback Send clicked');
   const href = win.location.href;
   assert(href.includes('composer_not_found'), 'composer_not_found reported (' + href + ')');
-  assert(href.includes('/0/'), 'failure ActiveSubmitReport emitted (not success)');
+  assert(href.includes(expectedSubmitPrefix('chatgpt', 3, 0)), 'failure ActiveSubmitReport emitted (not success)');
 }
 
 // ── Fixture 4: injected-text proof beats transcript editor / hidden editor ───
@@ -488,13 +534,16 @@ function fixture4() {
 
   // null input forces re-resolution via findInput(); the injected-text proof
   // must prefer the composer even though the transcript editor is DOM-earlier.
-  win.__caSubmitActivePrompt(null, 'chatgpt', 4);
+  win.__caSubmitActivePrompt(null, 'chatgpt', 4, FIXTURE_OPERATION_ID);
+  flushUntilClicked(state, ownedSend);
+  flushUntilSubmitSignal(state, win);
   let guard = 0;
-  while (state.timers().length > 0 && guard < 60) { flushNextTimer(state); guard++; }
+  while (state.timers().length > 0 && guard < 10) { flushNextTimer(state); guard++; }
   assert(ownedSend._clicked === 1, 'composer Send clicked via injected-text proof');
   assert(transcriptSubmit._clicked === 0, 'transcript Submit never clicked');
   assert(hiddenSend._clicked === 0, 'hidden composer Send never clicked');
-  assert(win.location.href.includes('/4/1/'), 'success ack for turn 4 (' + win.location.href + ')');
+  assert(win.location.href.includes(expectedSubmitPrefix('chatgpt', 4, 1)),
+    'success ack for turn 4 (' + win.location.href + ')');
 
   // Control: WITHOUT the injected-text stamp the transcript editor (DOM-early)
   // wins, proving fixture 4 actually exercises the proof and the hazard is real.
@@ -514,7 +563,7 @@ function fixture4() {
   ctrlComposerEditor.textContent = injected;
   attach(ctrlShell, ctrlComposerEditor);
   attach(control.document.body, ctrlShell);
-  ctrl.__caSubmitActivePrompt(null, 'chatgpt', 4);
+  ctrl.__caSubmitActivePrompt(null, 'chatgpt', 4, FIXTURE_OPERATION_ID);
   guard = 0;
   while (control.timers().length > 0 && guard < 60) { flushNextTimer(control); guard++; }
   assert(ctrlSubmit._clicked === 1 && ctrlComposerEditor.textContent,
@@ -556,12 +605,15 @@ function fixture5() {
   assert(found === ownedSend, 'owned Send resolved from narrow composer root');
   assert(found !== feedbackSend, 'unrelated Send inside chat wrapper excluded');
 
-  win.__caSubmitActivePrompt(null, 'chatgpt', 5);
+  win.__caSubmitActivePrompt(null, 'chatgpt', 5, FIXTURE_OPERATION_ID);
+  flushUntilClicked(state, ownedSend);
+  flushUntilSubmitSignal(state, win);
   let guard = 0;
-  while (state.timers().length > 0 && guard < 60) { flushNextTimer(state); guard++; }
+  while (state.timers().length > 0 && guard < 10) { flushNextTimer(state); guard++; }
   assert(ownedSend._clicked === 1, 'composer Send clicked');
   assert(feedbackSend._clicked === 0, 'feedback Send inside chat ancestor never clicked');
-  assert(win.location.href.includes('/5/1/'), 'success ack for turn 5 (' + win.location.href + ')');
+  assert(win.location.href.includes(expectedSubmitPrefix('chatgpt', 5, 1)),
+    'success ack for turn 5 (' + win.location.href + ')');
 }
 
 // ── Fixture 6: stale input holding different text is re-resolved to composer ──
@@ -588,12 +640,15 @@ function fixture6() {
   attach(body, formB);
 
   // explicit stale input is passed, but currentComposerRoot must discard it
-  win.__caSubmitActivePrompt(inputA, 'chatgpt', 6);
+  win.__caSubmitActivePrompt(inputA, 'chatgpt', 6, FIXTURE_OPERATION_ID);
+  flushUntilClicked(state, sendB);
+  flushUntilSubmitSignal(state, win);
   let guard = 0;
-  while (state.timers().length > 0 && guard < 60) { flushNextTimer(state); guard++; }
+  while (state.timers().length > 0 && guard < 10) { flushNextTimer(state); guard++; }
   assert(sendB._clicked === 1, 'CURRENT composer Send clicked');
   assert(sendA._clicked === 0, 'stale composer Send never clicked');
-  assert(win.location.href.includes('/6/1/'), 'success ack for turn 6 (' + win.location.href + ')');
+  assert(win.location.href.includes(expectedSubmitPrefix('chatgpt', 6, 1)),
+    'success ack for turn 6 (' + win.location.href + ')');
 }
 
 // ── Fixture 7: ChatGPT narrow text-input wrapper must not own Send ───────────
@@ -640,12 +695,15 @@ function fixture7() {
   assert(found !== null, 'no owned Send dropped (send_button_candidate_count must be >= 1)');
 
   // ACTIVE path: auto-submit must click the form-owned Send through the wrapper.
-  win.__caSubmitActivePrompt(textarea, 'chatgpt', 7);
+  win.__caSubmitActivePrompt(textarea, 'chatgpt', 7, FIXTURE_OPERATION_ID);
+  flushUntilClicked(state, sendButton);
+  flushUntilSubmitSignal(state, win);
   let guard = 0;
-  while (state.timers().length > 0 && guard < 60) { flushNextTimer(state); guard++; }
+  while (state.timers().length > 0 && guard < 10) { flushNextTimer(state); guard++; }
   assert(sendButton._clicked === 1, 'composer Send clicked through narrow wrapper');
   assert(transcriptSend._clicked === 0, 'transcript Send never clicked');
-  assert(win.location.href.includes('/7/1/'), 'success ack for turn 7 (' + win.location.href + ')');
+  assert(win.location.href.includes(expectedSubmitPrefix('chatgpt', 7, 1)),
+    'success ack for turn 7 (' + win.location.href + ')');
 }
 
 // ── Fixture 8: arbitrary custom identity (acme) rides the generic driver ──────
@@ -678,12 +736,14 @@ function fixture8() {
   assert(found === send, 'acme Send is composer-owned (no built-in id required)');
 
   // Auto-submit with the custom id; the arena signal must carry 'acme'.
-  win.__caSubmitActivePrompt(input, 'acme', 9);
+  win.__caSubmitActivePrompt(input, 'acme', 9, FIXTURE_OPERATION_ID);
+  flushUntilClicked(state, send);
+  flushUntilSubmitSignal(state, win);
   let guard = 0;
-  while (state.timers().length > 0 && guard < 60) { flushNextTimer(state); guard++; }
+  while (state.timers().length > 0 && guard < 10) { flushNextTimer(state); guard++; }
   assert(send._clicked === 1, 'composer Send clicked for acme');
   const href = win.location.href;
-  assert(href.includes('/acme/9/1/') || href.includes('active-submit/acme/9/1/'),
+  assert(href.includes(expectedSubmitPrefix('acme', 9, 1)),
     'active-submit signal carries custom id acme (' + href + ')');
 }
 

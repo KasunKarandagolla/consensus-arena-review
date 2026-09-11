@@ -4,7 +4,20 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 pub const MAX_RESIDENT_OPERATIONS: usize = 2;
-pub const MAX_OPERATION_CRITICAL_EVENTS: usize = 2_100;
+/// Maximum declared response chunks for one operation's chunked response.
+/// `ResponseStart.chunk_count` admission is validated against this bound in
+/// `browser_backend.rs`. A complete legal response additionally needs
+/// Start/End/Done plus a small finite number of operation control events,
+/// so the total per-operation mailbox budget is this plus headroom below.
+pub const MAX_RESPONSE_CHUNKS: usize = 2_100;
+/// Small finite headroom for non-chunk operation control events that share
+/// the per-operation mailbox with a chunked response (ResponseStart,
+/// ResponseEnd, Done, plus a bounded number of submit-report/control
+/// signals). Kept small so the total stays within the 2 MiB / low-memory
+/// budget; the 2 MiB payload bound is unchanged.
+pub const MAX_OPERATION_CONTROL_EVENT_HEADROOM: usize = 16;
+pub const MAX_OPERATION_CRITICAL_EVENTS: usize =
+    MAX_RESPONSE_CHUNKS + MAX_OPERATION_CONTROL_EVENT_HEADROOM;
 pub const MAX_OPERATION_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_CRITICAL_EVENT_BYTES: usize = 64 * 1024;
 pub const CRITICAL_INGRESS_CAPACITY: usize = 256;
