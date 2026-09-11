@@ -16,11 +16,43 @@ pub const MAX_RESPONSE_CHUNKS: usize = 2_100;
 /// signals). Kept small so the total stays within the 2 MiB / low-memory
 /// budget; the 2 MiB payload bound is unchanged.
 pub const MAX_OPERATION_CONTROL_EVENT_HEADROOM: usize = 16;
+/// Total cumulative event budget for one resident operation: response chunks
+/// plus the bound control/headroom events. Enforced as a cumulative
+/// operation-lifetime total (not merely current queue depth), so a fast
+/// consumer cannot evade the cap by `recv`ing between sends.
 pub const MAX_OPERATION_CRITICAL_EVENTS: usize =
     MAX_RESPONSE_CHUNKS + MAX_OPERATION_CONTROL_EVENT_HEADROOM;
+/// Semantic model-response content bound. The declared `ResponseStart` byte
+/// length is admitted against this exactly (2 MiB unchanged).
 pub const MAX_OPERATION_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+/// Separate finite allowance for bounded transport/control metadata
+/// (ResponseStart/End/Done checksums, submit reports, protocol faults) so a
+/// maximum legal response is never invalidated merely because the envelope
+/// consumes a few bytes. Finite and deliberately small relative to content.
+pub const MAX_OPERATION_CONTROL_PAYLOAD_HEADROOM: usize = 128 * 1024;
+/// Cumulative per-operation transport payload budget applied by `dispatch`.
+/// Response content stays capped at `MAX_OPERATION_PAYLOAD_BYTES`; this wider
+/// ceiling absorbs bounded control metadata without weakening the 2 MiB limit.
+pub const MAX_OPERATION_TOTAL_TRANSPORT_BYTES: usize =
+    MAX_OPERATION_PAYLOAD_BYTES.saturating_add(MAX_OPERATION_CONTROL_PAYLOAD_HEADROOM);
+/// Generic pre-ingress bound for any single critical event (whole responses,
+/// manual responses, controls). Browser response chunks use the tighter
+/// `MAX_RESPONSE_CHUNK_BYTES` rule instead.
 pub const MAX_CRITICAL_EVENT_BYTES: usize = 64 * 1024;
-pub const CRITICAL_INGRESS_CAPACITY: usize = 256;
+/// Protocol-specific decoded byte bound for ONE browser response chunk. The
+/// generator chunks at 1000 Unicode code points (at most ~4 KiB of UTF-8), so
+/// this is the tight bound appropriate to that protocol even though some
+/// bounded controls still use the generic 64 KiB ceiling.
+pub const MAX_RESPONSE_CHUNK_BYTES: usize = 8 * 1024;
+/// Global controls/fault/wake margin not charged to one operation.
+pub const CRITICAL_INGRESS_SYSTEM_HEADROOM: usize = 32;
+/// Fixed worst-case reservation. A conforming set of all admitted resident
+/// operations can enqueue its complete event budget even if the bridge is
+/// temporarily not draining. Derived from the admission contract — never a
+/// magic literal.
+pub const CRITICAL_INGRESS_CAPACITY: usize = MAX_RESIDENT_OPERATIONS
+    .saturating_mul(MAX_OPERATION_CRITICAL_EVENTS)
+    .saturating_add(CRITICAL_INGRESS_SYSTEM_HEADROOM);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CriticalTransportError {
@@ -50,6 +82,11 @@ struct MailboxState<T> {
     queue: VecDeque<(T, usize)>,
     queued_events: usize,
     queued_payload_bytes: usize,
+    /// Monotonic operation-lifetime accounting. Never decremented by `recv()`.
+    /// Admission budgets run against these totals, so consuming events from the
+    /// queue cannot mask a budget overflow.
+    accepted_events_total: usize,
+    accepted_payload_bytes_total: usize,
     failed: Option<CriticalTransportError>,
     closed: bool,
     notify: Arc<Notify>,
@@ -58,6 +95,8 @@ struct MailboxState<T> {
 
 struct HubInner<T> {
     operations: HashMap<OperationId, MailboxState<T>>,
+    max_events: usize,
+    max_payload_bytes: usize,
 }
 
 pub struct CriticalEventHub<T> {
@@ -80,11 +119,28 @@ pub struct OperationInbox<T> {
 
 impl<T> CriticalEventHub<T> {
     pub fn new() -> Self {
+        Self::with_budgets(
+            MAX_OPERATION_CRITICAL_EVENTS,
+            MAX_OPERATION_TOTAL_TRANSPORT_BYTES,
+        )
+    }
+
+    fn with_budgets(max_events: usize, max_payload_bytes: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HubInner {
                 operations: HashMap::new(),
+                max_events,
+                max_payload_bytes,
             })),
         }
+    }
+
+    /// Test-only constructor with deliberately tiny budgets so cumulative
+    /// event/payload accounting is exercisable without multi-MiB allocations
+    /// or thousands of synthetic events.
+    #[cfg(test)]
+    pub fn new_for_budget_test(max_events: usize, max_payload_bytes: usize) -> Self {
+        Self::with_budgets(max_events, max_payload_bytes)
     }
 
     /// Register a new operation mailbox. Synchronous, short lock.
@@ -115,6 +171,8 @@ impl<T> CriticalEventHub<T> {
             queue: VecDeque::new(),
             queued_events: 0,
             queued_payload_bytes: 0,
+            accepted_events_total: 0,
+            accepted_payload_bytes_total: 0,
             failed: None,
             closed: false,
             notify: notify.clone(),
@@ -132,6 +190,8 @@ impl<T> CriticalEventHub<T> {
     /// `payload_cost` is already computed via `critical_payload_cost`.
     pub fn dispatch(&self, operation_id: OperationId, event: T, payload_cost: usize) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let max_events = inner.max_events;
+        let max_payload_bytes = inner.max_payload_bytes;
         let Some(state) = inner.operations.get_mut(&operation_id) else {
             // stale/unknown operation — ignore (old events)
             return;
@@ -139,16 +199,42 @@ impl<T> CriticalEventHub<T> {
         if state.failed.is_some() || state.closed {
             return;
         }
-        if state.queued_events + 1 > MAX_OPERATION_CRITICAL_EVENTS {
+        // Cumulative operation-lifetime event budget. Deliberately monotonic:
+        // a fast consumer must not be able to evade the cap by recv'ing between
+        // sends, so the accounted total is never decremented on recv.
+        let next_events = match state.accepted_events_total.checked_add(1) {
+            Some(next) => next,
+            None => {
+                state.failed = Some(CriticalTransportError::EventBudgetExceeded);
+                state.notify.notify_one();
+                return;
+            }
+        };
+        if next_events > max_events {
             state.failed = Some(CriticalTransportError::EventBudgetExceeded);
             state.notify.notify_one();
             return;
         }
-        if state.queued_payload_bytes + payload_cost > MAX_OPERATION_PAYLOAD_BYTES {
+        // Cumulative payload budget with the same monotonic semantics. The
+        // ceiling is the 2 MiB response content bound plus a separate bounded
+        // control allowance, so Start/End/Done metadata can never invalidate a
+        // maximum legal response.
+        let next_payload = match state.accepted_payload_bytes_total.checked_add(payload_cost) {
+            Some(next) => next,
+            None => {
+                state.failed = Some(CriticalTransportError::PayloadBudgetExceeded);
+                state.notify.notify_one();
+                return;
+            }
+        };
+        if next_payload > max_payload_bytes {
             state.failed = Some(CriticalTransportError::PayloadBudgetExceeded);
             state.notify.notify_one();
             return;
         }
+        // Only after BOTH cumulative checks pass do we enqueue.
+        state.accepted_events_total = next_events;
+        state.accepted_payload_bytes_total = next_payload;
         state.queue.push_back((event, payload_cost));
         state.queued_events += 1;
         state.queued_payload_bytes += payload_cost;
@@ -378,18 +464,62 @@ mod tests {
 
     #[tokio::test]
     async fn ct7_payload_budget_overflow() {
-        let hub: CriticalEventHub<String> = CriticalEventHub::new();
+        // Cumulative transport budget: response content (2 MiB) plus a separate
+        // bounded control allowance; here exercised with a tiny test budget.
+        // Two dispatches whose cumulative cost exceeds the ceiling must
+        // sticky-fail the operation.
+        let hub: CriticalEventHub<String> = CriticalEventHub::new_for_budget_test(100, 10);
         let op = crate::pipeline_ids::OperationId::new();
         let mut inbox = hub.register(op.clone(), 0, true).unwrap();
-        let big = "a".repeat(MAX_OPERATION_PAYLOAD_BYTES - 100);
-        hub.dispatch(op.clone(), big.clone(), big.len());
-        // Next small should exceed
-        hub.dispatch(op.clone(), "x".repeat(200), 200);
+        hub.dispatch(op.clone(), "aaaaaa".to_string(), 6);
+        // cumulative 6 + 6 > 10 base budget
+        hub.dispatch(op.clone(), "bbbbbb".to_string(), 6);
         let res = inbox.recv().await;
         assert_eq!(
             res.unwrap_err(),
             CriticalTransportError::PayloadBudgetExceeded
         );
+    }
+
+    #[tokio::test]
+    async fn ct_cumulative_event_does_not_reset_after_recv() {
+        // Recv drains the queue but must never reset the operation-lifetime
+        // event accounting: the cap cannot be evaded by fast consumption.
+        let hub: CriticalEventHub<u32> = CriticalEventHub::new_for_budget_test(3, 1_000_000);
+        let op = crate::pipeline_ids::OperationId::new();
+        let mut inbox = hub.register(op.clone(), 0, true).unwrap();
+        for i in 0..3 {
+            hub.dispatch(op.clone(), i, 1);
+            assert_eq!(inbox.recv().await.unwrap(), i);
+        }
+        // Cumulative total is already 3; the next event must fail even though
+        // the queue is empty right now.
+        hub.dispatch(op.clone(), 99, 1);
+        let res = inbox.recv().await;
+        assert_eq!(
+            res.unwrap_err(),
+            CriticalTransportError::EventBudgetExceeded
+        );
+        hub.retire_exact(&op);
+    }
+
+    #[tokio::test]
+    async fn ct_cumulative_payload_does_not_reset_after_recv() {
+        // Same monotonic semantics for the payload budget: draining between
+        // sends must not allow the cumulative total to reset.
+        let hub: CriticalEventHub<String> = CriticalEventHub::new_for_budget_test(100, 10);
+        let op = crate::pipeline_ids::OperationId::new();
+        let mut inbox = hub.register(op.clone(), 0, true).unwrap();
+        hub.dispatch(op.clone(), "aaaaaa".to_string(), 6);
+        assert_eq!(inbox.recv().await.unwrap(), "aaaaaa");
+        hub.dispatch(op.clone(), "bbbbbb".to_string(), 6);
+        // Queue is empty again but cumulative total (12) still exceeds budget (10).
+        let res = inbox.recv().await;
+        assert_eq!(
+            res.unwrap_err(),
+            CriticalTransportError::PayloadBudgetExceeded
+        );
+        hub.retire_exact(&op);
     }
 
     #[tokio::test]
@@ -590,18 +720,52 @@ mod tests {
 
     #[test]
     fn ct_capacity_finite_bound() {
-        assert_eq!(CRITICAL_INGRESS_CAPACITY, 256);
         assert_eq!(MAX_CRITICAL_EVENT_BYTES, 64 * 1024);
+        assert_eq!(MAX_RESPONSE_CHUNK_BYTES, 8 * 1024);
+        assert_eq!(MAX_OPERATION_PAYLOAD_BYTES, 2 * 1024 * 1024);
+        assert_eq!(
+            MAX_OPERATION_CRITICAL_EVENTS,
+            MAX_RESPONSE_CHUNKS + MAX_OPERATION_CONTROL_EVENT_HEADROOM
+        );
+        assert_eq!(
+            MAX_OPERATION_TOTAL_TRANSPORT_BYTES,
+            MAX_OPERATION_PAYLOAD_BYTES + MAX_OPERATION_CONTROL_PAYLOAD_HEADROOM
+        );
         // Formal worst-case ingress payload bound:
-        // queue (256 slots) * 64 KiB per event = 16 MiB
-        // hub per-operation payload (2 MiB * 2 ops) = 4 MiB
-        // total bounded < 20 MiB + overhead, well within 2 GB target
+        // queue (derived capacity slots) * 64 KiB per event = ~267 MiB (string
+        // ops only; response chunks use the 8 KiB decoded bound)
+        // hub per-operation payload (2 MiB content + 128 KiB control, x2 ops)
+        // total bounded well within the 2 GB target
         let worst_queue = CRITICAL_INGRESS_CAPACITY * MAX_CRITICAL_EVENT_BYTES;
-        let worst_hub = MAX_RESIDENT_OPERATIONS * MAX_OPERATION_PAYLOAD_BYTES;
+        let worst_hub = MAX_RESIDENT_OPERATIONS * MAX_OPERATION_TOTAL_TRANSPORT_BYTES;
         let total = worst_queue + worst_hub;
-        assert_eq!(worst_queue, 16 * 1024 * 1024);
-        assert_eq!(worst_hub, 4 * 1024 * 1024);
-        assert_eq!(total, 20 * 1024 * 1024);
+        assert_eq!(worst_queue, 4_264 * 64 * 1024);
+        assert!(total < 300 * 1024 * 1024);
         assert!(total < 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn critical_ingress_capacity_covers_all_resident_operation_budgets() {
+        // The derived ingress capacity must be at least the sum of every
+        // admitted resident operation's cumulative budget plus finite system
+        // headroom, so a conforming set of operations can enqueue its complete
+        // event budget while the bridge is temporarily not draining.
+        assert_eq!(
+            CRITICAL_INGRESS_CAPACITY,
+            MAX_RESIDENT_OPERATIONS * MAX_OPERATION_CRITICAL_EVENTS
+                + CRITICAL_INGRESS_SYSTEM_HEADROOM
+        );
+        for residents in 1..=MAX_RESIDENT_OPERATIONS {
+            assert!(
+                CRITICAL_INGRESS_CAPACITY
+                    >= residents * MAX_OPERATION_CRITICAL_EVENTS + CRITICAL_INGRESS_SYSTEM_HEADROOM
+            );
+        }
+        // A single event beyond a full conforming operation budget is NOT
+        // conforming: admitted budget excludes the overflow margin entirely.
+        assert!(
+            (CRITICAL_INGRESS_SYSTEM_HEADROOM) < MAX_OPERATION_CRITICAL_EVENTS,
+            "system headroom must stay strictly below the per-operation budget"
+        );
     }
 }

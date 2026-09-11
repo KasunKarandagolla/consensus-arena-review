@@ -4,6 +4,7 @@ use crate::browser_harness::{
 };
 use crate::critical_transport::{
     CRITICAL_INGRESS_CAPACITY, CriticalEventHub, CriticalTransportError, MAX_CRITICAL_EVENT_BYTES,
+    MAX_RESPONSE_CHUNK_BYTES,
 };
 use crate::errors::AgentError;
 use crate::pipeline_ids::{BrowserSurface, OperationContext, OperationId};
@@ -5067,7 +5068,7 @@ fn handle_arena_url(ingress: BrowserEventIngress, window_label: &'static str, ur
             let text = urlencoding::decode(encoded)
                 .unwrap_or_default()
                 .into_owned();
-            if text.len() > MAX_CRITICAL_EVENT_BYTES {
+            if text.len() > MAX_RESPONSE_CHUNK_BYTES {
                 ingress.protocol_fault_with(Some(operation_id.clone()), "oversized response chunk");
                 return;
             }
@@ -7355,16 +7356,234 @@ mod tests {
     }
 
     #[test]
-    fn critical_ingress_capacity_is_256() {
-        assert_eq!(super::CRITICAL_INGRESS_CAPACITY, 256);
+    fn critical_ingress_capacity_is_derived() {
+        use crate::critical_transport::{
+            CRITICAL_INGRESS_SYSTEM_HEADROOM, MAX_CRITICAL_EVENT_BYTES,
+            MAX_OPERATION_CRITICAL_EVENTS, MAX_OPERATION_TOTAL_TRANSPORT_BYTES,
+            MAX_RESIDENT_OPERATIONS, MAX_RESPONSE_CHUNK_BYTES,
+        };
         assert_eq!(
-            crate::critical_transport::MAX_CRITICAL_EVENT_BYTES,
-            64 * 1024
+            super::CRITICAL_INGRESS_CAPACITY,
+            MAX_RESIDENT_OPERATIONS * MAX_OPERATION_CRITICAL_EVENTS
+                + CRITICAL_INGRESS_SYSTEM_HEADROOM
         );
-        // Finite bound proof already in critical_transport, duplicate here for browser_backend scope
-        let worst =
-            super::CRITICAL_INGRESS_CAPACITY * crate::critical_transport::MAX_CRITICAL_EVENT_BYTES;
-        assert_eq!(worst, 16 * 1024 * 1024);
+        assert_eq!(MAX_CRITICAL_EVENT_BYTES, 64 * 1024);
+        assert_eq!(MAX_RESPONSE_CHUNK_BYTES, 8 * 1024);
+        // Finite bound proof already in critical_transport, duplicated here for
+        // browser_backend scope. Theoretical worst case (everything a generic
+        // 64 KiB control event) stays a bounded constant.
+        let worst = super::CRITICAL_INGRESS_CAPACITY * MAX_CRITICAL_EVENT_BYTES;
+        assert_eq!(worst, 4_264 * 64 * 1024);
+        assert_eq!(
+            MAX_OPERATION_TOTAL_TRANSPORT_BYTES,
+            2 * 1024 * 1024 + 128 * 1024
+        );
+        assert!(worst < 300 * 1024 * 1024);
+    }
+
+    #[test]
+    fn full_conforming_reservation_fits_without_critical_full() {
+        use crate::critical_transport::{
+            CRITICAL_INGRESS_SYSTEM_HEADROOM, MAX_OPERATION_CRITICAL_EVENTS,
+            MAX_RESIDENT_OPERATIONS,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        };
+        // Bridge permanently paused: receiver exists but is never read, so the
+        // whole conforming reservation must sit in the sync channel untouched.
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let (crit_tx, _crit_rx) =
+            std::sync::mpsc::sync_channel::<super::NavEvent>(super::CRITICAL_INGRESS_CAPACITY);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let ingress =
+            super::BrowserEventIngress::new_for_test(aux_tx, crit_tx, epoch.clone(), alive);
+        // Enqueue the COMPLETE event budget of every resident operation. Each
+        // operation reserves its full cumulative event budget; all must be
+        // admitted with no overflow while nothing drains.
+        for op_index in 0..MAX_RESIDENT_OPERATIONS {
+            let op = crate::pipeline_ids::OperationId::new();
+            for seq in 0..MAX_OPERATION_CRITICAL_EVENTS {
+                let ev = super::NavEvent::ResponseChunk {
+                    operation_id: op.clone(),
+                    agent_id: "chatgpt".to_string(),
+                    turn: op_index as u32,
+                    sequence: seq as u32,
+                    text: "x".to_string(),
+                };
+                ingress
+                    .try_send(ev)
+                    .unwrap_or_else(|e| panic!("conforming reservation must fit, got {e:?}"));
+            }
+            let _ = op;
+        }
+        assert_eq!(
+            epoch.load(Ordering::SeqCst),
+            0,
+            "no overflow may bump the epoch"
+        );
+        // The finite system headroom remains available after the full operation
+        // reservation: bounded global control/fault/wake events can still be
+        // queued without CriticalFull.
+        for i in 0..CRITICAL_INGRESS_SYSTEM_HEADROOM {
+            let ev = super::NavEvent::CriticalTransportFault {
+                operation_id: None,
+                reason: format!("control-{i}"),
+            };
+            ingress.try_send(ev).unwrap_or_else(|e| {
+                panic!("system headroom must accept control event {i}, got {e:?}")
+            });
+        }
+        assert_eq!(epoch.load(Ordering::SeqCst), 0);
+        // The derived bound is now exact: one more event is a genuine overflow
+        // that still fails closed through the epoch/wake mechanism.
+        let overflow = super::NavEvent::Response {
+            operation_id: crate::pipeline_ids::OperationId::new(),
+            agent_id: "chatgpt".to_string(),
+            turn: 99,
+            text: "overflow".to_string(),
+        };
+        let res = ingress.try_send(overflow);
+        assert!(
+            matches!(res, Err(super::BrowserIngressError::CriticalFull)),
+            "one beyond the derived capacity must be CriticalFull, got {res:?}"
+        );
+        assert!(
+            epoch.load(Ordering::SeqCst) > 0,
+            "overflow must bump the epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_declared_response_plus_control_headroom_is_valid() {
+        use crate::critical_transport::{
+            MAX_OPERATION_CONTROL_EVENT_HEADROOM, MAX_OPERATION_CONTROL_PAYLOAD_HEADROOM,
+            MAX_OPERATION_CRITICAL_EVENTS, MAX_OPERATION_PAYLOAD_BYTES,
+            MAX_OPERATION_TOTAL_TRANSPORT_BYTES, MAX_RESPONSE_CHUNKS,
+        };
+        // Model-response content limit stays exactly 2 MiB.
+        assert_eq!(MAX_OPERATION_PAYLOAD_BYTES, 2 * 1024 * 1024);
+        // A response declaring the exact maximum is still admitted at start.
+        assert!(super::response_start_within_transport_limits(
+            MAX_OPERATION_PAYLOAD_BYTES,
+            MAX_RESPONSE_CHUNKS as u32
+        ));
+        // The cumulative transport budget separates response content from
+        // bounded control metadata (a separate finite allowance).
+        assert_eq!(
+            MAX_OPERATION_TOTAL_TRANSPORT_BYTES,
+            MAX_OPERATION_PAYLOAD_BYTES + MAX_OPERATION_CONTROL_PAYLOAD_HEADROOM
+        );
+        // Actual bounded envelope metadata of one complete legal protocol,
+        // priced with the production cost function, plus a bounded slack for
+        // the remaining control headroom slots, stays far inside the separate
+        // control allowance — so a maximum legal response is never invalidated
+        // merely because Start/End/Done/submit metadata consumes a few bytes.
+        let op = crate::pipeline_ids::OperationId::new();
+        let envelope = super::critical_payload_cost(&super::NavEvent::ResponseStart {
+            operation_id: op.clone(),
+            agent_id: "chatgpt".to_string(),
+            turn: 1,
+            byte_length: MAX_OPERATION_PAYLOAD_BYTES,
+            chunk_count: MAX_RESPONSE_CHUNKS as u32,
+            checksum: "aabbccdd".to_string(),
+        }) + super::critical_payload_cost(&super::NavEvent::ResponseEnd {
+            operation_id: op.clone(),
+            agent_id: "chatgpt".to_string(),
+            turn: 1,
+            checksum: "aabbccdd".to_string(),
+        }) + super::critical_payload_cost(&super::NavEvent::Done {
+            operation_id: op.clone(),
+            agent_id: "chatgpt".to_string(),
+            turn: 1,
+        }) + super::critical_payload_cost(&super::NavEvent::ActiveSubmitReport {
+            operation_id: op.clone(),
+            agent_id: "chatgpt".to_string(),
+            turn: 1,
+            succeeded: true,
+            method: "click".to_string(),
+            send_enabled: true,
+            error: None,
+        }) + MAX_OPERATION_CONTROL_EVENT_HEADROOM * 64;
+        assert!(
+            envelope < MAX_OPERATION_CONTROL_PAYLOAD_HEADROOM,
+            "envelope {envelope} must fit the separate control allowance"
+        );
+        assert!(
+            MAX_OPERATION_PAYLOAD_BYTES + envelope <= MAX_OPERATION_TOTAL_TRANSPORT_BYTES,
+            "max response content plus envelope must fit the cumulative transport budget"
+        );
+        // Event-budget relationship: chunks plus control headroom.
+        assert!(
+            MAX_RESPONSE_CHUNKS + MAX_OPERATION_CONTROL_EVENT_HEADROOM
+                <= MAX_OPERATION_CRITICAL_EVENTS
+        );
+    }
+
+    #[test]
+    fn oversized_response_chunk_is_rejected_for_exact_operation() {
+        use crate::critical_transport::{MAX_CRITICAL_EVENT_BYTES, MAX_RESPONSE_CHUNK_BYTES};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        };
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let (crit_tx, crit_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let ingress =
+            super::BrowserEventIngress::new_for_test(aux_tx, crit_tx, epoch.clone(), alive);
+        let op = crate::pipeline_ids::OperationId::new();
+        // Above the 8 KiB chunk-specific decoded bound but well below the
+        // generic 64 KiB critical-event bound: only the chunk-specific rule
+        // may reject it.
+        let text = "x".repeat(MAX_RESPONSE_CHUNK_BYTES + 1);
+        assert!(text.len() <= MAX_CRITICAL_EVENT_BYTES);
+        let url = format!(
+            "arena://response-chunk/{}/{}/1/0/{}",
+            op.as_str(),
+            "chatgpt",
+            urlencoding::encode(&text)
+        );
+        let parsed = url.parse::<tauri::Url>().expect("chunk URL should parse");
+        super::handle_arena_url(ingress, "arena-nav", &parsed);
+        assert_eq!(
+            epoch.load(Ordering::SeqCst),
+            0,
+            "oversized chunk is a per-op protocol fault, not an ingress overflow"
+        );
+        let mut exact_fault = false;
+        let mut oversized_chunk_queued = false;
+        while let Ok(ev) = crit_rx.try_recv() {
+            match ev {
+                super::NavEvent::CriticalTransportFault {
+                    operation_id,
+                    reason: _,
+                } => {
+                    assert_eq!(
+                        operation_id,
+                        Some(op.clone()),
+                        "fault must be targeted to the exact operation"
+                    );
+                    exact_fault = true;
+                }
+                super::NavEvent::ResponseChunk { text, .. } => {
+                    assert!(
+                        text.len() <= MAX_RESPONSE_CHUNK_BYTES,
+                        "no chunk may exceed the 8 KiB decoded bound"
+                    );
+                    oversized_chunk_queued = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(exact_fault, "must queue an exact-operation protocol fault");
+        assert!(
+            !oversized_chunk_queued,
+            "oversized response chunk must not be queued"
+        );
     }
 
     // ── FIX C: protocol fault must wake ───────────────────────────────────────
