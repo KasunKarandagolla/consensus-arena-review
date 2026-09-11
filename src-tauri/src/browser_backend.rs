@@ -441,6 +441,16 @@ pub struct BrowserDiagnostics {
     // per-agent current operation_id for correlation (spec 4)
     current_operation: Arc<Mutex<HashMap<String, String>>>,
     current_phase: Arc<Mutex<HashMap<String, String>>>,
+    // 02E atomic diagnostic authority gate: outer serialization primitive
+    // that makes the exact-current OperationId check linearizable with the
+    // full operation-critical diagnostic/harness/UI recording section and
+    // with every authority mutation (set/clear/reset). Lock order is always
+    // operation_record_gate -> current_operation -> current_phase/records/
+    // timeline helper locks. Never hold any of these across `.await`, never
+    // acquire this gate from a WebView callback, and never call
+    // set_operation/clear_operation from inside a gated critical-record
+    // closure (non-reentrant Mutex would self-deadlock).
+    operation_record_gate: Arc<Mutex<()>>,
     // Cross-platform forensics extensions (§4-9, §17) — bounded 100 per agent
     pub navigation_intents:
         Arc<Mutex<HashMap<String, std::collections::VecDeque<NavigationIntent>>>>,
@@ -469,6 +479,7 @@ impl BrowserDiagnostics {
             timeline: BrowserTimeline::new(),
             current_operation: Arc::new(Mutex::new(HashMap::new())),
             current_phase: Arc::new(Mutex::new(HashMap::new())),
+            operation_record_gate: Arc::new(Mutex::new(())),
             navigation_intents: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_events: Arc::new(Mutex::new(HashMap::new())),
             action_records: Arc::new(Mutex::new(HashMap::new())),
@@ -629,6 +640,13 @@ impl BrowserDiagnostics {
     }
 
     pub fn set_operation(&self, agent_id: &str, operation_id: &str, phase: &str) {
+        // 02E: serialize authority publication against atomic critical
+        // recording. Gate is outermost; inner map locks stay short and
+        // emit_timeline below must never reacquire this gate.
+        let _authority = self
+            .operation_record_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         self.current_operation
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -648,6 +666,12 @@ impl BrowserDiagnostics {
     }
 
     pub fn clear_operation(&self, agent_id: &str) {
+        // 02E: serialize authority revocation against atomic critical
+        // recording under the same gate as set_operation/clear_operation_if.
+        let _authority = self
+            .operation_record_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         self.current_operation
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -672,6 +696,12 @@ impl BrowserDiagnostics {
     /// still equals `operation_id`. A stale finish for a retired operation
     /// can never clear a newer operation installed afterwards.
     pub fn clear_operation_if(&self, agent_id: &str, operation_id: &OperationId) {
+        // 02E: same serialization gate as set_operation so a stale clear
+        // cannot interleave with an authorized critical-record section.
+        let _authority = self
+            .operation_record_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut map = self
             .current_operation
             .lock()
@@ -682,6 +712,38 @@ impl BrowserDiagnostics {
         {
             map.remove(agent_id);
         }
+    }
+
+    /// 02E atomic diagnostic authority: verify the exact `OperationId` is
+    /// still current and, if so, run `f` while the authority gate remains
+    /// held. This makes the check linearizable with set/clear/replacement
+    /// and with the full critical diagnostic/harness/UI side-effect section.
+    ///
+    /// Contract: `f` may use the normal diagnostic map locks (they are
+    /// distinct mutexes) but must never call `set_operation`,
+    /// `clear_operation`, `clear_operation_if`, or anything else that tries
+    /// to reacquire this non-reentrant gate. Never hold the returned section
+    /// across `.await`, and never invoke it from a WebView callback.
+    pub fn with_exact_operation_authority<R>(
+        &self,
+        agent_id: &str,
+        operation_id: &OperationId,
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let _authority = self
+            .operation_record_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let matches = self
+            .current_operation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(agent_id)
+            .is_some_and(|current| current == operation_id.as_str());
+        if !matches {
+            return None;
+        }
+        Some(f())
     }
 
     pub fn current_operation_id(&self, agent_id: &str) -> String {
@@ -1004,6 +1066,14 @@ impl BrowserDiagnostics {
     }
 
     pub fn begin_setup_run(&self, metadata: BrowserSetupMetadata) {
+        // 02E: serialize the direct authority-map reset against atomic
+        // critical recording. This guard is held for the whole synchronous
+        // reset; none of the callees below reacquire the gate, and nothing
+        // here awaits, so no self-deadlock.
+        let _authority = self
+            .operation_record_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         self.records
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -2222,15 +2292,28 @@ pub fn record_setup_completion(diagnostics: &BrowserDiagnostics, agent_id: &str,
 }
 
 pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event: &NavEvent) {
-    // 02D defensive authority gate: an operation-critical payload may affect
-    // active diagnostics/UI/control evidence only for its exact, still-current
-    // OperationId. Stale/unknown/retired ids return here before signal
-    // metadata, active UI emission, or record mutation, so no future direct
-    // call site can reintroduce the stale-diagnostic leak. Events without an
-    // active OperationId (setup/auxiliary/system) are exempt.
-    if !accepted_critical_event_is_current(diagnostics, event) {
-        return;
+    // 02E atomic diagnostic authority: an operation-critical payload may
+    // affect active diagnostics/harness/UI only inside
+    // `with_exact_operation_authority`, which verifies the exact,
+    // still-current OperationId while holding the authority gate and keeps
+    // the gate held for the entire recording section. The bridge
+    // `Accepted + accepted_critical_event_is_current` check remains only as
+    // a cheap stale-event prefilter, not the final guarantee. Events without
+    // an active OperationId (setup/auxiliary/system) are exempt and keep the
+    // prior path.
+    match event.critical_identity() {
+        Some((agent_id, operation_id)) => {
+            let _ = diagnostics.with_exact_operation_authority(agent_id, operation_id, || {
+                record_nav_event_inner(app, diagnostics, event)
+            });
+        }
+        None => {
+            record_nav_event_inner(app, diagnostics, event);
+        }
     }
+}
+
+fn record_nav_event_inner(app: &AppHandle, diagnostics: &BrowserDiagnostics, event: &NavEvent) {
     record_signal_metadata(diagnostics, event);
 
     if let NavEvent::ConsoleDiagnostic {
@@ -3937,6 +4020,9 @@ impl NavEvent {
 /// enough: an event accepted for A, superseded by B before diagnostic
 /// recording, must not mutate B's evidence. Events without an active
 /// `OperationId` (setup/auxiliary/system) are exempt and return true.
+/// 02E: this snapshot check is the bridge prefilter only; the final
+/// authority is the atomic `with_exact_operation_authority` wrapper inside
+/// `record_nav_event`.
 fn accepted_critical_event_is_current(diagnostics: &BrowserDiagnostics, event: &NavEvent) -> bool {
     match event.critical_identity() {
         Some((agent_id, operation_id)) => diagnostics.is_current_operation(agent_id, operation_id),
@@ -4149,8 +4235,11 @@ impl BrowserState {
                 // 02D authority ordering: dispatch FIRST, then record diagnostics
                 // only for accepted, still-current operation payloads. A stale
                 // event rejected by the hub must leave active diagnostics/UI
-                // untouched; an accepted event superseded before recording is
-                // stopped by the second exact-current check.
+                // untouched. 02E: the `Accepted + is_current` check below is
+                // only a cheap prefilter; the final guarantee is the atomic
+                // authority wrapper inside `record_nav_event`, which holds the
+                // operation gate across the exact check and the full recording
+                // section.
                 if let Some(op_id) = event.critical_operation_id().cloned() {
                     let cost = critical_payload_cost(&event);
                     // Bounded transient clone (chunks <= 8 KiB, controls <= 64
@@ -4198,8 +4287,14 @@ impl BrowserState {
     /// Clear session-only browser state without replacing the process-lifetime
     /// channel, diagnostics object, or named WebView handles.
     pub fn reset_for_session(&mut self) {
-        // Retire any active operation mailbox as stale/session-reset and wake waiters
+        // Retire any active operation mailbox as stale/session-reset and wake waiters.
+        // 02E: also retire the exact diagnostic authority for the retired
+        // operation so reset cannot leave it as the current diagnostic owner.
+        // Exact-only: never clear by agent alone, so a newer operation (if
+        // any) is preserved.
         if let Some(ctx) = self.active_operation.take() {
+            self.diagnostics
+                .clear_operation_if(&ctx.agent_id, &ctx.operation_id);
             self.critical_hub.retire_exact(&ctx.operation_id);
         }
         self.conversation_urls.clear();
@@ -8912,6 +9007,282 @@ mod tests {
         // Exact clear for B removes it.
         diagnostics.clear_operation_if("claude", &op_b);
         assert!(!diagnostics.is_current_operation("claude", &op_b));
+    }
+
+    // ── 02E E1-E6: atomic diagnostic authority ──────────────────────────
+    //
+    // E1 proves serialization across the interval that would contain
+    // diagnostic mutation (barrier/channel rendezvous, not sleeps). E2-E6
+    // are sequential and fully deterministic. Timeouts below are deadlock
+    // safety nets only, never correctness assertions.
+
+    #[test]
+    fn e1_authorized_recording_blocks_publication() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        let (op_a, op_b) = gate_test_ids();
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.set_operation("claude", op_a.as_str(), "submitting");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let seq = Arc::new(AtomicU64::new(0));
+        let applied_seq = Arc::new(AtomicU64::new(u64::MAX));
+        let published_seq = Arc::new(AtomicU64::new(u64::MAX));
+        // Recorder: authorized A section holds the gate open until released.
+        let d_rec = diagnostics.clone();
+        let seq_rec = seq.clone();
+        let applied_rec = applied_seq.clone();
+        let recorder = std::thread::spawn(move || {
+            let out = d_rec.with_exact_operation_authority("claude", &op_a, || {
+                entered_tx.send(()).expect("entered send");
+                release_rx.recv().expect("release recv");
+                seq_rec.fetch_add(1, Ordering::SeqCst)
+            });
+            let v = out.expect("A must be authorized while current");
+            applied_rec.store(v, Ordering::SeqCst);
+        });
+        // Publisher: starts B publication only after A is inside, then
+        // records its order after set_operation returns.
+        let d_pub = diagnostics.clone();
+        let seq_pub = seq.clone();
+        let published_pub = published_seq.clone();
+        let op_b_pub = op_b.clone();
+        let publisher = std::thread::spawn(move || {
+            entered_rx.recv().expect("wait for A inside");
+            attempting_tx.send(()).expect("attempting send");
+            d_pub.set_operation("claude", op_b_pub.as_str(), "submitting");
+            published_pub.store(seq_pub.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+        });
+        // Main: wait for both rendezvous deterministically, then release.
+        attempting_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("publisher must attempt B while A holds authority");
+        release_tx.send(()).expect("release send");
+        recorder.join().expect("recorder join");
+        publisher.join().expect("publisher join");
+        assert!(diagnostics.is_current_operation("claude", &op_b));
+        assert!(
+            applied_seq.load(Ordering::SeqCst) < published_seq.load(Ordering::SeqCst),
+            "B publication must order after A-recording completion"
+        );
+    }
+
+    #[test]
+    fn e2_stale_a_rejected_after_b_publication() {
+        let (op_a, op_b) = gate_test_ids();
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.set_operation("claude", op_a.as_str(), "submitting");
+        diagnostics.set_operation("claude", op_b.as_str(), "submitting");
+        // Stale A can no longer enter the authorized section.
+        assert!(!diagnostics.is_current_operation("claude", &op_a));
+        let ran_a = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_a_clone = ran_a.clone();
+        let out_a = diagnostics.with_exact_operation_authority("claude", &op_a, || {
+            ran_a_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(out_a.is_none(), "stale A must be rejected");
+        assert!(!ran_a.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!super::accepted_critical_event_is_current(
+            &diagnostics,
+            &gate_response(op_a.clone(), "claude", 7)
+        ));
+    }
+
+    #[test]
+    fn e3_current_b_enters_normally() {
+        let (_op_a, op_b) = gate_test_ids();
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.set_operation("claude", op_b.as_str(), "submitting");
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_clone = ran.clone();
+        let out = diagnostics.with_exact_operation_authority("claude", &op_b, || {
+            ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(out.is_some(), "current B must enter");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(super::accepted_critical_event_is_current(
+            &diagnostics,
+            &gate_response(op_b.clone(), "claude", 7)
+        ));
+        assert!(super::accepted_critical_event_is_current(
+            &diagnostics,
+            &gate_submit_report(op_b.clone(), "claude", 7)
+        ));
+    }
+
+    #[test]
+    fn e4_stale_finish_cannot_clear_newer_operation() {
+        // Extend D6 into the session lifecycle: a stale finish/clear for A
+        // must not disturb B's diagnostic authority.
+        let (mut state, _epoch, _alive, hub) = lifecycle_test_state(0, true);
+        let owner = crate::session_runtime::SessionOwner {
+            session_id: "e4".to_string(),
+            run_generation: 1,
+        };
+        let (ctx_a, _inbox_a) = state
+            .begin_active_operation(
+                &owner,
+                "claude",
+                7,
+                crate::pipeline_ids::BrowserSurface::Participant,
+            )
+            .expect("begin A");
+        let op_a = ctx_a.operation_id.clone();
+        state.finish_active_operation(&op_a, true);
+        let (ctx_b, _inbox_b) = state
+            .begin_active_operation(
+                &owner,
+                "claude",
+                8,
+                crate::pipeline_ids::BrowserSurface::Participant,
+            )
+            .expect("begin B");
+        // Stale finish(A) replay must leave B intact.
+        state.finish_active_operation(&op_a, true);
+        assert_eq!(
+            state
+                .active_operation
+                .as_ref()
+                .expect("B still active")
+                .operation_id,
+            ctx_b.operation_id
+        );
+        assert!(
+            state
+                .diagnostics
+                .is_current_operation("claude", &ctx_b.operation_id)
+        );
+        // Direct stale clear also a no-op.
+        state.diagnostics.clear_operation_if("claude", &op_a);
+        assert!(
+            state
+                .diagnostics
+                .is_current_operation("claude", &ctx_b.operation_id)
+        );
+        assert_eq!(
+            state.diagnostics.current_operation_id("claude"),
+            ctx_b.operation_id.as_str()
+        );
+        hub.retire_exact(&ctx_b.operation_id);
+    }
+
+    #[test]
+    fn e5_reset_for_session_clears_exact_diagnostic_ownership() {
+        let (mut state, _epoch, _alive, hub) = lifecycle_test_state(0, true);
+        let owner = crate::session_runtime::SessionOwner {
+            session_id: "e5".to_string(),
+            run_generation: 1,
+        };
+        let (ctx_a, _inbox_a) = state
+            .begin_active_operation(
+                &owner,
+                "claude",
+                7,
+                crate::pipeline_ids::BrowserSurface::Participant,
+            )
+            .expect("begin A");
+        assert!(
+            state
+                .diagnostics
+                .is_current_operation("claude", &ctx_a.operation_id)
+        );
+        let event_a = gate_response(ctx_a.operation_id.clone(), "claude", 7);
+        state.reset_for_session();
+        // Hub retired and exact diagnostic ownership cleared.
+        assert_eq!(
+            hub.dispatch(ctx_a.operation_id.clone(), event_a.clone(), 13),
+            crate::critical_transport::DispatchOutcome::IgnoredUnknownOperation
+        );
+        assert!(
+            !state
+                .diagnostics
+                .is_current_operation("claude", &ctx_a.operation_id)
+        );
+        assert_ne!(
+            state.diagnostics.current_operation_id("claude"),
+            ctx_a.operation_id.as_str()
+        );
+        assert!(!super::accepted_critical_event_is_current(
+            &state.diagnostics,
+            &event_a
+        ));
+    }
+
+    #[test]
+    fn e6_non_operation_events_exempt_and_preserved() {
+        let (_op_a, op_b) = gate_test_ids();
+        let diagnostics = super::BrowserDiagnostics::new();
+        diagnostics.set_operation("claude", op_b.as_str(), "submitting");
+        let exempt = [
+            super::NavEvent::Ready("claude".to_string()),
+            super::NavEvent::SetupResponseObserved("claude".to_string()),
+            super::NavEvent::SendDetected("claude".to_string(), None),
+            super::NavEvent::SetupManualConfirmed("claude".to_string()),
+            super::NavEvent::ChallengeDetected("claude".to_string(), "indicator".to_string()),
+            super::NavEvent::ResumeRequested("claude".to_string()),
+            super::NavEvent::SessionAborted,
+            super::NavEvent::CriticalTransportOverflowWake { failed_epoch: 1 },
+        ];
+        for event in &exempt {
+            assert!(
+                event.critical_identity().is_none(),
+                "exempt event must carry no OperationId: {event:?}"
+            );
+            assert!(
+                event.critical_operation_id().is_none(),
+                "exempt event must carry no critical op: {event:?}"
+            );
+            assert!(
+                super::accepted_critical_event_is_current(&diagnostics, event),
+                "exempt event must stay exempt: {event:?}"
+            );
+        }
+        // The gated critical set is exactly the seven operation-bearing
+        // variants from the single critical_identity match.
+        for event in [
+            gate_response(op_b.clone(), "claude", 7),
+            super::NavEvent::ResponseStart {
+                operation_id: op_b.clone(),
+                agent_id: "claude".to_string(),
+                turn: 7,
+                byte_length: 5,
+                chunk_count: 1,
+                checksum: "c".to_string(),
+            },
+            super::NavEvent::ResponseChunk {
+                operation_id: op_b.clone(),
+                agent_id: "claude".to_string(),
+                turn: 7,
+                sequence: 0,
+                text: "x".to_string(),
+            },
+            super::NavEvent::ResponseEnd {
+                operation_id: op_b.clone(),
+                agent_id: "claude".to_string(),
+                turn: 7,
+                checksum: "c".to_string(),
+            },
+            super::NavEvent::Done {
+                operation_id: op_b.clone(),
+                agent_id: "claude".to_string(),
+                turn: 7,
+            },
+            super::NavEvent::ManualResponse {
+                operation_id: op_b.clone(),
+                agent_id: "claude".to_string(),
+                turn: 7,
+                response: "manual".to_string(),
+            },
+            gate_submit_report(op_b.clone(), "claude", 7),
+        ] {
+            assert!(
+                event.critical_identity().is_some(),
+                "critical event must carry OperationId: {event:?}"
+            );
+        }
     }
 }
 
