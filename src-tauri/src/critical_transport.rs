@@ -152,6 +152,24 @@ impl<T> CriticalEventHub<T> {
         }
     }
 
+    /// Targeted protocol failure for a single operation. Preserves
+    /// first-terminal-failure semantics: if the mailbox already holds a
+    /// terminal error it is left unchanged. Returns true if the operation
+    /// existed and was newly failed, false for stale/retired ids.
+    pub fn fail_exact(&self, operation_id: &OperationId, error: CriticalTransportError) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(state) = inner.operations.get_mut(operation_id) else {
+            return false;
+        };
+        if state.failed.is_none() {
+            state.failed = Some(error);
+            state.notify.notify_one();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Fail all operations registered before `failed_epoch` (i.e., overflow happened after they were registered).
     /// For determinism, we fail every operation whose registration_epoch < failed_epoch,
     /// or if failed_epoch is just increment after overflow, fail all currently registered.

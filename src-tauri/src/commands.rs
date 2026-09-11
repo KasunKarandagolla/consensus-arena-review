@@ -1158,9 +1158,15 @@ pub async fn captcha_resolved(
     agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let nav_tx = {
+        let browser = state.browser_state.lock().await;
+        browser.nav_tx.clone()
+    };
+    nav_tx
+        .try_send(NavEvent::ResumeRequested(agent_id.clone()))
+        .map_err(|e| format!("Could not resume after captcha: {e}"))?;
     let mut browser = state.browser_state.lock().await;
-    browser.captcha_resolved.insert(agent_id.clone());
-    browser.nav_tx.send(NavEvent::ResumeRequested(agent_id));
+    browser.captcha_resolved.insert(agent_id);
     Ok(())
 }
 
@@ -1212,7 +1218,9 @@ pub async fn retry_setup_agent(
         &agent.base_url,
     )
     .map_err(|error| error.to_string())?;
-    nav_tx.send(NavEvent::ResumeRequested(agent_id));
+    nav_tx
+        .try_send(NavEvent::ResumeRequested(agent_id))
+        .map_err(|e| format!("Could not request setup retry: {e}"))?;
     Ok(())
 }
 
@@ -1249,8 +1257,10 @@ pub async fn confirm_setup_agent(
         }
         (browser.diagnostics.clone(), browser.nav_tx.clone())
     };
+    nav_tx
+        .try_send(NavEvent::SetupManualConfirmed(agent_id.clone()))
+        .map_err(|e| format!("Could not confirm setup agent: {e}"))?;
     record_setup_completion(&diagnostics, &agent_id, "user_confirmed_manual");
-    nav_tx.send(NavEvent::SetupManualConfirmed(agent_id));
     Ok(())
 }
 
@@ -1294,12 +1304,14 @@ pub async fn provide_manual_model_response(
         }
         (browser.nav_tx.clone(), ctx)
     };
-    nav_tx.send(NavEvent::ManualResponse {
-        operation_id: context.operation_id.clone(),
-        agent_id,
-        turn: turn_number,
-        response,
-    });
+    nav_tx
+        .try_send(NavEvent::ManualResponse {
+            operation_id: context.operation_id.clone(),
+            agent_id,
+            turn: turn_number,
+            response,
+        })
+        .map_err(|e| format!("Could not deliver manual response: {e}"))?;
     Ok(())
 }
 
