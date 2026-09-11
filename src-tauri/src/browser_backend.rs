@@ -2107,7 +2107,7 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
         NavEvent::UnsupportedNavigation { .. }
         | NavEvent::SessionAborted
         | NavEvent::CriticalTransportFault { .. }
-        | NavEvent::CriticalTransportOverflowWake => None,
+        | NavEvent::CriticalTransportOverflowWake { .. } => None,
     }
 }
 
@@ -2700,7 +2700,7 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
         }
         NavEvent::SessionAborted
         | NavEvent::CriticalTransportFault { .. }
-        | NavEvent::CriticalTransportOverflowWake => return,
+        | NavEvent::CriticalTransportOverflowWake { .. } => return,
         _ => {}
     }
 
@@ -2768,7 +2768,7 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
         | NavEvent::UserAgent { .. }
         | NavEvent::SessionAborted
         | NavEvent::CriticalTransportFault { .. }
-        | NavEvent::CriticalTransportOverflowWake => return,
+        | NavEvent::CriticalTransportOverflowWake { .. } => return,
     };
     // Harness: emit timeline for these NavEvents before updating record
     {
@@ -3014,7 +3014,7 @@ pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event
             | NavEvent::UserAgent { .. }
             | NavEvent::SessionAborted
             | NavEvent::CriticalTransportFault { .. }
-            | NavEvent::CriticalTransportOverflowWake => {}
+            | NavEvent::CriticalTransportOverflowWake { .. } => {}
         }
     }) {
         emit_browser_diagnostic(app, &record, message);
@@ -3479,7 +3479,8 @@ impl BrowserEventIngress {
         let is_critical = event.critical_operation_id().is_some()
             || matches!(
                 event,
-                NavEvent::CriticalTransportFault { .. } | NavEvent::CriticalTransportOverflowWake
+                NavEvent::CriticalTransportFault { .. }
+                    | NavEvent::CriticalTransportOverflowWake { .. }
             );
         if is_critical {
             let cost = critical_payload_cost(&event);
@@ -3567,10 +3568,10 @@ impl BrowserEventIngress {
     }
 
     fn signal_ingress_overflow(&self) {
-        let _new_epoch = self.critical_failure_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let failed_epoch = self.critical_failure_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         match self
             .critical_tx
-            .try_send(NavEvent::CriticalTransportOverflowWake)
+            .try_send(NavEvent::CriticalTransportOverflowWake { failed_epoch })
         {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
@@ -3645,7 +3646,7 @@ pub fn critical_payload_cost(event: &NavEvent) -> usize {
         }
         NavEvent::Done { .. } => 32,
         NavEvent::CriticalTransportFault { reason, .. } => reason.len() + 32,
-        NavEvent::CriticalTransportOverflowWake => 32,
+        NavEvent::CriticalTransportOverflowWake { .. } => 32,
         _ => 0,
     }
 }
@@ -3661,6 +3662,33 @@ impl<T> Drop for CriticalBridgeGuard<T> {
         self.hub
             .fail_all(CriticalTransportError::IngressUnavailable);
     }
+}
+
+/// Single deterministic step of critical-bridge epoch accounting, shared by
+/// the process-lifetime bridge thread and tests.
+///
+/// Epoch E means "an ingress loss/failure happened before E". Operations
+/// registered before a newly observed epoch fail closed; a stale or repeated
+/// observation at or below the already-accounted epoch is an idempotent
+/// no-op. The atomic failure epoch is authoritative — this helper never
+/// manufactures a synthetic epoch.
+fn account_bridge_epoch(
+    hub: &CriticalEventHub<NavEvent>,
+    last_seen_epoch: &mut u64,
+    observed_epoch: u64,
+) {
+    if observed_epoch > *last_seen_epoch {
+        hub.fail_registered_before_epoch(observed_epoch, CriticalTransportError::IngressOverflow);
+        *last_seen_epoch = observed_epoch;
+    }
+}
+
+/// Observation half of the overflow-wake arm, shared by the bridge and tests:
+/// a wake notifies the epoch it was produced for, but the atomic failure
+/// epoch is authoritative and monotonic, so the bridge accounts for the
+/// newest known epoch of the two. Never manufactures a synthetic epoch.
+fn observe_overflow_wake(failed_epoch: u64, current_atomic_epoch: u64) -> u64 {
+    failed_epoch.max(current_atomic_epoch)
 }
 
 #[derive(Debug, Clone)]
@@ -3800,7 +3828,12 @@ pub enum NavEvent {
     },
     /// Tiny overflow wake to guarantee post-epoch observation without delivering
     /// protocol semantics. Never produced by JS.
-    CriticalTransportOverflowWake,
+    /// Carries the actual failure epoch produced by `signal_ingress_overflow`.
+    /// The bridge treats it as a notification of that epoch only — never as
+    /// permission to manufacture a synthetic epoch.
+    CriticalTransportOverflowWake {
+        failed_epoch: u64,
+    },
 }
 
 impl NavEvent {
@@ -3977,24 +4010,26 @@ impl BrowserState {
                 hub: critical_hub_clone.clone(),
                 alive: alive_clone.clone(),
             };
-            let mut last_seen_epoch = epoch_clone.load(Ordering::SeqCst);
+            // The ingress epoch is initialized to zero before this bridge is
+            // spawned. Starting from zero ensures an overflow that races ahead
+            // of initial thread scheduling cannot be silently adopted as
+            // "already observed": the first drained event observes it.
+            let mut last_seen_epoch = 0_u64;
             while let Ok(event) = critical_rx.recv() {
                 match &event {
-                    NavEvent::CriticalTransportOverflowWake => {
-                        let current_epoch = epoch_clone.load(Ordering::SeqCst);
-                        if current_epoch != last_seen_epoch {
-                            critical_hub_clone.fail_registered_before_epoch(
-                                current_epoch,
-                                CriticalTransportError::IngressOverflow,
-                            );
-                            last_seen_epoch = current_epoch;
-                        } else {
-                            // Even without epoch change, overflow wake must fail present ops (defensive)
-                            critical_hub_clone.fail_registered_before_epoch(
-                                current_epoch.saturating_add(1),
-                                CriticalTransportError::IngressOverflow,
-                            );
-                        }
+                    NavEvent::CriticalTransportOverflowWake { failed_epoch } => {
+                        // Atomic is authoritative and monotonic. A wake may be
+                        // stale by the time it is dequeued: account for the
+                        // newest known epoch, never manufacture N+1.
+                        let observed_epoch = observe_overflow_wake(
+                            *failed_epoch,
+                            epoch_clone.load(Ordering::SeqCst),
+                        );
+                        account_bridge_epoch(
+                            &critical_hub_clone,
+                            &mut last_seen_epoch,
+                            observed_epoch,
+                        );
                         record_nav_event(&bridge_app_crit, &diagnostics_crit, &event);
                         continue;
                     }
@@ -4017,13 +4052,7 @@ impl BrowserState {
                     _ => {}
                 }
                 let current_epoch = epoch_clone.load(Ordering::SeqCst);
-                if current_epoch != last_seen_epoch {
-                    critical_hub_clone.fail_registered_before_epoch(
-                        current_epoch,
-                        CriticalTransportError::IngressOverflow,
-                    );
-                    last_seen_epoch = current_epoch;
-                }
+                account_bridge_epoch(&critical_hub_clone, &mut last_seen_epoch, current_epoch);
                 // For diagnostics, also record critical events where relevant
                 record_nav_event(&bridge_app_crit, &diagnostics_crit, &event);
                 if let Some(op_id) = event.critical_operation_id().cloned() {
@@ -4071,6 +4100,30 @@ impl BrowserState {
         self.connected_account_busy_until = None;
     }
 
+    /// Post-registration fence for `begin_active_operation`: revalidates
+    /// ingress liveness and the failure epoch immediately after mailbox
+    /// registration and before `active_operation` is published.
+    ///
+    /// If the ingress transitioned across the registration window, the exact
+    /// just-created mailbox is retired (freed for reuse, waiters woken with
+    /// `Closed`) and an explicit pre-submit error is returned. Shared with
+    /// tests so the fence decision is exercised as production logic.
+    fn validate_registration_window(
+        &self,
+        operation_id: &OperationId,
+        epoch_before: u64,
+    ) -> Result<(), AgentError> {
+        let alive_after = self.critical_alive.load(Ordering::SeqCst);
+        let epoch_after = self.critical_failure_epoch.load(Ordering::SeqCst);
+        if !alive_after || epoch_after != epoch_before {
+            self.critical_hub.retire_exact(operation_id);
+            return Err(AgentError::UnknownError(
+                "critical ingress changed during registration".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn begin_active_operation(
         &mut self,
         owner: &crate::session_runtime::SessionOwner,
@@ -4101,6 +4154,11 @@ impl BrowserState {
             .critical_hub
             .register(context.operation_id.clone(), epoch, alive)
             .map_err(|e| AgentError::UnknownError(format!("critical hub register failed: {e}")))?;
+        // Registration is only valid if the process-lifetime ingress did not
+        // transition while the mailbox was being installed (bridge death or a
+        // failure-epoch bump in the window). No browser injection or physical
+        // Send has happened yet, so rejecting here is pre-submit safe.
+        self.validate_registration_window(&context.operation_id, epoch)?;
         self.active_operation = Some(context.clone());
         // Preserve diagnostic behavior (legacy active_turn)
         self.active_turn = Some((agent_id.to_string(), turn));
@@ -7333,13 +7391,7 @@ mod tests {
             let mut last = epoch_clone.load(Ordering::SeqCst);
             while let Ok(event) = crit_rx.recv() {
                 let cur = epoch_clone.load(Ordering::SeqCst);
-                if cur != last {
-                    hub_clone.fail_registered_before_epoch(
-                        cur,
-                        crate::critical_transport::CriticalTransportError::IngressOverflow,
-                    );
-                    last = cur;
-                }
+                super::account_bridge_epoch(&hub_clone, &mut last, cur);
                 if let super::NavEvent::CriticalTransportFault { reason, .. } = &event {
                     hub_clone.fail_all(
                         crate::critical_transport::CriticalTransportError::Protocol(reason.clone()),
@@ -7396,19 +7448,14 @@ mod tests {
             let mut last = epoch_clone.load(Ordering::SeqCst);
             while let Ok(event) = crit_rx.recv() {
                 match &event {
-                    super::NavEvent::CriticalTransportOverflowWake => {
-                        let cur = epoch_clone.load(Ordering::SeqCst);
-                        if cur != last {
-                            hub_clone.fail_registered_before_epoch(
-                                cur,
-                                crate::critical_transport::CriticalTransportError::IngressOverflow,
-                            );
-                            last = cur;
-                        } else {
-                            hub_clone.fail_all(
-                                crate::critical_transport::CriticalTransportError::IngressOverflow,
-                            );
-                        }
+                    super::NavEvent::CriticalTransportOverflowWake { failed_epoch } => {
+                        // Same accounting as the production bridge: the wake
+                        // notifies an epoch, never manufactures one.
+                        let observed = super::observe_overflow_wake(
+                            *failed_epoch,
+                            epoch_clone.load(Ordering::SeqCst),
+                        );
+                        super::account_bridge_epoch(&hub_clone, &mut last, observed);
                         continue;
                     }
                     super::NavEvent::CriticalTransportFault { reason, .. } => {
@@ -7422,13 +7469,7 @@ mod tests {
                     _ => {}
                 }
                 let cur = epoch_clone.load(Ordering::SeqCst);
-                if cur != last {
-                    hub_clone.fail_registered_before_epoch(
-                        cur,
-                        crate::critical_transport::CriticalTransportError::IngressOverflow,
-                    );
-                    last = cur;
-                }
+                super::account_bridge_epoch(&hub_clone, &mut last, cur);
                 if let Some(op_id) = event.critical_operation_id().cloned() {
                     let cost = super::critical_payload_cost(&event);
                     hub_clone.dispatch(op_id, event, cost);
@@ -7621,7 +7662,7 @@ mod tests {
         let mut count = 0;
         while let Ok(ev) = crit_rx.try_recv() {
             count += 1;
-            if matches!(ev, super::NavEvent::CriticalTransportOverflowWake) {
+            if matches!(ev, super::NavEvent::CriticalTransportOverflowWake { .. }) {
                 wake_found = true;
             }
         }
@@ -7670,7 +7711,9 @@ mod tests {
         let after2 = epoch2.load(Ordering::SeqCst);
         assert!(after2 > before2);
         // After epoch bump, try to send wake directly should either succeed or be Full (proving non-empty)
-        let wake_try = crit2_tx.try_send(super::NavEvent::CriticalTransportOverflowWake);
+        let wake_try = crit2_tx.try_send(super::NavEvent::CriticalTransportOverflowWake {
+            failed_epoch: epoch2.load(Ordering::SeqCst),
+        });
         // Either wake succeeded (queued) or was Full (queue proven non-empty)
         assert!(
             wake_try.is_ok() || matches!(wake_try, Err(std::sync::mpsc::TrySendError::Full(_)))
@@ -7696,15 +7739,12 @@ mod tests {
             let mut last = epoch_clone.load(Ordering::SeqCst);
             while let Ok(event) = crit_rx.recv() {
                 match &event {
-                    super::NavEvent::CriticalTransportOverflowWake => {
-                        let cur = epoch_clone.load(Ordering::SeqCst);
-                        if cur != last {
-                            hub_clone.fail_registered_before_epoch(
-                                cur,
-                                crate::critical_transport::CriticalTransportError::IngressOverflow,
-                            );
-                            last = cur;
-                        }
+                    super::NavEvent::CriticalTransportOverflowWake { failed_epoch } => {
+                        let observed = super::observe_overflow_wake(
+                            *failed_epoch,
+                            epoch_clone.load(Ordering::SeqCst),
+                        );
+                        super::account_bridge_epoch(&hub_clone, &mut last, observed);
                         continue;
                     }
                     super::NavEvent::CriticalTransportFault {
@@ -7730,13 +7770,7 @@ mod tests {
                     _ => {}
                 }
                 let cur = epoch_clone.load(Ordering::SeqCst);
-                if cur != last {
-                    hub_clone.fail_registered_before_epoch(
-                        cur,
-                        crate::critical_transport::CriticalTransportError::IngressOverflow,
-                    );
-                    last = cur;
-                }
+                super::account_bridge_epoch(&hub_clone, &mut last, cur);
                 if let Some(op_id) = event.critical_operation_id().cloned() {
                     let cost = super::critical_payload_cost(&event);
                     hub_clone.dispatch(op_id, event, cost);
@@ -7781,15 +7815,12 @@ mod tests {
             let mut last = epoch_clone.load(Ordering::SeqCst);
             while let Ok(event) = crit_rx.recv() {
                 match &event {
-                    super::NavEvent::CriticalTransportOverflowWake => {
-                        let cur = epoch_clone.load(Ordering::SeqCst);
-                        if cur != last {
-                            hub_clone.fail_registered_before_epoch(
-                                cur,
-                                crate::critical_transport::CriticalTransportError::IngressOverflow,
-                            );
-                            last = cur;
-                        }
+                    super::NavEvent::CriticalTransportOverflowWake { failed_epoch } => {
+                        let observed = super::observe_overflow_wake(
+                            *failed_epoch,
+                            epoch_clone.load(Ordering::SeqCst),
+                        );
+                        super::account_bridge_epoch(&hub_clone, &mut last, observed);
                         continue;
                     }
                     super::NavEvent::CriticalTransportFault {
@@ -7815,13 +7846,7 @@ mod tests {
                     _ => {}
                 }
                 let cur = epoch_clone.load(Ordering::SeqCst);
-                if cur != last {
-                    hub_clone.fail_registered_before_epoch(
-                        cur,
-                        crate::critical_transport::CriticalTransportError::IngressOverflow,
-                    );
-                    last = cur;
-                }
+                super::account_bridge_epoch(&hub_clone, &mut last, cur);
                 if let Some(op_id) = event.critical_operation_id().cloned() {
                     let cost = super::critical_payload_cost(&event);
                     hub_clone.dispatch(op_id, event, cost);
@@ -7904,13 +7929,12 @@ mod tests {
             let mut last = epoch_clone.load(Ordering::SeqCst);
             while let Ok(event) = crit_rx.recv() {
                 match &event {
-                    super::NavEvent::CriticalTransportOverflowWake => {
-                        let cur = epoch_clone.load(Ordering::SeqCst);
-                        hub_clone.fail_registered_before_epoch(
-                            cur,
-                            crate::critical_transport::CriticalTransportError::IngressOverflow,
+                    super::NavEvent::CriticalTransportOverflowWake { failed_epoch } => {
+                        let observed = super::observe_overflow_wake(
+                            *failed_epoch,
+                            epoch_clone.load(Ordering::SeqCst),
                         );
-                        last = cur;
+                        super::account_bridge_epoch(&hub_clone, &mut last, observed);
                         continue;
                     }
                     super::NavEvent::CriticalTransportFault {
@@ -8009,7 +8033,7 @@ mod tests {
         let mut drained = 0;
         while let Ok(ev) = crit_rx.try_recv() {
             drained += 1;
-            if matches!(ev, super::NavEvent::CriticalTransportOverflowWake) {
+            if matches!(ev, super::NavEvent::CriticalTransportOverflowWake { .. }) {
                 saw_wake = true;
             }
         }
@@ -8017,6 +8041,239 @@ mod tests {
         // The invariant is epoch bumped and post-epoch condition holds
         assert!(epoch_after > epoch_before);
         assert!(saw_wake || drained >= 2);
+    }
+
+    // ── Transport-lifecycle correction: epoch/wake/registration tests ──────
+    //
+    // These exercise the shared production accounting (`account_bridge_epoch`)
+    // and the registration fence (`validate_registration_window`) directly
+    // with real hubs and atomics — no sleeps, no duplicated bridge logic.
+
+    fn lifecycle_test_state(
+        epoch_value: u64,
+        alive_value: bool,
+    ) -> (
+        super::BrowserState,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        crate::critical_transport::CriticalEventHub<super::NavEvent>,
+    ) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64},
+        };
+        let (aux_tx, _aux_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let (crit_tx, _crit_rx) = std::sync::mpsc::sync_channel::<super::NavEvent>(8);
+        let epoch = Arc::new(AtomicU64::new(epoch_value));
+        let alive = Arc::new(AtomicBool::new(alive_value));
+        let hub: crate::critical_transport::CriticalEventHub<super::NavEvent> =
+            crate::critical_transport::CriticalEventHub::new();
+        let ingress =
+            super::BrowserEventIngress::new_for_test(aux_tx, crit_tx, epoch.clone(), alive.clone());
+        let state = super::BrowserState::new_with_ingress(
+            ingress,
+            hub.clone(),
+            epoch.clone(),
+            alive.clone(),
+        );
+        (state, epoch, alive, hub)
+    }
+
+    #[tokio::test]
+    async fn epoch_e1_pre_bridge_overflow_fails_older_operation() {
+        // Overflow bumps the atomic epoch before the bridge ever observes it
+        // (wake itself lost to Full). A bridge starting from zero must fail
+        // the older operation on its first drained observation — never treat
+        // the overflow as already seen.
+        use std::sync::atomic::Ordering;
+        let (_state, epoch, _alive, hub) = lifecycle_test_state(0, true);
+        let op_a = crate::pipeline_ids::OperationId::new();
+        let mut inbox_a = hub.register(op_a.clone(), 0, true).unwrap();
+        // Overflow with no queued wake: epoch 0 -> 1.
+        epoch.fetch_add(1, Ordering::SeqCst);
+        // Bridge's first observation after (late) start: last_seen starts 0.
+        let mut last_seen = 0_u64;
+        super::account_bridge_epoch(&hub, &mut last_seen, epoch.load(Ordering::SeqCst));
+        assert_eq!(last_seen, 1);
+        let res = inbox_a.recv().await;
+        assert_eq!(
+            res.unwrap_err(),
+            crate::critical_transport::CriticalTransportError::IngressOverflow
+        );
+        hub.retire_exact(&op_a);
+    }
+
+    #[tokio::test]
+    async fn epoch_e2_stale_wake_spares_post_overflow_operation() {
+        // Epoch 1 already accounted for; operation B registers at epoch 1;
+        // the stale wake for that same overflow must be a no-op for B.
+        // There is no synthetic current_epoch + 1 failure.
+        use std::sync::atomic::Ordering;
+        let (_state, epoch, _alive, hub) = lifecycle_test_state(1, true);
+        let mut last_seen = 1_u64;
+        let op_b = crate::pipeline_ids::OperationId::new();
+        let mut inbox_b = hub.register(op_b.clone(), 1, true).unwrap();
+        // Stale wake for the already-accounted overflow, observed exactly as
+        // the production bridge arm observes it.
+        let observed = super::observe_overflow_wake(1, epoch.load(Ordering::SeqCst));
+        super::account_bridge_epoch(&hub, &mut last_seen, observed);
+        assert_eq!(last_seen, 1, "stale wake must not advance accounting");
+        // B remains fully usable.
+        hub.dispatch(
+            op_b.clone(),
+            super::NavEvent::Response {
+                operation_id: op_b.clone(),
+                agent_id: "chatgpt".to_string(),
+                turn: 1,
+                text: "alive".to_string(),
+            },
+            5,
+        );
+        let v = inbox_b.recv().await.unwrap();
+        assert!(
+            matches!(v, super::NavEvent::Response { .. }),
+            "post-overflow operation must survive its own stale wake"
+        );
+        hub.retire_exact(&op_b);
+    }
+
+    #[tokio::test]
+    async fn epoch_e3_newer_epoch_still_fails_older_operation() {
+        // A registered at epoch 1; epoch advances to 2. Even a stale wake
+        // carrying 1 observes max(1, atomic 2) = 2 and fails A.
+        use std::sync::atomic::Ordering;
+        let (_state, epoch, _alive, hub) = lifecycle_test_state(1, true);
+        let mut last_seen = 1_u64;
+        let op_a = crate::pipeline_ids::OperationId::new();
+        let mut inbox_a = hub.register(op_a.clone(), 1, true).unwrap();
+        epoch.fetch_add(1, Ordering::SeqCst);
+        // Stale wake carrying 1, observed exactly as the production bridge
+        // arm observes it: max(1, atomic 2) = 2.
+        let observed = super::observe_overflow_wake(1, epoch.load(Ordering::SeqCst));
+        assert_eq!(observed, 2);
+        super::account_bridge_epoch(&hub, &mut last_seen, observed);
+        assert_eq!(last_seen, 2);
+        let res = inbox_a.recv().await;
+        assert_eq!(
+            res.unwrap_err(),
+            crate::critical_transport::CriticalTransportError::IngressOverflow
+        );
+        hub.retire_exact(&op_a);
+    }
+
+    #[tokio::test]
+    async fn epoch_e6_repeated_same_epoch_wake_is_idempotent() {
+        // After epoch 2 is accounted for, repeating the wake for 1 (or 2)
+        // must not fail an operation registered at epoch 2.
+        use std::sync::atomic::Ordering;
+        let (_state, epoch, _alive, hub) = lifecycle_test_state(2, true);
+        let mut last_seen = 2_u64;
+        let op_c = crate::pipeline_ids::OperationId::new();
+        let mut inbox_c = hub.register(op_c.clone(), 2, true).unwrap();
+        for failed_epoch in [1_u64, 2_u64, 2_u64] {
+            let observed = super::observe_overflow_wake(failed_epoch, epoch.load(Ordering::SeqCst));
+            super::account_bridge_epoch(&hub, &mut last_seen, observed);
+        }
+        assert_eq!(last_seen, 2);
+        hub.dispatch(
+            op_c.clone(),
+            super::NavEvent::Response {
+                operation_id: op_c.clone(),
+                agent_id: "kimi".to_string(),
+                turn: 3,
+                text: "stable".to_string(),
+            },
+            6,
+        );
+        let v = inbox_c.recv().await.unwrap();
+        assert!(matches!(v, super::NavEvent::Response { .. }));
+        hub.retire_exact(&op_c);
+    }
+
+    #[test]
+    fn epoch_e4_registration_spanning_alive_loss_rejected_before_publication() {
+        // Bridge death (alive true -> false) across the registration window:
+        // the fence rejects, retires the exact mailbox, and nothing is
+        // published as the active operation.
+        let (state, _epoch, alive, hub) = lifecycle_test_state(0, true);
+        let op = crate::pipeline_ids::OperationId::new();
+        // Bind the inbox: dropping it would retire the mailbox via Drop and
+        // vacate the retirement proof below.
+        let _inbox = hub.register(op.clone(), 0, true).unwrap();
+        // Simulate bridge death between mailbox install and publication.
+        alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        let res = state.validate_registration_window(&op, 0);
+        assert!(res.is_err(), "liveness loss must reject registration");
+        // Exact mailbox retired: the id is registerable again (slot freed,
+        // no stale failure state lingers for a later operation).
+        assert!(
+            hub.register(op.clone(), 0, true).is_ok(),
+            "fenced mailbox must be retired"
+        );
+        assert!(
+            state.active_operation.is_none(),
+            "nothing may be published across liveness loss"
+        );
+    }
+
+    #[test]
+    fn epoch_e5_registration_spanning_epoch_bump_rejected_before_publication() {
+        // Failure-epoch advance (E -> E+1) across the registration window:
+        // the mailbox installed at the stale epoch is retired, never
+        // published — it must not escape the sweep it should have joined.
+        use std::sync::atomic::Ordering;
+        let (state, epoch, _alive, hub) = lifecycle_test_state(0, true);
+        let op = crate::pipeline_ids::OperationId::new();
+        // Bind the inbox: dropping it would retire the mailbox via Drop and
+        // vacate the retirement proof below.
+        let _inbox = hub.register(op.clone(), 0, true).unwrap();
+        // Simulate overflow between mailbox install and publication.
+        epoch.fetch_add(1, Ordering::SeqCst);
+        let res = state.validate_registration_window(&op, 0);
+        assert!(res.is_err(), "epoch change must reject registration");
+        assert!(
+            hub.register(op.clone(), 1, true).is_ok(),
+            "fenced mailbox must be retired"
+        );
+        assert!(
+            state.active_operation.is_none(),
+            "nothing may be published across an epoch change"
+        );
+    }
+
+    #[test]
+    fn epoch_registration_fence_passes_when_ingress_stable() {
+        // No transition across the window: validation succeeds and the
+        // mailbox remains installed for publication.
+        let (state, _epoch, _alive, hub) = lifecycle_test_state(0, true);
+        let op = crate::pipeline_ids::OperationId::new();
+        // Bind the inbox: dropping it would retire the mailbox via Drop and
+        // vacate the residency proof below.
+        let _inbox = hub.register(op.clone(), 0, true).unwrap();
+        assert!(state.validate_registration_window(&op, 0).is_ok());
+        // Still resident (duplicate registration must fail).
+        assert!(hub.register(op.clone(), 0, true).is_err());
+        hub.retire_exact(&op);
+    }
+
+    #[test]
+    fn epoch_begin_rejects_dead_bridge_before_publication() {
+        // End-to-end through begin_active_operation with a dead bridge:
+        // explicit failure, no active_operation published, no mailbox leaked
+        // under a usable id... (mailbox never created: pre-check rejects).
+        let (mut state, _epoch, _alive, _hub) = lifecycle_test_state(0, false);
+        let owner = crate::session_runtime::SessionOwner {
+            session_id: "sess".to_string(),
+            run_generation: 1,
+        };
+        let res = state.begin_active_operation(
+            &owner,
+            "chatgpt",
+            1,
+            crate::pipeline_ids::BrowserSurface::Participant,
+        );
+        assert!(res.is_err(), "dead bridge must reject begin");
+        assert!(state.active_operation.is_none());
     }
 
     #[test]
