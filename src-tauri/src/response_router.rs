@@ -9,7 +9,7 @@ use tokio::time::{Instant, timeout};
 
 use crate::agent_brain::{AgentBrain, AgentDecision, BrainSource};
 use crate::blueprint_store::{BlueprintSection, SectionStatus};
-use crate::browser_backend::NavEvent;
+use crate::browser_backend::{ActiveControlKind, NavEvent};
 use crate::errors::{AgentError, ErrorKind};
 use crate::memory_store::SessionSummaryData;
 use crate::orchestrator::{
@@ -60,10 +60,19 @@ fn response_checksum(text: &str) -> String {
 
 impl ResponseAssembly {
     fn start(byte_length: usize, chunk_count: u32, checksum: String) -> Result<Self, AgentError> {
-        const MAX_RESPONSE_CHUNKS: u32 = 20_000;
-        if chunk_count > MAX_RESPONSE_CHUNKS {
+        if byte_length > crate::critical_transport::MAX_RESPONSE_PAYLOAD_BYTES {
+            return Err(AgentError::ExtractionFailed(
+                "response transport declared byte length exceeds 2MiB".to_string(),
+            ));
+        }
+        if chunk_count as usize > crate::critical_transport::MAX_RESPONSE_CHUNKS {
             return Err(AgentError::ExtractionFailed(
                 "response transport declared too many chunks".to_string(),
+            ));
+        }
+        if checksum.len() > 64 {
+            return Err(AgentError::ExtractionFailed(
+                "checksum too long".to_string(),
             ));
         }
         Ok(Self {
@@ -268,15 +277,19 @@ fn take_queued_response_for_turn(
 ) -> Option<String> {
     while let Ok(event) = nav_rx.try_recv() {
         match event {
-            NavEvent::Response(event_agent, event_turn, response)
-                if event_agent == agent_id && event_turn == turn =>
-            {
+            NavEvent::Response {
+                agent_id: event_agent,
+                turn: event_turn,
+                text: response,
+                ..
+            } if event_agent == agent_id && event_turn == turn => {
                 return Some(response);
             }
             NavEvent::ManualResponse {
                 agent_id: event_agent,
                 turn: event_turn,
                 response,
+                ..
             } if event_agent == agent_id && event_turn == turn => return Some(response),
             stale => tracing::warn!(
                 "[ACTIVE] Drained non-response event while recovering late response for {} turn {}: {:?}",
@@ -311,12 +324,14 @@ async fn await_submit_ack(
     loop {
         match nav_rx.recv().await {
             Some(NavEvent::ActiveSubmitReport {
+                operation_id: _,
                 agent_id: ev_agent,
                 turn: ev_turn,
                 succeeded,
                 method,
                 send_enabled,
                 error,
+                ..
             }) if ev_agent == agent_id && ev_turn == turn => {
                 if succeeded {
                     return Ok(None);
@@ -327,18 +342,24 @@ async fn await_submit_ack(
                     "submit failed: {detail}"
                 )));
             }
-            Some(NavEvent::Response(ev_agent, ev_turn, text))
-                if ev_agent == agent_id && ev_turn == turn =>
-            {
+            Some(NavEvent::Response {
+                operation_id: _,
+                agent_id: ev_agent,
+                turn: ev_turn,
+                text,
+                ..
+            }) if ev_agent == agent_id && ev_turn == turn => {
                 tracing::warn!(
                     "[SUBMIT] response for {agent_id} turn {turn} arrived before its ack; treating as confirmed"
                 );
                 return Ok(Some(text));
             }
             Some(NavEvent::ManualResponse {
+                operation_id: _,
                 agent_id: ev_agent,
                 turn: ev_turn,
                 response,
+                ..
             }) if ev_agent == agent_id && ev_turn == turn => {
                 return Ok(Some(response));
             }
@@ -349,6 +370,23 @@ async fn await_submit_ack(
                 return Err(AgentError::ExtractionFailed(format!(
                     "Agent {} reported an error",
                     ev_agent
+                )));
+            }
+            Some(NavEvent::ActiveControl {
+                agent_id: ev_agent,
+                kind,
+                detail,
+                ..
+            }) if ev_agent == agent_id => {
+                return Err(AgentError::ExtractionFailed(format!(
+                    "Active control {:?} for {}: {}",
+                    kind, ev_agent, detail
+                )));
+            }
+            Some(NavEvent::CriticalTransportFault(reason)) => {
+                return Err(AgentError::UnknownError(format!(
+                    "critical transport fault: {}",
+                    reason
                 )));
             }
             Some(_) => continue,
@@ -2710,26 +2748,35 @@ async fn wait_for_response_until(
                 // D-040 [NAV]
                 tracing::debug!("[NAV] {:?}", event);
                 match event {
-                    NavEvent::Response(ev_agent, ev_turn, text) => {
+                    NavEvent::Response {
+                        agent_id: ev_agent,
+                        turn: ev_turn,
+                        text,
+                        ..
+                    } => {
                         if ev_agent == agent_id && ev_turn == turn {
                             return Ok(text);
                         }
                     }
                     NavEvent::ResponseStart {
+                        operation_id: _,
                         agent_id: ev_agent,
                         turn: ev_turn,
                         byte_length,
                         chunk_count,
                         checksum,
+                        ..
                     } if ev_agent == agent_id && ev_turn == turn => {
                         assembly =
                             Some(ResponseAssembly::start(byte_length, chunk_count, checksum)?);
                     }
                     NavEvent::ResponseChunk {
+                        operation_id: _,
                         agent_id: ev_agent,
                         turn: ev_turn,
                         sequence,
                         text,
+                        ..
                     } if ev_agent == agent_id && ev_turn == turn => {
                         let Some(active) = assembly.as_mut() else {
                             return Err(AgentError::ExtractionFailed(
@@ -2739,9 +2786,11 @@ async fn wait_for_response_until(
                         active.insert(sequence, text)?;
                     }
                     NavEvent::ResponseEnd {
+                        operation_id: _,
                         agent_id: ev_agent,
                         turn: ev_turn,
                         checksum,
+                        ..
                     } if ev_agent == agent_id && ev_turn == turn => {
                         let Some(active) = assembly.take() else {
                             return Err(AgentError::ExtractionFailed(
@@ -2750,7 +2799,12 @@ async fn wait_for_response_until(
                         };
                         return active.finish(&checksum);
                     }
-                    NavEvent::Done(ev_agent, ev_turn) => {
+                    NavEvent::Done {
+                        operation_id: _,
+                        agent_id: ev_agent,
+                        turn: ev_turn,
+                        ..
+                    } => {
                         if ev_agent == agent_id && ev_turn == turn {
                             // `done` is only a completion marker from the page script.
                             // It carries no response text, and some WebViews can deliver it
@@ -2762,13 +2816,158 @@ async fn wait_for_response_until(
                         }
                     }
                     NavEvent::ManualResponse {
+                        operation_id: _,
                         agent_id: ev_agent,
                         turn: ev_turn,
                         response,
+                        ..
                     } => {
                         if ev_agent == agent_id && ev_turn == turn {
                             return Ok(response);
                         }
+                    }
+                    NavEvent::ActiveControl {
+                        agent_id: ev_agent,
+                        kind: ActiveControlKind::Challenge,
+                        detail: indicator,
+                        ..
+                    } if ev_agent == agent_id => {
+                        let lower = indicator.to_ascii_lowercase();
+                        let kind = if lower.contains("login")
+                            || lower.contains("sign in")
+                            || lower.contains("sign-in")
+                            || lower.contains("auth")
+                        {
+                            "login required"
+                        } else if lower.contains("captcha")
+                            || lower.contains("challenge")
+                            || lower.contains("security")
+                            || lower.contains("cloudflare")
+                            || lower.contains("verify")
+                        {
+                            "captcha/challenge"
+                        } else {
+                            "challenge"
+                        };
+                        tracing::warn!(
+                            "[CHALLENGE] {} blocked by {}: {} — waiting for ResumeRequested (600s)",
+                            agent_id,
+                            kind,
+                            indicator
+                        );
+                        let resume_deadline =
+                            tokio::time::Instant::now() + Duration::from_secs(600);
+                        loop {
+                            match tokio::time::timeout_at(resume_deadline, nav_rx.recv()).await
+                            {
+                                Ok(Some(NavEvent::ResumeRequested(req_id)))
+                                    if req_id == agent_id =>
+                                {
+                                    tracing::info!(
+                                        "[CHALLENGE] {} resume received, retrying wait for response (turn {})",
+                                        agent_id,
+                                        turn
+                                    );
+                                    break;
+                                }
+                                Ok(Some(NavEvent::Ready(req_id))) if req_id == agent_id => {
+                                    tracing::info!(
+                                        "[CHALLENGE] {} ready after challenge, continuing wait (turn {})",
+                                        agent_id,
+                                        turn
+                                    );
+                                    break;
+                                }
+                                Ok(Some(NavEvent::ActiveControl {
+                                    agent_id: ch_id,
+                                    kind: ActiveControlKind::Challenge,
+                                    ..
+                                })) if ch_id == agent_id => {
+                                    tracing::warn!(
+                                        "[CHALLENGE] {} still blocked: {}",
+                                        agent_id,
+                                        indicator
+                                    );
+                                    continue;
+                                }
+                                Ok(Some(NavEvent::ManualResponse {
+                                    operation_id: _,
+                                    agent_id: m_id,
+                                    turn: m_turn,
+                                    response,
+                                    ..
+                                })) if m_id == agent_id && m_turn == turn => {
+                                    return Ok(response);
+                                }
+                                Ok(Some(NavEvent::Response {
+                                    operation_id: _,
+                                    agent_id: m_id,
+                                    turn: m_turn,
+                                    text,
+                                    ..
+                                })) if m_id == agent_id && m_turn == turn => {
+                                    return Ok(text);
+                                }
+                                Ok(Some(NavEvent::ActiveControl {
+                                    agent_id: u_id,
+                                    kind: ActiveControlKind::Unshowable,
+                                    detail: url,
+                                    ..
+                                })) if u_id == agent_id => {
+                                    return Err(AgentError::NavigationFailed(format!(
+                                        "{} navigated to unshowable URL while blocked: {}",
+                                        agent_id, url
+                                    )));
+                                }
+                                Ok(Some(NavEvent::SessionAborted)) => {
+                                    return Err(AgentError::UnknownError(
+                                        "Session aborted while waiting for challenge resume"
+                                            .to_string(),
+                                    ));
+                                }
+                                Ok(None) => {
+                                    return Err(AgentError::NavigationFailed(
+                                        "channel closed while waiting for challenge resume"
+                                            .to_string(),
+                                    ));
+                                }
+                                Err(_) => {
+                                    return Err(AgentError::CaptchaRequired(format!(
+                                        "{} blocked by verification challenge: timeout waiting for resume (600s)",
+                                        agent_id
+                                    )));
+                                }
+                                Ok(Some(_)) => continue,
+                            }
+                        }
+                    }
+                    NavEvent::ActiveControl {
+                        agent_id: ev_agent,
+                        kind: ActiveControlKind::Error,
+                        detail,
+                        ..
+                    } if ev_agent == agent_id => {
+                        return Err(AgentError::ExtractionFailed(format!(
+                            "Agent {} reported an error: {}",
+                            ev_agent, detail
+                        )));
+                    }
+                    NavEvent::ActiveControl {
+                        agent_id: ev_agent,
+                        kind: ActiveControlKind::Unshowable,
+                        detail: url,
+                        ..
+                    } if ev_agent == agent_id => {
+                        return Err(AgentError::NavigationFailed(format!(
+                            "Agent {} navigated to an unshowable URL: {}",
+                            ev_agent, url
+                        )));
+                    }
+                    NavEvent::CriticalTransportFault(reason) => {
+                        return Err(AgentError::UnknownError(format!(
+                            "critical transport fault: {}",
+                            reason
+                        )));
                     }
                     NavEvent::Error(ev_agent) => {
                         if ev_agent == agent_id {
@@ -2844,15 +3043,21 @@ async fn wait_for_response_until(
                                         continue;
                                     }
                                     Ok(Some(NavEvent::ManualResponse {
+                                        operation_id: _,
                                         agent_id: m_id,
                                         turn: m_turn,
                                         response,
+                                        ..
                                     })) if m_id == agent_id && m_turn == turn => {
                                         return Ok(response);
                                     }
-                                    Ok(Some(NavEvent::Response(m_id, m_turn, text)))
-                                        if m_id == agent_id && m_turn == turn =>
-                                    {
+                                    Ok(Some(NavEvent::Response {
+                                        operation_id: _,
+                                        agent_id: m_id,
+                                        turn: m_turn,
+                                        text,
+                                        ..
+                                    })) if m_id == agent_id && m_turn == turn => {
                                         return Ok(text);
                                     }
                                     Ok(Some(NavEvent::UnshowableUrl(u_id, url)))
@@ -2935,6 +3140,7 @@ mod tests {
         error: Option<&str>,
     ) -> NavEvent {
         NavEvent::ActiveSubmitReport {
+            operation_id: crate::pipeline_ids::OperationId::new(),
             agent_id: agent_id.to_string(),
             turn,
             succeeded,
@@ -3000,11 +3206,12 @@ mod tests {
     #[tokio::test]
     async fn ack_captures_early_response_for_exact_agent_turn() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(NavEvent::Response(
-            "chatgpt".to_string(),
-            4,
-            "early text".to_string(),
-        ))
+        tx.send(NavEvent::Response {
+            operation_id: crate::pipeline_ids::OperationId::new(),
+            agent_id: "chatgpt".to_string(),
+            turn: 4,
+            text: "early text".to_string(),
+        })
         .await
         .unwrap();
         drop(tx);
@@ -3019,6 +3226,7 @@ mod tests {
     async fn ack_accepts_manual_response_for_exact_agent_turn() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         tx.send(NavEvent::ManualResponse {
+            operation_id: crate::pipeline_ids::OperationId::new(),
             agent_id: "deepseek".to_string(),
             turn: 5,
             response: "pasted".to_string(),
@@ -3065,11 +3273,12 @@ mod tests {
         tx.send(NavEvent::Ready("chatgpt".to_string()))
             .await
             .unwrap();
-        tx.send(NavEvent::Response(
-            "chatgpt".to_string(),
-            1,
-            "stale".to_string(),
-        ))
+        tx.send(NavEvent::Response {
+            operation_id: crate::pipeline_ids::OperationId::new(),
+            agent_id: "chatgpt".to_string(),
+            turn: 1,
+            text: "stale".to_string(),
+        })
         .await
         .unwrap();
         let drained = drain_stale_active_events(&mut rx);
@@ -3091,25 +3300,28 @@ mod tests {
     #[tokio::test]
     async fn queued_response_recovery_requires_exact_agent_and_turn() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(NavEvent::Response(
-            "other".to_string(),
-            4,
-            "stale agent".to_string(),
-        ))
+        tx.send(NavEvent::Response {
+            operation_id: crate::pipeline_ids::OperationId::new(),
+            agent_id: "other".to_string(),
+            turn: 4,
+            text: "stale agent".to_string(),
+        })
         .await
         .unwrap();
-        tx.send(NavEvent::Response(
-            "claude".to_string(),
-            3,
-            "stale turn".to_string(),
-        ))
+        tx.send(NavEvent::Response {
+            operation_id: crate::pipeline_ids::OperationId::new(),
+            agent_id: "claude".to_string(),
+            turn: 3,
+            text: "stale turn".to_string(),
+        })
         .await
         .unwrap();
-        tx.send(NavEvent::Response(
-            "claude".to_string(),
-            4,
-            "current".to_string(),
-        ))
+        tx.send(NavEvent::Response {
+            operation_id: crate::pipeline_ids::OperationId::new(),
+            agent_id: "claude".to_string(),
+            turn: 4,
+            text: "current".to_string(),
+        })
         .await
         .unwrap();
         assert_eq!(
@@ -3146,11 +3358,12 @@ mod tests {
             !handle.is_finished(),
             "should still be waiting for Response after resume"
         );
-        tx.send(NavEvent::Response(
-            agent.to_string(),
+        tx.send(NavEvent::Response {
+            operation_id: crate::pipeline_ids::OperationId::new(),
+            agent_id: agent.to_string(),
             turn,
-            "hello".to_string(),
-        ))
+            text: "hello".to_string(),
+        })
         .await
         .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
@@ -3178,6 +3391,7 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         tx.send(NavEvent::ManualResponse {
+            operation_id: crate::pipeline_ids::OperationId::new(),
             agent_id: agent.to_string(),
             turn,
             response: "pasted".to_string(),
@@ -3237,11 +3451,12 @@ mod tests {
             !handle.is_finished(),
             "challenge for other agent should be ignored"
         );
-        tx.send(NavEvent::Response(
-            agent.to_string(),
+        tx.send(NavEvent::Response {
+            operation_id: crate::pipeline_ids::OperationId::new(),
+            agent_id: agent.to_string(),
             turn,
-            "ok".to_string(),
-        ))
+            text: "ok".to_string(),
+        })
         .await
         .unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), handle)

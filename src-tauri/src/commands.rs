@@ -1283,20 +1283,39 @@ pub async fn provide_manual_model_response(
             return Err("Manual response is only available while a session is running".to_string());
         }
     }
-    let nav_tx = {
+    let (op_id, dispatch_result) = {
         let browser = state.browser_state.lock().await;
-        if browser.active_turn.as_ref() != Some(&(agent_id.clone(), turn_number)) {
+        // Validate active operation exists
+        let ctx = browser
+            .current_operation_for_agent(&agent_id)
+            .ok_or_else(|| {
+                "This model and turn are not currently awaiting a response".to_string()
+            })?;
+        if ctx.turn != turn_number || ctx.agent_id != agent_id {
             return Err("This model and turn are not currently awaiting a response".to_string());
         }
-        browser.nav_tx.clone()
-    };
-    nav_tx
-        .try_send(NavEvent::ManualResponse {
-            agent_id,
+        // Validate session owner
+        let owner = state
+            .session_runtime
+            .current_owner()
+            .ok_or_else(|| "No active session".to_string())?;
+        if ctx.session_id != owner.session_id || ctx.run_generation != owner.run_generation {
+            return Err("Stale operation — session generation mismatch".to_string());
+        }
+        if response.len() > crate::critical_transport::MAX_RESPONSE_PAYLOAD_BYTES {
+            return Err("Model response exceeds 2MiB limit".to_string());
+        }
+        let op_id = ctx.operation_id.clone();
+        let event = NavEvent::ManualResponse {
+            operation_id: op_id.clone(),
+            agent_id: agent_id.clone(),
             turn: turn_number,
-            response,
-        })
-        .map_err(|error| format!("Could not deliver manual model response: {error}"))
+            response: response.clone(),
+        };
+        let res = browser.dispatch_manual_response(&op_id, event);
+        (op_id, res)
+    };
+    dispatch_result.map_err(|e| format!("Could not deliver manual model response: {e}"))
 }
 
 #[tauri::command(rename_all = "snake_case")]
