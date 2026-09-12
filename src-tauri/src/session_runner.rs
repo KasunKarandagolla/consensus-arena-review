@@ -4,6 +4,7 @@ use crate::browser_backend::{
     record_prompt_injection_error, record_prompt_injection_report, record_setup_completion,
     record_setup_expected_agent, record_setup_stale_signal, resolve_participant,
 };
+use crate::browser_lifecycle::{BrowserLifecycleController, is_auth_blocker_reason};
 use crate::errors::AgentError;
 use crate::orchestrator::{AppState, SessionConfig};
 use serde_json::json;
@@ -305,23 +306,6 @@ async fn perform_priming_injection(
     }
 }
 
-fn drain_stale_nav_events(nav_rx: &mut Receiver<NavEvent>, context: &str) -> usize {
-    let mut drained = 0usize;
-    loop {
-        match nav_rx.try_recv() {
-            Ok(event) => {
-                drained = drained.saturating_add(1);
-                tracing::warn!(
-                    "[SETUP] Drained stale nav event before {context}: {:?}",
-                    event
-                );
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return drained,
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return drained,
-        }
-    }
-}
-
 fn assign_role(agent_id: &str, config: &SessionConfig) -> String {
     if agent_id == config.leader_agent_id {
         return "Leader".to_string();
@@ -338,152 +322,111 @@ fn assign_role(agent_id: &str, config: &SessionConfig) -> String {
     ROLES.get(pos + 1).unwrap_or(&"Analyst").to_string()
 }
 
+/// Session 03 authoritative setup readiness: waits on
+/// `BrowserLifecycleController` state (exact window + owner + document
+/// generation lease), never on lossy auxiliary `NavEvent::Ready`. Auxiliary
+/// events may still update UI/diagnostics elsewhere but cannot satisfy this
+/// wait. Challenge/login verification keeps the existing recoverable UX:
+/// the user completing authentication never manufactures Ready — only
+/// current-generation composer evidence does.
 pub(crate) async fn wait_for_setup_ready(
     agent_id: &str,
+    window_label: &str,
+    lifecycle: &BrowserLifecycleController,
     base_url: &str,
     display_name: &str,
     app: &AppHandle,
     diagnostics: &crate::browser_backend::BrowserDiagnostics,
-    nav_rx: &mut Receiver<NavEvent>,
 ) -> Result<(), AgentError> {
-    loop {
-        let agent_id_owned = agent_id.to_string();
-        let ready = tokio::time::timeout(
+    let first = lifecycle
+        .wait_until_ready(
+            window_label,
+            agent_id,
             std::time::Duration::from_secs(READINESS_WAIT_TIMEOUT_SECS),
-            async {
-                loop {
-                    match nav_rx.recv().await {
-                        Some(NavEvent::Ready(id)) if id == agent_id_owned => break Ok(()),
-                        Some(NavEvent::Error(id)) if id == agent_id_owned => {
-                            break Err(AgentError::NavigationFailed(
-                                diagnostics.readiness_timeout_message(&id, display_name),
-                            ));
-                        }
-                        Some(NavEvent::ChallengeDetected(id, indicator))
-                            if id == agent_id_owned =>
-                        {
-                            break Err(AgentError::CaptchaRequired(indicator));
-                        }
-                        Some(NavEvent::UnshowableUrl(id, url)) if id == agent_id_owned => {
-                            break Err(AgentError::NavigationFailed(format!(
-                                "{} navigated to a URL this WebView cannot display: {}",
-                                display_name_for(&id),
-                                url
-                            )));
-                        }
-                        Some(NavEvent::SessionAborted) => {
-                            break Err(AgentError::UnknownError("Session aborted".to_string()));
-                        }
-                        // Login page detected (e.g., Claude at /login, GLM Chinese login) — treat
-                        // like a challenge: wait for user to complete login (600s) rather than
-                        // timing out after 100s. This prevents premature `setup_failed_recoverable`
-                        // for pages that correctly show login UI but have no composer yet.
-                        Some(NavEvent::SendProbe {
-                            agent_id: probe_id,
-                            page_state_hint: Some(hint),
-                            ..
-                        }) if probe_id == agent_id_owned && hint == "possible_login_required" => {
-                            break Err(AgentError::CaptchaRequired("login_required".to_string()));
-                        }
-                        Some(_) => continue,
-                        None => {
-                            break Err(AgentError::NavigationFailed("channel closed".to_string()));
-                        }
-                    }
-                }
-            },
         )
         .await;
-
-        match ready {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(AgentError::CaptchaRequired(indicator))) => {
-                let _ = app.emit("captcha-detected", json!({ "agent_id": agent_id }));
-                let is_login = indicator == "login_required";
-                let _ = app.emit("boss-message", json!({
-                    "text": if is_login {
-                        format!("{display_name} is showing a login page at {base_url}. Please log in in the {} window, then click Resume or wait for it to become ready.", display_name)
-                    } else {
-                        format!("{display_name} needs verification ({indicator}). Complete the check in the model window, then click Resume.")
-                    },
-                    "message_type": "status"
-                }));
-                let resumed = tokio::time::timeout(std::time::Duration::from_secs(600), async {
-                    loop {
-                        match nav_rx.recv().await {
-                            Some(NavEvent::ResumeRequested(id)) if id == agent_id => {
-                                let _ = app.emit("boss-message", json!({
-                                    "text": format!(
-                                        "Checking {display_name} again; waiting for a ready composer."
-                                    ),
-                                    "message_type": "status"
-                                }));
-                                continue;
-                            }
-                            Some(NavEvent::Ready(id)) if id == agent_id => break Ok(()),
-                            Some(NavEvent::ChallengeDetected(id, next_indicator)) if id == agent_id => {
-                                record_browser_blocker(
-                                    app,
-                                    diagnostics,
-                                    agent_id,
-                                    "captcha_or_challenge",
-                                    "captcha_or_challenge",
-                                    None,
-                                    "Verification challenge still present",
-                                    Some(&next_indicator),
-                                );
-                                let _ = app.emit("captcha-detected", json!({ "agent_id": agent_id }));
-                            }
-                            Some(NavEvent::UnshowableUrl(id, url)) if id == agent_id => {
-                                break Err(AgentError::NavigationFailed(format!(
-                                    "{display_name} navigated to a URL this WebView cannot display: {url}"
-                                )))
-                            }
-                            Some(NavEvent::SessionAborted) => {
-                                break Err(AgentError::UnknownError("Session aborted".to_string()))
-                            }
-                            Some(_) => continue,
-                            None => break Err(AgentError::NavigationFailed(
-                                "channel closed while waiting for verification resume".to_string(),
-                            )),
-                        }
-                    }
-                })
-                .await;
-                match resumed {
-                    Ok(Ok(())) => return Ok(()),
-                    Ok(Err(error)) => return Err(error),
-                    Err(_) => {
-                        let message = "timeout waiting for verification resume (600s)".to_string();
-                        record_browser_blocker(
-                            app,
-                            diagnostics,
-                            agent_id,
-                            "timeout",
-                            "error",
-                            Some(base_url),
-                            "Verification resume timed out",
-                            Some(&message),
-                        );
-                        // RC1-A4: expose as CaptchaRequired (Permanent) so callers can
-                        // distinguish challenge-expiry from a normal Timeout. Matches
-                        // active-turn wait_for_response challenge expiry semantics.
-                        return Err(AgentError::CaptchaRequired(format!(
-                            "{display_name} blocked by verification challenge: timeout waiting for resume (600s)"
-                        )));
-                    }
-                }
-            }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => {
-                let last_real_url = diagnostics
-                    .last_real_navigation_url(agent_id)
-                    .unwrap_or_else(|| "unknown".to_string());
-                return Err(AgentError::Timeout(format!(
-                    "{display_name} window timed out waiting for readiness from {base_url}. Last real URL: {last_real_url}. See Settings → Diagnostics."
-                )));
-            }
+    let blocked_reason = match first {
+        Ok(_) => return Ok(()),
+        Err(wait) => wait.blocked_reason.clone().unwrap_or_default(),
+    };
+    if !is_auth_blocker_reason(&blocked_reason) {
+        let last_real_url = diagnostics
+            .last_real_navigation_url(agent_id)
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(AgentError::Timeout(format!(
+            "{display_name} window timed out waiting for readiness from {base_url}. Last real URL: {last_real_url}. See Settings → Diagnostics."
+        )));
+    }
+    let is_login = blocked_reason.to_ascii_lowercase().contains("login")
+        || blocked_reason.contains("auth_route");
+    let _ = app.emit("captcha-detected", json!({ "agent_id": agent_id }));
+    let _ = app.emit("boss-message", json!({
+        "text": if is_login {
+            format!("{display_name} is showing a login page at {base_url}. Please log in in the model window, then click Resume or wait for it to become ready.")
+        } else {
+            format!("{display_name} needs verification ({blocked_reason}). Complete the check in the model window, then click Resume.")
+        },
+        "message_type": "status"
+    }));
+    // Extended recoverable wait for user-completed verification. A resume
+    // request is only a wakeup; genuine current-generation composer evidence
+    // must still create Ready.
+    match lifecycle
+        .wait_until_ready(window_label, agent_id, std::time::Duration::from_secs(600))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let message = "timeout waiting for verification resume (600s)".to_string();
+            record_browser_blocker(
+                app,
+                diagnostics,
+                agent_id,
+                "timeout",
+                "error",
+                Some(base_url),
+                "Verification resume timed out",
+                Some(&message),
+            );
+            // RC1-A4: expose as CaptchaRequired (Permanent) so callers can
+            // distinguish challenge-expiry from a normal Timeout. Matches
+            // active-turn wait_for_response challenge expiry semantics.
+            Err(AgentError::CaptchaRequired(format!(
+                "{display_name} blocked by verification challenge: timeout waiting for resume (600s)"
+            )))
         }
+    }
+}
+
+/// Disposition of one auxiliary event observed while a failed setup waits
+/// for an explicit retry control. Only the exact expected failed agent's
+/// explicit control authorizes re-running setup; unrelated events keep the
+/// wrapper waiting instead of re-entering `run_setup`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SetupRetrySignal {
+    /// Explicit retry control for the failed agent: re-run setup.
+    Retry,
+    /// Explicit manual confirmation for the failed agent: announce and retry.
+    ManualConfirmed,
+    /// Session aborted / channel closed: terminal teardown.
+    Abort,
+    /// Anything else (including other agents' events): keep waiting.
+    Ignore,
+}
+
+pub(crate) fn classify_setup_retry_signal(
+    failed_agent: Option<&str>,
+    event: &NavEvent,
+) -> SetupRetrySignal {
+    match event {
+        NavEvent::ResumeRequested(id) if failed_agent.is_some_and(|failed| failed == id) => {
+            SetupRetrySignal::Retry
+        }
+        NavEvent::SetupManualConfirmed(id) if failed_agent.is_some_and(|failed| failed == id) => {
+            SetupRetrySignal::ManualConfirmed
+        }
+        NavEvent::SessionAborted => SetupRetrySignal::Abort,
+        _ => SetupRetrySignal::Ignore,
     }
 }
 
@@ -582,7 +525,7 @@ pub async fn run_setup(
 
         let agent_config = resolve_participant(agent_id, &custom)
             .ok_or_else(|| AgentError::NavigationFailed(format!("Unknown model id: {agent_id}")))?;
-        let (window, diagnostics, window_kind) = {
+        let (window, diagnostics, lifecycle, window_kind, window_label) = {
             let browser = state.browser_state.lock().await;
             let window = if is_leader {
                 browser.leader_window.clone()
@@ -595,10 +538,17 @@ pub async fn run_setup(
                     if is_leader { "leader" } else { "nav" }
                 ))
             })?;
+            let window_label = if is_leader {
+                crate::browser_backend::LEADER_WINDOW_LABEL
+            } else {
+                crate::browser_backend::NAV_WINDOW_LABEL
+            };
             (
                 window,
                 browser.diagnostics.clone(),
+                browser.lifecycle.clone(),
                 if is_leader { "leader" } else { "nav" },
+                window_label,
             )
         };
 
@@ -610,14 +560,14 @@ pub async fn run_setup(
         }
 
         record_setup_expected_agent(&diagnostics, agent_id);
-        let drained = drain_stale_nav_events(nav_rx, &format!("setup for {agent_id}"));
-        if drained > 0 {
-            tracing::warn!("[SETUP] Drained {drained} stale nav events before {agent_id}");
-        }
+        // Session 03: readiness is generation-bound controller state, so no
+        // blanket auxiliary-queue drain is part of correctness. Stale
+        // auxiliary events can neither satisfy nor corrupt the wait below.
 
         let navigation_result = navigate_agent_window(
             app,
             &diagnostics,
+            &lifecycle,
             &window,
             agent_id,
             window_kind,
@@ -638,11 +588,12 @@ pub async fn run_setup(
 
         match wait_for_setup_ready(
             agent_id,
+            window_label,
+            &lifecycle,
             &agent_config.base_url,
             &agent_config.display_name,
             app,
             &diagnostics,
-            nav_rx,
         )
         .await
         {
@@ -1285,11 +1236,12 @@ pub async fn run_setup(
                             let _ = app.emit("boss-message", json!({"text": format!("{} page navigation detected after timeout; re-priming... (attempt {}/{})", agent_config.display_name, nav_recovery_count, MAX_SETUP_NAVIGATION_RECOVERIES), "message_type": "status"}));
                             if let Err(e) = wait_for_setup_ready(
                                 agent_id,
+                                window_label,
+                                &lifecycle,
                                 &agent_config.base_url,
                                 &agent_config.display_name,
                                 app,
                                 &diagnostics,
-                                nav_rx,
                             )
                             .await
                             {
@@ -1494,7 +1446,8 @@ pub async fn run_debate(
 
 #[cfg(test)]
 mod tests {
-    use super::capability_verified;
+    use super::{SetupRetrySignal, capability_verified, classify_setup_retry_signal};
+    use crate::browser_backend::NavEvent;
 
     // A. Strong setup capability proof completes setup (accelerator) — all four
     //    signal strengths true and no injection error → the gate holds true.
@@ -1563,5 +1516,99 @@ mod tests {
         // turn. It is a readiness signal; turnover is the ACTIVE loop's job.
         let verified = capability_verified(true, true, true, None);
         assert!(verified);
+    }
+
+    // U2: unrelated auxiliary events cannot authorize a setup retry. Only
+    // the exact failed agent's explicit control retries; everything else
+    // keeps the wrapper waiting.
+    #[test]
+    fn unrelated_aux_event_cannot_authorize_retry() {
+        let failed = Some("claude");
+        assert_eq!(
+            classify_setup_retry_signal(failed, &NavEvent::ResumeRequested("claude".to_string())),
+            SetupRetrySignal::Retry
+        );
+        assert_eq!(
+            classify_setup_retry_signal(
+                failed,
+                &NavEvent::SetupManualConfirmed("claude".to_string())
+            ),
+            SetupRetrySignal::ManualConfirmed
+        );
+        // Wrong agent, unknown agent, and no failed agent: never retry.
+        assert_eq!(
+            classify_setup_retry_signal(failed, &NavEvent::ResumeRequested("qwen".to_string())),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(
+                failed,
+                &NavEvent::SetupManualConfirmed("qwen".to_string())
+            ),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(None, &NavEvent::ResumeRequested("claude".to_string())),
+            SetupRetrySignal::Ignore
+        );
+        // Unrelated traffic (other agents' Ready, probes, responses, aborts
+        // of nothing) never re-runs setup.
+        assert_eq!(
+            classify_setup_retry_signal(failed, &NavEvent::Ready("chatgpt".to_string())),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(failed, &NavEvent::Ready("claude".to_string())),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(
+                failed,
+                &NavEvent::ChallengeDetected("claude".to_string(), "turnstile".to_string())
+            ),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(
+                failed,
+                &NavEvent::UnshowableUrl("claude".to_string(), "https://x.example/".to_string())
+            ),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(
+                failed,
+                &NavEvent::SendDetected("claude".to_string(), None)
+            ),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(failed, &NavEvent::SessionAborted),
+            SetupRetrySignal::Abort
+        );
+    }
+
+    // U3/U6: retry/confirm identity is exact — tested through the same
+    // classifier the outer wrapper uses.
+    #[test]
+    fn retry_signal_identity_is_exact() {
+        assert_eq!(
+            classify_setup_retry_signal(
+                Some("claude"),
+                &NavEvent::ResumeRequested("claude".to_string())
+            ),
+            SetupRetrySignal::Retry
+        );
+        assert_eq!(
+            classify_setup_retry_signal(
+                Some("claude"),
+                &NavEvent::ResumeRequested("CLAUDE".to_string())
+            ),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(Some("claude"), &NavEvent::ResumeRequested("".to_string())),
+            SetupRetrySignal::Ignore
+        );
     }
 }

@@ -6,6 +6,7 @@ mod agentic_manager;
 mod blueprint_store;
 mod browser_backend;
 mod browser_harness;
+mod browser_lifecycle;
 mod capability_registry;
 mod checkpoint;
 mod commands;

@@ -2,6 +2,9 @@ use crate::browser_harness::{
     self, ActionRecord, ActionTarget, BoundingRect, BrowserEvent, BrowserTimeline, EventType,
     NavigationIntent, PageLifecycleEvent, SafeDomForensics, SafeElement,
 };
+use crate::browser_lifecycle::{
+    BrowserLifecycleController, FinishDecision, LeaseSignalKind, ProviderPolicy, ReadyLease,
+};
 use crate::critical_transport::{
     CRITICAL_INGRESS_CAPACITY, CriticalEventHub, CriticalTransportError, DispatchOutcome,
     MAX_CRITICAL_EVENT_BYTES, MAX_RESPONSE_CHUNK_BYTES,
@@ -2198,6 +2201,11 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
         NavEvent::SendProbe { agent_id, .. } => Some((agent_id.as_str(), "send-probe")),
         NavEvent::ChallengeDetected(agent_id, _) => Some((agent_id.as_str(), "challenge")),
         NavEvent::UnshowableUrl(agent_id, _) => Some((agent_id.as_str(), "unshowable")),
+        // Session 03: system-critical lease authority signal (diagnostics
+        // mirror only; the controller already applied it on the bridge).
+        NavEvent::BrowserLeaseSignal { agent_id, kind, .. } => {
+            Some((agent_id.as_str(), kind.as_str()))
+        }
         NavEvent::ResumeRequested(agent_id) => Some((agent_id.as_str(), "resume")),
         NavEvent::ManualResponse { agent_id, .. } => Some((agent_id.as_str(), "manual_response")),
         NavEvent::ConsoleDiagnostic { .. } => None,
@@ -2829,6 +2837,25 @@ fn record_nav_event_inner(app: &AppHandle, diagnostics: &BrowserDiagnostics, eve
 
     let (agent_id, phase, message) = match event {
         NavEvent::Ready(agent_id) => (agent_id, "composer_detected", "Composer detected"),
+        // Session 03 diagnostics mirror only: the critical bridge already
+        // applied this signal to the lifecycle controller. A Ready lease
+        // mirrors legacy Ready diagnostics; revocations only record the
+        // blocker and never authorize anything here.
+        NavEvent::BrowserLeaseSignal {
+            agent_id,
+            kind,
+            reason,
+            ..
+        } => match kind {
+            LeaseSignalKind::Ready => (agent_id, "composer_detected", "Composer detected"),
+            _ => {
+                let _ = update_diagnostic(diagnostics, agent_id, |record| {
+                    record.last_blocker = reason.clone();
+                    record.current_phase = "blocked".to_string();
+                });
+                return;
+            }
+        },
         NavEvent::Error(agent_id) => {
             let _ = update_diagnostic(diagnostics, agent_id, |record| {
                 if record.readiness_timeout_ms.is_none() {
@@ -2898,6 +2925,9 @@ fn record_nav_event_inner(app: &AppHandle, diagnostics: &BrowserDiagnostics, eve
         let op = diagnostics.current_operation_id(agent_id);
         let ev_type = match event {
             NavEvent::Ready(_) => EventType::ComposerDetected,
+            NavEvent::BrowserLeaseSignal { kind, .. } if *kind == LeaseSignalKind::Ready => {
+                EventType::ComposerDetected
+            }
             NavEvent::SendDetected(_, _) => EventType::SendDetected,
             NavEvent::SetupManualConfirmed(_) => EventType::PrimingCompleted,
             NavEvent::ManualResponse { .. } => EventType::ResponseObserved,
@@ -2920,6 +2950,9 @@ fn record_nav_event_inner(app: &AppHandle, diagnostics: &BrowserDiagnostics, eve
         };
         let details = match event {
             NavEvent::Ready(_) => {
+                serde_json::json!({ "input_found": true, "composer_detected": true })
+            }
+            NavEvent::BrowserLeaseSignal { kind, .. } if *kind == LeaseSignalKind::Ready => {
                 serde_json::json!({ "input_found": true, "composer_detected": true })
             }
             NavEvent::SendDetected(_, reason) => serde_json::json!({ "reason": reason.clone() }),
@@ -2985,6 +3018,24 @@ fn record_nav_event_inner(app: &AppHandle, diagnostics: &BrowserDiagnostics, eve
                     serde_json::json!({ "new_phase": phase }),
                 );
             }
+            NavEvent::BrowserLeaseSignal { kind, .. } if *kind == LeaseSignalKind::Ready => {
+                diagnostics.emit_harness_event(
+                    agent_id,
+                    EventType::InputDetected,
+                    phase,
+                    &op,
+                    "",
+                    serde_json::json!({}),
+                );
+                diagnostics.emit_harness_event(
+                    agent_id,
+                    EventType::PhaseChanged,
+                    phase,
+                    &op,
+                    "",
+                    serde_json::json!({ "new_phase": phase }),
+                );
+            }
             NavEvent::SendDetected(_, _) => {
                 diagnostics.emit_harness_event(
                     agent_id,
@@ -3024,12 +3075,19 @@ fn record_nav_event_inner(app: &AppHandle, diagnostics: &BrowserDiagnostics, eve
                 | NavEvent::ResponseEnd { .. }
                 | NavEvent::Done { .. }
                 | NavEvent::SetupResponseObserved(_)
-        ) {
+        ) || matches!(event, NavEvent::BrowserLeaseSignal { kind, .. } if *kind == LeaseSignalKind::Ready)
+        {
             record.last_blocker = "none".to_string();
             record.last_blocker_url_redacted = None;
         }
         match event {
             NavEvent::Ready(_) => {
+                record.last_ready_at = Some(timestamp.clone());
+                record.input_found = true;
+                record.page_state_hint = Some("composer_detected".to_string());
+                record.page_health_hint = Some("interactive".to_string());
+            }
+            NavEvent::BrowserLeaseSignal { kind, .. } if *kind == LeaseSignalKind::Ready => {
                 record.last_ready_at = Some(timestamp.clone());
                 record.input_found = true;
                 record.page_state_hint = Some("composer_detected".to_string());
@@ -3129,6 +3187,7 @@ fn record_nav_event_inner(app: &AppHandle, diagnostics: &BrowserDiagnostics, eve
             | NavEvent::ConsoleDiagnostic { .. }
             | NavEvent::ChallengeDetected(_, _)
             | NavEvent::UnshowableUrl(_, _)
+            | NavEvent::BrowserLeaseSignal { .. }
             | NavEvent::UnsupportedNavigation { .. }
             | NavEvent::ResumeRequested(_)
             | NavEvent::PageLifecycle { .. }
@@ -3604,6 +3663,7 @@ impl BrowserEventIngress {
                 event,
                 NavEvent::CriticalTransportFault { .. }
                     | NavEvent::CriticalTransportOverflowWake { .. }
+                    | NavEvent::BrowserLeaseSignal { .. }
             );
         if is_critical {
             let cost = critical_payload_cost(&event);
@@ -3768,6 +3828,7 @@ pub fn critical_payload_cost(event: &NavEvent) -> usize {
             method.len() + error.as_deref().map_or(0, str::len) + 64
         }
         NavEvent::Done { .. } => 32,
+        NavEvent::BrowserLeaseSignal { reason, .. } => reason.len().saturating_add(64),
         NavEvent::CriticalTransportFault { reason, .. } => reason.len() + 32,
         NavEvent::CriticalTransportOverflowWake { .. } => 32,
         _ => 0,
@@ -3901,6 +3962,20 @@ pub enum NavEvent {
     },
     ChallengeDetected(String, String),
     UnshowableUrl(String, String),
+    /// System-critical semantic lease signal (Session 03). Generation-bearing
+    /// document authority — NOT auxiliary telemetry. Carries no `OperationId`
+    /// because it is document authority, not an active-turn response; the
+    /// critical bridge intercepts it and applies it directly to the
+    /// `BrowserLifecycleController` without touching operation mailboxes.
+    /// Legacy `Ready(agent)` remains parsed for diagnostics/UI compatibility
+    /// but has zero authority to grant active readiness.
+    BrowserLeaseSignal {
+        window_label: String,
+        agent_id: String,
+        document_generation: u64,
+        kind: LeaseSignalKind,
+        reason: String,
+    },
     UnsupportedNavigation {
         window_label: String,
         url: String,
@@ -4072,6 +4147,10 @@ pub struct BrowserState {
     critical_failure_epoch: Arc<AtomicU64>,
     critical_alive: Arc<AtomicBool>,
     pub diagnostics: BrowserDiagnostics,
+    /// Session 03 authoritative browser readiness authority (process
+    /// lifetime, shared by persistent-window callbacks). Diagnostics mirror
+    /// lifecycle state for observability but never authorize injection.
+    pub lifecycle: BrowserLifecycleController,
     pub pending_sends: HashSet<String>,
     pub captcha_resolved: HashSet<String>,
     /// IMP-4: per-agent cooldown map.
@@ -4110,6 +4189,7 @@ impl BrowserState {
             critical_failure_epoch,
             critical_alive,
             diagnostics: BrowserDiagnostics::new(),
+            lifecycle: BrowserLifecycleController::new(),
             pending_sends: HashSet::new(),
             captcha_resolved: HashSet::new(),
             cooldowns: HashMap::new(),
@@ -4136,6 +4216,7 @@ impl BrowserState {
             critical_failure_epoch: failure_epoch,
             critical_alive: alive,
             diagnostics: BrowserDiagnostics::new(),
+            lifecycle: BrowserLifecycleController::new(),
             pending_sends: HashSet::new(),
             captcha_resolved: HashSet::new(),
             cooldowns: HashMap::new(),
@@ -4170,10 +4251,34 @@ impl BrowserState {
         );
         let diagnostics_aux = state.diagnostics.clone();
         let diagnostics_crit = state.diagnostics.clone();
+        let lifecycle_crit = state.lifecycle.clone();
+        let lifecycle_aux = state.lifecycle.clone();
         let sink_slot = state.nav_sink.clone();
         let bridge_app_aux = app.clone();
         std::thread::spawn(move || {
             while let Ok(event) = aux_rx.recv() {
+                // Session 03: same-document SPA route authority. A
+                // same-document move to an auth/security/ineligible route
+                // revokes readiness natively (no generation bump — the JS
+                // realm is identical). Telemetry handling below is unchanged.
+                if let NavEvent::PageLifecycle {
+                    window_label,
+                    event_type,
+                    url,
+                    ..
+                } = &event
+                {
+                    if matches!(
+                        event_type.as_str(),
+                        "history_pushState"
+                            | "history_replaceState"
+                            | "popstate"
+                            | "hashchange"
+                            | "url_changed_JS"
+                    ) {
+                        lifecycle_aux.spa_route_changed(window_label, &sanitized_url(url));
+                    }
+                }
                 record_nav_event(&bridge_app_aux, &diagnostics_aux, &event);
                 forward_nav_event(&sink_slot, event);
             }
@@ -4195,6 +4300,34 @@ impl BrowserState {
             // "already observed": the first drained event observes it.
             let mut last_seen_epoch = 0_u64;
             while let Ok(event) = critical_rx.recv() {
+                // Session 03: system-critical lease signals are document
+                // authority, not operation traffic. Account the failure epoch
+                // first (a burst of leases alone must still observe an
+                // overflow), then intercept before operation-mailbox dispatch:
+                // apply directly to the lifecycle controller (short sync
+                // lock, never charged to an operation mailbox), then mirror
+                // into diagnostics. Stale signals are rejected by
+                // owner+generation and leave state untouched.
+                if let NavEvent::BrowserLeaseSignal {
+                    window_label,
+                    agent_id,
+                    document_generation,
+                    kind,
+                    reason,
+                } = &event
+                {
+                    let current_epoch = epoch_clone.load(Ordering::SeqCst);
+                    account_bridge_epoch(&critical_hub_clone, &mut last_seen_epoch, current_epoch);
+                    lifecycle_crit.apply_signal(
+                        window_label,
+                        agent_id,
+                        *document_generation,
+                        kind.clone(),
+                        reason,
+                    );
+                    record_nav_event(&bridge_app_crit, &diagnostics_crit, &event);
+                    continue;
+                }
                 match &event {
                     NavEvent::CriticalTransportOverflowWake { failed_epoch } => {
                         // Atomic is authoritative and monotonic. A wake may be
@@ -4285,7 +4418,7 @@ impl BrowserState {
     }
 
     /// Clear session-only browser state without replacing the process-lifetime
-    /// channel, diagnostics object, or named WebView handles.
+    /// channel, diagnostics object, lifecycle controller, or named WebView handles.
     pub fn reset_for_session(&mut self) {
         // Retire any active operation mailbox as stale/session-reset and wake waiters.
         // 02E: also retire the exact diagnostic authority for the retired
@@ -4297,6 +4430,9 @@ impl BrowserState {
                 .clear_operation_if(&ctx.agent_id, &ctx.operation_id);
             self.critical_hub.retire_exact(&ctx.operation_id);
         }
+        // Session 03: revoke session/window owner leases without destroying
+        // the process-lifetime controller captured by window callbacks.
+        self.lifecycle.reset_for_session();
         self.conversation_urls.clear();
         self.pending_sends.clear();
         self.captcha_resolved.clear();
@@ -4581,9 +4717,12 @@ enum AutomationActivationPolicy {
     Deferred,
 }
 
-/// Browser-owned authentication and security documents must not receive the
-/// Arena runtime. Provider application documents are activated only after the
-/// native Finished event, never at document start.
+/// Legacy coarse post-load install gate (built-in-only, subdomain-permissive).
+/// Session 03: NO LONGER the activation authority. The exact
+/// `BrowserLifecycleController` policy (exact origin, custom-capable) owns
+/// activation via `page_finished` in `activate_automation_after_page_load`.
+/// Retained for unit-test documentation of the historical rule only.
+#[allow(dead_code)]
 fn automation_activation_policy(agent_id: &str, url: &str) -> AutomationActivationPolicy {
     let Ok(parsed) = url.parse::<tauri::Url>() else {
         return AutomationActivationPolicy::Deferred;
@@ -4642,23 +4781,45 @@ fn record_automation_activation(
     });
 }
 
+/// Derive the declarative lifecycle policy for one navigation from the exact
+/// navigation target URL. Built-in vs custom is resolved from the static
+/// registry; the application origin always comes from the validated target
+/// URL itself (the merged-registry base URL at every call site), so custom
+/// participants reach generic verification without baked-in host lists.
+fn lifecycle_policy_for_navigation(agent_id: &str, target_url: &str) -> Option<ProviderPolicy> {
+    let is_custom = get_agent_config(agent_id).is_none();
+    ProviderPolicy::from_base_url(agent_id, target_url, is_custom, 0)
+}
+
 fn activate_automation_after_page_load(
     window: &WebviewWindow,
     diagnostics: &BrowserDiagnostics,
+    lifecycle: &BrowserLifecycleController,
     agent_id: &str,
     url: &str,
 ) {
-    if automation_activation_policy(agent_id, url) == AutomationActivationPolicy::Deferred {
-        record_automation_activation(diagnostics, agent_id, "deferred");
-        tracing::debug!("[AUTOMATION] deferred for browser-owned document: {url}");
-        return;
-    }
     // The shared nav can be reassigned while it is navigating. Resolve and
     // verify ownership at activation time, immediately before identity and
     // generic-runtime eval, rather than capturing an agent in its callback.
     if !diagnostics.is_active(window.label(), agent_id) {
         return;
     }
+    // Session 03: a Finished event is never Ready. Enter VERIFYING against
+    // the current owner/generation/exact-origin policy first (built-ins and
+    // custom participants alike); ambiguous or superseded completions fail
+    // closed here without any runtime eval.
+    let (token, policy) = match lifecycle.page_finished(window.label(), url) {
+        FinishDecision::Verify { token, policy } => (token, policy),
+        FinishDecision::Passive { reason } => {
+            record_automation_activation(diagnostics, agent_id, "deferred");
+            tracing::debug!("[LIFECYCLE] Finished stays PASSIVE ({reason}): {url}");
+            return;
+        }
+        FinishDecision::Stale => {
+            tracing::debug!("[LIFECYCLE] stale/ambiguous Finished ignored: {url}");
+            return;
+        }
+    };
     if let Err(error) = set_window_identity(window, agent_id) {
         record_browser_error(
             &window.app_handle(),
@@ -4667,6 +4828,26 @@ fn activate_automation_after_page_load(
             &error.to_string(),
         );
         return;
+    }
+    // Install only data for this current document, then the static generic
+    // runtime idempotently. The runtime proves its composer with
+    // current-generation lease evidence; VERIFYING becomes READY only then.
+    match crate::browser_lifecycle::document_identity_script(&token, &policy) {
+        Ok(script) => {
+            if let Err(error) = window.eval(&script) {
+                record_browser_error(
+                    &window.app_handle(),
+                    diagnostics,
+                    agent_id,
+                    &format!("document identity activation failed: {error}"),
+                );
+                return;
+            }
+        }
+        Err(error) => {
+            record_browser_error(&window.app_handle(), diagnostics, agent_id, &error);
+            return;
+        }
     }
     if let Err(error) = window.eval(GENERIC_INIT_SCRIPT) {
         record_browser_error(
@@ -4684,6 +4865,7 @@ fn activate_automation_after_page_load(
 pub fn navigate_agent_window(
     app: &AppHandle,
     diagnostics: &BrowserDiagnostics,
+    lifecycle: &BrowserLifecycleController,
     window: &WebviewWindow,
     agent_id: &str,
     window_kind: &str,
@@ -4692,6 +4874,12 @@ pub fn navigate_agent_window(
     let window_label = window.label().to_string();
     diagnostics.register(agent_id, &window_label, window_kind);
     diagnostics.set_active(&window_label, agent_id);
+    // Session 03: assigning an owner revokes any old lease immediately, so a
+    // shared-window A→B switch can never reuse A's evidence for B — even
+    // before the new navigation finishes.
+    if let Some(policy) = lifecycle_policy_for_navigation(agent_id, target_url) {
+        lifecycle.assign_owner(&window_label, agent_id, policy);
+    }
     // Harness: set operation for navigation
     {
         let generation = diagnostics.setup_generation();
@@ -4787,6 +4975,7 @@ fn handle_page_load(
     window: WebviewWindow,
     payload: tauri::webview::PageLoadPayload<'_>,
     diagnostics: &BrowserDiagnostics,
+    lifecycle: &BrowserLifecycleController,
 ) {
     let window_label = window.label().to_string();
     let Some(agent_id) = diagnostics.active_agent(&window_label) else {
@@ -4896,7 +5085,12 @@ fn handle_page_load(
         }
     }
     if event == PageLoadEvent::Finished {
-        activate_automation_after_page_load(&window, diagnostics, &agent_id, &url);
+        activate_automation_after_page_load(&window, diagnostics, lifecycle, &agent_id, &url);
+    } else {
+        // Session 03: full-document Started is the invalidation boundary —
+        // increment the per-window generation and revoke the prior lease.
+        // A Start never grants VERIFYING or READY.
+        lifecycle.page_started(&window_label, &url);
     }
 }
 
@@ -4948,15 +5142,18 @@ fn is_allowed_oauth_popup(url: &tauri::Url) -> bool {
 /// Used by response_router.rs — caller extracts window from BrowserState
 /// and drops the lock BEFORE calling this function.
 ///
-/// wait_ready: true  = wait for arena://ready signal (window just navigated)
-/// wait_ready: false = inject immediately (leader window already loaded)
+/// Session 03 authorization: active injection requires the exact current
+/// `ReadyLease` for this window + agent. `wait_ready=true` awaits it;
+/// `wait_ready=false` never bypasses it — it requires a current lease to
+/// already exist. The same lease is revalidated immediately before eval so
+/// a navigation between the wait and the eval cannot reach prompt mutation.
 pub async fn inject_to_window(
     window: WebviewWindow,
+    lifecycle: &BrowserLifecycleController,
     agent_id: &str,
     prompt: &str,
     turn: u32,
     operation_id: Option<&OperationId>,
-    nav_rx: &mut AsyncNavReceiver<NavEvent>,
     wait_ready: bool,
     auto_submit: bool,
 ) -> Result<(), AgentError> {
@@ -4965,26 +5162,58 @@ pub async fn inject_to_window(
             "auto_submit requires operation_id".to_string(),
         ));
     }
-    if wait_ready {
-        let agent_id_owned = agent_id.to_string();
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(READINESS_WAIT_TIMEOUT_SECS),
-            wait_for_ready(agent_id_owned, nav_rx),
-        )
-        .await
+    let window_label = window.label().to_string();
+    let lease: ReadyLease = if wait_ready {
+        match lifecycle
+            .wait_until_ready(
+                &window_label,
+                agent_id,
+                std::time::Duration::from_secs(READINESS_WAIT_TIMEOUT_SECS),
+            )
+            .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
+            Ok(lease) => lease,
+            Err(wait) => {
+                let blocker = wait
+                    .blocked_reason
+                    .map(|reason| format!(" (last blocker: {reason})"))
+                    .unwrap_or_default();
                 return Err(AgentError::Timeout(format!(
-                    "Agent {} timed out waiting for ready signal",
-                    agent_id
+                    "Agent {agent_id} timed out waiting for ready lease on {window_label}{blocker}"
                 )));
             }
         }
-    }
+    } else {
+        lifecycle
+            .require_ready(&window_label, agent_id)
+            .map_err(|error| {
+                AgentError::InjectionFailed(format!(
+                    "no current readiness lease for {agent_id} on {window_label}: {}",
+                    error.detail
+                ))
+            })?
+    };
+    // Final native revalidation directly before eval: zero prompt mutation
+    // on a stale/superseded lease.
+    lifecycle.validate_lease(&lease).map_err(|error| {
+        AgentError::InjectionFailed(format!(
+            "readiness lease for {agent_id} went stale before eval: {}",
+            error.detail
+        ))
+    })?;
 
-    let js = build_inject_js(prompt, agent_id, turn, operation_id, auto_submit);
+    let application_origin = lifecycle
+        .application_origin(&window_label)
+        .unwrap_or_default();
+    let js = build_inject_js(
+        prompt,
+        agent_id,
+        turn,
+        operation_id,
+        auto_submit,
+        lease.document.document_generation,
+        &application_origin,
+    );
     window
         .eval(&js)
         .map_err(|e| AgentError::InjectionFailed(format!("inject eval failed: {}", e)))?;
@@ -4993,7 +5222,9 @@ pub async fn inject_to_window(
 }
 
 /// Inject a prompt using BrowserState directly.
-/// Used by session_runner.rs for setup phase.
+/// Legacy setup-phase helper (no production callers after the
+/// readiness-only setup migration); retained for source compatibility and
+/// routed through the same lease authority as every active injection.
 pub async fn inject_to_agent(
     state: &BrowserState,
     agent_id: &str,
@@ -5002,6 +5233,7 @@ pub async fn inject_to_agent(
     turn: u32,
     nav_rx: &mut AsyncNavReceiver<NavEvent>,
 ) -> Result<(), AgentError> {
+    let _ = nav_rx;
     if let Some(win) = state.select_window(is_leader) {
         set_window_identity(&win, agent_id)?;
         if let Some(config) = get_agent_config(agent_id) {
@@ -5018,11 +5250,25 @@ pub async fn inject_to_agent(
         .select_window(is_leader)
         .ok_or_else(|| AgentError::NavigationFailed("window not initialised".to_string()))?;
 
-    inject_to_window(window, agent_id, prompt, turn, None, nav_rx, true, false).await
+    inject_to_window(
+        window,
+        &state.lifecycle,
+        agent_id,
+        prompt,
+        turn,
+        None,
+        true,
+        false,
+    )
+    .await
 }
 
 // ── wait_for_ready ────────────────────────────────────────────────────────────
+// Legacy lossy auxiliary-Ready waiter. Session 03: NO LONGER the production
+// readiness authority (that is `BrowserLifecycleController::wait_until_ready`).
+// Retained for unit-test documentation of the historical contract only.
 
+#[allow(dead_code)]
 async fn wait_for_ready(
     agent_id: String,
     nav_rx: &mut AsyncNavReceiver<NavEvent>,
@@ -5141,6 +5387,56 @@ fn make_nav_closure(
     }
 }
 
+/// Parse one `arena://lease/<kind>/<agent>/<generation>/<rtv>[/<reason>]`
+/// signal into a system-critical `BrowserLeaseSignal`. Fail-closed: any
+/// malformed kind, agent, generation, or runtime version is dropped as an
+/// unknown diagnostic signal and never defaults to the newest generation or
+/// grants readiness. Lease signals never carry an `OperationId`, so a parse
+/// fault here must not fail unrelated operations (no `protocol_fault`).
+fn parse_lease_signal(
+    ingress: &BrowserEventIngress,
+    window_label: &'static str,
+    url: &tauri::Url,
+    kind_raw: &str,
+    agent_raw: &str,
+    gen_raw: &str,
+    rtv_raw: &str,
+    reason_raw: Option<&str>,
+) {
+    let parsed = (|| {
+        let kind = LeaseSignalKind::parse(kind_raw)?;
+        let agent_id = urlencoding::decode(agent_raw)
+            .unwrap_or_default()
+            .into_owned();
+        if agent_id.is_empty() || agent_id.len() > 128 {
+            return None;
+        }
+        let document_generation = gen_raw.parse::<u64>().ok()?;
+        let runtime_version = rtv_raw.parse::<u32>().ok()?;
+        if runtime_version != crate::browser_lifecycle::LEASE_RUNTIME_VERSION {
+            return None;
+        }
+        let reason = reason_raw
+            .map(|raw| {
+                crate::browser_lifecycle::bounded_reason(
+                    &urlencoding::decode(raw).unwrap_or_default().into_owned(),
+                )
+            })
+            .unwrap_or_default();
+        Some(NavEvent::BrowserLeaseSignal {
+            window_label: window_label.to_string(),
+            agent_id,
+            document_generation,
+            kind,
+            reason,
+        })
+    })();
+    match parsed {
+        Some(event) => send_nav_event(ingress, event),
+        None => send_unknown_arena_signal(ingress, window_label, url),
+    }
+}
+
 fn handle_arena_url(ingress: BrowserEventIngress, window_label: &'static str, url: &tauri::Url) {
     let Some(signal) = parse_arena_signal(url) else {
         send_unknown_arena_signal(&ingress, window_label, url);
@@ -5155,6 +5451,34 @@ fn handle_arena_url(ingress: BrowserEventIngress, window_label: &'static str, ur
                 NavEvent::Ready(agent_id.to_string())
             };
             send_nav_event(&ingress, event);
+        }
+        // Session 03: generation-bearing semantic lease signals. Malformed
+        // generation/runtime version is a protocol fault and never defaults
+        // to the newest generation. Legacy generation-less `ready` above
+        // stays parsed for diagnostics/UI compatibility only.
+        ("lease", [kind_raw, agent_raw, gen_raw, rtv_raw]) => {
+            parse_lease_signal(
+                &ingress,
+                window_label,
+                url,
+                kind_raw,
+                agent_raw,
+                gen_raw,
+                rtv_raw,
+                None,
+            );
+        }
+        ("lease", [kind_raw, agent_raw, gen_raw, rtv_raw, reason_raw]) => {
+            parse_lease_signal(
+                &ingress,
+                window_label,
+                url,
+                kind_raw,
+                agent_raw,
+                gen_raw,
+                rtv_raw,
+                Some(reason_raw),
+            );
         }
         ("error", [agent_id]) | ("error", [agent_id, _]) => {
             send_nav_event(&ingress, NavEvent::Error(agent_id.to_string()));
@@ -5990,7 +6314,15 @@ mod tests {
     fn inject_script_send_discovery_is_composer_rooted() {
         // The per-turn injector's diagnostic send probe must not scan the
         // document for a Send control; it reuses the composer-rooted helper.
-        let inject_js = super::build_inject_js("test prompt", "chatgpt", 1, None, true);
+        let inject_js = super::build_inject_js(
+            "test prompt",
+            "chatgpt",
+            1,
+            None,
+            true,
+            7,
+            "https://chatgpt.com",
+        );
         assert!(
             !inject_js.contains("document.querySelector(SEND_SELECTORS"),
             "inject script must not do document-wide Send discovery"
@@ -6155,10 +6487,50 @@ mod tests {
     fn inject_script_stamps_injected_text_for_ownership() {
         // The per-turn injector must stamp the injected prompt so the submit
         // helper and retries can prove they act on the CURRENT composer.
-        let inject_js = super::build_inject_js("test prompt", "chatgpt", 1, None, true);
+        let inject_js = super::build_inject_js(
+            "test prompt",
+            "chatgpt",
+            1,
+            None,
+            true,
+            7,
+            "https://chatgpt.com",
+        );
         assert!(
             inject_js.contains("window.__ca_lastInjectedText = text"),
             "inject script must stamp the injected text for current-composer proof"
+        );
+    }
+
+    #[test]
+    fn inject_script_carries_lease_generation_guard() {
+        // Session 03: per-turn JS must fail before composer mutation on
+        // owner/generation/readiness mismatch. Submit mechanics below the
+        // guard are unchanged.
+        let inject_js = super::build_inject_js(
+            "test prompt",
+            "claude",
+            2,
+            None,
+            false,
+            11,
+            "https://claude.ai",
+        );
+        assert!(
+            inject_js.contains("__ca_expectedGeneration = 11"),
+            "inject script must stamp the expected document generation"
+        );
+        assert!(
+            inject_js.contains("window.__ca_ready !== true"),
+            "inject script must check current readiness before mutation"
+        );
+        assert!(
+            inject_js.contains("lease_generation_mismatch")
+                && inject_js.contains("lease_agent_mismatch")
+                && inject_js.contains("lease_not_ready")
+                && inject_js.contains("lease_origin_mismatch")
+                && inject_js.contains("lease_route_ineligible"),
+            "inject script must report the exact lease failure"
         );
     }
 
@@ -7333,6 +7705,51 @@ mod tests {
             claude, kimi,
             "the shared nav identity is resolved at activation time"
         );
+    }
+
+    #[test]
+    fn generic_runtime_emits_generation_bearing_lease_signals() {
+        // Session 03: the static generic runtime must prove current-document
+        // evidence (generation-bearing lease signals) and revoke on
+        // blocker/composer-loss/SPA invalidation — without per-provider
+        // branches or response/submit redesign.
+        for required in [
+            "window.__ca_documentGeneration",
+            "window.__ca_applicationOrigin",
+            "window.__ca_runtimeVersion",
+            "arena://lease/",
+            "function leaseSignal(kind, reason)",
+            "function isRouteEligible()",
+            "function reevaluateLease()",
+            "function startLeaseMonitor()",
+            "__ca_history",
+        ] {
+            assert!(
+                super::GENERIC_INIT_SCRIPT.contains(required),
+                "generic runtime missing lease evidence: {required}"
+            );
+        }
+        // Static and generic: no generated per-agent runtime source, no
+        // provider host branches baked into the script.
+        for forbidden in [
+            "claude.ai",
+            "chatgpt.com",
+            "chat.qwen.ai",
+            "gemini.google.com",
+            "chat.deepseek.com",
+            "chat.z.ai",
+            "kimi.ai",
+        ] {
+            assert!(
+                !super::GENERIC_INIT_SCRIPT.contains(forbidden),
+                "provider host baked into generic runtime: {forbidden}"
+            );
+        }
+        // Repeated identical lease signals are deduped (bounded authority).
+        assert!(super::GENERIC_INIT_SCRIPT.contains("_lastLeaseSignal"));
+        // Revocation clears readiness; reacquisition needs fresh evidence
+        // (no old lease retained).
+        assert!(super::GENERIC_INIT_SCRIPT.contains("window.__ca_ready = false;"));
     }
 
     #[test]
@@ -9882,7 +10299,99 @@ window.__caAutomationInstalled = true;
 
     function signalReady() {
         const agentId = getAgentId();
+        // Legacy agent-only Ready stays for diagnostics/UI compatibility; it
+        // has zero authority to grant active readiness.
         try { window.location.href = 'arena://ready/' + agentId; } catch (e) {}
+        leaseSignal('ready', 'composer');
+        _leaseWasReady = true;
+        _reverifyPending = false;
+        startLeaseMonitor();
+    }
+
+    // Session 03: generation-bearing lease evidence. The native controller
+    // owns owner/generation/policy; this realm only reports evidence for the
+    // document identity Rust installed before this script ran. Provider
+    // policy comes from that installed snapshot — no provider branches here.
+    function getDocumentGeneration() {
+        var gen = window.__ca_documentGeneration;
+        return (typeof gen === 'number' && isFinite(gen) && gen >= 0) ? gen : null;
+    }
+    function getRuntimeVersion() {
+        var v = window.__ca_runtimeVersion;
+        return (typeof v === 'number' && isFinite(v)) ? v : null;
+    }
+    var _lastLeaseSignal = '';
+    function leaseSignal(kind, reason) {
+        // kind: ready | blocked | revoked | error. Repeated identical signals
+        // are deduped so lease authority never becomes telemetry traffic.
+        var gen = getDocumentGeneration();
+        var rtv = getRuntimeVersion();
+        if (gen === null || rtv === null) return;
+        var cleanReason = String(reason || '').replace(/[\r\n]+/g, ' ').slice(0, 64);
+        var key = kind + ':' + gen + ':' + cleanReason;
+        if (_lastLeaseSignal === key) return;
+        _lastLeaseSignal = key;
+        try { window.location.href = 'arena://lease/' + kind + '/' + encodeURIComponent(getAgentId()) + '/' + gen + '/' + rtv + '/' + encodeURIComponent(cleanReason); } catch (e) {}
+    }
+    function isRouteEligible() {
+        // Exact installed application origin plus a conservative
+        // auth/security path veto, mirrored from native policy.
+        try {
+            if (window.__ca_applicationOrigin && window.location.origin !== window.__ca_applicationOrigin) return false;
+        } catch (e) { return false; }
+        var path = '';
+        try { path = (window.location.pathname || '').toLowerCase(); } catch (e) {}
+        var veto = ['/login','/signin','/sign-in','/auth','/oauth','/challenge','/captcha','/verify','/security','/cdn-cgi'];
+        for (var vi = 0; vi < veto.length; vi++) { if (path.indexOf(veto[vi]) === 0) return false; }
+        return true;
+    }
+    var _leaseMonitor = null;
+    var _leaseWasReady = false;
+    var _reverifyPending = false;
+    function startLeaseMonitor() {
+        if (_leaseMonitor) return;
+        try { _leaseMonitor = setInterval(reevaluateLease, 1500); } catch (e) {}
+    }
+    function reevaluateLease() {
+        // Post-Ready same-document authority: revoke on ineligible route,
+        // challenge surface, or composer loss; reverify when the same
+        // document generation is healthy again (never retaining an old
+        // lease). Full-document navigation always resets this realm.
+        if (window.__ca_ready === true) {
+            if (!isRouteEligible()) {
+                window.__ca_ready = false;
+                var routePath = '';
+                try { routePath = (window.location.pathname || '').slice(0, 48); } catch (e) {}
+                leaseSignal('blocked', 'auth_route:' + routePath);
+                return;
+            }
+            if (detectChallengeOrUnshowable()) {
+                window.__ca_ready = false;
+                leaseSignal('blocked', 'challenge');
+                return;
+            }
+            if (!_lastReadyEl || !_lastReadyEl.isConnected || !isVisible(_lastReadyEl)) {
+                window.__ca_ready = false;
+                leaseSignal('revoked', 'composer_lost');
+                _readyStableCount = 0;
+                _lastReadyEl = null;
+                _checkReadyStart = Date.now();
+                if (!_reverifyPending) {
+                    _reverifyPending = true;
+                    try { setTimeout(checkReady, 500); } catch (e) { _reverifyPending = false; }
+                }
+            }
+            return;
+        }
+        // Previously ready but revoked: resume verification once the same
+        // document is healthy again. Guarded so only one chain runs.
+        if (_leaseWasReady && !_reverifyPending && isRouteEligible() && !detectChallengeOrUnshowable()) {
+            _reverifyPending = true;
+            _readyStableCount = 0;
+            _lastReadyEl = null;
+            _checkReadyStart = Date.now();
+            try { setTimeout(checkReady, 500); } catch (e) { _reverifyPending = false; }
+        }
     }
 
     var _lastChallengeSignal = '';
@@ -10001,6 +10510,8 @@ window.__caAutomationInstalled = true;
             var agentId = getAgentId();
             emitSendProbe(true);
             try { window.location.href = 'arena://ready/error-' + agentId; } catch (e) {}
+            leaseSignal('error', 'readiness_timeout');
+            _reverifyPending = false;
         } else {
             _readyStableCount = 0;
             _lastReadyEl = null;
@@ -10015,6 +10526,10 @@ window.__caAutomationInstalled = true;
             setTimeout(checkReady, 100);
         });
     }
+    // Session 03: same-document SPA route changes reevaluate the lease
+    // immediately (the 1.5s monitor is the backstop). Telemetry for these
+    // events is unchanged and stays auxiliary.
+    try { window.addEventListener('__ca_history', function() { reevaluateLease(); }); } catch (e) {}
 
     // R1.6: `button[type="submit"]` is intentionally removed — it matched
     // any submit button (including attachment/upload/plus/voice/stop) and
@@ -10672,6 +11187,17 @@ pub fn create_windows(
             (NAV_WINDOW_LABEL, "nav")
         };
         state.diagnostics.register(agent_id, label, kind);
+        // Session 03: construct the declarative lifecycle policy from the
+        // merged participant registry (built-ins and validated custom base
+        // URLs alike) so the controller never needs SettingsStore access
+        // from a page-load callback.
+        if let Some(info) = resolve_participant(agent_id, custom) {
+            if let Some(policy) =
+                ProviderPolicy::from_base_url(&info.agent_id, &info.base_url, info.is_custom, 0)
+            {
+                state.lifecycle.register_policy(label, policy);
+            }
+        }
         let _ = update_diagnostic(&state.diagnostics, agent_id, |record| {
             record.current_phase = "queued".to_string();
             record.last_error = None;
@@ -10715,6 +11241,7 @@ fn ensure_leader_window(
     let leader_tx = state.nav_tx.clone();
     let leader_popup_tx = state.nav_tx.clone();
     let leader_diagnostics = state.diagnostics.clone();
+    let leader_lifecycle = state.lifecycle.clone();
     let builder = WebviewWindowBuilder::new(
         app,
         LEADER_WINDOW_LABEL,
@@ -10733,7 +11260,7 @@ fn ensure_leader_window(
         LEADER_WINDOW_LABEL,
     ))
     .on_page_load(move |window, payload| {
-        handle_page_load(window, payload, &leader_diagnostics);
+        handle_page_load(window, payload, &leader_diagnostics, &leader_lifecycle);
     });
     let window = builder
         .build()
@@ -10765,6 +11292,7 @@ pub fn ensure_nav_window(
     let nav_tx = state.nav_tx.clone();
     let nav_popup_tx = state.nav_tx.clone();
     let nav_diagnostics = state.diagnostics.clone();
+    let nav_lifecycle = state.lifecycle.clone();
     let builder = WebviewWindowBuilder::new(
         app,
         NAV_WINDOW_LABEL,
@@ -10780,7 +11308,7 @@ pub fn ensure_nav_window(
     .on_navigation(make_nav_closure(nav_tx, NAV_WINDOW_LABEL))
     .on_new_window(make_new_window_handler(nav_popup_tx, NAV_WINDOW_LABEL))
     .on_page_load(move |window, payload| {
-        handle_page_load(window, payload, &nav_diagnostics);
+        handle_page_load(window, payload, &nav_diagnostics, &nav_lifecycle);
     });
     let window = builder
         .build()
@@ -10927,6 +11455,8 @@ fn build_inject_js(
     turn: u32,
     operation_id: Option<&OperationId>,
     auto_submit: bool,
+    document_generation: u64,
+    application_origin: &str,
 ) -> String {
     if auto_submit && operation_id.is_none() {
         tracing::error!("[CRITICAL] build_inject_js auto_submit requires operation_id");
@@ -10936,6 +11466,15 @@ fn build_inject_js(
         .map(|op| serde_json::to_string(op.as_str()).unwrap_or_else(|_| "\"\"".to_string()))
         .unwrap_or_else(|| "null".to_string());
     let _op_id_for_url = operation_id.map(|op| op.as_str().to_string());
+    // Session 03: stamp the expected document authority (owner, generation,
+    // exact application origin) into per-turn JS so the page fails before
+    // composer mutation on owner/generation/origin/route/readiness mismatch
+    // (async boundary between the Rust wait and this eval).
+    let lease_guard = crate::browser_lifecycle::injection_lease_guard_js(
+        agent_id,
+        document_generation,
+        application_origin,
+    );
 
     format!(
         r#"(function() {{
@@ -11178,6 +11717,9 @@ fn build_inject_js(
 var _injectAttempts = 0;
   var MAX_INJECT_ATTEMPTS = 50; // 50 × 200 ms ≈ 10 s before reporting failure
   function inject() {{
+    // Session 03 lease guard: fail before composer mutation on
+    // owner/generation/readiness mismatch. Submit mechanics below unchanged.
+    {lease_guard}
     var input = findInput();
     if (!input) {{
       _injectAttempts++;
@@ -11274,6 +11816,7 @@ var _injectAttempts = 0;
         turn,
         op_id_js,
         prompt_json,
-        if auto_submit { "true" } else { "false" }
+        if auto_submit { "true" } else { "false" },
+        lease_guard = lease_guard,
     )
 }

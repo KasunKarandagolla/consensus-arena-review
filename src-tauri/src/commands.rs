@@ -345,7 +345,7 @@ pub async fn start_session(
 
         // Browser readiness is not a terminal session failure. Keep the
         // windows/session/generation alive and wait for a focused retry.
-        loop {
+        'setup_loop: loop {
             match run_setup(&config_clone, &state_ref, &app_clone, &mut nav_rx).await {
                 Ok(()) => break,
                 Err(e) => {
@@ -372,38 +372,89 @@ pub async fn start_session(
                             }),
                         )
                         .ok();
-                    match nav_rx.recv().await {
-                        Some(NavEvent::ResumeRequested(_)) => continue,
-                        Some(NavEvent::SetupManualConfirmed(agent_id)) => {
-                            app_clone
-                                .emit(
-                                    "setup-agent-complete",
-                                    json!({
-                                        "agent_id": agent_id,
-                                        "conversation_url": ""
-                                    }),
-                                )
-                                .ok();
-                            continue;
-                        }
-                        Some(NavEvent::SessionAborted) | None => {
-                            // Owner-checked terminal cleanup: only the live owner may mutate status/runtime.
-                            let is_owner = state_ref
-                                .session_runtime
-                                .current_owner()
-                                .map(|o| o == owner_for_task)
-                                .unwrap_or(false);
-                            if is_owner {
-                                let mut orch = orch_clone.lock().await;
-                                orch.status = OrchestratorStatus::Ended;
-                                app_clone
-                                    .emit("session-status", json!({ "status": "ended" }))
-                                    .ok();
-                                state_ref.session_runtime.mark_completed(&owner_for_task);
+                    // Session 03: only the exact failed agent's explicit setup
+                    // control authorizes a retry. Unrelated events keep this
+                    // inner wait looping on recv — they never re-run
+                    // `run_setup` and never manufacture readiness.
+                    'retry_wait: loop {
+                        match nav_rx.recv().await {
+                            Some(event) => {
+                                match crate::session_runner::classify_setup_retry_signal(
+                                    agent_id.as_deref(),
+                                    &event,
+                                ) {
+                                    crate::session_runner::SetupRetrySignal::Retry => {
+                                        continue 'setup_loop;
+                                    }
+                                    crate::session_runner::SetupRetrySignal::ManualConfirmed => {
+                                        if let NavEvent::SetupManualConfirmed(confirmed_id) = &event
+                                        {
+                                            app_clone
+                                                .emit(
+                                                    "setup-agent-complete",
+                                                    json!({
+                                                        "agent_id": confirmed_id,
+                                                        "conversation_url": ""
+                                                    }),
+                                                )
+                                                .ok();
+                                        }
+                                        continue 'setup_loop;
+                                    }
+                                    crate::session_runner::SetupRetrySignal::Abort => {
+                                        // Owner-checked terminal cleanup: only the live owner may mutate status/runtime.
+                                        let is_owner = state_ref
+                                            .session_runtime
+                                            .current_owner()
+                                            .map(|o| o == owner_for_task)
+                                            .unwrap_or(false);
+                                        if is_owner {
+                                            let mut orch = orch_clone.lock().await;
+                                            orch.status = OrchestratorStatus::Ended;
+                                            app_clone
+                                                .emit(
+                                                    "session-status",
+                                                    json!({ "status": "ended" }),
+                                                )
+                                                .ok();
+                                            state_ref
+                                                .session_runtime
+                                                .mark_completed(&owner_for_task);
+                                        }
+                                        return;
+                                    }
+                                    crate::session_runner::SetupRetrySignal::Ignore => {
+                                        // Stale/unrelated signal while waiting for
+                                        // an explicit retry: record and keep
+                                        // waiting on recv. No setup re-entry.
+                                        let browser = state_ref.browser_state.lock().await;
+                                        crate::browser_backend::record_setup_stale_signal(
+                                            &browser.diagnostics,
+                                            agent_id.as_deref().unwrap_or("setup"),
+                                            &event,
+                                        );
+                                        continue 'retry_wait;
+                                    }
+                                }
                             }
-                            return;
+                            None => {
+                                // Owner-checked terminal cleanup: only the live owner may mutate status/runtime.
+                                let is_owner = state_ref
+                                    .session_runtime
+                                    .current_owner()
+                                    .map(|o| o == owner_for_task)
+                                    .unwrap_or(false);
+                                if is_owner {
+                                    let mut orch = orch_clone.lock().await;
+                                    orch.status = OrchestratorStatus::Ended;
+                                    app_clone
+                                        .emit("session-status", json!({ "status": "ended" }))
+                                        .ok();
+                                    state_ref.session_runtime.mark_completed(&owner_for_task);
+                                }
+                                return;
+                            }
                         }
-                        Some(_) => continue,
                     }
                 }
             }
@@ -1158,13 +1209,17 @@ pub async fn captcha_resolved(
     agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let nav_tx = {
+    let (nav_tx, lifecycle) = {
         let browser = state.browser_state.lock().await;
-        browser.nav_tx.clone()
+        (browser.nav_tx.clone(), browser.lifecycle.clone())
     };
     nav_tx
         .try_send(NavEvent::ResumeRequested(agent_id.clone()))
         .map_err(|e| format!("Could not resume after captcha: {e}"))?;
+    // Session 03: a completed verification is only a wakeup for lifecycle
+    // reevaluation. It never manufactures Ready; current-generation composer
+    // evidence must still create the lease.
+    lifecycle.request_recheck();
     let mut browser = state.browser_state.lock().await;
     browser.captcha_resolved.insert(agent_id);
     Ok(())
@@ -1186,6 +1241,19 @@ pub async fn retry_setup_agent(
     if !config.agent_ids.iter().any(|id| id == &agent_id) {
         return Err("Agent is not part of the active setup".to_string());
     }
+    // Session 03: an explicit retry is admitted only for the currently
+    // expected unfinished setup agent of a live Setup session — mirroring
+    // `confirm_setup_agent`. Otherwise any agent/any time could inject a
+    // `ResumeRequested` that the failure wrapper would honor.
+    if !state.session_runtime.is_active() {
+        return Err("No active setup session".to_string());
+    }
+    {
+        let orchestrator = state.orchestrator.lock().await;
+        if orchestrator.status != OrchestratorStatus::Setup {
+            return Err("Setup retry is only available during setup".to_string());
+        }
+    }
     // P2: resolve through the MERGED registry so a persisted custom participant
     // can be retried. Unknown ids keep the same rejection as before.
     let custom = state
@@ -1196,8 +1264,11 @@ pub async fn retry_setup_agent(
         .unwrap_or_default();
     let agent =
         resolve_participant(&agent_id, &custom).ok_or_else(|| "Unknown setup agent".to_string())?;
-    let (window, diagnostics, window_kind, nav_tx) = {
+    let (window, diagnostics, lifecycle, window_kind, nav_tx) = {
         let browser = state.browser_state.lock().await;
+        if !browser.diagnostics.is_expected_unfinished(&agent_id) {
+            return Err("Only the current unfinished setup agent can be retried".to_string());
+        }
         let is_leader = agent_id == config.leader_agent_id;
         let window = browser
             .select_window(is_leader)
@@ -1205,6 +1276,7 @@ pub async fn retry_setup_agent(
         (
             window,
             browser.diagnostics.clone(),
+            browser.lifecycle.clone(),
             if is_leader { "leader" } else { "nav" },
             browser.nav_tx.clone(),
         )
@@ -1212,6 +1284,7 @@ pub async fn retry_setup_agent(
     navigate_agent_window(
         &app,
         &diagnostics,
+        &lifecycle,
         &window,
         &agent_id,
         window_kind,
@@ -2240,6 +2313,10 @@ pub async fn run_single_model_diagnostic(
         let browser = state.browser_state.lock().await;
         browser.diagnostics.clone()
     };
+    let lifecycle = {
+        let browser = state.browser_state.lock().await;
+        browser.lifecycle.clone()
+    };
     let generation = diagnostics.setup_generation();
     let op = crate::browser_harness::operation_id_diagnostic_single(&agent_id, generation);
     diagnostics.set_operation(&agent_id, &op, "diagnostic");
@@ -2256,6 +2333,7 @@ pub async fn run_single_model_diagnostic(
     crate::browser_backend::navigate_agent_window(
         &app,
         &diagnostics,
+        &lifecycle,
         &window,
         &agent_id,
         "nav",
@@ -2880,10 +2958,14 @@ pub async fn launch_connected_account(
     // Attach this command to the process-lifetime ingress. The sender captured
     // by the shared WebView never changes, so a healthy authenticated window
     // does not need to be destroyed merely to receive navigation signals.
-    let (diagnostics, mut tokio_rx) = {
+    let (diagnostics, lifecycle, mut tokio_rx) = {
         let mut browser = state.browser_state.lock().await;
         let nav_rx = browser.attach_nav_receiver();
-        (browser.diagnostics.clone(), nav_rx)
+        (
+            browser.diagnostics.clone(),
+            browser.lifecycle.clone(),
+            nav_rx,
+        )
     };
 
     // A healthy same-agent/same-origin composer is already the desired account
@@ -2908,6 +2990,7 @@ pub async fn launch_connected_account(
         navigate_agent_window(
             &app,
             &diagnostics,
+            &lifecycle,
             &window,
             &agent_id,
             "nav",

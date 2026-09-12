@@ -580,7 +580,7 @@ async fn inject_active_prompt(
     turn: u32,
     state: &AppState,
     app: &AppHandle,
-    nav_rx: &mut Receiver<NavEvent>,
+    _nav_rx: &mut Receiver<NavEvent>,
 ) -> Result<
     (
         Option<String>,
@@ -604,6 +604,10 @@ async fn inject_active_prompt(
         }
     };
     let (context, mut inbox) = begin_operation(state, agent_id, turn, surface).await?;
+    let lifecycle = {
+        let browser = state.browser_state.lock().await;
+        browser.lifecycle.clone()
+    };
     let _ = app.emit(
         "active-turn-state",
         serde_json::json!({
@@ -612,13 +616,15 @@ async fn inject_active_prompt(
             "turn_number": turn,
         }),
     );
+    // Session 03: even wait_ready=false requires the exact current
+    // ReadyLease — injection can never bypass a missing/stale lease.
     let inject_result = crate::browser_backend::inject_to_window(
         window.clone(),
+        &lifecycle,
         agent_id,
         prompt,
         turn,
         Some(&context.operation_id),
-        nav_rx,
         false,
         true,
     )
@@ -2698,7 +2704,7 @@ async fn inject_and_wait_with_retry(
             "[LOCK] acquiring browser_state for inject_and_wait_with_retry/{}",
             target_model
         );
-        let (nav_window, diagnostics, target_url) = {
+        let (nav_window, diagnostics, lifecycle, target_url) = {
             let mut browser = state.browser_state.lock().await;
             let window = crate::browser_backend::ensure_nav_window(app, &mut browser)?;
             let target_url = browser
@@ -2714,7 +2720,12 @@ async fn inject_and_wait_with_retry(
                         "unknown participant model: {target_model}"
                     ))
                 })?;
-            (window, browser.diagnostics.clone(), target_url)
+            (
+                window,
+                browser.diagnostics.clone(),
+                browser.lifecycle.clone(),
+                target_url,
+            )
         };
         tracing::debug!(
             "[LOCK] released browser_state for inject_and_wait_with_retry/{}",
@@ -2744,6 +2755,7 @@ async fn inject_and_wait_with_retry(
         } else if let Err(e) = crate::browser_backend::navigate_agent_window(
             app,
             &diagnostics,
+            &lifecycle,
             &nav_window,
             target_model,
             "nav",
@@ -2790,13 +2802,16 @@ async fn inject_and_wait_with_retry(
                 "turn_number": turn,
             }),
         );
+        // Session 03: injection is authorized by the exact current
+        // ReadyLease — including the skip-navigation retry path, which must
+        // never bypass a missing/stale lease.
         let inject_res = crate::browser_backend::inject_to_window(
             nav_window.clone(),
+            &lifecycle,
             target_model,
             prompt,
             turn,
             Some(&context.operation_id),
-            nav_rx,
             !skip_navigate,
             true,
         )
