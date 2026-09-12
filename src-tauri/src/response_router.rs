@@ -2704,26 +2704,31 @@ async fn inject_and_wait_with_retry(
             "[LOCK] acquiring browser_state for inject_and_wait_with_retry/{}",
             target_model
         );
-        let (nav_window, diagnostics, lifecycle, target_url) = {
+        let (nav_window, diagnostics, lifecycle, trusted_base_url, target_url) = {
             let mut browser = state.browser_state.lock().await;
             let window = crate::browser_backend::ensure_nav_window(app, &mut browser)?;
+            // Session 03C: trusted provider origin comes only from the merged
+            // registry. The navigation target may be a saved conversation
+            // locator, but that locator is checked UNDER the trusted policy
+            // and can never redefine it.
+            let trusted_base_url =
+                crate::browser_backend::resolve_participant(target_model, &custom)
+                    .map(|info| info.base_url)
+                    .ok_or_else(|| {
+                        AgentError::NavigationFailed(format!(
+                            "unknown participant model: {target_model}"
+                        ))
+                    })?;
             let target_url = browser
                 .conversation_urls
                 .get(target_model)
                 .and_then(|url| url.clone())
-                .or_else(|| {
-                    crate::browser_backend::resolve_participant(target_model, &custom)
-                        .map(|info| info.base_url)
-                })
-                .ok_or_else(|| {
-                    AgentError::NavigationFailed(format!(
-                        "unknown participant model: {target_model}"
-                    ))
-                })?;
+                .unwrap_or_else(|| trusted_base_url.clone());
             (
                 window,
                 browser.diagnostics.clone(),
                 browser.lifecycle.clone(),
+                trusted_base_url,
                 target_url,
             )
         };
@@ -2760,6 +2765,7 @@ async fn inject_and_wait_with_retry(
             target_model,
             "nav",
             &target_url,
+            &trusted_base_url,
         ) {
             if !should_retry_after_failure(&e, &diagnostics, target_model, turn, attempt) {
                 update_model_health(state, target_model, false, Some(e.to_string())).await;

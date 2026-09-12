@@ -1296,6 +1296,21 @@ impl BrowserDiagnostics {
             .unwrap_or(false)
     }
 
+    /// The one setup agent currently expected and unfinished, if any.
+    /// Session 03C retry-admission seam: lets the retry command resolve the
+    /// expected agent without navigating.
+    pub fn expected_unfinished_agent(&self) -> Option<String> {
+        self.records
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .values()
+            .find(|record| {
+                record.expected_agent_id.as_deref() == Some(record.agent_id.as_str())
+                    && record.setup_completion_reason.is_none()
+            })
+            .map(|record| record.agent_id.clone())
+    }
+
     pub fn has_pending_user_submit(&self, agent_id: &str) -> bool {
         self.records
             .lock()
@@ -4781,14 +4796,52 @@ fn record_automation_activation(
     });
 }
 
-/// Derive the declarative lifecycle policy for one navigation from the exact
-/// navigation target URL. Built-in vs custom is resolved from the static
-/// registry; the application origin always comes from the validated target
-/// URL itself (the merged-registry base URL at every call site), so custom
-/// participants reach generic verification without baked-in host lists.
-fn lifecycle_policy_for_navigation(agent_id: &str, target_url: &str) -> Option<ProviderPolicy> {
+/// Session 03C: trusted policy source vs navigation locator.
+///
+/// `trusted_base_url` comes ONLY from the merged participant registry
+/// (built-in or validated custom base URL) and is the sole authority for the
+/// provider application origin. `target_url` is where the browser navigates —
+/// a registry base URL or a later conversation restore locator — and is
+/// checked UNDER the trusted policy, never the source of it. A stale, wrong,
+/// or foreign locator can therefore never redefine trusted origin authority.
+pub fn trusted_policy_for_navigation(
+    agent_id: &str,
+    trusted_base_url: &str,
+) -> Option<ProviderPolicy> {
+    // Save-time validation prevents custom IDs from shadowing built-ins, so
+    // a non-built-in ID is a custom participant by construction.
     let is_custom = get_agent_config(agent_id).is_none();
-    ProviderPolicy::from_base_url(agent_id, target_url, is_custom, 0)
+    ProviderPolicy::from_base_url(agent_id, trusted_base_url, is_custom, 0)
+}
+
+/// Check one navigation locator against an already-derived trusted policy.
+pub fn is_navigation_target_allowed(policy: &ProviderPolicy, target_url: &str) -> bool {
+    policy.application_eligible(target_url)
+}
+
+/// Pure navigation admission gate: trusted registry base first, locator
+/// second. Only `Admit` authorizes `assign_owner` + browser navigation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NavigationAdmission {
+    Admit { policy: ProviderPolicy },
+    RejectIneligible { policy_origin: String },
+    RejectNoAuthority,
+}
+
+pub fn decide_navigation_admission(
+    agent_id: &str,
+    trusted_base_url: &str,
+    target_url: &str,
+) -> NavigationAdmission {
+    let Some(policy) = trusted_policy_for_navigation(agent_id, trusted_base_url) else {
+        return NavigationAdmission::RejectNoAuthority;
+    };
+    if !is_navigation_target_allowed(&policy, target_url) {
+        return NavigationAdmission::RejectIneligible {
+            policy_origin: policy.application_origin.clone(),
+        };
+    }
+    NavigationAdmission::Admit { policy }
 }
 
 fn activate_automation_after_page_load(
@@ -4870,16 +4923,38 @@ pub fn navigate_agent_window(
     agent_id: &str,
     window_kind: &str,
     target_url: &str,
+    trusted_base_url: &str,
 ) -> Result<(), AgentError> {
     let window_label = window.label().to_string();
+    // Session 03C: trusted policy derives ONLY from the merged-registry base
+    // URL. The navigation locator is admitted under that policy and can never
+    // redefine it. Fail closed before ownership assignment and before any
+    // browser navigation is issued.
+    let policy = match decide_navigation_admission(agent_id, trusted_base_url, target_url) {
+        NavigationAdmission::Admit { policy } => policy,
+        NavigationAdmission::RejectIneligible { policy_origin } => {
+            let message = format!(
+                "navigation target is outside the trusted provider origin {policy_origin}: {}",
+                sanitized_url(target_url)
+            );
+            record_browser_error(app, diagnostics, agent_id, &message);
+            return Err(AgentError::NavigationFailed(message));
+        }
+        NavigationAdmission::RejectNoAuthority => {
+            let message = format!(
+                "no trusted provider policy for navigation target: {}",
+                sanitized_url(target_url)
+            );
+            record_browser_error(app, diagnostics, agent_id, &message);
+            return Err(AgentError::NavigationFailed(message));
+        }
+    };
     diagnostics.register(agent_id, &window_label, window_kind);
     diagnostics.set_active(&window_label, agent_id);
     // Session 03: assigning an owner revokes any old lease immediately, so a
     // shared-window A→B switch can never reuse A's evidence for B — even
     // before the new navigation finishes.
-    if let Some(policy) = lifecycle_policy_for_navigation(agent_id, target_url) {
-        lifecycle.assign_owner(&window_label, agent_id, policy);
-    }
+    lifecycle.assign_owner(&window_label, agent_id, policy);
     // Harness: set operation for navigation
     {
         let generation = diagnostics.setup_generation();
@@ -6078,8 +6153,10 @@ fn send_nav_event(ingress: &BrowserEventIngress, event: NavEvent) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENTS, ArenaSignal, GENERIC_INIT_SCRIPT, merged_participants, parse_arena_signal,
-        resolve_display_name, resolve_participant, validate_window_registry,
+        AGENTS, ArenaSignal, GENERIC_INIT_SCRIPT, NavigationAdmission, decide_navigation_admission,
+        is_navigation_target_allowed, merged_participants, parse_arena_signal,
+        resolve_display_name, resolve_participant, trusted_policy_for_navigation,
+        validate_window_registry,
     };
     use crate::settings_store::CustomParticipant;
 
@@ -7750,6 +7827,97 @@ mod tests {
         // Revocation clears readiness; reacquisition needs fresh evidence
         // (no old lease retained).
         assert!(super::GENERIC_INIT_SCRIPT.contains("window.__ca_ready = false;"));
+    }
+
+    // Session 03C: trusted policy source vs navigation locator. The locator
+    // is admitted UNDER the registry-derived policy and can never redefine it.
+
+    #[test]
+    fn trusted_policy_p1_same_origin_locator_admits() {
+        match decide_navigation_admission(
+            "claude",
+            "https://claude.ai/",
+            "https://claude.ai/chat/abc",
+        ) {
+            NavigationAdmission::Admit { policy } => {
+                assert_eq!(policy.agent_id, "claude");
+                assert_eq!(policy.application_origin, "https://claude.ai");
+                assert!(!policy.is_custom);
+                assert!(is_navigation_target_allowed(
+                    &policy,
+                    "https://claude.ai/chat/abc"
+                ));
+            }
+            other => panic!("same-origin locator must admit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trusted_policy_p2_foreign_locator_cannot_redefine_origin() {
+        // The locator-derived bug would have produced a policy whose origin
+        // is the foreign host. The trusted source must stay Claude.
+        let policy = trusted_policy_for_navigation("claude", "https://claude.ai/")
+            .expect("trusted base must build");
+        assert_eq!(policy.application_origin, "https://claude.ai");
+        assert!(!policy.application_eligible("https://evil.example/chat/abc"));
+        match decide_navigation_admission(
+            "claude",
+            "https://claude.ai/",
+            "https://evil.example/chat/abc",
+        ) {
+            NavigationAdmission::RejectIneligible { policy_origin } => {
+                assert_eq!(policy_origin, "https://claude.ai");
+            }
+            other => panic!("foreign locator must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trusted_policy_p3_custom_exact_origin_locator() {
+        match decide_navigation_admission(
+            "acme",
+            "https://app.acme.example/chat",
+            "https://app.acme.example/chat/1",
+        ) {
+            NavigationAdmission::Admit { policy } => {
+                assert!(policy.is_custom);
+                assert_eq!(policy.application_origin, "https://app.acme.example");
+                assert!(is_navigation_target_allowed(
+                    &policy,
+                    "https://app.acme.example/chat/1"
+                ));
+            }
+            other => panic!("custom same-origin locator must admit, got {other:?}"),
+        }
+        // Lookalike, foreign, and auth-path locators stay rejected.
+        for locator in [
+            "https://app.acme.example.evil.example/",
+            "https://other.example/",
+            "https://app.acme.example/login",
+        ] {
+            match decide_navigation_admission("acme", "https://app.acme.example/chat", locator) {
+                NavigationAdmission::RejectIneligible { .. } => {}
+                other => panic!("locator {locator} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn trusted_policy_p4_malformed_trusted_base_fails_closed() {
+        for trusted in ["not-a-url", "about:blank", "ftp://files.example/", ""] {
+            assert!(
+                trusted_policy_for_navigation("x", trusted).is_none(),
+                "malformed trusted base must build no policy: {trusted}"
+            );
+            match decide_navigation_admission("x", trusted, "https://claude.ai/new") {
+                NavigationAdmission::RejectNoAuthority => {}
+                other => panic!("malformed trusted base must reject, got {other:?}"),
+            }
+        }
+        // No policy means no owner/lease authority can be built from it.
+        let lifecycle = crate::browser_lifecycle::BrowserLifecycleController::new();
+        assert!(lifecycle.application_origin("arena-nav").is_none());
+        assert!(lifecycle.require_ready("arena-nav", "x").is_err());
     }
 
     #[test]

@@ -430,6 +430,62 @@ pub(crate) fn classify_setup_retry_signal(
     }
 }
 
+/// Session 03C: pure admission inputs for an explicit setup-retry command.
+/// The command resolves these from live state and `decide_setup_retry_intent`
+/// returns data only — no window, channel, navigation, or lease effects — so
+/// the intent seam provably cannot navigate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetupRetryAdmission {
+    pub requested_agent: String,
+    pub expected_unfinished_agent: Option<String>,
+    pub setup_completed: bool,
+    pub session_active: bool,
+    pub phase_is_setup: bool,
+    pub is_member: bool,
+}
+
+/// Data-only retry intent: the exact expected unfinished agent authorizes a
+/// `ResumeRequested` signal; every other combination is rejected with a
+/// stable reason. Emitting the signal never manufactures Ready — only
+/// current-generation composer evidence grants readiness, and only `run_setup`
+/// navigates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SetupRetryIntent {
+    Resume { agent_id: String },
+    Rejected { reason: &'static str },
+}
+
+pub(crate) fn decide_setup_retry_intent(admission: &SetupRetryAdmission) -> SetupRetryIntent {
+    if !admission.session_active {
+        return SetupRetryIntent::Rejected {
+            reason: "no_active_session",
+        };
+    }
+    if !admission.phase_is_setup {
+        return SetupRetryIntent::Rejected {
+            reason: "not_in_setup",
+        };
+    }
+    if !admission.is_member {
+        return SetupRetryIntent::Rejected {
+            reason: "unknown_agent",
+        };
+    }
+    if admission.setup_completed {
+        return SetupRetryIntent::Rejected {
+            reason: "already_completed",
+        };
+    }
+    if admission.expected_unfinished_agent.as_deref() != Some(admission.requested_agent.as_str()) {
+        return SetupRetryIntent::Rejected {
+            reason: "not_expected_agent",
+        };
+    }
+    SetupRetryIntent::Resume {
+        agent_id: admission.requested_agent.clone(),
+    }
+}
+
 fn format_display_list(names: &[String]) -> String {
     match names.len() {
         0 => String::new(),
@@ -571,6 +627,7 @@ pub async fn run_setup(
             &window,
             agent_id,
             window_kind,
+            &agent_config.base_url,
             &agent_config.base_url,
         );
         if let Err(error) = navigation_result {
@@ -1446,7 +1503,10 @@ pub async fn run_debate(
 
 #[cfg(test)]
 mod tests {
-    use super::{SetupRetrySignal, capability_verified, classify_setup_retry_signal};
+    use super::{
+        SetupRetryAdmission, SetupRetryIntent, SetupRetrySignal, capability_verified,
+        classify_setup_retry_signal, decide_setup_retry_intent,
+    };
     use crate::browser_backend::NavEvent;
 
     // A. Strong setup capability proof completes setup (accelerator) — all four
@@ -1609,6 +1669,113 @@ mod tests {
         assert_eq!(
             classify_setup_retry_signal(Some("claude"), &NavEvent::ResumeRequested("".to_string())),
             SetupRetrySignal::Ignore
+        );
+    }
+
+    // Session 03C R5: exact ResumeRequested(expected) classifies as one retry
+    // (idempotent — no consumption semantics), wrong/stale is ignored.
+    #[test]
+    fn retry_resume_classifies_idempotently() {
+        let failed = Some("claude");
+        let event = NavEvent::ResumeRequested("claude".to_string());
+        assert_eq!(
+            classify_setup_retry_signal(failed, &event),
+            SetupRetrySignal::Retry
+        );
+        assert_eq!(
+            classify_setup_retry_signal(failed, &event),
+            SetupRetrySignal::Retry
+        );
+        assert_eq!(
+            classify_setup_retry_signal(failed, &NavEvent::ResumeRequested("qwen".to_string())),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(None, &event),
+            SetupRetrySignal::Ignore
+        );
+    }
+
+    fn retry_admission(requested: &str) -> SetupRetryAdmission {
+        SetupRetryAdmission {
+            requested_agent: requested.to_string(),
+            expected_unfinished_agent: Some("claude".to_string()),
+            setup_completed: false,
+            session_active: true,
+            phase_is_setup: true,
+            is_member: true,
+        }
+    }
+
+    // Session 03C R1: exact expected unfinished agent produces only a
+    // data-only resume intent. The seam takes no window/channel and performs
+    // no navigation by construction.
+    #[test]
+    fn retry_intent_r1_exact_agent_resumes_without_side_effect() {
+        assert_eq!(
+            decide_setup_retry_intent(&retry_admission("claude")),
+            SetupRetryIntent::Resume {
+                agent_id: "claude".to_string()
+            }
+        );
+    }
+
+    // Session 03C R2: wrong agent identity is rejected.
+    #[test]
+    fn retry_intent_r2_wrong_agent_rejected() {
+        for requested in ["qwen", "CLAUDE", ""] {
+            match decide_setup_retry_intent(&retry_admission(requested)) {
+                SetupRetryIntent::Rejected { reason } => {
+                    assert_eq!(reason, "not_expected_agent");
+                }
+                SetupRetryIntent::Resume { .. } => {
+                    panic!("wrong agent {requested:?} must not produce retry intent")
+                }
+            }
+        }
+        // Non-member is rejected even before the expected-agent check.
+        let mut admission = retry_admission("mallory");
+        admission.is_member = false;
+        admission.expected_unfinished_agent = Some("mallory".to_string());
+        assert_eq!(
+            decide_setup_retry_intent(&admission),
+            SetupRetryIntent::Rejected {
+                reason: "unknown_agent"
+            }
+        );
+    }
+
+    // Session 03C R3: completed agent cannot be retried.
+    #[test]
+    fn retry_intent_r3_completed_agent_rejected() {
+        let mut admission = retry_admission("claude");
+        admission.setup_completed = true;
+        assert_eq!(
+            decide_setup_retry_intent(&admission),
+            SetupRetryIntent::Rejected {
+                reason: "already_completed"
+            }
+        );
+    }
+
+    // Session 03C R4: non-Setup session states are rejected.
+    #[test]
+    fn retry_intent_r4_non_setup_rejected() {
+        let mut inactive = retry_admission("claude");
+        inactive.session_active = false;
+        assert_eq!(
+            decide_setup_retry_intent(&inactive),
+            SetupRetryIntent::Rejected {
+                reason: "no_active_session"
+            }
+        );
+        let mut running = retry_admission("claude");
+        running.phase_is_setup = false;
+        assert_eq!(
+            decide_setup_retry_intent(&running),
+            SetupRetryIntent::Rejected {
+                reason: "not_in_setup"
+            }
         );
     }
 }

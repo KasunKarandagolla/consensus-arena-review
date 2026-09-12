@@ -1225,76 +1225,68 @@ pub async fn captcha_resolved(
     Ok(())
 }
 
-/// Re-focus and re-probe the agent currently blocked in Phase 1 setup without
+/// Signal a retry for the agent currently blocked in Phase 1 setup without
 /// creating a new session or changing setup_order/setup_generation.
+///
+/// Session 03C ownership: this command validates and signals retry intent
+/// only — it never navigates. `run_setup` remains the sole setup-navigation
+/// owner, so one explicit retry leads to exactly one setup-loop navigation.
+/// Emitting `ResumeRequested` never manufactures Ready.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn retry_setup_agent(
     agent_id: String,
     state: tauri::State<'_, AppState>,
-    app: AppHandle,
+    _app: AppHandle,
 ) -> Result<(), String> {
-    let config = {
+    let (config, session_active, phase_is_setup) = {
         let orchestrator = state.orchestrator.lock().await;
-        orchestrator.current_session.clone()
-    }
-    .ok_or_else(|| "No setup session is active".to_string())?;
-    if !config.agent_ids.iter().any(|id| id == &agent_id) {
-        return Err("Agent is not part of the active setup".to_string());
-    }
-    // Session 03: an explicit retry is admitted only for the currently
-    // expected unfinished setup agent of a live Setup session — mirroring
-    // `confirm_setup_agent`. Otherwise any agent/any time could inject a
-    // `ResumeRequested` that the failure wrapper would honor.
-    if !state.session_runtime.is_active() {
-        return Err("No active setup session".to_string());
-    }
-    {
-        let orchestrator = state.orchestrator.lock().await;
-        if orchestrator.status != OrchestratorStatus::Setup {
-            return Err("Setup retry is only available during setup".to_string());
-        }
-    }
+        (
+            orchestrator.current_session.clone(),
+            state.session_runtime.is_active(),
+            orchestrator.status == OrchestratorStatus::Setup,
+        )
+    };
+    let config = config.ok_or_else(|| "No setup session is active".to_string())?;
     // P2: resolve through the MERGED registry so a persisted custom participant
-    // can be retried. Unknown ids keep the same rejection as before.
+    // can be retried. Unknown ids keep the same rejection as before. Kept as a
+    // validation step only — the resolved record navigates nothing here.
     let custom = state
         .settings_store
         .lock()
         .await
         .get_custom_participants()
         .unwrap_or_default();
-    let agent =
-        resolve_participant(&agent_id, &custom).ok_or_else(|| "Unknown setup agent".to_string())?;
-    let (window, diagnostics, lifecycle, window_kind, nav_tx) = {
+    resolve_participant(&agent_id, &custom).ok_or_else(|| "Unknown setup agent".to_string())?;
+    let (nav_tx, admission) = {
         let browser = state.browser_state.lock().await;
-        if !browser.diagnostics.is_expected_unfinished(&agent_id) {
-            return Err("Only the current unfinished setup agent can be retried".to_string());
-        }
-        let is_leader = agent_id == config.leader_agent_id;
-        let window = browser
-            .select_window(is_leader)
-            .ok_or_else(|| "Model window is not available".to_string())?;
+        let expected_unfinished_agent = browser
+            .diagnostics
+            .expected_unfinished_agent()
+            .filter(|expected| expected == &agent_id);
         (
-            window,
-            browser.diagnostics.clone(),
-            browser.lifecycle.clone(),
-            if is_leader { "leader" } else { "nav" },
             browser.nav_tx.clone(),
+            crate::session_runner::SetupRetryAdmission {
+                requested_agent: agent_id.clone(),
+                expected_unfinished_agent,
+                setup_completed: browser.diagnostics.setup_completed(&agent_id),
+                session_active,
+                phase_is_setup,
+                is_member: config.agent_ids.iter().any(|id| id == &agent_id),
+            },
         )
     };
-    navigate_agent_window(
-        &app,
-        &diagnostics,
-        &lifecycle,
-        &window,
-        &agent_id,
-        window_kind,
-        &agent.base_url,
-    )
-    .map_err(|error| error.to_string())?;
-    nav_tx
-        .try_send(NavEvent::ResumeRequested(agent_id))
-        .map_err(|e| format!("Could not request setup retry: {e}"))?;
-    Ok(())
+    match crate::session_runner::decide_setup_retry_intent(&admission) {
+        crate::session_runner::SetupRetryIntent::Resume { agent_id } => nav_tx
+            .try_send(NavEvent::ResumeRequested(agent_id))
+            .map_err(|e| format!("Could not request setup retry: {e}")),
+        crate::session_runner::SetupRetryIntent::Rejected { reason } => Err(match reason {
+            "no_active_session" => "No active setup session".to_string(),
+            "not_in_setup" => "Setup retry is only available during setup".to_string(),
+            "unknown_agent" => "Agent is not part of the active setup".to_string(),
+            "already_completed" => "Setup agent is already completed".to_string(),
+            _ => "Only the current unfinished setup agent can be retried".to_string(),
+        }),
+    }
 }
 
 /// User-confirmed recovery path for a prompt that was visibly sent or answered
@@ -2338,6 +2330,7 @@ pub async fn run_single_model_diagnostic(
         &agent_id,
         "nav",
         &participant.base_url,
+        &participant.base_url,
     )
     .map_err(|e| e.to_string())?;
 
@@ -2994,6 +2987,7 @@ pub async fn launch_connected_account(
             &window,
             &agent_id,
             "nav",
+            &participant.base_url,
             &participant.base_url,
         )
         .map_err(|e| e.to_string())
