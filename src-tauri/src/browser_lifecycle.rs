@@ -42,6 +42,7 @@ pub struct ReadyLease {
     pub document: DocumentToken,
     pub policy_revision: u64,
     pub runtime_version: u32,
+    pub effective_application_origin: String,
 }
 
 /// Authority phase of one managed window.
@@ -89,6 +90,7 @@ impl LeaseSignalKind {
 pub struct ProviderPolicy {
     pub agent_id: String,
     pub application_origin: String,
+    pub application_origin_aliases: Vec<String>,
     pub is_custom: bool,
     pub revision: u64,
 }
@@ -172,28 +174,89 @@ impl ProviderPolicy {
     ) -> Option<Self> {
         let parsed = base_url.parse::<tauri::Url>().ok()?;
         let application_origin = normalized_origin(&parsed)?;
+        // Explicit exact trusted aliases come only from native built-in
+        // provider metadata keyed by `agent_id`. Each literal is normalized
+        // through the same origin parser as the canonical origin; malformed
+        // entries fail closed (skipped), duplicates are dropped, and custom
+        // participants never receive built-in aliases.
+        let mut application_origin_aliases = Vec::new();
+        if !is_custom {
+            for literal in Self::builtin_application_origin_alias_literals(agent_id) {
+                let Ok(alias_parsed) = literal.parse::<tauri::Url>() else {
+                    continue;
+                };
+                let Some(alias_origin) = normalized_origin(&alias_parsed) else {
+                    continue;
+                };
+                if alias_origin != application_origin
+                    && !application_origin_aliases.contains(&alias_origin)
+                {
+                    application_origin_aliases.push(alias_origin);
+                }
+            }
+        }
         Some(Self {
             agent_id: agent_id.to_string(),
             application_origin,
+            application_origin_aliases,
             is_custom,
             revision,
         })
     }
 
-    /// Native eligibility: exact application origin plus a non-browser-owned
-    /// path. Anything else (foreign origin, OAuth host, challenge host,
-    /// auth/security path, malformed URL) is `PASSIVE`.
-    pub fn application_eligible(&self, url: &str) -> bool {
-        let Ok(parsed) = url.parse::<tauri::Url>() else {
-            return false;
-        };
-        let Some(origin) = normalized_origin(&parsed) else {
-            return false;
-        };
-        if origin != self.application_origin {
+    /// Explicit exact trusted application-origin literals for built-in
+    /// providers, keyed by native `agent_id`. No wildcards, no subdomain
+    /// inheritance, no runtime learning: only these exact origins are
+    /// eligible alongside the canonical seed origin.
+    fn builtin_application_origin_alias_literals(agent_id: &str) -> &'static [&'static str] {
+        match agent_id {
+            "kimi" => &[
+                "https://www.kimi.ai",
+                "https://kimi.com",
+                "https://www.kimi.com",
+            ],
+            _ => &[],
+        }
+    }
+
+    /// Exact-origin membership: true only for the canonical origin or one
+    /// explicitly trusted alias. Custom participants are always exact-only,
+    /// even if an alias list were present.
+    pub fn allows_origin(&self, origin: &str) -> bool {
+        if origin == self.application_origin {
+            return true;
+        }
+        if self.is_custom {
             return false;
         }
-        !is_browser_owned_path(parsed.path())
+        self.application_origin_aliases
+            .iter()
+            .any(|alias| alias == origin)
+    }
+
+    /// Resolve the exact normalized origin of `url` when the current policy
+    /// admits it: the normalized origin must equal the canonical origin or
+    /// one explicit trusted alias, and the path must not be browser-owned
+    /// (auth/security surface). Returns `None` for foreign origins,
+    /// lookalike hosts, challenge hosts, auth paths, and malformed URLs.
+    pub fn effective_origin_for_url(&self, url: &str) -> Option<String> {
+        let parsed = url.parse::<tauri::Url>().ok()?;
+        let origin = normalized_origin(&parsed)?;
+        if !self.allows_origin(&origin) {
+            return None;
+        }
+        if is_browser_owned_path(parsed.path()) {
+            return None;
+        }
+        Some(origin)
+    }
+
+    /// Native eligibility: exact application origin (or explicit trusted
+    /// alias) plus a non-browser-owned path. Anything else (foreign origin,
+    /// OAuth host, challenge host, auth/security path, malformed URL) is
+    /// `PASSIVE`.
+    pub fn application_eligible(&self, url: &str) -> bool {
+        self.effective_origin_for_url(url).is_some()
     }
 }
 
@@ -257,6 +320,7 @@ pub enum FinishDecision {
     Verify {
         token: DocumentToken,
         policy: ProviderPolicy,
+        effective_origin: String,
     },
     /// Browser-owned/ineligible/ownerless document: no automation authority.
     Passive { reason: &'static str },
@@ -455,7 +519,11 @@ impl BrowserLifecycleController {
         }
         // Cross-origin completion that clearly belongs to a superseded
         // navigation (e.g. a delayed OAuth callback Finished after the app
-        // document Started): ignore without touching authority.
+        // document Started): ignore without touching authority. A redirect
+        // between exact trusted origins of one policy (canonical origin <->
+        // explicit alias) is one authority, not a superseded navigation, so
+        // it is exempt when both the Started and Finished URLs are admitted
+        // under the current policy.
         if !exact_started_match {
             let started_origin = state
                 .started_url
@@ -470,7 +538,16 @@ impl BrowserLifecycleController {
                 && finished_origin.is_some()
                 && started_origin != finished_origin
             {
-                return FinishDecision::Stale;
+                let same_authority = match &state.started_url {
+                    Some(started) => {
+                        policy.effective_origin_for_url(started).is_some()
+                            && policy.effective_origin_for_url(sanitized_url).is_some()
+                    }
+                    None => false,
+                };
+                if !same_authority {
+                    return FinishDecision::Stale;
+                }
             }
         }
         if !policy.application_eligible(sanitized_url) {
@@ -490,10 +567,15 @@ impl BrowserLifecycleController {
             return FinishDecision::Stale;
         }
         // Eligible candidate: enter VERIFYING (upgrade only — never downgrade
-        // an existing READY lease; a real reload always Starts first).
+        // an existing READY lease; a real reload always Starts first). Bind
+        // the exact admitted effective origin so later identity/injection
+        // guards stamp the actual document origin, not the canonical seed.
         if state.phase == LeasePhase::Ready {
             return FinishDecision::Stale;
         }
+        let Some(effective_origin) = policy.effective_origin_for_url(sanitized_url) else {
+            return FinishDecision::Stale;
+        };
         state.phase = LeasePhase::Verifying;
         state.blocked_reason = None;
         state.current_url = Some(sanitized_url.to_string());
@@ -504,7 +586,11 @@ impl BrowserLifecycleController {
         };
         drop(inner);
         self.changed.notify_waiters();
-        FinishDecision::Verify { token, policy }
+        FinishDecision::Verify {
+            token,
+            policy,
+            effective_origin,
+        }
     }
 
     /// Apply one generation-bearing semantic lease signal. The browser can
@@ -539,14 +625,19 @@ impl BrowserLifecycleController {
                     if state.phase != LeasePhase::Verifying {
                         return SignalOutcome::RejectedStale;
                     }
-                    let eligible = match (&state.policy, &state.current_url) {
-                        (Some(policy), Some(url)) => policy.application_eligible(url),
-                        _ => false,
-                    };
-                    if !eligible {
-                        return SignalOutcome::RejectedStale;
-                    }
                     let Some(policy) = state.policy.clone() else {
+                        return SignalOutcome::RejectedStale;
+                    };
+                    // Revalidate the controller's current URL against policy
+                    // at Ready acceptance and bind the exact admitted
+                    // effective origin into the lease. A stale Ready for a
+                    // silently changed document (alias B / auth path after
+                    // alias A VERIFYING) therefore cannot mint a lease.
+                    let Some(current_url) = state.current_url.clone() else {
+                        return SignalOutcome::RejectedStale;
+                    };
+                    let Some(effective_origin) = policy.effective_origin_for_url(&current_url)
+                    else {
                         return SignalOutcome::RejectedStale;
                     };
                     let lease = ReadyLease {
@@ -557,6 +648,7 @@ impl BrowserLifecycleController {
                         },
                         policy_revision: policy.revision,
                         runtime_version: LEASE_RUNTIME_VERSION,
+                        effective_application_origin: effective_origin,
                     };
                     state.phase = LeasePhase::Ready;
                     state.ready_lease = Some(lease.clone());
@@ -719,15 +811,22 @@ impl BrowserLifecycleController {
     }
 
     /// Exact application origin currently registered for a window, for
-    /// stamping into per-turn JS guards.
+    /// stamping into per-turn JS guards. When a current Ready lease exists,
+    /// returns the exact effective origin bound to that lease (the actual
+    /// admitted document origin, which may be an explicit trusted alias);
+    /// otherwise falls back to the canonical policy origin.
     pub fn application_origin(&self, window_label: &str) -> Option<String> {
         self.inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .windows
             .get(window_label)
-            .and_then(|s| s.policy.as_ref())
-            .map(|p| p.application_origin.clone())
+            .and_then(|s| {
+                if let Some(lease) = s.ready_lease.as_ref() {
+                    return Some(lease.effective_application_origin.clone());
+                }
+                s.policy.as_ref().map(|p| p.application_origin.clone())
+            })
     }
 
     /// Revalidate a previously awaited lease immediately before eval. Closes
@@ -873,10 +972,11 @@ pub fn injection_lease_guard_js(
 pub fn document_identity_script(
     token: &DocumentToken,
     policy: &ProviderPolicy,
+    effective_origin: &str,
 ) -> Result<String, String> {
     let agent_json = serde_json::to_string(&token.owner_agent_id)
         .map_err(|e| format!("agent serialization failed: {e}"))?;
-    let origin_json = serde_json::to_string(&policy.application_origin)
+    let origin_json = serde_json::to_string(effective_origin)
         .map_err(|e| format!("origin serialization failed: {e}"))?;
     Ok(format!(
         "window.name = '__consensus_arena_agent__:' + {agent_json}; window.__ca_agentId = {agent_json}; window.__ca_documentGeneration = {}; window.__ca_policyRevision = {}; window.__ca_applicationOrigin = {origin_json}; window.__ca_runtimeVersion = {}; window.__ca_ready = false;",
@@ -1033,6 +1133,258 @@ mod tests {
         let policy = test_policy("claude", "https://claude.ai");
         assert!(!policy.application_eligible(""));
         assert!(!policy.application_eligible("http://claude.ai/new"));
+    }
+
+    // ── A: provider origin alias (Session 03E) ──────────────────────────
+
+    fn kimi_policy() -> ProviderPolicy {
+        ProviderPolicy::from_base_url("kimi", "https://kimi.ai/", false, 1)
+            .expect("kimi policy must parse")
+    }
+
+    #[test]
+    fn a1_canonical_kimi_origin_eligible() {
+        let policy = kimi_policy();
+        assert_eq!(policy.application_origin, "https://kimi.ai");
+        assert!(!policy.is_custom);
+        assert!(policy.application_eligible("https://kimi.ai/"));
+        assert!(policy.application_eligible("https://kimi.ai/chat/abc123"));
+        assert_eq!(
+            policy.effective_origin_for_url("https://kimi.ai/chat/abc123"),
+            Some("https://kimi.ai".to_string())
+        );
+        assert!(policy.allows_origin("https://kimi.ai"));
+    }
+
+    #[test]
+    fn a2_explicit_kimi_aliases_eligible() {
+        let policy = kimi_policy();
+        // Exactly the three explicit official aliases, no more.
+        assert_eq!(policy.application_origin_aliases.len(), 3);
+        for alias_url in [
+            "https://www.kimi.ai/",
+            "https://kimi.com/",
+            "https://www.kimi.com/",
+        ] {
+            assert!(
+                policy.application_eligible(alias_url),
+                "explicit alias {alias_url} must be eligible"
+            );
+        }
+        assert_eq!(
+            policy.effective_origin_for_url("https://www.kimi.ai/chat/1"),
+            Some("https://www.kimi.ai".to_string())
+        );
+        assert_eq!(
+            policy.effective_origin_for_url("https://kimi.com/chat/1"),
+            Some("https://kimi.com".to_string())
+        );
+        assert_eq!(
+            policy.effective_origin_for_url("https://www.kimi.com/chat/1"),
+            Some("https://www.kimi.com".to_string())
+        );
+        assert!(policy.allows_origin("https://www.kimi.ai"));
+        assert!(policy.allows_origin("https://kimi.com"));
+        assert!(policy.allows_origin("https://www.kimi.com"));
+    }
+
+    #[test]
+    fn a3_kimi_lookalike_hosts_rejected() {
+        let policy = kimi_policy();
+        for lookalike in [
+            "https://foo.kimi.ai/",
+            "https://kimi.ai.evil.example/",
+            "https://evil-kimi.ai/",
+            "https://kimi.com.evil.example/",
+            "https://foo.kimi.com/",
+            "https://evil.kimi.ai/",
+            "https://evil.example/",
+        ] {
+            assert!(
+                !policy.application_eligible(lookalike),
+                "lookalike {lookalike} must stay rejected"
+            );
+            assert!(
+                policy.effective_origin_for_url(lookalike).is_none(),
+                "lookalike {lookalike} must resolve no effective origin"
+            );
+        }
+        assert!(!policy.allows_origin("https://foo.kimi.ai"));
+        assert!(!policy.allows_origin("https://kimi.ai.evil.example"));
+    }
+
+    #[test]
+    fn a4_custom_provider_gets_no_aliases() {
+        let custom =
+            ProviderPolicy::from_base_url("acme", "https://app.acme.example/chat", true, 1)
+                .expect("custom policy must parse");
+        assert!(custom.is_custom);
+        assert!(custom.application_origin_aliases.is_empty());
+        // Exact-only: no www/subdomain inheritance, no Kimi aliases.
+        assert!(custom.application_eligible("https://app.acme.example/chat/1"));
+        for rejected in [
+            "https://www.app.acme.example/chat/1",
+            "https://sub.app.acme.example/chat",
+            "https://www.kimi.ai/",
+            "https://kimi.com/",
+            "https://www.kimi.com/",
+            "https://kimi.ai/",
+        ] {
+            assert!(
+                !custom.application_eligible(rejected),
+                "custom policy must reject {rejected}"
+            );
+        }
+        assert!(!custom.allows_origin("https://www.kimi.ai"));
+    }
+
+    #[test]
+    fn a5_alias_auth_security_paths_vetoed() {
+        let policy = kimi_policy();
+        for path in [
+            "/login",
+            "/signin",
+            "/sign-in",
+            "/auth/callback",
+            "/oauth/authorize",
+            "/challenge",
+            "/captcha",
+            "/verify/email",
+            "/security/check",
+            "/cdn-cgi/challenge-platform",
+        ] {
+            for origin in [
+                "https://kimi.ai",
+                "https://www.kimi.ai",
+                "https://kimi.com",
+                "https://www.kimi.com",
+            ] {
+                let url = format!("{origin}{path}");
+                assert!(
+                    !policy.application_eligible(&url),
+                    "auth path {url} must stay PASSIVE"
+                );
+                assert!(
+                    policy.effective_origin_for_url(&url).is_none(),
+                    "auth path {url} must resolve no effective origin"
+                );
+            }
+        }
+        // Non-prefix lookalikes of the veto list stay eligible candidates.
+        assert!(policy.application_eligible("https://www.kimi.ai/chat/1"));
+    }
+
+    #[test]
+    fn a6_redirect_style_finished_verifies_on_alias() {
+        // Redirect target that was never a Started URL: owner seeded from the
+        // trusted Kimi base, Finished observed directly on an alias.
+        let lifecycle = controller_with_owner("arena-nav", "kimi", "https://kimi.ai/");
+        match lifecycle.page_finished("arena-nav", "https://www.kimi.ai/chat/1") {
+            FinishDecision::Verify {
+                token,
+                policy,
+                effective_origin,
+            } => {
+                assert_eq!(token.owner_agent_id, "kimi");
+                assert_eq!(policy.application_origin, "https://kimi.ai");
+                assert_eq!(effective_origin, "https://www.kimi.ai");
+            }
+            other => panic!("alias Finished must VERIFY, got {other:?}"),
+        }
+        let (phase, _, _, _) = lifecycle.describe("arena-nav");
+        assert_eq!(phase, LeasePhase::Verifying);
+    }
+
+    #[test]
+    fn a6b_seed_started_alias_finished_verifies_on_alias() {
+        // In-place redirect: Started at the canonical seed, Finished at an
+        // explicit alias. Same policy authority, so VERIFYING — not Stale.
+        let lifecycle = controller_with_owner("arena-nav", "kimi", "https://kimi.ai/");
+        lifecycle.page_started("arena-nav", "https://kimi.ai/");
+        match lifecycle.page_finished("arena-nav", "https://www.kimi.com/chat/1") {
+            FinishDecision::Verify {
+                effective_origin, ..
+            } => {
+                assert_eq!(effective_origin, "https://www.kimi.com");
+            }
+            other => panic!("seed-to-alias redirect must VERIFY, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a7_ready_lease_binds_actual_alias_origin() {
+        let lifecycle = controller_with_owner("arena-nav", "kimi", "https://kimi.ai/");
+        lifecycle.page_started("arena-nav", "https://kimi.ai/");
+        match lifecycle.page_finished("arena-nav", "https://www.kimi.ai/chat/1") {
+            FinishDecision::Verify { .. } => {}
+            other => panic!("alias Finished must VERIFY, got {other:?}"),
+        }
+        let lease = accept_ready(&lifecycle, "arena-nav", "kimi", 1);
+        assert_eq!(lease.effective_application_origin, "https://www.kimi.ai");
+        // The synchronous check authorizes against the bound alias lease.
+        let current = lifecycle
+            .require_ready("arena-nav", "kimi")
+            .expect("alias lease must authorize");
+        assert_eq!(current.effective_application_origin, "https://www.kimi.ai");
+        assert!(lifecycle.validate_lease(&lease).is_ok());
+        // The compat reader reflects the exact current lease origin while READY.
+        assert_eq!(
+            lifecycle.application_origin("arena-nav"),
+            Some("https://www.kimi.ai".to_string())
+        );
+    }
+
+    #[test]
+    fn a8_injection_guard_uses_lease_alias() {
+        let lifecycle = controller_with_owner("arena-nav", "kimi", "https://kimi.ai/");
+        lifecycle.page_started("arena-nav", "https://kimi.ai/");
+        match lifecycle.page_finished("arena-nav", "https://www.kimi.ai/chat/1") {
+            FinishDecision::Verify { .. } => {}
+            other => panic!("alias Finished must VERIFY, got {other:?}"),
+        }
+        let lease = accept_ready(&lifecycle, "arena-nav", "kimi", 1);
+        let guard = injection_lease_guard_js(
+            "kimi",
+            lease.document.document_generation,
+            &lease.effective_application_origin,
+        );
+        assert!(guard.contains("__ca_expectedOrigin = \"https://www.kimi.ai\""));
+        assert!(!guard.contains("__ca_expectedOrigin = \"https://kimi.ai\""));
+        // Identity script stamps the admitted alias, not the canonical seed.
+        let token = lease.document.clone();
+        let policy = kimi_policy();
+        let script = document_identity_script(&token, &policy, &lease.effective_application_origin)
+            .expect("script must build");
+        assert!(script.contains("__ca_applicationOrigin = \"https://www.kimi.ai\""));
+    }
+
+    #[test]
+    fn a11_owner_generation_revocation_unchanged_on_alias() {
+        let lifecycle = controller_with_owner("arena-nav", "kimi", "https://kimi.ai/");
+        lifecycle.page_started("arena-nav", "https://www.kimi.ai/chat/1");
+        match lifecycle.page_finished("arena-nav", "https://www.kimi.ai/chat/1") {
+            FinishDecision::Verify { .. } => {}
+            other => panic!("alias Finished must VERIFY, got {other:?}"),
+        }
+        let lease = accept_ready(&lifecycle, "arena-nav", "kimi", 1);
+        // Owner switch immediately revokes the alias lease.
+        lifecycle.assign_owner(
+            "arena-nav",
+            "claude",
+            test_policy("claude", "https://claude.ai"),
+        );
+        assert!(lifecycle.require_ready("arena-nav", "kimi").is_err());
+        assert!(lifecycle.require_ready("arena-nav", "claude").is_err());
+        assert!(lifecycle.validate_lease(&lease).is_err());
+        let (phase, owner, _, has_lease) = lifecycle.describe("arena-nav");
+        assert_eq!(phase, LeasePhase::Passive);
+        assert_eq!(owner.as_deref(), Some("claude"));
+        assert!(!has_lease);
+        // Stale alias Ready for the old generation cannot ready the new one.
+        assert_eq!(
+            lifecycle.apply_signal("arena-nav", "kimi", 1, LeaseSignalKind::Ready, "composer"),
+            SignalOutcome::RejectedStale
+        );
     }
 
     // ── G: generation/owner tests ─────────────────────────────────────
@@ -1677,9 +2029,14 @@ mod tests {
         lifecycle.assign_owner("arena-nav", "acme", custom);
         lifecycle.page_started("arena-nav", "https://app.acme.example/chat/1");
         match lifecycle.page_finished("arena-nav", "https://app.acme.example/chat/1") {
-            FinishDecision::Verify { token, policy } => {
+            FinishDecision::Verify {
+                token,
+                policy,
+                effective_origin,
+            } => {
                 assert!(policy.is_custom);
                 assert_eq!(token.owner_agent_id, "acme");
+                assert_eq!(effective_origin, "https://app.acme.example");
             }
             other => panic!("expected Verify for custom exact origin, got {other:?}"),
         }
@@ -1806,10 +2163,12 @@ mod tests {
         let policy = ProviderPolicy {
             agent_id: "claude".to_string(),
             application_origin: "https://claude.ai".to_string(),
+            application_origin_aliases: Vec::new(),
             is_custom: false,
             revision: 7,
         };
-        let script = document_identity_script(&token, &policy).expect("script must build");
+        let script = document_identity_script(&token, &policy, "https://claude.ai")
+            .expect("script must build");
         assert!(script.contains("__ca_documentGeneration = 42"));
         assert!(script.contains("__ca_policyRevision = 7"));
         assert!(script.contains("__ca_applicationOrigin = \"https://claude.ai\""));

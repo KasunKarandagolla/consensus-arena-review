@@ -4930,8 +4930,12 @@ fn activate_automation_after_page_load(
     // the current owner/generation/exact-origin policy first (built-ins and
     // custom participants alike); ambiguous or superseded completions fail
     // closed here without any runtime eval.
-    let (token, policy) = match lifecycle.page_finished(window.label(), url) {
-        FinishDecision::Verify { token, policy } => (token, policy),
+    let (token, policy, effective_origin) = match lifecycle.page_finished(window.label(), url) {
+        FinishDecision::Verify {
+            token,
+            policy,
+            effective_origin,
+        } => (token, policy, effective_origin),
         FinishDecision::Passive { reason } => {
             record_automation_activation(diagnostics, agent_id, "deferred");
             tracing::debug!("[LIFECYCLE] Finished stays PASSIVE ({reason}): {url}");
@@ -4954,7 +4958,7 @@ fn activate_automation_after_page_load(
     // Install only data for this current document, then the static generic
     // runtime idempotently. The runtime proves its composer with
     // current-generation lease evidence; VERIFYING becomes READY only then.
-    match crate::browser_lifecycle::document_identity_script(&token, &policy) {
+    match crate::browser_lifecycle::document_identity_script(&token, &policy, &effective_origin) {
         Ok(script) => {
             if let Err(error) = window.eval(&script) {
                 record_browser_error(
@@ -5346,9 +5350,10 @@ pub async fn inject_to_window(
         ))
     })?;
 
-    let application_origin = lifecycle
-        .application_origin(&window_label)
-        .unwrap_or_default();
+    // Session 03E: stamp the exact effective origin bound to the current
+    // Ready lease (the actual admitted document origin, which may be an
+    // explicit trusted alias), never the canonical policy origin.
+    let application_origin = &lease.effective_application_origin;
     let js = build_inject_js(
         prompt,
         agent_id,
@@ -5356,7 +5361,7 @@ pub async fn inject_to_window(
         operation_id,
         auto_submit,
         lease.document.document_generation,
-        &application_origin,
+        application_origin,
     );
     window
         .eval(&js)
@@ -7876,7 +7881,9 @@ mod tests {
             );
         }
         // Static and generic: no generated per-agent runtime source, no
-        // provider host branches baked into the script.
+        // provider host branches baked into the script. Session 03E: the
+        // Kimi alias hosts are listed too, so aliases can never be solved
+        // by baking them into JS — they live only in native policy.
         for forbidden in [
             "claude.ai",
             "chatgpt.com",
@@ -7885,6 +7892,9 @@ mod tests {
             "chat.deepseek.com",
             "chat.z.ai",
             "kimi.ai",
+            "www.kimi.ai",
+            "kimi.com",
+            "www.kimi.com",
         ] {
             assert!(
                 !super::GENERIC_INIT_SCRIPT.contains(forbidden),
@@ -7987,6 +7997,78 @@ mod tests {
         let lifecycle = crate::browser_lifecycle::BrowserLifecycleController::new();
         assert!(lifecycle.application_origin("arena-nav").is_none());
         assert!(lifecycle.require_ready("arena-nav", "x").is_err());
+    }
+
+    // Session 03E: explicit exact provider origin aliases. Trusted Kimi base
+    // admits conversation locators on official alias origins without letting
+    // any locator redefine trust.
+
+    #[test]
+    fn trusted_policy_p5_kimi_alias_locator_admits() {
+        for target in [
+            "https://www.kimi.ai/chat/example",
+            "https://kimi.com/chat/example",
+            "https://www.kimi.com/chat/example",
+            "https://kimi.ai/chat/example",
+        ] {
+            match decide_navigation_admission("kimi", "https://kimi.ai/", target) {
+                NavigationAdmission::Admit { policy } => {
+                    assert_eq!(policy.agent_id, "kimi");
+                    assert_eq!(policy.application_origin, "https://kimi.ai");
+                    assert!(!policy.is_custom);
+                    assert!(is_navigation_target_allowed(&policy, target));
+                }
+                other => panic!("kimi alias locator {target} must admit, got {other:?}"),
+            }
+        }
+        // Alias lookalikes, foreign hosts, and auth paths stay rejected.
+        for locator in [
+            "https://foo.kimi.ai/chat/example",
+            "https://kimi.ai.evil.example/chat/example",
+            "https://evil-kimi.ai/chat/example",
+            "https://kimi.com.evil.example/chat/example",
+            "https://foo.kimi.com/chat/example",
+            "https://evil.example/chat/example",
+            "https://www.kimi.ai/login",
+            "https://kimi.com/oauth/authorize",
+            "https://www.kimi.com/cdn-cgi/challenge-platform",
+        ] {
+            match decide_navigation_admission("kimi", "https://kimi.ai/", locator) {
+                NavigationAdmission::RejectIneligible { policy_origin } => {
+                    assert_eq!(policy_origin, "https://kimi.ai");
+                }
+                other => panic!("locator {locator} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn trusted_policy_p6_foreign_locator_cannot_redefine_alias_policy() {
+        // Same family as 03C P2: the locator is checked UNDER the trusted
+        // seed policy and can never mint alias trust of its own.
+        let policy = trusted_policy_for_navigation("kimi", "https://kimi.ai/")
+            .expect("trusted base must build");
+        assert_eq!(policy.application_origin, "https://kimi.ai");
+        assert!(!policy.application_eligible("https://evil.example/chat/abc"));
+        match decide_navigation_admission(
+            "kimi",
+            "https://kimi.ai/",
+            "https://evil.example/chat/abc",
+        ) {
+            NavigationAdmission::RejectIneligible { policy_origin } => {
+                assert_eq!(policy_origin, "https://kimi.ai");
+            }
+            other => panic!("foreign locator must be rejected, got {other:?}"),
+        }
+        // A foreign trusted base cannot borrow Kimi aliases either.
+        match decide_navigation_admission(
+            "acme",
+            "https://app.acme.example/chat",
+            "https://www.kimi.ai/chat/1",
+        ) {
+            NavigationAdmission::RejectIneligible { .. } => {}
+            other => panic!("cross-provider alias locator must be rejected, got {other:?}"),
+        }
     }
 
     #[test]
