@@ -772,6 +772,15 @@ impl BrowserDiagnostics {
             .setup_generation
     }
 
+    /// Session 03D: live setup-identity snapshot for control validation.
+    /// Returns the diagnostics-side `(session_id, setup_generation)` that a
+    /// producer must prove equal to the runtime owner before emitting an
+    /// identity-bearing setup control.
+    pub fn setup_identity_snapshot(&self) -> (String, u32) {
+        let metadata = self.metadata.lock().unwrap_or_else(|p| p.into_inner());
+        (metadata.session_id.clone(), metadata.setup_generation)
+    }
+
     pub fn current_phase_str(&self, agent_id: &str) -> String {
         self.current_phase
             .lock()
@@ -2208,7 +2217,7 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
         NavEvent::Done { agent_id, .. } => Some((agent_id.as_str(), "done")),
         NavEvent::SetupResponseObserved(agent_id) => Some((agent_id.as_str(), "setup-response")),
         NavEvent::SendDetected(agent_id, _) => Some((agent_id.as_str(), "sent")),
-        NavEvent::SetupManualConfirmed(agent_id) => Some((agent_id.as_str(), "manual_confirm")),
+        NavEvent::SetupManualConfirmed(key) => Some((key.agent_id.as_str(), "manual_confirm")),
         NavEvent::PromptInjectionReport { agent_id, .. } => {
             Some((agent_id.as_str(), "prompt-injection"))
         }
@@ -2222,6 +2231,9 @@ fn nav_event_signal(event: &NavEvent) -> Option<(&str, &'static str)> {
             Some((agent_id.as_str(), kind.as_str()))
         }
         NavEvent::ResumeRequested(agent_id) => Some((agent_id.as_str(), "resume")),
+        // Session 03D: identity-bearing setup controls are telemetry here;
+        // only the failed-setup consumer may honor them, on exact key match.
+        NavEvent::SetupRetryRequested(key) => Some((key.agent_id.as_str(), "setup_retry")),
         NavEvent::ManualResponse { agent_id, .. } => Some((agent_id.as_str(), "manual_response")),
         NavEvent::ConsoleDiagnostic { .. } => None,
         NavEvent::PageLifecycle { agent_id, .. } => Some((agent_id.as_str(), "lifecycle")),
@@ -2312,6 +2324,28 @@ pub fn record_setup_completion(diagnostics: &BrowserDiagnostics, agent_id: &str,
         }
         record.last_error = None;
     });
+}
+
+/// Session 03D: identity-aware setup completion for the live setup consumer.
+/// Mutates completion only while the diagnostics-side session/setup
+/// generation still equals the accepted control key AND the keyed agent is
+/// still the expected unfinished agent — defense-in-depth so a stale or
+/// duplicate acceptance can never mark a replaced/completed session complete.
+/// Returns true when the mutation was applied.
+pub fn record_setup_completion_if_current(
+    diagnostics: &BrowserDiagnostics,
+    key: &SetupControlKey,
+    reason: &str,
+) -> bool {
+    let (current_session_id, current_setup_generation) = diagnostics.setup_identity_snapshot();
+    if current_session_id != key.session_id || current_setup_generation != key.setup_generation {
+        return false;
+    }
+    if !diagnostics.is_expected_unfinished(&key.agent_id) {
+        return false;
+    }
+    record_setup_completion(diagnostics, &key.agent_id, reason);
+    true
 }
 
 pub fn record_nav_event(app: &AppHandle, diagnostics: &BrowserDiagnostics, event: &NavEvent) {
@@ -2886,8 +2920,11 @@ fn record_nav_event_inner(app: &AppHandle, diagnostics: &BrowserDiagnostics, eve
             (agent_id, "consulting", "Setup response detected")
         }
         NavEvent::SendDetected(agent_id, _) => (agent_id, "consulting", "User send detected"),
-        NavEvent::SetupManualConfirmed(agent_id) => {
-            (agent_id, "primed", "User confirmed setup completion")
+        // Session 03D mirror only: phase/message metadata. Completion itself
+        // is recorded exclusively by the live setup consumer after exact key
+        // acceptance, never by this process-lifetime mirror.
+        NavEvent::SetupManualConfirmed(key) => {
+            (&key.agent_id, "primed", "User confirmed setup completion")
         }
         NavEvent::ManualResponse { agent_id, .. } => (
             agent_id,
@@ -2925,6 +2962,7 @@ fn record_nav_event_inner(app: &AppHandle, diagnostics: &BrowserDiagnostics, eve
         | NavEvent::UnshowableUrl(_, _)
         | NavEvent::UnsupportedNavigation { .. }
         | NavEvent::ResumeRequested(_)
+        | NavEvent::SetupRetryRequested(_)
         | NavEvent::SendProbe { .. }
         | NavEvent::ConsoleDiagnostic { .. }
         | NavEvent::PageLifecycle { .. }
@@ -3114,7 +3152,11 @@ fn record_nav_event_inner(app: &AppHandle, diagnostics: &BrowserDiagnostics, eve
                 record.sent_signal_emitted = true;
             }
             NavEvent::SetupManualConfirmed(_) => {
-                record.setup_completion_reason = Some("user_confirmed_manual".to_string());
+                // Session 03D: signal metadata only. Setup completion is
+                // recorded exclusively by the live setup consumer after exact
+                // setup-control key acceptance — never by this
+                // process-lifetime mirror, so a stale producer cannot retain
+                // completion authority across owner/session replacement.
                 record.last_signal_type = Some("manual_confirm".to_string());
                 record.last_signal_agent_id = Some(record.agent_id.clone());
             }
@@ -3205,6 +3247,7 @@ fn record_nav_event_inner(app: &AppHandle, diagnostics: &BrowserDiagnostics, eve
             | NavEvent::BrowserLeaseSignal { .. }
             | NavEvent::UnsupportedNavigation { .. }
             | NavEvent::ResumeRequested(_)
+            | NavEvent::SetupRetryRequested(_)
             | NavEvent::PageLifecycle { .. }
             | NavEvent::SafeDomForensics { .. }
             | NavEvent::ActionEvent { .. }
@@ -3890,6 +3933,22 @@ fn observe_overflow_wake(failed_epoch: u64, current_atomic_epoch: u64) -> u64 {
     failed_epoch.max(current_atomic_epoch)
 }
 
+/// Session 03D: immutable setup-control identity, separate from active-turn
+/// `OperationId` (setup controls are not model-turn operations). A setup
+/// retry/manual confirmation is accepted IFF all four dimensions exactly
+/// match the current failed-setup authority:
+/// - `session_id`: logical session ownership;
+/// - `run_generation`: restarted/reacquired execution of the same session;
+/// - `setup_generation`: setup/browser generation;
+/// - `agent_id`: the exact expected setup member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupControlKey {
+    pub session_id: String,
+    pub run_generation: u64,
+    pub setup_generation: u32,
+    pub agent_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum NavEvent {
     Ready(String),
@@ -3930,7 +3989,11 @@ pub enum NavEvent {
     },
     SetupResponseObserved(String),
     SendDetected(String, Option<String>),
-    SetupManualConfirmed(String),
+    /// Session 03D: explicit manual setup-completion/re-entry authority bound
+    /// to the exact current setup-control identity. The live setup consumer
+    /// accepts it only on full four-dimension equality and is the sole place
+    /// that records completion for it.
+    SetupManualConfirmed(SetupControlKey),
     /// Explicit user-entered content for the one active turn currently being
     /// awaited. This is deliberately distinct from a browser response event.
     ManualResponse {
@@ -3996,7 +4059,13 @@ pub enum NavEvent {
         url: String,
         reason: String,
     },
+    /// Session 03D: challenge/login/lifecycle wakeup only. Carries agent
+    /// identity alone and has ZERO authority to re-enter failed setup.
     ResumeRequested(String),
+    /// Session 03D: explicit setup re-entry authority bound to the exact
+    /// current setup-control identity. Only the failed-setup consumer may
+    /// honor it, and only on full four-dimension equality.
+    SetupRetryRequested(SetupControlKey),
     SessionAborted,
     ConsoleDiagnostic {
         agent_id: String,
@@ -7982,6 +8051,63 @@ mod tests {
     }
 
     #[test]
+    fn setup_completion_applies_only_for_current_identity() {
+        // Session 03D I8: completion mutates only while the
+        // diagnostics-side session/setup generation equals the accepted
+        // control key, so a stale acceptance can never mark a replaced
+        // session complete.
+        fn setup_diagnostics() -> super::BrowserDiagnostics {
+            let diagnostics = super::BrowserDiagnostics::new();
+            diagnostics.begin_setup_run(super::BrowserSetupMetadata {
+                setup_generation: 4,
+                session_id: "sess-1".to_string(),
+                selected_leader_id: "claude".to_string(),
+                selected_agent_ids: vec!["claude".to_string(), "qwen".to_string()],
+                setup_order: vec!["claude".to_string(), "qwen".to_string()],
+            });
+            diagnostics.register("claude", super::NAV_WINDOW_LABEL, "nav");
+            diagnostics.register("qwen", super::NAV_WINDOW_LABEL, "nav");
+            super::record_setup_expected_agent(&diagnostics, "claude");
+            diagnostics
+        }
+        fn key(session: &str, run: u64, setup: u32, agent: &str) -> super::SetupControlKey {
+            super::SetupControlKey {
+                session_id: session.to_string(),
+                run_generation: run,
+                setup_generation: setup,
+                agent_id: agent.to_string(),
+            }
+        }
+        let diagnostics = setup_diagnostics();
+        assert!(super::record_setup_completion_if_current(
+            &diagnostics,
+            &key("sess-1", 7, 4, "claude"),
+            "user_confirmed_manual"
+        ));
+        assert!(diagnostics.setup_completed("claude"));
+        // Duplicate acceptance after completion is a no-op (idempotent).
+        assert!(!super::record_setup_completion_if_current(
+            &diagnostics,
+            &key("sess-1", 7, 4, "claude"),
+            "user_confirmed_manual"
+        ));
+        // Stale session, stale setup generation, and wrong agent never apply.
+        for stale in [
+            key("sess-2", 7, 4, "claude"),
+            key("sess-1", 7, 3, "claude"),
+            key("sess-1", 7, 4, "qwen"),
+        ] {
+            let fresh = setup_diagnostics();
+            assert!(
+                !super::record_setup_completion_if_current(&fresh, &stale, "user_confirmed_manual"),
+                "stale key must not mutate completion: {stale:?}"
+            );
+            assert!(!fresh.setup_completed("claude"));
+            assert!(!fresh.setup_completed("qwen"));
+        }
+    }
+
+    #[test]
     fn connected_page_reuse_requires_same_agent_origin_and_healthy_composer() {
         let diagnostics = super::BrowserDiagnostics::new();
         diagnostics.register("claude", super::NAV_WINDOW_LABEL, "nav");
@@ -9801,11 +9927,18 @@ mod tests {
         let (_op_a, op_b) = gate_test_ids();
         let diagnostics = super::BrowserDiagnostics::new();
         diagnostics.set_operation("claude", op_b.as_str(), "submitting");
+        let control_key = super::SetupControlKey {
+            session_id: "sess-1".to_string(),
+            run_generation: 7,
+            setup_generation: 4,
+            agent_id: "claude".to_string(),
+        };
         let exempt = [
             super::NavEvent::Ready("claude".to_string()),
             super::NavEvent::SetupResponseObserved("claude".to_string()),
             super::NavEvent::SendDetected("claude".to_string(), None),
-            super::NavEvent::SetupManualConfirmed("claude".to_string()),
+            super::NavEvent::SetupManualConfirmed(control_key.clone()),
+            super::NavEvent::SetupRetryRequested(control_key.clone()),
             super::NavEvent::ChallengeDetected("claude".to_string(), "indicator".to_string()),
             super::NavEvent::ResumeRequested("claude".to_string()),
             super::NavEvent::SessionAborted,

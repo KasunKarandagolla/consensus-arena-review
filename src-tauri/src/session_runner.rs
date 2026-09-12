@@ -1,12 +1,14 @@
 use crate::browser_backend::{
-    MAX_SETUP_NAVIGATION_RECOVERIES, NavEvent, READINESS_WAIT_TIMEOUT_SECS, display_name_for,
-    navigate_agent_window, record_browser_blocker, record_browser_error, record_prompt_injected,
-    record_prompt_injection_error, record_prompt_injection_report, record_setup_completion,
-    record_setup_expected_agent, record_setup_stale_signal, resolve_participant,
+    MAX_SETUP_NAVIGATION_RECOVERIES, NavEvent, READINESS_WAIT_TIMEOUT_SECS, SetupControlKey,
+    display_name_for, navigate_agent_window, record_browser_blocker, record_browser_error,
+    record_prompt_injected, record_prompt_injection_error, record_prompt_injection_report,
+    record_setup_completion, record_setup_expected_agent, record_setup_stale_signal,
+    resolve_participant,
 };
 use crate::browser_lifecycle::{BrowserLifecycleController, is_auth_blocker_reason};
 use crate::errors::AgentError;
 use crate::orchestrator::{AppState, SessionConfig};
+use crate::session_runtime::SessionOwner;
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc::Receiver;
@@ -399,30 +401,32 @@ pub(crate) async fn wait_for_setup_ready(
 }
 
 /// Disposition of one auxiliary event observed while a failed setup waits
-/// for an explicit retry control. Only the exact expected failed agent's
-/// explicit control authorizes re-running setup; unrelated events keep the
-/// wrapper waiting instead of re-entering `run_setup`.
+/// for an explicit retry control. Only an identity-bearing control whose
+/// full setup-control key exactly matches the current failed-setup authority
+/// authorizes re-running setup; everything else keeps the wrapper waiting
+/// instead of re-entering `run_setup`. In particular an unscoped
+/// `ResumeRequested` (challenge/lifecycle wakeup) has zero retry authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetupRetrySignal {
-    /// Explicit retry control for the failed agent: re-run setup.
+    /// Explicit identity-bearing retry control: re-run setup.
     Retry,
-    /// Explicit manual confirmation for the failed agent: announce and retry.
+    /// Explicit identity-bearing manual confirmation: announce and retry.
     ManualConfirmed,
     /// Session aborted / channel closed: terminal teardown.
     Abort,
-    /// Anything else (including other agents' events): keep waiting.
+    /// Anything else (including unscoped wakeups): keep waiting.
     Ignore,
 }
 
 pub(crate) fn classify_setup_retry_signal(
-    failed_agent: Option<&str>,
+    expected: Option<&SetupControlKey>,
     event: &NavEvent,
 ) -> SetupRetrySignal {
     match event {
-        NavEvent::ResumeRequested(id) if failed_agent.is_some_and(|failed| failed == id) => {
+        NavEvent::SetupRetryRequested(key) if expected.is_some_and(|expected| expected == key) => {
             SetupRetrySignal::Retry
         }
-        NavEvent::SetupManualConfirmed(id) if failed_agent.is_some_and(|failed| failed == id) => {
+        NavEvent::SetupManualConfirmed(key) if expected.is_some_and(|expected| expected == key) => {
             SetupRetrySignal::ManualConfirmed
         }
         NavEvent::SessionAborted => SetupRetrySignal::Abort,
@@ -431,9 +435,11 @@ pub(crate) fn classify_setup_retry_signal(
 }
 
 /// Session 03C: pure admission inputs for an explicit setup-retry command.
-/// The command resolves these from live state and `decide_setup_retry_intent`
-/// returns data only — no window, channel, navigation, or lease effects — so
-/// the intent seam provably cannot navigate.
+/// Session 03D: extended with the live identity snapshot so the produced
+/// intent carries the exact setup-control key. The command resolves these
+/// from live state and `decide_setup_retry_intent` returns data only — no
+/// window, channel, navigation, or lease effects — so the intent seam
+/// provably cannot navigate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SetupRetryAdmission {
     pub requested_agent: String,
@@ -442,16 +448,24 @@ pub(crate) struct SetupRetryAdmission {
     pub session_active: bool,
     pub phase_is_setup: bool,
     pub is_member: bool,
+    /// Current runtime owner snapshot, if any.
+    pub owner: Option<SessionOwner>,
+    /// Orchestrator-side current session ID, if any.
+    pub orchestrator_session_id: Option<String>,
+    /// Diagnostics-side session/setup generation snapshot.
+    pub diagnostics_session_id: Option<String>,
+    pub diagnostics_setup_generation: Option<u32>,
 }
 
-/// Data-only retry intent: the exact expected unfinished agent authorizes a
-/// `ResumeRequested` signal; every other combination is rejected with a
-/// stable reason. Emitting the signal never manufactures Ready — only
-/// current-generation composer evidence grants readiness, and only `run_setup`
-/// navigates.
+/// Data-only retry intent: the exact expected unfinished agent, proven
+/// against the current session/run/setup identity, authorizes an
+/// identity-bearing `SetupRetryRequested` signal; every other combination is
+/// rejected with a stable reason. Emitting the signal never manufactures
+/// Ready — only current-generation composer evidence grants readiness, and
+/// only `run_setup` navigates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetupRetryIntent {
-    Resume { agent_id: String },
+    Resume { key: SetupControlKey },
     Rejected { reason: &'static str },
 }
 
@@ -481,8 +495,34 @@ pub(crate) fn decide_setup_retry_intent(admission: &SetupRetryAdmission) -> Setu
             reason: "not_expected_agent",
         };
     }
+    let Some(owner) = admission.owner.as_ref() else {
+        return SetupRetryIntent::Rejected { reason: "no_owner" };
+    };
+    if admission.orchestrator_session_id.as_deref() != Some(owner.session_id.as_str()) {
+        return SetupRetryIntent::Rejected {
+            reason: "session_mismatch",
+        };
+    }
+    let (Some(diagnostics_session_id), Some(diagnostics_setup_generation)) = (
+        admission.diagnostics_session_id.as_ref(),
+        admission.diagnostics_setup_generation,
+    ) else {
+        return SetupRetryIntent::Rejected {
+            reason: "diagnostics_mismatch",
+        };
+    };
+    if diagnostics_session_id != &owner.session_id {
+        return SetupRetryIntent::Rejected {
+            reason: "diagnostics_mismatch",
+        };
+    }
     SetupRetryIntent::Resume {
-        agent_id: admission.requested_agent.clone(),
+        key: SetupControlKey {
+            session_id: owner.session_id.clone(),
+            run_generation: owner.run_generation,
+            setup_generation: diagnostics_setup_generation,
+            agent_id: admission.requested_agent.clone(),
+        },
     }
 }
 
@@ -1060,7 +1100,9 @@ pub async fn run_setup(
                     Some(NavEvent::SetupResponseObserved(id)) if id == agent_id_clone => {
                         break Ok(SetupCompletionProof::ResponseAfterInjection);
                     }
-                    Some(NavEvent::SetupManualConfirmed(id)) if id == agent_id_clone => {
+                    Some(NavEvent::SetupManualConfirmed(key))
+                        if key.agent_id == agent_id_clone =>
+                    {
                         break Ok(SetupCompletionProof::UserConfirmedManual);
                     }
                     Some(NavEvent::ChallengeDetected(id, indicator)) if id == agent_id_clone => {
@@ -1176,8 +1218,8 @@ pub async fn run_setup(
                                         SetupCompletionProof::ResponseAfterInjection,
                                     );
                                 }
-                                Ok(Some(NavEvent::SetupManualConfirmed(confirm_id)))
-                                    if confirm_id == agent_id_clone =>
+                                Ok(Some(NavEvent::SetupManualConfirmed(key)))
+                                    if key.agent_id == agent_id_clone =>
                                 {
                                     break 'setup_proof Ok(
                                         SetupCompletionProof::UserConfirmedManual,
@@ -1504,10 +1546,11 @@ pub async fn run_debate(
 #[cfg(test)]
 mod tests {
     use super::{
-        SetupRetryAdmission, SetupRetryIntent, SetupRetrySignal, capability_verified,
-        classify_setup_retry_signal, decide_setup_retry_intent,
+        SetupControlKey, SetupRetryAdmission, SetupRetryIntent, SetupRetrySignal,
+        capability_verified, classify_setup_retry_signal, decide_setup_retry_intent,
     };
     use crate::browser_backend::NavEvent;
+    use crate::session_runtime::SessionOwner;
 
     // A. Strong setup capability proof completes setup (accelerator) — all four
     //    signal strengths true and no injection error → the gate holds true.
@@ -1578,32 +1621,129 @@ mod tests {
         assert!(verified);
     }
 
-    // U2: unrelated auxiliary events cannot authorize a setup retry. Only
-    // the exact failed agent's explicit control retries; everything else
-    // keeps the wrapper waiting.
+    // Session 03D I-suite: setup-control identity. The failed-setup consumer
+    // accepts a control only when session/run/setup/agent all exactly match
+    // its immutable expectation. Unscoped `ResumeRequested` wakeups never
+    // authorize retry or completion.
+    fn control_key() -> SetupControlKey {
+        SetupControlKey {
+            session_id: "sess-1".to_string(),
+            run_generation: 7,
+            setup_generation: 4,
+            agent_id: "claude".to_string(),
+        }
+    }
+
+    fn retry_event(key: &SetupControlKey) -> NavEvent {
+        NavEvent::SetupRetryRequested(key.clone())
+    }
+
+    fn confirm_event(key: &SetupControlKey) -> NavEvent {
+        NavEvent::SetupManualConfirmed(key.clone())
+    }
+
+    // I1: exact identity authorizes retry.
     #[test]
-    fn unrelated_aux_event_cannot_authorize_retry() {
-        let failed = Some("claude");
+    fn identity_i1_exact_key_retries() {
+        let key = control_key();
         assert_eq!(
-            classify_setup_retry_signal(failed, &NavEvent::ResumeRequested("claude".to_string())),
+            classify_setup_retry_signal(Some(&key), &retry_event(&key)),
             SetupRetrySignal::Retry
         );
+        // Idempotent: no consumption semantics, same verdict twice.
+        assert_eq!(
+            classify_setup_retry_signal(Some(&key), &retry_event(&key)),
+            SetupRetrySignal::Retry
+        );
+    }
+
+    // I2: old session is rejected.
+    #[test]
+    fn identity_i2_old_session_ignored() {
+        let expected = control_key();
+        let mut stale = control_key();
+        stale.session_id = "sess-2".to_string();
+        assert_eq!(
+            classify_setup_retry_signal(Some(&expected), &retry_event(&stale)),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(Some(&expected), &confirm_event(&stale)),
+            SetupRetrySignal::Ignore
+        );
+    }
+
+    // I3: old run generation of the same session is rejected.
+    #[test]
+    fn identity_i3_old_run_ignored() {
+        let expected = control_key();
+        let mut stale = control_key();
+        stale.run_generation = 6;
+        assert_eq!(
+            classify_setup_retry_signal(Some(&expected), &retry_event(&stale)),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(Some(&expected), &confirm_event(&stale)),
+            SetupRetrySignal::Ignore
+        );
+    }
+
+    // I4: old setup generation is rejected.
+    #[test]
+    fn identity_i4_old_setup_generation_ignored() {
+        let expected = control_key();
+        let mut stale = control_key();
+        stale.setup_generation = 3;
+        assert_eq!(
+            classify_setup_retry_signal(Some(&expected), &retry_event(&stale)),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(Some(&expected), &confirm_event(&stale)),
+            SetupRetrySignal::Ignore
+        );
+    }
+
+    // I5: wrong agent is rejected.
+    #[test]
+    fn identity_i5_wrong_agent_ignored() {
+        let expected = control_key();
+        let mut foreign = control_key();
+        foreign.agent_id = "qwen".to_string();
+        assert_eq!(
+            classify_setup_retry_signal(Some(&expected), &retry_event(&foreign)),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(Some(&expected), &confirm_event(&foreign)),
+            SetupRetrySignal::Ignore
+        );
+        // No expected authority at all: nothing is authorized.
+        assert_eq!(
+            classify_setup_retry_signal(None, &retry_event(&expected)),
+            SetupRetrySignal::Ignore
+        );
+    }
+
+    // I6: unscoped ResumeRequested never authorizes failed setup retry —
+    // for the expected agent, other agents, or no authority — while abort
+    // behavior is preserved.
+    #[test]
+    fn identity_i6_unscoped_resume_has_no_retry_authority() {
+        let expected = control_key();
+        let expected_ref = Some(&expected);
         assert_eq!(
             classify_setup_retry_signal(
-                failed,
-                &NavEvent::SetupManualConfirmed("claude".to_string())
+                expected_ref,
+                &NavEvent::ResumeRequested("claude".to_string())
             ),
-            SetupRetrySignal::ManualConfirmed
-        );
-        // Wrong agent, unknown agent, and no failed agent: never retry.
-        assert_eq!(
-            classify_setup_retry_signal(failed, &NavEvent::ResumeRequested("qwen".to_string())),
             SetupRetrySignal::Ignore
         );
         assert_eq!(
             classify_setup_retry_signal(
-                failed,
-                &NavEvent::SetupManualConfirmed("qwen".to_string())
+                expected_ref,
+                &NavEvent::ResumeRequested("qwen".to_string())
             ),
             SetupRetrySignal::Ignore
         );
@@ -1611,87 +1751,73 @@ mod tests {
             classify_setup_retry_signal(None, &NavEvent::ResumeRequested("claude".to_string())),
             SetupRetrySignal::Ignore
         );
-        // Unrelated traffic (other agents' Ready, probes, responses, aborts
-        // of nothing) never re-runs setup.
         assert_eq!(
-            classify_setup_retry_signal(failed, &NavEvent::Ready("chatgpt".to_string())),
-            SetupRetrySignal::Ignore
-        );
-        assert_eq!(
-            classify_setup_retry_signal(failed, &NavEvent::Ready("claude".to_string())),
+            classify_setup_retry_signal(expected_ref, &NavEvent::Ready("claude".to_string())),
             SetupRetrySignal::Ignore
         );
         assert_eq!(
             classify_setup_retry_signal(
-                failed,
+                expected_ref,
                 &NavEvent::ChallengeDetected("claude".to_string(), "turnstile".to_string())
             ),
             SetupRetrySignal::Ignore
         );
         assert_eq!(
-            classify_setup_retry_signal(
-                failed,
-                &NavEvent::UnshowableUrl("claude".to_string(), "https://x.example/".to_string())
-            ),
-            SetupRetrySignal::Ignore
-        );
-        assert_eq!(
-            classify_setup_retry_signal(
-                failed,
-                &NavEvent::SendDetected("claude".to_string(), None)
-            ),
-            SetupRetrySignal::Ignore
-        );
-        assert_eq!(
-            classify_setup_retry_signal(failed, &NavEvent::SessionAborted),
+            classify_setup_retry_signal(expected_ref, &NavEvent::SessionAborted),
             SetupRetrySignal::Abort
         );
     }
 
-    // U3/U6: retry/confirm identity is exact — tested through the same
-    // classifier the outer wrapper uses.
+    // I7: exact manual-confirm identity authorizes completion handling.
     #[test]
-    fn retry_signal_identity_is_exact() {
+    fn identity_i7_exact_manual_confirm_accepted() {
+        let key = control_key();
         assert_eq!(
-            classify_setup_retry_signal(
-                Some("claude"),
-                &NavEvent::ResumeRequested("claude".to_string())
-            ),
-            SetupRetrySignal::Retry
-        );
-        assert_eq!(
-            classify_setup_retry_signal(
-                Some("claude"),
-                &NavEvent::ResumeRequested("CLAUDE".to_string())
-            ),
-            SetupRetrySignal::Ignore
-        );
-        assert_eq!(
-            classify_setup_retry_signal(Some("claude"), &NavEvent::ResumeRequested("".to_string())),
-            SetupRetrySignal::Ignore
+            classify_setup_retry_signal(Some(&key), &confirm_event(&key)),
+            SetupRetrySignal::ManualConfirmed
         );
     }
 
-    // Session 03C R5: exact ResumeRequested(expected) classifies as one retry
-    // (idempotent — no consumption semantics), wrong/stale is ignored.
+    // I8: any mismatched manual-confirm dimension is ignored (and therefore
+    // can never reach completion mutation).
     #[test]
-    fn retry_resume_classifies_idempotently() {
-        let failed = Some("claude");
-        let event = NavEvent::ResumeRequested("claude".to_string());
+    fn identity_i8_stale_manual_confirm_ignored() {
+        let expected = control_key();
+        let mut stale_session = control_key();
+        stale_session.session_id = "sess-9".to_string();
+        let mut stale_run = control_key();
+        stale_run.run_generation = 1;
+        let mut stale_setup = control_key();
+        stale_setup.setup_generation = 1;
+        let mut stale_agent = control_key();
+        stale_agent.agent_id = "".to_string();
+        for stale in [&stale_session, &stale_run, &stale_setup, &stale_agent] {
+            assert_eq!(
+                classify_setup_retry_signal(Some(&expected), &confirm_event(stale)),
+                SetupRetrySignal::Ignore,
+                "stale manual confirm must be ignored: {stale:?}"
+            );
+        }
+    }
+
+    // I9: producer/consumer race — event built for owner A evaluated against
+    // owner B's expectation (same agent) is ignored in both directions.
+    #[test]
+    fn identity_i9_cross_owner_controls_rejected() {
+        let mut key_a = control_key();
+        key_a.run_generation = 7;
+        let mut key_b = control_key();
+        key_b.run_generation = 8;
         assert_eq!(
-            classify_setup_retry_signal(failed, &event),
-            SetupRetrySignal::Retry
-        );
-        assert_eq!(
-            classify_setup_retry_signal(failed, &event),
-            SetupRetrySignal::Retry
-        );
-        assert_eq!(
-            classify_setup_retry_signal(failed, &NavEvent::ResumeRequested("qwen".to_string())),
+            classify_setup_retry_signal(Some(&key_b), &retry_event(&key_a)),
             SetupRetrySignal::Ignore
         );
         assert_eq!(
-            classify_setup_retry_signal(None, &event),
+            classify_setup_retry_signal(Some(&key_b), &confirm_event(&key_a)),
+            SetupRetrySignal::Ignore
+        );
+        assert_eq!(
+            classify_setup_retry_signal(Some(&key_a), &retry_event(&key_b)),
             SetupRetrySignal::Ignore
         );
     }
@@ -1704,18 +1830,35 @@ mod tests {
             session_active: true,
             phase_is_setup: true,
             is_member: true,
+            owner: Some(SessionOwner {
+                session_id: "sess-1".to_string(),
+                run_generation: 7,
+            }),
+            orchestrator_session_id: Some("sess-1".to_string()),
+            diagnostics_session_id: Some("sess-1".to_string()),
+            diagnostics_setup_generation: Some(4),
         }
     }
 
-    // Session 03C R1: exact expected unfinished agent produces only a
-    // data-only resume intent. The seam takes no window/channel and performs
-    // no navigation by construction.
+    fn expected_retry_key() -> SetupControlKey {
+        SetupControlKey {
+            session_id: "sess-1".to_string(),
+            run_generation: 7,
+            setup_generation: 4,
+            agent_id: "claude".to_string(),
+        }
+    }
+
+    // Session 03C R1 + 03D I10: exact expected unfinished agent with proven
+    // identity produces only a data-only resume intent carrying the exact
+    // key. The seam takes no window/channel and performs no navigation by
+    // construction.
     #[test]
     fn retry_intent_r1_exact_agent_resumes_without_side_effect() {
         assert_eq!(
             decide_setup_retry_intent(&retry_admission("claude")),
             SetupRetryIntent::Resume {
-                agent_id: "claude".to_string()
+                key: expected_retry_key()
             }
         );
     }
@@ -1763,6 +1906,7 @@ mod tests {
     fn retry_intent_r4_non_setup_rejected() {
         let mut inactive = retry_admission("claude");
         inactive.session_active = false;
+        inactive.owner = None;
         assert_eq!(
             decide_setup_retry_intent(&inactive),
             SetupRetryIntent::Rejected {
@@ -1775,6 +1919,42 @@ mod tests {
             decide_setup_retry_intent(&running),
             SetupRetryIntent::Rejected {
                 reason: "not_in_setup"
+            }
+        );
+    }
+
+    // 03D identity admission: owner/session/diagnostics mismatches reject
+    // with stable reasons and never produce a key.
+    #[test]
+    fn retry_intent_identity_mismatch_rejected() {
+        let mut no_owner = retry_admission("claude");
+        no_owner.owner = None;
+        assert_eq!(
+            decide_setup_retry_intent(&no_owner),
+            SetupRetryIntent::Rejected { reason: "no_owner" }
+        );
+        let mut session_mismatch = retry_admission("claude");
+        session_mismatch.orchestrator_session_id = Some("sess-2".to_string());
+        assert_eq!(
+            decide_setup_retry_intent(&session_mismatch),
+            SetupRetryIntent::Rejected {
+                reason: "session_mismatch"
+            }
+        );
+        let mut diagnostics_mismatch = retry_admission("claude");
+        diagnostics_mismatch.diagnostics_session_id = Some("sess-2".to_string());
+        assert_eq!(
+            decide_setup_retry_intent(&diagnostics_mismatch),
+            SetupRetryIntent::Rejected {
+                reason: "diagnostics_mismatch"
+            }
+        );
+        let mut missing_diagnostics = retry_admission("claude");
+        missing_diagnostics.diagnostics_setup_generation = None;
+        assert_eq!(
+            decide_setup_retry_intent(&missing_diagnostics),
+            SetupRetryIntent::Rejected {
+                reason: "diagnostics_mismatch"
             }
         );
     }

@@ -4,8 +4,8 @@ use std::sync::atomic::Ordering;
 
 use crate::agent_brain::AgentBrain;
 use crate::browser_backend::{
-    NavEvent, create_windows, ensure_nav_window, get_agent_config, navigate_agent_window,
-    record_setup_completion, resolve_participant,
+    NavEvent, SetupControlKey, create_windows, ensure_nav_window, get_agent_config,
+    navigate_agent_window, record_setup_completion_if_current, resolve_participant,
 };
 use crate::context_manager::ContextManager;
 use crate::errors::AgentError;
@@ -311,6 +311,10 @@ pub async fn start_session(
     start_permit.ensure_admitted().map_err(|e| e.to_string())?;
     let (activate_tx, activate_rx) = tokio::sync::oneshot::channel::<()>();
     let owner_for_task = start_owner.clone();
+    // Session 03D: this session's setup generation travels into the task by
+    // value, so the failed-setup consumer always compares controls against
+    // its own immutable expectation — never live mutable state.
+    let task_setup_generation = setup_generation;
     let handle = tokio::spawn(async move {
         if activate_rx.await.is_err() {
             return;
@@ -372,32 +376,55 @@ pub async fn start_session(
                             }),
                         )
                         .ok();
-                    // Session 03: only the exact failed agent's explicit setup
-                    // control authorizes a retry. Unrelated events keep this
-                    // inner wait looping on recv — they never re-run
-                    // `run_setup` and never manufacture readiness.
+                    // Session 03D: the expected control key is immutable task
+                    // state (session/run/setup/agent). Only an
+                    // identity-bearing control matching all four dimensions
+                    // authorizes retry or completion. Unscoped
+                    // `ResumeRequested` wakeups and stale cross-session
+                    // controls keep this inner wait looping on recv.
                     'retry_wait: loop {
                         match nav_rx.recv().await {
                             Some(event) => {
+                                let expected_key =
+                                    agent_id.as_ref().map(|failed| SetupControlKey {
+                                        session_id: config_clone.session_id.clone(),
+                                        run_generation: owner_for_task.run_generation,
+                                        setup_generation: task_setup_generation,
+                                        agent_id: failed.clone(),
+                                    });
                                 match crate::session_runner::classify_setup_retry_signal(
-                                    agent_id.as_deref(),
+                                    expected_key.as_ref(),
                                     &event,
                                 ) {
                                     crate::session_runner::SetupRetrySignal::Retry => {
                                         continue 'setup_loop;
                                     }
                                     crate::session_runner::SetupRetrySignal::ManualConfirmed => {
-                                        if let NavEvent::SetupManualConfirmed(confirmed_id) = &event
-                                        {
-                                            app_clone
-                                                .emit(
-                                                    "setup-agent-complete",
-                                                    json!({
-                                                        "agent_id": confirmed_id,
-                                                        "conversation_url": ""
-                                                    }),
+                                        if let NavEvent::SetupManualConfirmed(key) = &event {
+                                            // Authoritative completion lives
+                                            // here at the exact-current
+                                            // consumer — never in the command
+                                            // producer or the diagnostics
+                                            // mirror.
+                                            let applied = {
+                                                let browser = state_ref.browser_state.lock().await;
+                                                crate::browser_backend::record_setup_completion_if_current(
+                                                    &browser.diagnostics,
+                                                    key,
+                                                    "user_confirmed_manual",
                                                 )
-                                                .ok();
+                                            };
+                                            if applied {
+                                                app_clone
+                                                    .emit(
+                                                        "setup-agent-complete",
+                                                        json!({
+                                                            "agent_id": key.agent_id,
+                                                            "conversation_url": ""
+                                                        }),
+                                                    )
+                                                    .ok();
+                                            }
                                         }
                                         continue 'setup_loop;
                                     }
@@ -1209,9 +1236,40 @@ pub async fn captcha_resolved(
     agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let (nav_tx, lifecycle) = {
+    // Sequential snapshots only — never nest orchestrator/browser/runtime
+    // locks.
+    let (phase_is_setup, orchestrator_session_id, is_member) = {
+        let orchestrator = state.orchestrator.lock().await;
+        (
+            orchestrator.status == OrchestratorStatus::Setup,
+            orchestrator
+                .current_session
+                .as_ref()
+                .map(|config| config.session_id.clone()),
+            orchestrator
+                .current_session
+                .as_ref()
+                .is_some_and(|config| config.agent_ids.iter().any(|id| id == &agent_id)),
+        )
+    };
+    let owner = state.session_runtime.current_owner();
+    let (nav_tx, lifecycle, admission) = {
         let browser = state.browser_state.lock().await;
-        (browser.nav_tx.clone(), browser.lifecycle.clone())
+        let (diagnostics_session_id, diagnostics_setup_generation) =
+            browser.diagnostics.setup_identity_snapshot();
+        let admission = crate::session_runner::SetupRetryAdmission {
+            requested_agent: agent_id.clone(),
+            expected_unfinished_agent: browser.diagnostics.expected_unfinished_agent(),
+            setup_completed: browser.diagnostics.setup_completed(&agent_id),
+            session_active: owner.is_some(),
+            phase_is_setup,
+            is_member,
+            owner,
+            orchestrator_session_id,
+            diagnostics_session_id: Some(diagnostics_session_id),
+            diagnostics_setup_generation: Some(diagnostics_setup_generation),
+        };
+        (browser.nav_tx.clone(), browser.lifecycle.clone(), admission)
     };
     nav_tx
         .try_send(NavEvent::ResumeRequested(agent_id.clone()))
@@ -1220,6 +1278,18 @@ pub async fn captcha_resolved(
     // reevaluation. It never manufactures Ready; current-generation composer
     // evidence must still create the lease.
     lifecycle.request_recheck();
+    // Session 03D: preserve the product behavior where a CAPTCHA Resume can
+    // rerun an already-failed setup — but only as a separate identity-bearing
+    // retry intent, emitted solely when the exact current setup identity is
+    // provable. Otherwise the wakeup above is the whole effect. Best-effort:
+    // a full ingress here must not fail the wakeup contract.
+    if let crate::session_runner::SetupRetryIntent::Resume { key } =
+        crate::session_runner::decide_setup_retry_intent(&admission)
+    {
+        if let Err(error) = nav_tx.try_send(NavEvent::SetupRetryRequested(key)) {
+            tracing::warn!("[SETUP] Could not queue identity retry after captcha: {error}");
+        }
+    }
     let mut browser = state.browser_state.lock().await;
     browser.captcha_resolved.insert(agent_id);
     Ok(())
@@ -1231,21 +1301,25 @@ pub async fn captcha_resolved(
 /// Session 03C ownership: this command validates and signals retry intent
 /// only — it never navigates. `run_setup` remains the sole setup-navigation
 /// owner, so one explicit retry leads to exactly one setup-loop navigation.
-/// Emitting `ResumeRequested` never manufactures Ready.
+///
+/// Session 03D identity: the emitted `SetupRetryRequested` carries the exact
+/// current setup-control key (session/run/setup/agent) proven against live
+/// state. A delayed event can never authorize a newer session. Emitting the
+/// signal never manufactures Ready.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn retry_setup_agent(
     agent_id: String,
     state: tauri::State<'_, AppState>,
     _app: AppHandle,
 ) -> Result<(), String> {
-    let (config, session_active, phase_is_setup) = {
+    let (config, phase_is_setup) = {
         let orchestrator = state.orchestrator.lock().await;
         (
             orchestrator.current_session.clone(),
-            state.session_runtime.is_active(),
             orchestrator.status == OrchestratorStatus::Setup,
         )
     };
+    let owner = state.session_runtime.current_owner();
     let config = config.ok_or_else(|| "No setup session is active".to_string())?;
     // P2: resolve through the MERGED registry so a persisted custom participant
     // can be retried. Unknown ids keep the same rejection as before. Kept as a
@@ -1259,31 +1333,36 @@ pub async fn retry_setup_agent(
     resolve_participant(&agent_id, &custom).ok_or_else(|| "Unknown setup agent".to_string())?;
     let (nav_tx, admission) = {
         let browser = state.browser_state.lock().await;
-        let expected_unfinished_agent = browser
-            .diagnostics
-            .expected_unfinished_agent()
-            .filter(|expected| expected == &agent_id);
+        let (diagnostics_session_id, diagnostics_setup_generation) =
+            browser.diagnostics.setup_identity_snapshot();
         (
             browser.nav_tx.clone(),
             crate::session_runner::SetupRetryAdmission {
                 requested_agent: agent_id.clone(),
-                expected_unfinished_agent,
+                expected_unfinished_agent: browser.diagnostics.expected_unfinished_agent(),
                 setup_completed: browser.diagnostics.setup_completed(&agent_id),
-                session_active,
+                session_active: owner.is_some(),
                 phase_is_setup,
                 is_member: config.agent_ids.iter().any(|id| id == &agent_id),
+                owner,
+                orchestrator_session_id: Some(config.session_id.clone()),
+                diagnostics_session_id: Some(diagnostics_session_id),
+                diagnostics_setup_generation: Some(diagnostics_setup_generation),
             },
         )
     };
     match crate::session_runner::decide_setup_retry_intent(&admission) {
-        crate::session_runner::SetupRetryIntent::Resume { agent_id } => nav_tx
-            .try_send(NavEvent::ResumeRequested(agent_id))
+        crate::session_runner::SetupRetryIntent::Resume { key } => nav_tx
+            .try_send(NavEvent::SetupRetryRequested(key))
             .map_err(|e| format!("Could not request setup retry: {e}")),
         crate::session_runner::SetupRetryIntent::Rejected { reason } => Err(match reason {
-            "no_active_session" => "No active setup session".to_string(),
+            "no_active_session" | "no_owner" => "No active setup session".to_string(),
             "not_in_setup" => "Setup retry is only available during setup".to_string(),
             "unknown_agent" => "Agent is not part of the active setup".to_string(),
             "already_completed" => "Setup agent is already completed".to_string(),
+            "session_mismatch" | "diagnostics_mismatch" => {
+                "Setup session identity changed; retry is no longer valid".to_string()
+            }
             _ => "Only the current unfinished setup agent can be retried".to_string(),
         }),
     }
@@ -1293,40 +1372,66 @@ pub async fn retry_setup_agent(
 /// but whose browser event was missed. This advances only the currently
 /// expected setup agent; it neither clicks Send nor manufactures a browser
 /// send/response signal.
+///
+/// Session 03D identity: the producer only enqueues an identity-bearing
+/// `SetupManualConfirmed(key)` proven against live state. It must NOT record
+/// setup completion itself — the process-lifetime diagnostics object would let
+/// a stale producer retain completion authority across owner/session
+/// replacement. The live setup consumer records completion after exact key
+/// acceptance.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn confirm_setup_agent(
     agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if !state.session_runtime.is_active() {
-        return Err("No active setup session".to_string());
-    }
-    let setup_order = {
+    let (setup_order, owner, phase_is_setup, session_id) = {
         let orchestrator = state.orchestrator.lock().await;
         let config = orchestrator
             .current_session
             .as_ref()
             .ok_or_else(|| "No setup session is active".to_string())?;
-        if orchestrator.status != OrchestratorStatus::Setup {
-            return Err("Manual confirmation is only available during setup".to_string());
-        }
-        config.setup_order()
+        (
+            config.setup_order(),
+            state.session_runtime.current_owner(),
+            orchestrator.status == OrchestratorStatus::Setup,
+            Some(config.session_id.clone()),
+        )
     };
-    if !setup_order.iter().any(|id| id == &agent_id) {
-        return Err("Agent is not part of the active setup order".to_string());
-    }
-    let (diagnostics, nav_tx) = {
+    let (nav_tx, admission) = {
         let browser = state.browser_state.lock().await;
-        if !browser.diagnostics.is_expected_unfinished(&agent_id) {
-            return Err("Only the current unfinished setup agent can be confirmed".to_string());
-        }
-        (browser.diagnostics.clone(), browser.nav_tx.clone())
+        let (diagnostics_session_id, diagnostics_setup_generation) =
+            browser.diagnostics.setup_identity_snapshot();
+        (
+            browser.nav_tx.clone(),
+            crate::session_runner::SetupRetryAdmission {
+                requested_agent: agent_id.clone(),
+                expected_unfinished_agent: browser.diagnostics.expected_unfinished_agent(),
+                setup_completed: browser.diagnostics.setup_completed(&agent_id),
+                session_active: owner.is_some(),
+                phase_is_setup,
+                is_member: setup_order.iter().any(|id| id == &agent_id),
+                owner,
+                orchestrator_session_id: session_id,
+                diagnostics_session_id: Some(diagnostics_session_id),
+                diagnostics_setup_generation: Some(diagnostics_setup_generation),
+            },
+        )
     };
-    nav_tx
-        .try_send(NavEvent::SetupManualConfirmed(agent_id.clone()))
-        .map_err(|e| format!("Could not confirm setup agent: {e}"))?;
-    record_setup_completion(&diagnostics, &agent_id, "user_confirmed_manual");
-    Ok(())
+    match crate::session_runner::decide_setup_retry_intent(&admission) {
+        crate::session_runner::SetupRetryIntent::Resume { key } => nav_tx
+            .try_send(NavEvent::SetupManualConfirmed(key))
+            .map_err(|e| format!("Could not confirm setup agent: {e}")),
+        crate::session_runner::SetupRetryIntent::Rejected { reason } => Err(match reason {
+            "no_active_session" | "no_owner" => "No active setup session".to_string(),
+            "not_in_setup" => "Manual confirmation is only available during setup".to_string(),
+            "unknown_agent" => "Agent is not part of the active setup order".to_string(),
+            "already_completed" => "Setup agent is already completed".to_string(),
+            "session_mismatch" | "diagnostics_mismatch" => {
+                "Setup session identity changed; confirmation is no longer valid".to_string()
+            }
+            _ => "Only the current unfinished setup agent can be confirmed".to_string(),
+        }),
+    }
 }
 
 /// User-confirmed active-turn recovery. The response is accepted only for the
