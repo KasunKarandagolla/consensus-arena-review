@@ -1,6 +1,6 @@
 # Consensus Arena — Build / Delivery Lane
 
-**Current evidence:** `audits/delivery-loop-v1-runtime-dogfood.md` (2026-09-15),
+**Current evidence:** `audits/delivery-loop-v1-linux-e2e.md` (2026-09-15),
 with `audits/delivery-loop-v1-post.md` retained as the preceding
 source-review audit.
 
@@ -78,13 +78,26 @@ If protected acceptance content changes:
 - restore it from the acceptance commit;
 - fail the attempt.
 
-### 6. Bounded repair
+### 6. Independent outcome handling
+
+- PASS requires at least one executed required check, with every required
+  check passing and protected acceptance unchanged.
+- FAIL requires valid required-check evidence demonstrating incorrect behavior;
+  a worker exit code or prose is not enough.
+- INCONCLUSIVE represents infrastructure, missing, malformed, skipped,
+  incomplete, or uncorrelated evidence. It stops the current bounded run in
+  an owner-visible Failed state and does not consume a product-code repair
+  attempt. Resume reruns the frozen verification.
+- Mixed outcomes are deterministic: FAIL takes precedence over INCONCLUSIVE,
+  which takes precedence over PASS.
+
+### 7. Bounded repair
 
 - implementation + repairs are bounded to three attempts in current V1;
 - after repair, Arena reruns the **same frozen profile/commands**;
 - PASS/FAIL is evidence-driven.
 
-### 7. Durable owner question
+### 8. Durable owner question
 
 When worker output indicates `needs_user`:
 
@@ -96,11 +109,11 @@ When worker output indicates `needs_user`:
 
 This intentionally avoids requiring a worker process/tool call to remain suspended across the human decision.
 
-### 8. Abort
+### 9. Abort
 
 `SessionRuntime` ownership protects exact-task abort semantics. Child ownership provides worker cleanup. State is marked Cancelled only after stopping the correct owner.
 
-### 9. Verified candidate and Apply
+### 10. Verified candidate and Apply
 
 Verified work remains isolated until explicit user Apply.
 
@@ -127,10 +140,10 @@ Audit establishes:
 ## Current known limitations
 
 - DSH must already be available; Arena does not package/install it.
-- The 2026-09-15 runtime dogfood started Vite but could not reach a completed
-  current-source native GUI binary within the local build window; DSH was also
-  absent. Full end-to-end execution through a real Tauri GUI session remains
-  unproven. See `audits/delivery-loop-v1-runtime-dogfood.md`.
+- The native Linux binary and Build UI now launch/render in a real Tauri
+  session, but full Delivery E2E remains unproven because the qualified DSH
+  candidate reached the configured endpoint and received HTTP 401. See
+  `audits/delivery-loop-v1-linux-e2e.md`.
 - Windows runtime parity remains a separate qualification requirement.
 - Delivery V1 currently implements its own bounded orchestration. The post-gates strategy selects Dagu as a candidate to remove more durable workflow/wait/retry mechanics, but Dagu is not integrated.
 

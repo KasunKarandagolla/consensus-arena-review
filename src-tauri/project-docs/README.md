@@ -57,15 +57,17 @@ The latest local post-implementation audit establishes a first Build vertical sl
 - `needs_user` is persisted before the existing AskUser event is emitted; restart can re-present the persisted question.
 - Apply is explicit and only fast-forwards a clean, unchanged original checkout to a verified candidate.
 - DSH is not yet bundled/installed by Arena.
-- The new Build lane has not yet been proven through a complete real Tauri GUI dogfood run in the supplied audits.
+- Native Linux Tauri launch and the Build UI setup screen are now runtime-proven.
+  A complete model-backed Delivery GUI dogfood run remains unproven because
+  the qualified external DSH run received HTTP 401 before making a change.
 
-See `DELIVERY.md` and `audits/delivery-loop-v1-post.md`.
+See `DELIVERY.md` and `audits/delivery-loop-v1-linux-e2e.md`.
 
-The 2026-09-15 runtime dogfood audit records the first environment-level
-attempt: frontend dev startup and source verification succeeded, but DSH was
-not installed and the current native binary did not finish building within the
-available local runtime window. The real GUI Delivery loop therefore remains
-unproven.
+The 2026-09-15 Linux E2E audit records the current environment-level attempt:
+frontend and native startup succeeded, the Build UI rendered, verifier and
+admission hardening were tested, and DSH `0.1.5-rc.1` reached the configured
+endpoint but received HTTP 401. The real GUI Delivery loop therefore remains
+unproven, while the earlier runtime audit is retained as historical evidence.
 
 ## Current strategic next layer
 

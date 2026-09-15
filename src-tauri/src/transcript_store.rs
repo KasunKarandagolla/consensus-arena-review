@@ -99,6 +99,14 @@ impl TranscriptStore {
         }
     }
 
+    pub fn delete_delivery_state(&mut self, session_id: &str) -> Result<(), AgentError> {
+        self.conn.execute(
+            "DELETE FROM delivery_runs WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn create_session(&mut self, config: &SessionConfig) -> Result<(), AgentError> {
         let session_type = serde_json::to_string(&config.session_type)
             .unwrap_or_else(|_| "custom".to_string())

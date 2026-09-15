@@ -11,7 +11,7 @@ interface Details{project_brief:string;status:string;turn_count:number;section_c
 interface Menu{sessionId:string;x:number;y:number}
 
 export default function Sidebar(){
-  const {selectedSessionId,recoveryState,settingsOpen,sidebarCollapsed,sessionStatus,setSessionStatus,setIsDraftSession,setSelectedSessionId,setRecoveryState,clearSessionState,setSettingsOpen,addToast,participants,clearBlueprintSections,appendBlueprintSection,setSetupBrief}=useAppStore()
+  const {selectedSessionId,recoveryState,settingsOpen,sidebarCollapsed,sessionStatus,setSessionStatus,setIsDraftSession,setSelectedSessionId,setRecoveryState,clearSessionState,setSettingsOpen,addToast,participants,clearBlueprintSections,appendBlueprintSection,setSetupBrief,setActiveMode,setDeliveryState}=useAppStore()
   const [sessions,setSessions]=useState<Session[]>([]),[health,setHealth]=useState<Record<string,ModelHealth>>({}),[menu,setMenu]=useState<Menu|null>(null),[rename,setRename]=useState<string|null>(null),[renameValue,setRenameValue]=useState('')
   const menuRef=useRef<HTMLDivElement>(null),renameRef=useRef<HTMLInputElement>(null)
   const loadSeqRef=useRef(0)
@@ -26,7 +26,7 @@ export default function Sidebar(){
   useEffect(()=>{if(!menu)return;const close=(e:MouseEvent)=>{if(!menuRef.current?.contains(e.target as Node))setMenu(null)};document.addEventListener('mousedown',close);return()=>document.removeEventListener('mousedown',close)},[menu])
   useEffect(()=>{if(!headingMenuOpen)return;const close=(e:MouseEvent)=>{if(headingMenuRef.current?.contains(e.target as Node) || headingDotsRef.current?.contains(e.target as Node))return;setHeadingMenuOpen(false)};document.addEventListener('mousedown',close);return()=>document.removeEventListener('mousedown',close)},[headingMenuOpen])
   useEffect(()=>renameRef.current?.focus(),[rename])
-  function newSession(){loadSeqRef.current+=1;clearSessionState();setSelectedSessionId(null);setSessionStatus('setup');setIsDraftSession(true)}
+  function newSession(){loadSeqRef.current+=1;clearSessionState();setSelectedSessionId(null);setActiveMode('consult');setDeliveryState(null);setSessionStatus('setup');setIsDraftSession(true)}
   async function recover(){if(!recoveryState)return;try{clearSessionState();await invoke('recover_session',{session_id:recoveryState.session_id});setSelectedSessionId(recoveryState.session_id);setSessionStatus('ended');setRecoveryState(null);addToast('Recovery loaded')}catch(e){console.error(e);addToast('Recovery failed')}}
   async function remove(id:string){setMenu(null);try{await invoke('delete_session',{session_id:id});if(selectedSessionId===id){setSelectedSessionId(null);setSessionStatus('idle')}await loadSessions();addToast('Session deleted')}catch(e){console.error(e);addToast(String(e))}}
   async function exportSession(id:string){setMenu(null);try{const path=await invoke<string>('export_blueprint',{format:'markdown',session_id:id});addToast(`Saved to ${path}`)}catch(e){console.error(e);addToast('Export failed')}}

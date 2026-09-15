@@ -86,6 +86,12 @@ Use three outcomes conceptually:
 
 An owner waiver remains a waiver, not a fake PASS.
 
+Delivery applies this precedence deterministically: a valid behavioral FAIL
+wins over any INCONCLUSIVE result; otherwise INCONCLUSIVE wins over PASS. A
+profile with zero required executable checks is rejected, and zero executed
+checks can never produce PASS. INCONCLUSIVE stops the current run without
+consuming a product-code repair attempt; Resume reruns the frozen checks.
+
 ## Required-scenario protection
 
 If using self-healing/generative testing tools, required scenarios must not silently disappear or become skipped while still yielding a green build.

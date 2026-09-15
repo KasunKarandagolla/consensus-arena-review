@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -107,7 +108,8 @@ const ALLOWED_PROGRAMS: &[&str] = &[
 
 fn path_is_relative(path: &str) -> bool {
     let path = Path::new(path);
-    !path.is_absolute()
+    !path.to_string_lossy().trim().is_empty()
+        && !path.is_absolute()
         && !path
             .components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
@@ -162,6 +164,10 @@ pub fn validate_profile(profile: &VerificationProfile, repo: &Path) -> Result<()
             profile.version
         ));
     }
+    if profile.commands.is_empty() {
+        return Err("verification profile must contain at least one required check".to_string());
+    }
+    let mut command_ids = HashSet::new();
     for command in &profile.commands {
         if command.id.trim().is_empty()
             || command.program.trim().is_empty()
@@ -169,11 +175,18 @@ pub fn validate_profile(profile: &VerificationProfile, repo: &Path) -> Result<()
         {
             return Err(format!("invalid verification command {}", command.id));
         }
+        if !command_ids.insert(command.id.trim().to_string()) {
+            return Err(format!("duplicate verification command id {}", command.id));
+        }
         validate_command(repo, command)?;
     }
+    let mut protected_paths = HashSet::new();
     for path in &profile.protected_paths {
         if !path_is_relative(path) {
             return Err(format!("protected path escapes the worktree: {path}"));
+        }
+        if !protected_paths.insert(path.clone()) {
+            return Err(format!("duplicate protected path: {path}"));
         }
         let resolved = repo.join(path);
         if !resolved.exists() {
@@ -211,13 +224,19 @@ fn hash_bytes(bytes: &[u8]) -> Result<String, String> {
     Ok(format!("{:x}", h.finalize()))
 }
 
-fn receipt_verdict(all_pass: bool, any_inconclusive: bool) -> &'static str {
-    if all_pass {
-        "pass"
+fn receipt_verdict(
+    executed_checks: usize,
+    any_failure: bool,
+    any_inconclusive: bool,
+) -> &'static str {
+    if executed_checks == 0 {
+        "inconclusive"
+    } else if any_failure {
+        "fail"
     } else if any_inconclusive {
         "inconclusive"
     } else {
-        "fail"
+        "pass"
     }
 }
 
@@ -347,7 +366,7 @@ pub async fn verify(
     validate_profile(profile, repo)?;
     std::fs::create_dir_all(evidence).map_err(|e| e.to_string())?;
     let mut checks = Vec::new();
-    let mut all_pass = true;
+    let mut any_failure = false;
     let mut any_inconclusive = false;
     for command in &profile.commands {
         let started = Instant::now();
@@ -362,8 +381,8 @@ pub async fn verify(
         let stderr = bound_output(stderr);
         std::fs::write(&stdout_path, &stdout).map_err(|e| e.to_string())?;
         std::fs::write(&stderr_path, &stderr).map_err(|e| e.to_string())?;
-        if status != "pass" {
-            all_pass = false;
+        if status == "fail" {
+            any_failure = true;
         }
         if status == "inconclusive" {
             any_inconclusive = true;
@@ -379,8 +398,9 @@ pub async fn verify(
     }
     let protected_paths_unchanged = protected_files_unchanged(repo, protected_before);
     if !protected_paths_unchanged {
-        all_pass = false;
+        any_failure = true;
     }
+    let executed_checks = checks.len();
     let receipt = VerificationReceipt {
         session_id: session_id.into(),
         candidate_sha: candidate_sha(repo)?,
@@ -388,7 +408,7 @@ pub async fn verify(
         profile_hash: profile_hash(profile)?,
         protected_paths_unchanged,
         checks,
-        verdict: receipt_verdict(all_pass, any_inconclusive).into(),
+        verdict: receipt_verdict(executed_checks, any_failure, any_inconclusive).into(),
     };
     std::fs::write(
         evidence.join("receipt.json"),
@@ -434,10 +454,77 @@ mod tests {
     }
 
     #[test]
-    fn infrastructure_evidence_is_inconclusive() {
-        assert_eq!(receipt_verdict(true, false), "pass");
-        assert_eq!(receipt_verdict(false, false), "fail");
-        assert_eq!(receipt_verdict(false, true), "inconclusive");
+    fn aggregate_verdict_precedence_is_explicit() {
+        assert_eq!(receipt_verdict(2, false, false), "pass");
+        assert_eq!(receipt_verdict(1, true, false), "fail");
+        assert_eq!(receipt_verdict(1, false, true), "inconclusive");
+        assert_eq!(receipt_verdict(2, true, true), "fail");
+        assert_eq!(receipt_verdict(2, false, true), "inconclusive");
+        assert_eq!(receipt_verdict(2, true, false), "fail");
+        assert_eq!(receipt_verdict(0, false, false), "inconclusive");
+    }
+
+    #[test]
+    fn rejects_empty_and_duplicate_profile_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "consensus-arena-verification-profile-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create test directory");
+        std::fs::write(root.join("protected.txt"), "protected").expect("write protected file");
+        let command = || VerificationCommand {
+            id: "check".to_string(),
+            program: "git".to_string(),
+            args: vec!["status".to_string()],
+            cwd: ".".to_string(),
+            timeout_seconds: 10,
+        };
+        assert!(
+            validate_profile(
+                &VerificationProfile {
+                    version: 1,
+                    commands: Vec::new(),
+                    protected_paths: Vec::new(),
+                },
+                &root
+            )
+            .is_err()
+        );
+        assert!(
+            validate_profile(
+                &VerificationProfile {
+                    version: 1,
+                    commands: vec![command(), command()],
+                    protected_paths: Vec::new(),
+                },
+                &root
+            )
+            .is_err()
+        );
+        assert!(
+            validate_profile(
+                &VerificationProfile {
+                    version: 1,
+                    commands: vec![command()],
+                    protected_paths: vec![String::new()],
+                },
+                &root
+            )
+            .is_err()
+        );
+        assert!(
+            validate_profile(
+                &VerificationProfile {
+                    version: 1,
+                    commands: vec![command()],
+                    protected_paths: vec!["protected.txt".to_string(), "protected.txt".to_string()],
+                },
+                &root
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(&root).expect("remove test directory");
     }
 
     #[test]

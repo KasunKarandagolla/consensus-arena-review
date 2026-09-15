@@ -87,6 +87,55 @@ fn launch_delivery_with_permit(
     permit.commit(handle, activate_tx)
 }
 
+async fn rollback_delivery_admission(
+    state: &AppState,
+    repo: &std::path::Path,
+    worktree: &std::path::Path,
+    branch: &str,
+    session_id: &str,
+    branch_preexisted: bool,
+    worktree_created: bool,
+    session_attempted: bool,
+    previous_state_file: Option<&[u8]>,
+    previous_state_slot: Option<crate::delivery::DeliveryState>,
+) {
+    if worktree_created {
+        let _ = tokio::process::Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(worktree)
+            .current_dir(repo)
+            .output()
+            .await;
+    }
+    if !branch_preexisted {
+        let _ = git_command(repo, &["branch", "-D", branch]).await;
+    }
+    if session_attempted {
+        let db = state.transcript_store.clone();
+        let session_id = session_id.to_string();
+        let _ = crate::db_helpers::run_blocking(move || {
+            let mut store = db.lock().map_err(|_| {
+                crate::errors::AgentError::DatabaseError(
+                    "delivery transcript lock poisoned during rollback".to_string(),
+                )
+            })?;
+            store.delete_delivery_state(&session_id)?;
+            let _ = store.delete_session(&session_id);
+            Ok::<(), crate::errors::AgentError>(())
+        })
+        .await;
+    }
+    match previous_state_file {
+        Some(contents) => {
+            let _ = std::fs::write(&state.delivery_state_path, contents);
+        }
+        None => {
+            let _ = std::fs::remove_file(&state.delivery_state_path);
+        }
+    }
+    *state.delivery_state.lock().await = previous_state_slot;
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn start_delivery(
     objective: String,
@@ -140,7 +189,19 @@ pub async fn start_delivery(
     {
         return Err("Configure the primary Agent Brain before starting Build mode".to_string());
     }
+    let previous_state_file = match std::fs::read(&state.delivery_state_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("read existing delivery state: {error}")),
+    };
+    let previous_state_slot = state.delivery_state.lock().await.clone();
     let id = Uuid::new_v4().to_string();
+    let short = id.chars().take(8).collect::<String>();
+    let branch = format!("arena-delivery/{short}");
+    let branch_ref = format!("refs/heads/{branch}");
+    let branch_preexisted = git_command(&repo, &["show-ref", "--verify", &branch_ref])
+        .await
+        .map(|output| output.status.success())?;
     // Reserve the single runtime owner before creating any worktree, session
     // row, or persisted delivery state. Concurrent Build clicks must not
     // leave an orphaned candidate after one launch loses admission.
@@ -148,33 +209,68 @@ pub async fn start_delivery(
         .session_runtime
         .try_acquire_start(id.clone())
         .map_err(|error| error.to_string())?;
-    let short = id.chars().take(8).collect::<String>();
     let data_dir = state
         .delivery_state_path
         .parent()
         .ok_or_else(|| "invalid Arena data directory".to_string())?;
     let worktree = data_dir.join("delivery-worktrees").join(&id);
-    let branch = format!("arena-delivery/{short}");
-    std::fs::create_dir_all(
+    if worktree.exists() {
+        return Err("delivery worktree path already exists".to_string());
+    }
+    if let Err(error) = std::fs::create_dir_all(
         worktree
             .parent()
             .ok_or_else(|| "invalid worktree directory".to_string())?,
-    )
-    .map_err(|error| format!("create delivery worktree directory: {error}"))?;
-    let add = tokio::process::Command::new("git")
+    ) {
+        return Err(format!("create delivery worktree directory: {error}"));
+    }
+    let add = match tokio::process::Command::new("git")
         .args(["worktree", "add", "-b", &branch])
         .arg(&worktree)
         .arg(&base)
         .current_dir(&repo)
         .output()
         .await
-        .map_err(|error| format!("create isolated worktree: {error}"))?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            rollback_delivery_admission(
+                state.inner(),
+                &repo,
+                &worktree,
+                &branch,
+                &id,
+                branch_preexisted,
+                false,
+                false,
+                previous_state_file.as_deref(),
+                previous_state_slot.clone(),
+            )
+            .await;
+            return Err(format!("create isolated worktree: {error}"));
+        }
+    };
     if !add.status.success() {
+        let partially_created = worktree.exists();
+        rollback_delivery_admission(
+            state.inner(),
+            &repo,
+            &worktree,
+            &branch,
+            &id,
+            branch_preexisted,
+            partially_created,
+            false,
+            previous_state_file.as_deref(),
+            previous_state_slot.clone(),
+        )
+        .await;
         return Err(format!(
             "could not create isolated worktree: {}",
             String::from_utf8_lossy(&add.stderr).trim()
         ));
     }
+    let worktree_created = true;
     let id_for_db = id.clone();
     let config = SessionConfig {
         session_id: id.clone(),
@@ -184,7 +280,7 @@ pub async fn start_delivery(
         leader_agent_id: String::new(),
     };
     let db = state.transcript_store.clone();
-    crate::db_helpers::run_blocking(move || {
+    let session_result = crate::db_helpers::run_blocking(move || {
         let mut store = db.lock().map_err(|_| {
             crate::errors::AgentError::DatabaseError(
                 "delivery transcript lock poisoned".to_string(),
@@ -192,8 +288,23 @@ pub async fn start_delivery(
         })?;
         store.create_session(&config)
     })
-    .await
-    .map_err(|error| format!("create delivery session: {error}"))?;
+    .await;
+    if let Err(error) = session_result {
+        rollback_delivery_admission(
+            state.inner(),
+            &repo,
+            &worktree,
+            &branch,
+            &id,
+            branch_preexisted,
+            worktree_created,
+            true,
+            previous_state_file.as_deref(),
+            previous_state_slot.clone(),
+        )
+        .await;
+        return Err(format!("create delivery session: {error}"));
+    }
     let now = chrono::Utc::now().timestamp();
     let mut value = crate::delivery::DeliveryState {
         schema_version: crate::delivery::DELIVERY_SCHEMA_VERSION,
@@ -201,7 +312,7 @@ pub async fn start_delivery(
         objective: objective.clone(),
         source_workspace: repo.to_string_lossy().into(),
         worktree_path: worktree.to_string_lossy().into(),
-        branch_name: branch,
+        branch_name: branch.clone(),
         base_commit: base,
         phase: crate::delivery::DeliveryPhase::Preparing,
         contract: Some(crate::delivery::DeliveryContract {
@@ -226,14 +337,51 @@ pub async fn start_delivery(
         updated_at: now,
         message: "Preparing project…".to_string(),
     };
-    crate::delivery::persist_state(
+    if let Err(error) = crate::delivery::persist_state(
         &state.delivery_state_path,
         &state.delivery_state,
         &state.transcript_store,
         &mut value,
     )
-    .await?;
-    launch_delivery_with_permit(state.inner(), &app, value, permit)?;
+    .await
+    {
+        rollback_delivery_admission(
+            state.inner(),
+            &repo,
+            &worktree,
+            &branch,
+            &id,
+            branch_preexisted,
+            worktree_created,
+            true,
+            previous_state_file.as_deref(),
+            previous_state_slot.clone(),
+        )
+        .await;
+        return Err(error);
+    }
+    let owner = permit.owner();
+    if let Err(error) = launch_delivery_with_permit(state.inner(), &app, value, permit) {
+        // A stop racing the final handoff owns cleanup and will persist the
+        // cancelled state. If the permit became stale without that owner,
+        // clean up the new admission artifacts here.
+        if state.session_runtime.current_owner().as_ref() != Some(&owner) {
+            rollback_delivery_admission(
+                state.inner(),
+                &repo,
+                &worktree,
+                &branch,
+                &id,
+                branch_preexisted,
+                worktree_created,
+                true,
+                previous_state_file.as_deref(),
+                previous_state_slot,
+            )
+            .await;
+        }
+        return Err(error);
+    }
     Ok(id_for_db)
 }
 
@@ -277,8 +425,14 @@ pub async fn resume_delivery(
             | crate::delivery::DeliveryPhase::Repairing
             | crate::delivery::DeliveryPhase::Failed
     ) {
+        let retry_verification = value
+            .last_verification
+            .as_ref()
+            .is_some_and(|receipt| receipt.verdict == "inconclusive");
         crate::delivery::reset_for_recovery(&value, true).await?;
-        value.phase = if value.acceptance_commit.is_some() {
+        value.phase = if retry_verification {
+            crate::delivery::DeliveryPhase::Verifying
+        } else if value.acceptance_commit.is_some() {
             crate::delivery::DeliveryPhase::Repairing
         } else {
             crate::delivery::DeliveryPhase::AuthoringAcceptance

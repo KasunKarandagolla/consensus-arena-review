@@ -632,6 +632,12 @@ pub async fn run(
             let receipt = verification::verify(&state.session_id, &worktree, &profile, &hashes, &state_path.parent().unwrap_or(std::path::Path::new(".")).join("delivery-evidence").join(&state.session_id), 1).await?;
             state.last_verification = Some(receipt.clone());
             if receipt.verdict == "pass" { finish_verified(&app, &state_path, &delivery_slot, &transcript, &mut state).await?; return Ok::<(), String>(()); }
+            if receipt.verdict == "inconclusive" {
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some("Verification inconclusive; no implementation repair was attempted. Resolve the verification environment and resume to rerun the frozen checks.".to_string());
+                persist_emit(&app, &state_path, &delivery_slot, &transcript, &mut state).await?;
+                return Ok::<(), String>(());
+            }
             if !attempts_remaining(state.attempt) { state.phase = DeliveryPhase::Failed; return Ok(()); }
             state.phase = DeliveryPhase::Repairing;
         }
@@ -674,6 +680,12 @@ pub async fn run(
             }
             state.last_verification = Some(receipt.clone());
             if receipt.verdict == "pass" { finish_verified(&app, &state_path, &delivery_slot, &transcript, &mut state).await?; return Ok(()); }
+            if receipt.verdict == "inconclusive" {
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some("Verification inconclusive; product-code repair was not attempted. Resolve the verification environment and resume to rerun the frozen checks.".to_string());
+                persist_emit(&app, &state_path, &delivery_slot, &transcript, &mut state).await?;
+                break;
+            }
             if !attempts_remaining(state.attempt) { state.phase = DeliveryPhase::Failed; break; }
             state.phase = DeliveryPhase::Repairing;
             persist_emit(&app, &state_path, &delivery_slot, &transcript, &mut state).await?;
@@ -742,5 +754,10 @@ mod tests {
         assert_eq!(MAX_IMPLEMENTATION_ATTEMPTS, 3);
         assert!(attempts_remaining(2));
         assert!(!attempts_remaining(3));
+    }
+
+    #[test]
+    fn malformed_persisted_state_is_rejected() {
+        assert!(serde_json::from_str::<DeliveryState>("{\"phase\":\"failed\"}").is_err());
     }
 }
