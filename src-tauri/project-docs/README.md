@@ -59,15 +59,17 @@ The latest local post-implementation audit establishes a first Build vertical sl
 - DSH is not yet bundled/installed by Arena.
 - Native Linux Tauri launch and the Build UI setup screen are now runtime-proven.
   A complete model-backed Delivery GUI dogfood run remains unproven because
-  the qualified external DSH run received HTTP 401 before making a change.
+  the qualified external DSH run did not complete a disposable coding change.
 
-See `DELIVERY.md` and `audits/delivery-loop-v1-linux-e2e.md`.
+See `DELIVERY.md` and `audits/delivery-loop-v1-linux-runtime-qualification.md`.
 
-The 2026-09-15 Linux E2E audit records the current environment-level attempt:
-frontend and native startup succeeded, the Build UI rendered, verifier and
-admission hardening were tested, and DSH `0.1.5-rc.1` reached the configured
-endpoint but received HTTP 401. The real GUI Delivery loop therefore remains
-unproven, while the earlier runtime audit is retained as historical evidence.
+The 2026-09-15 Linux runtime qualification audit records the current
+environment-level attempt: the configured Arena credential and current model
+authenticated at the NVIDIA-compatible endpoint, but DSH `0.1.5-rc.1` could
+not complete a disposable coding task. The native GUI could not be relaunched
+because GTK could not connect to the unavailable X display. The real GUI
+Delivery loop therefore remains unproven, while earlier successful native
+launch evidence and prior source/runtime audits remain historical evidence.
 
 ## Current strategic next layer
 

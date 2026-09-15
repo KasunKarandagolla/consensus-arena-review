@@ -8,6 +8,7 @@ use tokio::process::{Child, Command};
 pub const RESULT_SCHEMA_VERSION: u32 = 1;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const API_KEY_ENV: &str = "ARENA_DSH_API_KEY";
+const MAX_MODEL_OUTPUT_TOKENS: u32 = 4096;
 
 #[derive(Debug, Clone)]
 pub struct DshModelConfig {
@@ -144,7 +145,7 @@ fn write_runtime_patch(path: &Path, config: &DshModelConfig) -> Result<(), Strin
         .ok_or_else(|| "invalid DSH runtime patch path".to_string())?;
     std::fs::create_dir_all(parent).map_err(|error| format!("create DSH runtime data: {error}"))?;
     let patch = format!(
-        "- id: llm-pi-ai\n  config:\n    providers:\n      arena_primary:\n        apiKeyEnv: {API_KEY_ENV}\n        api: openai-completions\n        baseURL: {}\n        models:\n          - id: {}\n            name: Arena primary\n            contextWindow: 128000\n- id: agent-default-model\n  config:\n    provider: arena_primary\n    model: {}\n",
+        "- id: llm-pi-ai\n  config:\n    providers:\n      arena_primary:\n        apiKeyEnv: {API_KEY_ENV}\n        api: openai-completions\n        baseURL: {}\n        models:\n          - id: {}\n            name: Arena primary\n            contextWindow: 128000\n            maxTokens: {MAX_MODEL_OUTPUT_TOKENS}\n- id: agent-default-model\n  config:\n    provider: arena_primary\n    model: {}\n",
         yaml_string(&config.base_url),
         yaml_string(&config.model),
         yaml_string(&config.model)
@@ -256,5 +257,26 @@ mod tests {
         let result: WorkerResultContract = serde_json::from_str(raw).expect("valid result");
         assert_eq!(result.status, WorkerStatus::NeedsUser);
         assert_eq!(result.question.expect("question").options.len(), 2);
+    }
+
+    #[test]
+    fn generated_patch_sets_bounded_model_output() {
+        let path = std::env::temp_dir().join(format!(
+            "arena-dsh-runtime-patch-{}-test.yml",
+            std::process::id()
+        ));
+        let config = DshModelConfig {
+            api_key: "test-key".to_string(),
+            base_url: "https://example.invalid/v1".to_string(),
+            model: "example/model".to_string(),
+        };
+
+        write_runtime_patch(&path, &config).expect("runtime patch should be written");
+        let patch = std::fs::read_to_string(&path).expect("runtime patch should be readable");
+
+        assert!(patch.contains("apiKeyEnv: ARENA_DSH_API_KEY"));
+        assert!(patch.contains("maxTokens: 4096"));
+
+        let _ = std::fs::remove_file(path);
     }
 }

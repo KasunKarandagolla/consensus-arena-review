@@ -1,6 +1,6 @@
 # Consensus Arena — Build / Delivery Lane
 
-**Current evidence:** `audits/delivery-loop-v1-linux-e2e.md` (2026-09-15),
+**Current evidence:** `audits/delivery-loop-v1-linux-runtime-qualification.md` (2026-09-15),
 with `audits/delivery-loop-v1-post.md` retained as the preceding
 source-review audit.
 
@@ -140,10 +140,15 @@ Audit establishes:
 ## Current known limitations
 
 - DSH must already be available; Arena does not package/install it.
-- The native Linux binary and Build UI now launch/render in a real Tauri
-  session, but full Delivery E2E remains unproven because the qualified DSH
-  candidate reached the configured endpoint and received HTTP 401. See
-  `audits/delivery-loop-v1-linux-e2e.md`.
+- The configured Arena credential and current model authenticate successfully
+  at the NVIDIA-compatible endpoint, but standalone DSH coding remains
+  unqualified. DSH `0.1.5-rc.1` reached the endpoint but could not complete a
+  disposable coding task, so full Delivery E2E remains unproven. See
+  `audits/delivery-loop-v1-linux-runtime-qualification.md`.
+- A native launch was attempted again in the qualification environment, but
+  GTK could not connect to its unavailable X display. The earlier successful
+  native launch/Build UI render remains historical runtime evidence; it was
+  not re-proven in this session.
 - Windows runtime parity remains a separate qualification requirement.
 - Delivery V1 currently implements its own bounded orchestration. The post-gates strategy selects Dagu as a candidate to remove more durable workflow/wait/retry mechanics, but Dagu is not integrated.
 
