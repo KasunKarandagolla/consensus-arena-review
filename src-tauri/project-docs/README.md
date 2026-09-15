@@ -61,15 +61,16 @@ The latest local post-implementation audit establishes a first Build vertical sl
   A complete model-backed Delivery GUI dogfood run remains unproven because
   the qualified external DSH run did not complete a disposable coding change.
 
-See `DELIVERY.md` and `audits/delivery-loop-v1-linux-runtime-qualification.md`.
+See `DELIVERY.md`, `audits/delivery-loop-v1-linux-runtime-qualification.md`,
+and the current qualification record in
+`audits/delivery-dsh-tool-loop-and-linux-e2e.md`.
 
-The 2026-09-15 Linux runtime qualification audit records the current
-environment-level attempt: the configured Arena credential and current model
-authenticated at the NVIDIA-compatible endpoint, but DSH `0.1.5-rc.1` could
-not complete a disposable coding task. The native GUI could not be relaunched
-because GTK could not connect to the unavailable X display. The real GUI
-Delivery loop therefore remains unproven, while earlier successful native
-launch evidence and prior source/runtime audits remain historical evidence.
+The current qualification record adds a direct provider contract probe: the
+selected Nemotron route did not return native OpenAI `tool_calls`, and the one
+permitted documented fallback route returned HTTP 410. DSH therefore was not
+started because its required native tool-loop precondition was not met. A
+display-capable relaunch did render the current Build setup UI, but the real
+model-backed Delivery loop remains unproven.
 
 ## Current strategic next layer
 

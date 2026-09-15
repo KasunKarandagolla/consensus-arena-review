@@ -1,8 +1,9 @@
 # Consensus Arena — Build / Delivery Lane
 
-**Current evidence:** `audits/delivery-loop-v1-linux-runtime-qualification.md` (2026-09-15),
-with `audits/delivery-loop-v1-post.md` retained as the preceding
-source-review audit.
+**Current evidence:** `audits/delivery-dsh-tool-loop-and-linux-e2e.md`
+(2026-09-15), with
+`audits/delivery-loop-v1-linux-runtime-qualification.md` and
+`audits/delivery-loop-v1-post.md` retained as preceding audits.
 
 ## Purpose
 
@@ -140,15 +141,14 @@ Audit establishes:
 ## Current known limitations
 
 - DSH must already be available; Arena does not package/install it.
-- The configured Arena credential and current model authenticate successfully
-  at the NVIDIA-compatible endpoint, but standalone DSH coding remains
-  unqualified. DSH `0.1.5-rc.1` reached the endpoint but could not complete a
-  disposable coding task, so full Delivery E2E remains unproven. See
-  `audits/delivery-loop-v1-linux-runtime-qualification.md`.
-- A native launch was attempted again in the qualification environment, but
-  GTK could not connect to its unavailable X display. The earlier successful
-  native launch/Build UI render remains historical runtime evidence; it was
-  not re-proven in this session.
+- The current direct provider qualification did not prove native
+  `message.tool_calls` for `nvidia/nemotron-3-super-120b-a12b`; the one
+  permitted documented fallback, `moonshotai/kimi-k2-instruct`, returned HTTP
+  410. DSH `0.1.5-rc.1` was not started because its native tool-loop
+  precondition was not met, so standalone coding and full Delivery E2E remain
+  unproven. See `audits/delivery-dsh-tool-loop-and-linux-e2e.md`.
+- A display-capable `tauri dev` relaunch rendered the current New session
+  screen and the Build setup UI. No Delivery run was started.
 - Windows runtime parity remains a separate qualification requirement.
 - Delivery V1 currently implements its own bounded orchestration. The post-gates strategy selects Dagu as a candidate to remove more durable workflow/wait/retry mechanics, but Dagu is not integrated.
 
