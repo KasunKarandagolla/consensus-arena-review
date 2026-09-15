@@ -6,7 +6,7 @@ import Topbar from '@/components/layout/Topbar'
 export default function DeliveryView() {
   const state = useAppStore(s => s.deliveryState)
   const setState = useAppStore(s => s.setDeliveryState)
-  useEffect(() => { invoke<string>('get_delivery_state').then(raw => { try { const parsed = JSON.parse(raw) as DeliveryState|null; if (parsed) setState(parsed) } catch {} }).catch(() => {}) }, [setState])
+  useEffect(() => { let disposed = false; invoke<string>('get_delivery_state').then(raw => { if (disposed) return; try { const parsed = JSON.parse(raw) as DeliveryState|null; if (parsed) setState(parsed) } catch {} }).catch(() => {}); return () => { disposed = true } }, [setState])
   const terminal = state?.phase === 'verified' || state?.phase === 'applied' || state?.phase === 'cancelled' || state?.phase === 'failed'
   async function apply(){try{await invoke('apply_delivery',{session_id:state?.session_id});}catch(error){useAppStore.getState().addToast(String(error),7000)}}
   async function resume(){try{await invoke('resume_delivery')}catch(error){useAppStore.getState().addToast(String(error),7000)}}

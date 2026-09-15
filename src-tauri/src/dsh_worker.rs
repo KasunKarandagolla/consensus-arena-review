@@ -105,7 +105,7 @@ where
     Ok(bounded_text(bytes))
 }
 
-async fn collect_process(mut child: Child) -> Result<WorkerExecution, String> {
+async fn collect_process(child: &mut Child) -> Result<WorkerExecution, String> {
     let stdout = child
         .stdout
         .take()
@@ -208,22 +208,28 @@ pub async fn run(
     if let Some(dsh_home) = std::env::var_os("ARENA_DSH_HOME") {
         command.env("DSH_HOME", dsh_home);
     }
-    let child = command.spawn().map_err(|error| {
+    let mut child = command.spawn().map_err(|error| {
         format!("could not start DSH; install DSH or configure ARENA_DSH_EXECUTABLE: {error}")
     })?;
-    let mut execution =
-        match tokio::time::timeout(Duration::from_secs(timeout_seconds), collect_process(child))
-            .await
-        {
-            Ok(result) => result?,
-            Err(_) => WorkerExecution {
+    let mut execution = match tokio::time::timeout(
+        Duration::from_secs(timeout_seconds),
+        collect_process(&mut child),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            WorkerExecution {
                 exit_code: None,
                 timed_out: true,
                 stdout: String::new(),
                 stderr: "DSH worker timed out".to_string(),
                 result: None,
-            },
-        };
+            }
+        }
+    };
     let result_file = result_path(runtime_dir);
     if result_file.is_file() {
         let raw = std::fs::read_to_string(&result_file)

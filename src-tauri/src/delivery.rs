@@ -580,7 +580,21 @@ async fn reset_worktree(state: &DeliveryState, commit: &str) -> Result<(), Strin
     git_ok(worktree, &["clean", "-fd"]).await
 }
 
+pub fn recovery_requires_worktree_reset(state: &DeliveryState, implementation: bool) -> bool {
+    if !implementation {
+        return true;
+    }
+    !state
+        .last_verification
+        .as_ref()
+        .is_some_and(|receipt| receipt.verdict == "inconclusive")
+}
+
 pub async fn reset_for_recovery(state: &DeliveryState, implementation: bool) -> Result<(), String> {
+    if !recovery_requires_worktree_reset(state, implementation) {
+        clean_runtime(std::path::Path::new(&state.worktree_path)).await?;
+        return Ok(());
+    }
     let commit = if implementation {
         state
             .acceptance_commit
@@ -754,6 +768,22 @@ mod tests {
         assert_eq!(MAX_IMPLEMENTATION_ATTEMPTS, 3);
         assert!(attempts_remaining(2));
         assert!(!attempts_remaining(3));
+    }
+
+    #[test]
+    fn inconclusive_resume_preserves_candidate_worktree() {
+        let mut state = sample_state();
+        state.last_verification = Some(VerificationReceipt {
+            session_id: state.session_id.clone(),
+            candidate_sha: "candidate".to_string(),
+            contract_revision: 1,
+            profile_hash: "profile".to_string(),
+            protected_paths_unchanged: true,
+            checks: Vec::new(),
+            verdict: "inconclusive".to_string(),
+        });
+        assert!(!recovery_requires_worktree_reset(&state, true));
+        assert!(recovery_requires_worktree_reset(&state, false));
     }
 
     #[test]

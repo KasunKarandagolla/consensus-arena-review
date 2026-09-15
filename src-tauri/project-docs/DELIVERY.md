@@ -1,6 +1,6 @@
 # Consensus Arena — Build / Delivery Lane
 
-**Current evidence:** `audits/delivery-dsh-v4-worker-and-e2e.md`
+**Current evidence:** `audits/delivery-v1-programme-qualification-2026-09-16.md`
 (2026-09-15 to 2026-09-16), with
 `audits/delivery-dsh-tool-loop-and-linux-e2e.md`,
 `audits/delivery-loop-v1-linux-runtime-qualification.md` and
@@ -54,6 +54,13 @@ The current source expects a DSH CLI invocation of
 `.arena-runtime/result.json` worker receipt. No DSH version is pinned by Arena.
 
 Arena does **not** currently install/package DSH.
+
+The reproducibility qualification found one exact top-level
+`@deepseek-ai/dsh@0.1.5-rc.1` package with rc2 transitive components selected by
+declared semver ranges. The tested external runtime is reproducible from its
+package manifest and frozen pnpm lockfile, subject to registry/store and
+external profile availability. Arena does not treat the mixed tree as a reason
+to upgrade or downgrade DSH without a new qualification.
 
 ### 4. Acceptance authoring and freeze
 
@@ -152,6 +159,9 @@ Audit establishes:
   blank in this qualification session. No genuine Delivery UI run was started
   and no middle-stage manual substitution was used.
 - Windows runtime parity remains a separate qualification requirement.
+- A source/test hardening pass now preserves an uncommitted candidate during
+  INCONCLUSIVE verification resume, constrains receipt IDs, explicitly waits
+  for DSH timeout cleanup, and filters delayed Delivery UI events by session.
 - Delivery V1 currently implements its own bounded orchestration. The post-gates strategy selects Dagu as a candidate to remove more durable workflow/wait/retry mechanics, but Dagu is not integrated.
 
 ## Next architecture candidate: Dagu

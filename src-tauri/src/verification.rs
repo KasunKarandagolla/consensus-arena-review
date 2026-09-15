@@ -8,6 +8,7 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
 const MAX_CAPTURE_BYTES: usize = 128 * 1024;
+const MAX_COMMAND_ID_LENGTH: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerificationCommand {
@@ -116,6 +117,49 @@ fn path_is_relative(path: &str) -> bool {
         && !path.to_string_lossy().contains(':')
 }
 
+fn command_id_allowed(id: &str) -> bool {
+    if id.is_empty()
+        || id.len() > MAX_COMMAND_ID_LENGTH
+        || id == "."
+        || id == ".."
+        || !id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return false;
+    }
+    let stem = id
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    !matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
 pub fn program_allowed(program: &str) -> bool {
     if program.trim().is_empty() || program.starts_with('-') || !path_is_relative(program) {
         return false;
@@ -126,7 +170,7 @@ pub fn program_allowed(program: &str) -> bool {
 }
 
 pub fn validate_command(repo: &Path, command: &VerificationCommand) -> Result<(), String> {
-    if command.id.trim().is_empty() || !program_allowed(&command.program) {
+    if !command_id_allowed(&command.id) || !program_allowed(&command.program) {
         return Err(format!(
             "verification command {} uses a disallowed program",
             command.id
@@ -169,7 +213,7 @@ pub fn validate_profile(profile: &VerificationProfile, repo: &Path) -> Result<()
     }
     let mut command_ids = HashSet::new();
     for command in &profile.commands {
-        if command.id.trim().is_empty()
+        if !command_id_allowed(&command.id)
             || command.program.trim().is_empty()
             || !path_is_relative(&command.cwd)
         {
@@ -444,6 +488,15 @@ mod tests {
         assert!(program_allowed("cargo"));
         assert!(program_allowed("./gradlew"));
         assert!(!program_allowed("node_modules/.bin/tester"));
+    }
+
+    #[test]
+    fn rejects_unsafe_receipt_command_ids() {
+        assert!(!command_id_allowed("../outside"));
+        assert!(!command_id_allowed("nested/check"));
+        assert!(!command_id_allowed("CON"));
+        assert!(!command_id_allowed("receipt:check"));
+        assert!(command_id_allowed("frontend-build.v1"));
     }
 
     #[test]

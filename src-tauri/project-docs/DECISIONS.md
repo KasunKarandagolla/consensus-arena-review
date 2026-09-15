@@ -54,7 +54,9 @@ DSH is **not** the owner of Arena product decisions, acceptance authority, or du
 
 **Accepted as next validation direction. Not implemented yet.** Dagu is attractive because it provides local durable runs, retries/history, processless root human tasks, REST/CLI control, and an existing DSH harness composition.
 
-Do not code Dagu into Arena without a focused integrated slice proving the actual wait/restart/duplicate-answer/repair semantics on Linux and then Windows.
+Do not code Dagu into Arena without first passing the standalone falsification
+gate, followed by a focused integrated slice proving the actual
+wait/restart/duplicate-answer/repair semantics on Linux and then Windows.
 
 If Dagu fails materially, keep the stable work-order/worker/verifier contracts and fall back to a small Arena-owned controller. Do not reopen the entire agent-substrate search automatically.
 

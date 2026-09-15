@@ -46,7 +46,7 @@ Do **not** load every project document for a narrow task. This documentation is 
 
 ## Current verified transition point
 
-The latest local post-implementation audit establishes a first Build vertical slice with these invariants:
+The latest local post-implementation audit establishes a first Build vertical slice with these invariants at source/test level:
 
 - Consult mode remains separate and unchanged.
 - Build mode does not require leader/participants or model WebViews.
@@ -73,6 +73,13 @@ did change a repository and emit a schema-1 receipt through the same DSH
 boundary, so DSH remains promising while the requested V4 route remains
 unqualified. Full Arena Delivery E2E and runtime reliability branches remain
 unproven.
+
+The 2026-09-16 programme qualification fixed the INCONCLUSIVE resume
+candidate-preservation defect, hardened evidence receipt IDs and DSH timeout
+cleanup, and added a stale Delivery-event guard. Native WebKitGTK still renders
+blank on the current Linux session because DRI/EGL authentication is
+unavailable; no UI-to-Apply run was claimed. See
+`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/delivery-v1-programme-qualification-2026-09-16.md`.
 
 See `audits/delivery-dsh-v4-worker-and-e2e.md` for the permanent evidence.
 

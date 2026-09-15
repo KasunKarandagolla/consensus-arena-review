@@ -30,6 +30,8 @@ export function useIpcListeners() {
 
       cleanups.push(await listen('delivery-state', (e) => {
         const payload = e.payload as import('@/stores/useAppStore').DeliveryState
+        const current = useAppStore.getState().deliveryState
+        if (current && current.session_id !== payload.session_id) return
         store.setActiveMode('delivery')
         store.setDeliveryState({ ...useAppStore.getState().deliveryState, ...payload })
       }))
