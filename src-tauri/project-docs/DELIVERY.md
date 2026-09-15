@@ -1,7 +1,8 @@
 # Consensus Arena — Build / Delivery Lane
 
-**Current evidence:** `audits/delivery-dsh-tool-loop-and-linux-e2e.md`
-(2026-09-15), with
+**Current evidence:** `audits/delivery-dsh-v4-worker-and-e2e.md`
+(2026-09-15 to 2026-09-16), with
+`audits/delivery-dsh-tool-loop-and-linux-e2e.md`,
 `audits/delivery-loop-v1-linux-runtime-qualification.md` and
 `audits/delivery-loop-v1-post.md` retained as preceding audits.
 
@@ -141,14 +142,15 @@ Audit establishes:
 ## Current known limitations
 
 - DSH must already be available; Arena does not package/install it.
-- The current direct provider qualification did not prove native
-  `message.tool_calls` for `nvidia/nemotron-3-super-120b-a12b`; the one
-  permitted documented fallback, `moonshotai/kimi-k2-instruct`, returned HTTP
-  410. DSH `0.1.5-rc.1` was not started because its native tool-loop
-  precondition was not met, so standalone coding and full Delivery E2E remain
-  unproven. See `audits/delivery-dsh-tool-loop-and-linux-e2e.md`.
-- A display-capable `tauri dev` relaunch rendered the current New session
-  screen and the Build setup UI. No Delivery run was started.
+- DeepSeek V4 Flash `deepseek-ai/deepseek-v4-flash-0731` reached the NVIDIA
+  model-list endpoint, but bounded inference timed out and its standalone DSH
+  run did not produce a coding change or worker receipt. The single permitted
+  control, `meta/muse-glimmer-30b`, completed a real DSH coding task and
+  emitted an Arena-shaped schema-1 worker receipt. The current default model
+  was not changed. See `audits/delivery-dsh-v4-worker-and-e2e.md`.
+- Native X11 launch was reconfirmed, but the managed `tauri dev` WebView was
+  blank in this qualification session. No genuine Delivery UI run was started
+  and no middle-stage manual substitution was used.
 - Windows runtime parity remains a separate qualification requirement.
 - Delivery V1 currently implements its own bounded orchestration. The post-gates strategy selects Dagu as a candidate to remove more durable workflow/wait/retry mechanics, but Dagu is not integrated.
 

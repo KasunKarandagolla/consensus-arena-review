@@ -27,7 +27,15 @@ DSH is **not** selected as Arena's full durable product substrate. Multiple host
 
 ### Current role
 
-**Use narrowly** as bounded coding/debugging/repair worker with the proven NIM configuration.
+**Use narrowly** as the bounded coding/debugging/repair worker contract, but
+keep hosted model qualification explicit. The 2026-09-15/16 qualification
+proved the same DSH/OpenAI-completions boundary with the permitted Muse Glimmer
+control, while `deepseek-ai/deepseek-v4-flash-0731` timed out during bounded
+inference and did not complete the worker contract. DSH therefore remains
+promising but the current V4 route is not qualified.
+
+See `audits/delivery-dsh-v4-worker-and-e2e.md` for the route, receipt, and
+resource evidence.
 
 Do not upgrade the tested DSH version merely to chase features without qualification; upstream moves quickly.
 

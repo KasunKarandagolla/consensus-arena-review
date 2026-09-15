@@ -1,6 +1,6 @@
 # Consensus Arena — Project Documentation Index
 
-**Last refreshed:** 2026-09-15
+**Last refreshed:** 2026-09-16
 **Purpose:** Small, modular source-of-truth documents for humans, ChatGPT, and Codex working on Consensus Arena.
 
 ## Current product in one paragraph
@@ -57,20 +57,24 @@ The latest local post-implementation audit establishes a first Build vertical sl
 - `needs_user` is persisted before the existing AskUser event is emitted; restart can re-present the persisted question.
 - Apply is explicit and only fast-forwards a clean, unchanged original checkout to a verified candidate.
 - DSH is not yet bundled/installed by Arena.
-- Native Linux Tauri launch and the Build UI setup screen are now runtime-proven.
-  A complete model-backed Delivery GUI dogfood run remains unproven because
-  the qualified external DSH run did not complete a disposable coding change.
+- Native Linux Tauri launch was reconfirmed, but the managed WebView was blank
+  during the latest qualification session, so no Delivery UI dogfood run was
+  started in that session.
 
 See `DELIVERY.md`, `audits/delivery-loop-v1-linux-runtime-qualification.md`,
 and the current qualification record in
-`audits/delivery-dsh-tool-loop-and-linux-e2e.md`.
+`audits/delivery-dsh-v4-worker-and-e2e.md`.
 
-The current qualification record adds a direct provider contract probe: the
-selected Nemotron route did not return native OpenAI `tool_calls`, and the one
-permitted documented fallback route returned HTTP 410. DSH therefore was not
-started because its required native tool-loop precondition was not met. A
-display-capable relaunch did render the current Build setup UI, but the real
-model-backed Delivery loop remains unproven.
+The current qualification record adds a direct DeepSeek V4 Flash provider
+sanity check and a real DSH comparison. V4 Flash reached model listing but
+bounded inference timed out; its standalone DSH task did not change a
+repository or emit a worker receipt. The single permitted Muse Glimmer control
+did change a repository and emit a schema-1 receipt through the same DSH
+boundary, so DSH remains promising while the requested V4 route remains
+unqualified. Full Arena Delivery E2E and runtime reliability branches remain
+unproven.
+
+See `audits/delivery-dsh-v4-worker-and-e2e.md` for the permanent evidence.
 
 ## Current strategic next layer
 
@@ -78,7 +82,7 @@ After seven substrate qualification sessions and a post-gates Astra consultation
 
 > Arena product authority + reusable durable workflow mechanics + bounded worker + independent deterministic verification.
 
-**Dagu** is the selected next workflow-engine candidate to validate because it offers local durable runs, retries/history, root human tasks, REST/CLI control, and an existing `harness.run` composition for DeepSeek Harness. **Dagu is not yet part of the current implemented Build lane.** Do not document or code as though it is already integrated.
+**Dagu** remains a deferred workflow-engine candidate because it offers local durable runs, retries/history, root human tasks, REST/CLI control, and an existing `harness.run` composition for DeepSeek Harness. **Dagu is not yet part of the current implemented Build lane and is not the next action from this qualification.** Finish Linux runtime reliability and genuine Delivery E2E with a proven worker profile before any Dagu validation.
 
 ## Documentation maintenance
 

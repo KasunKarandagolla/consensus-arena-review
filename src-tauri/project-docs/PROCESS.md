@@ -42,6 +42,15 @@ npm run build
 
 Use real project paths/source layout rather than assuming the historical command examples are exact.
 
+For hosted-worker qualification, first establish the installed provider
+adapter contract, then run a bounded direct provider sanity check and one
+deterministic standalone repository task. A model response or HTTP success is
+not worker proof: the task must make the repository change and emit the
+structured receipt consumed by Arena. Use one control model only when a
+primary route failure leaves DSH-versus-provider ownership ambiguous. Record
+route failures and runtime blockers in a new permanent audit; do not change
+Arena's default model or start Dagu from incomplete worker evidence.
+
 ## Product-change discipline
 
 Before building a new subsystem ask:
