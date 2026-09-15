@@ -751,6 +751,7 @@ pub async fn run_agent_loop(
         crate::context_manager::SessionType::Api => "api",
         crate::context_manager::SessionType::Security => "security",
         crate::context_manager::SessionType::Custom => "custom",
+        crate::context_manager::SessionType::Delivery => "delivery",
     }
     .to_string();
     let memory_context = {

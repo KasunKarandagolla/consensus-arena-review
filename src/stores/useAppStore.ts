@@ -53,6 +53,8 @@ export interface ActiveBrainStatus {
   kind: ActiveBrainKind
   model: string
 }
+export type DeliveryPhase = 'preparing'|'authoring_acceptance'|'waiting_for_user'|'acceptance_ready'|'implementing'|'verifying'|'repairing'|'verified'|'applied'|'cancelled'|'failed'
+export interface DeliveryState { session_id:string; phase:DeliveryPhase; status_text?:string; message?:string; attempt:number; objective:string; verification_summary?:string|null; candidate_commit?:string|null; branch_name?:string; contract?:{revision:number;acceptance_criteria:{id:string;description:string}[]}; last_verification?:unknown }
 
 // ── Hackathon types (frontend-safe) ────────────────────────────────────────────
 
@@ -106,6 +108,8 @@ export interface HackathonRunSafe {
 }
 
 export interface AppStore {
+  activeMode: 'consult' | 'delivery'
+  deliveryState: DeliveryState | null
   // P3: unified participant registry (built-ins + persisted custom)
   participants: Participant[]
   setParticipants: (participants: Participant[]) => void
@@ -162,6 +166,8 @@ export interface AppStore {
 
   // Actions
   setSessionStatus: (status: AppStore['sessionStatus']) => void
+  setActiveMode: (mode: AppStore['activeMode']) => void
+  setDeliveryState: (state: DeliveryState | null) => void
   setIsDraftSession: (isDraft: boolean) => void
   addSetupProgress: (agentId: string) => void
   clearSetupProgress: () => void
@@ -212,6 +218,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setParticipants: (participants) => set({ participants }),
 
   sessionStatus: 'idle',
+  activeMode: 'consult',
+  deliveryState: null,
   isDraftSession: false,
   setupProgress: [],
   selectedSessionId: null,
@@ -239,6 +247,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   hackathonOpen: false,
 
   setSessionStatus: (status) => set({ sessionStatus: status }),
+  setActiveMode: (activeMode) => set({ activeMode }),
+  setDeliveryState: (deliveryState) => set({ deliveryState }),
   setIsDraftSession: (isDraft) => set({ isDraftSession: isDraft }),
   addSetupProgress: (agentId) => set((s) => ({
     setupProgress: s.setupProgress.includes(agentId)

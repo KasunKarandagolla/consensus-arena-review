@@ -1,50 +1,86 @@
-# Consensus Arena Project Documentation
+# Consensus Arena — Project Documentation Index
 
-## Current status
+**Last refreshed:** 2026-09-15
+**Purpose:** Small, modular source-of-truth documents for humans, ChatGPT, and Codex working on Consensus Arena.
 
-The backend is feature-complete for the documented scope. The production
-React frontend has been rebuilt from
-`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/mockup/preview.html`
-while preserving the existing Tauri IPC contract. The preview design is the
-current implemented baseline and must not be replaced without explicit
-approval.
+## Current product in one paragraph
 
-The backend and frontend builds passed during the Phase 1 post-audit. Phase 1
-Memory is implemented and checkpointed at `f0847c0`. A real interactive Tauri
-memory test remains before Phase 2 Skills: exercise Route, RouteCompare,
-Blueprint, AskUser, export, and restore. Evidence is recorded in
-`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/phase1-memory-post.md`.
+Consensus Arena is a native Tauri 2 desktop application evolving from an AI expert-panel blueprint tool into a **product-authority and delivery system for a nontechnical product owner**. It now has two deliberately separate lanes:
 
-## AGENTS.md
-Current path: `/home/kasun/Music/arena/consensus-arena/AGENTS.md`.
+1. **Consult** — the existing leader-driven frontier-model consultation system using authenticated consumer web chats and an OpenAI-compatible orchestration brain.
+2. **Build / Delivery** — a new parallel lane that can take bounded product work into an isolated Git worktree, use a bounded DSH worker, freeze executable acceptance material, verify independently, repair with bounded attempts, persist owner questions, and apply only a verified candidate under strict Git preconditions.
 
-Codex reads this automatically at the start of every session in that
-project folder (per the Codex CLI guide's section 9). It bakes in every
-non-negotiable constraint, named risk, and design ground truth from this
-project so you don't have to repeat them by hand in every prompt.
+The long-term direction is not to turn Arena into another coding-agent platform. Arena should own **product intent, owner decisions, progression policy, and acceptance authority**, while reusing external workers, workflow engines, Git, test runners, browser/native automation, deployment tools, and other commodity infrastructure.
 
-## PROCESS-md-codex-patch.md
-Historical patch retained for context. Its Codex CLI workflow is now
-incorporated into PROCESS.md.
+## Reality hierarchy
 
-## CLAUDE-PROJECT-INSTRUCTIONS.md
-Project context, constraints, current state, and named risks for Claude.
+When sources disagree, use this order:
 
-## Development launch
+1. **Current source and runtime evidence**
+2. **Latest permanent audit in `audits/`**
+3. **These project docs**
+4. Historical prompts/specifications/research
 
-```bash
-cd /home/kasun/Music/arena/consensus-arena
-npm run tauri dev
-```
+Do not preserve a doc claim because it is written here. Correct the docs when current source proves otherwise.
 
-## Verification
+The post-gates Delivery audits dated 2026-09-14 supersede the older consultation-only status language in the previous project docs.
 
-```bash
-cd /home/kasun/Music/arena/consensus-arena/src && npm run build
-cd /home/kasun/Music/arena/consensus-arena/src-tauri && cargo check
-cd /home/kasun/Music/arena/consensus-arena && git diff --check
-```
+## Read only what the task needs
 
-Read real source before changing status claims. As of the Phase 1 Memory
-post-audit, the verified counts are 16 AppState fields and 38 Tauri commands
-defined/registered; recount from source whenever a task depends on them.
+Always read `DECISIONS.md` first after this index, then use this map.
+
+| Task | Read next |
+|---|---|
+| Product direction / scope / user experience | `PRODUCT.md`, `DECISIONS.md`, `SUBSTRATE_RESEARCH.md` |
+| Overall system architecture | `ARCHITECTURE.md`, then lane-specific doc |
+| Legacy expert-panel / browser consultation | `CONSULTATION.md`, `BACKEND.md`, `IPC.md`, `RELIABILITY.md` |
+| Build / Delivery work | `DELIVERY.md`, `BACKEND.md`, `IPC.md`, `RELIABILITY.md` |
+| Dagu / DSH / substrate decisions | `SUBSTRATE_RESEARCH.md`, `DELIVERY.md`, `DECISIONS.md` |
+| Frontend / UX | `FRONTEND.md`, `PRODUCT.md`, `IPC.md` |
+| IPC / Tauri commands / events | `IPC.md`, then real Rust command/event source |
+| Memory | `MEMORY.md`, `BACKEND.md` |
+| Reliability / audits / recovery | `RELIABILITY.md`, relevant lane doc, latest audit |
+| Coding or implementation | `PROCESS.md`, root `AGENTS.md`, plus relevant technical docs |
+
+Do **not** load every project document for a narrow task. This documentation is intentionally modular to save context.
+
+## Current verified transition point
+
+The latest local post-implementation audit establishes a first Build vertical slice with these invariants:
+
+- Consult mode remains separate and unchanged.
+- Build mode does not require leader/participants or model WebViews.
+- Work occurs in an isolated `arena-delivery/<short-id>` Git worktree created from a clean base.
+- DSH is currently a bounded external worker, not Arena's durable product authority.
+- Executable acceptance material is authored **before implementation**, frozen, protected by hashes, and verified independently from worker narration.
+- Required checks are rerun after repair; attempts are bounded.
+- `needs_user` is persisted before the existing AskUser event is emitted; restart can re-present the persisted question.
+- Apply is explicit and only fast-forwards a clean, unchanged original checkout to a verified candidate.
+- DSH is not yet bundled/installed by Arena.
+- The new Build lane has not yet been proven through a complete real Tauri GUI dogfood run in the supplied audits.
+
+See `DELIVERY.md` and `audits/delivery-loop-v1-post.md`.
+
+The 2026-09-15 runtime dogfood audit records the first environment-level
+attempt: frontend dev startup and source verification succeeded, but DSH was
+not installed and the current native binary did not finish building within the
+available local runtime window. The real GUI Delivery loop therefore remains
+unproven.
+
+## Current strategic next layer
+
+After seven substrate qualification sessions and a post-gates Astra consultation, the accepted architecture is **not** a monolithic agent substrate. The current recommendation is:
+
+> Arena product authority + reusable durable workflow mechanics + bounded worker + independent deterministic verification.
+
+**Dagu** is the selected next workflow-engine candidate to validate because it offers local durable runs, retries/history, root human tasks, REST/CLI control, and an existing `harness.run` composition for DeepSeek Harness. **Dagu is not yet part of the current implemented Build lane.** Do not document or code as though it is already integrated.
+
+## Documentation maintenance
+
+After a meaningful milestone:
+
+1. verify source/runtime first;
+2. update only affected modular docs;
+3. add or retain a permanent audit under `src-tauri/project-docs/audits/`;
+4. update `DECISIONS.md` if a durable architecture/product decision changed;
+5. update this index only if the document map/current transition point changed.

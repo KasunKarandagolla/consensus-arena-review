@@ -612,6 +612,7 @@ pub async fn run_setup(
         crate::orchestrator::SessionType::Api => "API Design",
         crate::orchestrator::SessionType::Security => "Security Review",
         crate::orchestrator::SessionType::Custom => "Custom",
+        crate::orchestrator::SessionType::Delivery => "Delivery",
     }
     .to_string();
 

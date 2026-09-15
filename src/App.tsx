@@ -9,6 +9,7 @@ import EmptyView from '@/components/views/EmptyView'
 import SetupView from '@/components/views/SetupView'
 import PrimingView from '@/components/views/PrimingView'
 import ActiveView from '@/components/views/ActiveView'
+import DeliveryView from '@/components/views/DeliveryView'
 import AskUserPopup from '@/components/overlays/AskUserPopup'
 import CaptchaOverlay from '@/components/overlays/CaptchaOverlay'
 import RateLimitOverlay from '@/components/overlays/RateLimitOverlay'
@@ -19,7 +20,7 @@ import HackathonMiniWindow from '@/components/hackathon/HackathonMiniWindow'
 export default function App() {
   useIpcListeners()
 
-  const { sessionStatus, askUserPending, captchaPending, setRecoveryState } = useAppStore()
+  const { sessionStatus, askUserPending, captchaPending, setRecoveryState, activeMode } = useAppStore()
 
   // Batch D: the runtime <style> injection (INJECTED_STYLES) that used to
   // live here has been removed. All those keyframes/classes now live in
@@ -34,6 +35,16 @@ export default function App() {
   // name resolution is populated for the whole session.
   useEffect(() => {
     void loadParticipants()
+    invoke<string>('get_delivery_recovery_state')
+      .then((raw) => {
+        if (!raw || raw === 'null') return
+        const delivery = JSON.parse(raw) as import('@/stores/useAppStore').DeliveryState | null
+        if (delivery) {
+          useAppStore.getState().setDeliveryState(delivery)
+          useAppStore.getState().setActiveMode('delivery')
+        }
+      })
+      .catch(() => {})
     invoke<string>('get_recovery_state')
       .then((raw) => {
         const state = JSON.parse(raw) as { available: boolean; session_id: string }
@@ -61,7 +72,8 @@ export default function App() {
       <Sidebar />
 
       <main className="main-shell">
-        {sessionStatus === 'idle' && <EmptyView />}
+        {activeMode === 'delivery' && <DeliveryView />}
+        {activeMode === 'consult' && sessionStatus === 'idle' && <EmptyView />}
         {sessionStatus === 'setup' && <SetupView />}
         {(sessionStatus === 'priming' || sessionStatus === 'requirements') && <PrimingView />}
         {isActive && <ActiveView />}

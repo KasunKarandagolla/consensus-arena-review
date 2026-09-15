@@ -8,6 +8,7 @@ pub enum SessionType {
     Api,
     Security,
     Custom,
+    Delivery,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

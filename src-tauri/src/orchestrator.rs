@@ -179,6 +179,8 @@ pub struct AppState {
     pub pause_requested: Arc<AtomicBool>,
     /// Last persisted checkpoint (mirrors settings_store key checkpoint:<session_id>, cached).
     pub checkpoint: Arc<Mutex<Option<crate::checkpoint::SessionCheckpoint>>>,
+    pub delivery_state: Arc<Mutex<Option<crate::delivery::DeliveryState>>>,
+    pub delivery_state_path: PathBuf,
 }
 
 impl AppState {
@@ -248,6 +250,8 @@ impl AppState {
             hackathon_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pause_requested: Arc::new(AtomicBool::new(false)),
             checkpoint: Arc::new(Mutex::new(None)),
+            delivery_state: Arc::new(Mutex::new(None)),
+            delivery_state_path: PathBuf::from(data_dir).join("delivery-state.json"),
         }
     }
 }

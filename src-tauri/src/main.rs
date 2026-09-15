@@ -13,6 +13,8 @@ mod commands;
 mod context_manager;
 mod critical_transport;
 mod db_helpers;
+mod delivery;
+mod dsh_worker;
 mod errors;
 mod hackathon;
 mod memory_store;
@@ -30,6 +32,7 @@ mod signals;
 mod token_budget;
 mod transcript_store;
 mod turn_manager;
+mod verification;
 
 use orchestrator::AppState;
 use tauri::{Emitter, Manager};
@@ -96,6 +99,12 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             // Session management
             commands::start_session,
+            commands::start_delivery,
+            commands::get_delivery_state,
+            commands::get_delivery_recovery_state,
+            commands::resume_delivery,
+            commands::abort_delivery,
+            commands::apply_delivery,
             // BUGFIX (Cline audit, post-Batch-D): pause_session and
             // resume_session were fully implemented in commands.rs but were
             // never registered here — the frontend could never actually call

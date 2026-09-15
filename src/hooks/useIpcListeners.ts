@@ -28,6 +28,12 @@ export function useIpcListeners() {
     async function setup() {
       const store = useAppStore.getState()
 
+      cleanups.push(await listen('delivery-state', (e) => {
+        const payload = e.payload as import('@/stores/useAppStore').DeliveryState
+        store.setActiveMode('delivery')
+        store.setDeliveryState({ ...useAppStore.getState().deliveryState, ...payload })
+      }))
+
       // session-status
       cleanups.push(await listen('session-status', (e) => {
         const { status, setup_order, selected_agent_ids } = e.payload as {

@@ -52,9 +52,51 @@ impl TranscriptStore {
                 response TEXT NOT NULL,
                 consensus_signal TEXT NOT NULL,
                 timestamp INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS delivery_runs (
+                session_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
             );",
             )
             .map_err(AgentError::from)
+    }
+
+    pub fn save_delivery_state(
+        &mut self,
+        session_id: &str,
+        state_json: &str,
+        updated_at: i64,
+    ) -> Result<(), AgentError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO delivery_runs (session_id, state_json, updated_at) VALUES (?1, ?2, ?3)",
+            params![session_id, state_json, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_delivery_state(&self, session_id: &str) -> Result<Option<String>, AgentError> {
+        match self.conn.query_row(
+            "SELECT state_json FROM delivery_runs WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(SqliteError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(AgentError::from(error)),
+        }
+    }
+
+    pub fn get_latest_delivery_state(&self) -> Result<Option<String>, AgentError> {
+        match self.conn.query_row(
+            "SELECT state_json FROM delivery_runs ORDER BY updated_at DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(SqliteError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(AgentError::from(error)),
+        }
     }
 
     pub fn create_session(&mut self, config: &SessionConfig) -> Result<(), AgentError> {

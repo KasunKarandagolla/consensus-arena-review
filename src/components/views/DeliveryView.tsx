@@ -1,0 +1,15 @@
+import { useEffect } from 'react'
+import { safeInvoke as invoke } from '@/lib/tauri'
+import { useAppStore, type DeliveryState } from '@/stores/useAppStore'
+import Topbar from '@/components/layout/Topbar'
+
+export default function DeliveryView() {
+  const state = useAppStore(s => s.deliveryState)
+  const setState = useAppStore(s => s.setDeliveryState)
+  useEffect(() => { invoke<string>('get_delivery_state').then(raw => { try { const parsed = JSON.parse(raw) as DeliveryState|null; if (parsed) setState(parsed) } catch {} }).catch(() => {}) }, [setState])
+  const terminal = state?.phase === 'verified' || state?.phase === 'applied' || state?.phase === 'cancelled' || state?.phase === 'failed'
+  async function apply(){try{await invoke('apply_delivery',{session_id:state?.session_id});}catch(error){useAppStore.getState().addToast(String(error),7000)}}
+  async function resume(){try{await invoke('resume_delivery')}catch(error){useAppStore.getState().addToast(String(error),7000)}}
+  async function abort(){if(state)try{await invoke('abort_delivery',{session_id:state.session_id})}catch(error){useAppStore.getState().addToast(String(error),7000)}}
+  return <section className="view"><Topbar title={state?.objective?.slice(0,48) || 'Build'} /><div className="scroll pt" style={{display:'flex',justifyContent:'center'}}><div className="fw"><div className="fh">{state?.status_text || state?.message || 'Preparing your build…'}</div><div className="fh-sub">Arena owns acceptance and verification; worker prose never marks a build successful.</div>{state?.contract?.acceptance_criteria?.length ? <div className="fg"><label className="fl">This build will be considered successful when:</label>{state.contract.acceptance_criteria.map(c=><div key={c.id} style={{padding:'8px 0',color:'var(--t2)'}}>✓ {c.description}</div>)}</div> : null}{state && <div className="fg" style={{color:'var(--t3)',fontSize:12}}>Attempt {state.attempt} · {state.branch_name || 'isolated candidate'}{state.verification_summary ? ` · ${state.verification_summary}` : ''}</div>}{state?.phase === 'verified' && <button className="btn-p" onClick={()=>void apply()}>Apply</button>}{state?.phase === 'applied' && <div className="form-success">Candidate applied safely to the original branch.</div>}{terminal && state?.phase !== 'verified' && state?.phase !== 'applied' && <button className="btn-p" onClick={()=>void resume()}>Resume build</button>}{!terminal && <button className="sv-btn" onClick={()=>void abort()}>Stop build</button>}</div></div></section>
+}

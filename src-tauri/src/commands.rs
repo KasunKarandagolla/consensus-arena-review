@@ -17,6 +17,367 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
+async fn git_command(
+    repo: &std::path::Path,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .await
+        .map_err(|error| format!("run git {}: {error}", args.join(" ")))
+}
+
+async fn read_delivery_state(
+    state: &AppState,
+) -> Result<Option<crate::delivery::DeliveryState>, String> {
+    let db = state.transcript_store.clone();
+    let raw = crate::db_helpers::run_blocking(move || {
+        let store = db.lock().map_err(|_| {
+            crate::errors::AgentError::DatabaseError(
+                "delivery transcript lock poisoned".to_string(),
+            )
+        })?;
+        store.get_latest_delivery_state()
+    })
+    .await
+    .map_err(|error| format!("read delivery state: {error}"))?;
+    let raw = raw.or_else(|| std::fs::read_to_string(&state.delivery_state_path).ok());
+    raw.map(|value| {
+        serde_json::from_str(&value).map_err(|error| format!("invalid delivery state: {error}"))
+    })
+    .transpose()
+}
+
+async fn launch_delivery(
+    state: &AppState,
+    app: &AppHandle,
+    value: crate::delivery::DeliveryState,
+    resume: bool,
+) -> Result<(), String> {
+    let id = value.session_id.clone();
+    let permit = if resume {
+        state.session_runtime.try_acquire_resume(id)?
+    } else {
+        state.session_runtime.try_acquire_start(id)?
+    };
+    launch_delivery_with_permit(state, app, value, permit)
+}
+
+fn launch_delivery_with_permit(
+    state: &AppState,
+    app: &AppHandle,
+    value: crate::delivery::DeliveryState,
+    permit: crate::session_runtime::SessionStartPermit,
+) -> Result<(), String> {
+    let owner = permit.owner();
+    let handle = tokio::spawn(crate::delivery::run(
+        state.session_runtime.clone(),
+        app.clone(),
+        value,
+        state.delivery_state_path.clone(),
+        owner,
+        state.delivery_state.clone(),
+        state.transcript_store.clone(),
+        state.ask_user_tx.clone(),
+        state.settings_store.clone(),
+    ));
+    let (activate_tx, _activate_rx) = tokio::sync::oneshot::channel();
+    permit.commit(handle, activate_tx)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn start_delivery(
+    objective: String,
+    repo_path: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let objective = objective.trim().to_string();
+    if objective.is_empty() {
+        return Err("Build objective is required".to_string());
+    }
+    let repo = std::path::PathBuf::from(repo_path.trim());
+    if !repo.is_dir() {
+        return Err("Project folder does not exist".to_string());
+    }
+    let repo = repo
+        .canonicalize()
+        .map_err(|error| format!("resolve project folder: {error}"))?;
+    let top = git_command(&repo, &["rev-parse", "--show-toplevel"]).await?;
+    if !top.status.success() {
+        return Err("Project folder must be a Git repository".to_string());
+    }
+    let git_root = std::path::PathBuf::from(String::from_utf8_lossy(&top.stdout).trim());
+    if git_root.canonicalize().ok().as_ref() != Some(&repo) {
+        return Err("Choose the repository root, not a subdirectory".to_string());
+    }
+    let dirty = git_command(&repo, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    if !dirty.status.success() {
+        return Err("Could not inspect the Git working tree".to_string());
+    }
+    if !dirty.stdout.is_empty() {
+        return Err(
+            "Delivery requires a clean base working tree; Arena will not stash or discard changes"
+                .to_string(),
+        );
+    }
+    let head = git_command(&repo, &["rev-parse", "HEAD"]).await?;
+    if !head.status.success() {
+        return Err("Could not resolve repository HEAD".to_string());
+    }
+    let base = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let brain = state
+        .settings_store
+        .lock()
+        .await
+        .get_agent_brain_config()
+        .map_err(|error| format!("read Agent Brain settings: {error}"))?;
+    if brain.api_key.trim().is_empty()
+        || brain.base_url.trim().is_empty()
+        || brain.model.trim().is_empty()
+    {
+        return Err("Configure the primary Agent Brain before starting Build mode".to_string());
+    }
+    let id = Uuid::new_v4().to_string();
+    // Reserve the single runtime owner before creating any worktree, session
+    // row, or persisted delivery state. Concurrent Build clicks must not
+    // leave an orphaned candidate after one launch loses admission.
+    let permit = state
+        .session_runtime
+        .try_acquire_start(id.clone())
+        .map_err(|error| error.to_string())?;
+    let short = id.chars().take(8).collect::<String>();
+    let data_dir = state
+        .delivery_state_path
+        .parent()
+        .ok_or_else(|| "invalid Arena data directory".to_string())?;
+    let worktree = data_dir.join("delivery-worktrees").join(&id);
+    let branch = format!("arena-delivery/{short}");
+    std::fs::create_dir_all(
+        worktree
+            .parent()
+            .ok_or_else(|| "invalid worktree directory".to_string())?,
+    )
+    .map_err(|error| format!("create delivery worktree directory: {error}"))?;
+    let add = tokio::process::Command::new("git")
+        .args(["worktree", "add", "-b", &branch])
+        .arg(&worktree)
+        .arg(&base)
+        .current_dir(&repo)
+        .output()
+        .await
+        .map_err(|error| format!("create isolated worktree: {error}"))?;
+    if !add.status.success() {
+        return Err(format!(
+            "could not create isolated worktree: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        ));
+    }
+    let id_for_db = id.clone();
+    let config = SessionConfig {
+        session_id: id.clone(),
+        project_brief: objective.clone(),
+        session_type: SessionType::Delivery,
+        agent_ids: Vec::new(),
+        leader_agent_id: String::new(),
+    };
+    let db = state.transcript_store.clone();
+    crate::db_helpers::run_blocking(move || {
+        let mut store = db.lock().map_err(|_| {
+            crate::errors::AgentError::DatabaseError(
+                "delivery transcript lock poisoned".to_string(),
+            )
+        })?;
+        store.create_session(&config)
+    })
+    .await
+    .map_err(|error| format!("create delivery session: {error}"))?;
+    let now = chrono::Utc::now().timestamp();
+    let mut value = crate::delivery::DeliveryState {
+        schema_version: crate::delivery::DELIVERY_SCHEMA_VERSION,
+        session_id: id_for_db.clone(),
+        objective: objective.clone(),
+        source_workspace: repo.to_string_lossy().into(),
+        worktree_path: worktree.to_string_lossy().into(),
+        branch_name: branch,
+        base_commit: base,
+        phase: crate::delivery::DeliveryPhase::Preparing,
+        contract: Some(crate::delivery::DeliveryContract {
+            revision: 1,
+            objective,
+            acceptance_criteria: Vec::new(),
+            constraints: vec!["No deployment or external infrastructure changes".to_string()],
+            worker_brief: "Acceptance tests are frozen before implementation".to_string(),
+        }),
+        user_answers: Vec::new(),
+        protected_files: Vec::new(),
+        protected_hashes: Vec::new(),
+        verification_commands: Vec::new(),
+        acceptance_commit: None,
+        attempt: 0,
+        pending_question: None,
+        waiting_phase: None,
+        candidate_commit: None,
+        last_worker_summary: None,
+        last_verification: None,
+        created_at: now,
+        updated_at: now,
+        message: "Preparing project…".to_string(),
+    };
+    crate::delivery::persist_state(
+        &state.delivery_state_path,
+        &state.delivery_state,
+        &state.transcript_store,
+        &mut value,
+    )
+    .await?;
+    launch_delivery_with_permit(state.inner(), &app, value, permit)?;
+    Ok(id_for_db)
+}
+
+#[tauri::command]
+pub async fn get_delivery_state(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    serde_json::to_string(&read_delivery_state(state.inner()).await?)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_delivery_recovery_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    get_delivery_state(state).await
+}
+
+#[tauri::command]
+pub async fn resume_delivery(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let mut value = read_delivery_state(state.inner())
+        .await?
+        .ok_or_else(|| "No delivery state to resume".to_string())?;
+    if matches!(
+        value.phase,
+        crate::delivery::DeliveryPhase::Verified
+            | crate::delivery::DeliveryPhase::Applied
+            | crate::delivery::DeliveryPhase::Cancelled
+    ) {
+        return Ok(());
+    }
+    if value.phase == crate::delivery::DeliveryPhase::Preparing
+        || value.phase == crate::delivery::DeliveryPhase::AuthoringAcceptance
+    {
+        crate::delivery::reset_for_recovery(&value, false).await?;
+    }
+    if matches!(
+        value.phase,
+        crate::delivery::DeliveryPhase::Implementing
+            | crate::delivery::DeliveryPhase::Repairing
+            | crate::delivery::DeliveryPhase::Failed
+    ) {
+        crate::delivery::reset_for_recovery(&value, true).await?;
+        value.phase = if value.acceptance_commit.is_some() {
+            crate::delivery::DeliveryPhase::Repairing
+        } else {
+            crate::delivery::DeliveryPhase::AuthoringAcceptance
+        };
+    }
+    launch_delivery(state.inner(), &app, value, true).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn abort_delivery(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let value = read_delivery_state(state.inner())
+        .await?
+        .ok_or_else(|| "No delivery state to abort".to_string())?;
+    if value.session_id != session_id {
+        return Err("The requested delivery is not the current delivery".to_string());
+    }
+    let owner = state.session_runtime.current_owner();
+    if let Some(owner) = owner {
+        if owner.session_id != session_id {
+            return Err("Another session owns the active runtime".to_string());
+        }
+        if let Some(guard) = state.session_runtime.stop_owner(&owner).await? {
+            *state.ask_user_tx.lock().await = None;
+            let mut cancelled = value;
+            cancelled.phase = crate::delivery::DeliveryPhase::Cancelled;
+            crate::delivery::persist_state(
+                &state.delivery_state_path,
+                &state.delivery_state,
+                &state.transcript_store,
+                &mut cancelled,
+            )
+            .await?;
+            crate::delivery::emit(&app, &cancelled).await;
+            guard.finish();
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn apply_delivery(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let mut value = read_delivery_state(state.inner())
+        .await?
+        .ok_or_else(|| "No delivery state".to_string())?;
+    if value.session_id != session_id {
+        return Err("The requested delivery is not the current delivery".to_string());
+    }
+    if value.phase != crate::delivery::DeliveryPhase::Verified {
+        return Err("Only a Verified delivery can be applied".to_string());
+    }
+    let candidate = value
+        .candidate_commit
+        .clone()
+        .ok_or_else(|| "Verified delivery has no candidate commit".to_string())?;
+    let source = std::path::Path::new(&value.source_workspace);
+    let clean = git_command(source, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    if !clean.status.success() || !clean.stdout.is_empty() {
+        return Err("Cannot apply: the original repository is not clean".to_string());
+    }
+    let head = git_command(source, &["rev-parse", "HEAD"]).await?;
+    let current = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    if current != value.base_commit {
+        return Err("Cannot apply: the original repository moved since Build started".to_string());
+    }
+    let exists = git_command(
+        source,
+        &["cat-file", "-e", &format!("{candidate}^{{commit}}")],
+    )
+    .await?;
+    if !exists.status.success() {
+        return Err("Cannot apply: the verified candidate commit is unavailable".to_string());
+    }
+    let ff = git_command(source, &["merge", "--ff-only", &candidate]).await?;
+    if !ff.status.success() {
+        return Err(format!(
+            "Cannot apply safely: {}",
+            String::from_utf8_lossy(&ff.stderr).trim()
+        ));
+    }
+    value.phase = crate::delivery::DeliveryPhase::Applied;
+    crate::delivery::persist_state(
+        &state.delivery_state_path,
+        &state.delivery_state,
+        &state.transcript_store,
+        &mut value,
+    )
+    .await?;
+    crate::delivery::emit(&app, &value).await;
+    Ok(())
+}
+
 fn redact_diagnostic_text(value: &str) -> String {
     let mut redact_next = false;
     value
@@ -307,6 +668,8 @@ pub async fn start_session(
     let hk_cancel_clone = state.hackathon_cancel.clone();
     let pause_req_clone = state.pause_requested.clone();
     let checkpoint_clone = state.checkpoint.clone();
+    let delivery_clone = state.delivery_state.clone();
+    let delivery_path_clone = state.delivery_state_path.clone();
 
     start_permit.ensure_admitted().map_err(|e| e.to_string())?;
     let (activate_tx, activate_rx) = tokio::sync::oneshot::channel::<()>();
@@ -343,6 +706,8 @@ pub async fn start_session(
             hackathon_cancel: hk_cancel_clone,
             pause_requested: pause_req_clone,
             checkpoint: checkpoint_clone,
+            delivery_state: delivery_clone,
+            delivery_state_path: delivery_path_clone,
         };
 
         let mut nav_rx = tokio_rx;
@@ -778,6 +1143,8 @@ pub async fn resume_session(
     let hk_cancel_clone = state.hackathon_cancel.clone();
     let pause_req_clone = state.pause_requested.clone();
     let checkpoint_clone = state.checkpoint.clone();
+    let delivery_clone = state.delivery_state.clone();
+    let delivery_path_clone = state.delivery_state_path.clone();
     // Spawn resumed loop — skip setup, go directly to debate loop (gated)
     let handle = tokio::spawn(async move {
         if activate_rx.await.is_err() {
@@ -807,6 +1174,8 @@ pub async fn resume_session(
             hackathon_cancel: hk_cancel_clone,
             pause_requested: pause_req_clone,
             checkpoint: checkpoint_clone,
+            delivery_state: delivery_clone,
+            delivery_state_path: delivery_path_clone,
         };
         let runtime_for_terminal = state_ref.session_runtime.clone();
         let owner_for_terminal = resume_owner.clone();
