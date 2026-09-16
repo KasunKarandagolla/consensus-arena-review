@@ -29,6 +29,11 @@ database and uses `db_helpers::run_blocking` with the production
 
 The test leaves no database or fixture in the user's real application data.
 
+The injected missing-index-row fixture is repaired explicitly. The current
+count-based health check does not detect that particular external-content FTS5
+corruption by itself, so automatic detection of every index inconsistency is
+not claimed by this qualification.
+
 ## Boundaries
 
 The test directly records representative model-reliability observations so the
