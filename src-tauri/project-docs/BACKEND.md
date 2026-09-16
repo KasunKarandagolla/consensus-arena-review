@@ -71,7 +71,11 @@ The project has disk-backed stores for settings, transcripts, blueprint/session 
 
 ### Memory
 
-Phase 1 memory is implemented, not merely a future specification. See `MEMORY.md`.
+Phase 1 memory is implemented, not merely a future specification. The
+production SQLite store and its `run_blocking` access boundary are runtime
+qualified by the isolated Phase 1 exercise; native UI and live provider
+integration remain unproven. See `MEMORY.md` and
+`audits/memory-phase1-runtime-qualification.md`.
 
 ### Delivery backend
 

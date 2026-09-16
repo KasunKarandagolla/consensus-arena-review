@@ -16,6 +16,14 @@ Current project context/source exposes persistent concepts including:
 - FTS/search health and repair;
 - export/restore with health checks.
 
+The production `MemoryStore` backend is runtime-qualified by the isolated
+`memory_store::tests::phase1_runtime_round_trip_and_repair` exercise. That
+qualification covers `run_blocking` access, session/project/global writes,
+open questions, model reliability aggregation, pattern confidence, context
+assembly, FTS search and repair, store reopen persistence, and export/restore
+health checks. Native UI wiring, provider-driven writes through a live model
+run, and whole-app restart continuity remain unproven.
+
 Read current `memory_store.rs` before relying on exact table/field schema.
 
 ## Product boundary

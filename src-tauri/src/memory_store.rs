@@ -1471,4 +1471,184 @@ mod tests {
         eprintln!("memory smoke database: {}", path.display());
         Ok(())
     }
+
+    #[tokio::test]
+    async fn phase1_runtime_round_trip_and_repair() -> Result<(), AgentError> {
+        let root = std::env::temp_dir().join(format!(
+            "consensus-arena-phase1-memory-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root)
+            .map_err(|error| AgentError::DatabaseError(error.to_string()))?;
+        let source_path = root.join("memory.db");
+        let export_path = root.join("export.db");
+        let restored_path = root.join("restored.db");
+        let source_text = source_path.to_string_lossy().into_owned();
+        let export_text = export_path.to_string_lossy().into_owned();
+        let restored_text = restored_path.to_string_lossy().into_owned();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(MemoryStore::new(&source_text)?));
+
+        let project = "memory runtime qualification";
+        let session = "session-runtime-1";
+        let shared_for_write = shared.clone();
+        crate::db_helpers::run_blocking(move || {
+            let mut memory = shared_for_write
+                .lock()
+                .map_err(|_| AgentError::DatabaseError("memory test lock poisoned".to_string()))?;
+            memory.add_session_fact(
+                session,
+                project,
+                "learned",
+                "SQLite FTS preserves product continuity",
+                None,
+                "leader",
+                "confirmed",
+            )?;
+            memory.save_project_config(project, "Arena owns product truth")?;
+            memory.add_project_memory_with_source(
+                project,
+                "decision",
+                "Use SQLite FTS for product memory search",
+                Some("runtime test"),
+                None,
+                "owner",
+                "confirmed",
+            )?;
+            memory.add_project_memory_with_source(
+                project,
+                "decision",
+                "Use SQLite FTS for product memory search",
+                None,
+                None,
+                "owner",
+                "confirmed",
+            )?;
+            memory.add_project_memory_with_source(
+                project,
+                "decision",
+                "Use SQLite FTS for product memory search",
+                None,
+                None,
+                "owner",
+                "confirmed",
+            )?;
+            memory.add_open_question(session, project, "Which search index should we use?", 1)?;
+            memory.record_model_response(project, "muse", "database", true, session)?;
+            memory.record_model_response(project, "muse", "database", false, session)?;
+            memory.add_pattern(
+                project,
+                "FTS query",
+                "search project memory",
+                "found decision",
+            )?;
+            memory.add_pattern(
+                project,
+                "FTS query",
+                "search project memory",
+                "found decision",
+            )?;
+            memory.write_session_completion_memory(
+                session,
+                project,
+                &SessionSummaryData {
+                    investigated: vec!["SQLite".to_string()],
+                    completed: vec!["memory runtime".to_string()],
+                    learned: vec!["Search is product continuity".to_string()],
+                    next_steps: vec!["Run native UI qualification".to_string()],
+                },
+                &[],
+                3,
+                4,
+            )?;
+            Ok(())
+        })
+        .await?;
+
+        let shared_for_read = shared.clone();
+        let export_for_read = export_text.clone();
+        let snapshot = crate::db_helpers::run_blocking(move || {
+            let mut memory = shared_for_read
+                .lock()
+                .map_err(|_| AgentError::DatabaseError("memory test lock poisoned".to_string()))?;
+            let session_facts = memory.get_session_facts(session)?;
+            let project_memory = memory.get_project_memory(project)?;
+            let search = memory.search_project_memory(project, "SQLite", 5)?;
+            let questions = memory.get_open_questions(project)?;
+            let strengths = memory.get_model_strengths(project)?;
+            let patterns = memory.get_patterns(project)?;
+            let global = memory.get_global_memory()?;
+            let context = memory.build_memory_context(session, project, Some("database"), None)?;
+            memory.export_to(&export_for_read)?;
+            Ok::<_, AgentError>((
+                session_facts,
+                project_memory,
+                search,
+                questions,
+                strengths,
+                patterns,
+                global,
+                context,
+            ))
+        })
+        .await?;
+        assert_eq!(snapshot.0.len(), 1);
+        assert_eq!(
+            snapshot.1.len(),
+            6,
+            "config, decision, and completion facts should persist"
+        );
+        assert!(
+            snapshot
+                .2
+                .iter()
+                .any(|entry| entry.category == "decision" && entry.content.contains("SQLite FTS")),
+            "FTS should find the decision"
+        );
+        assert_eq!(snapshot.3.len(), 1);
+        assert_eq!(snapshot.4[0].label, "moderate");
+        assert_eq!(snapshot.5[0].confidence, 2);
+        assert_eq!(snapshot.6.len(), 1);
+        assert!(snapshot.7.contains("Arena owns product truth"));
+
+        let reopened = MemoryStore::new(&source_text)?;
+        assert_eq!(reopened.get_session_facts(session)?.len(), 1);
+        assert_eq!(
+            reopened.get_project_config(project)?,
+            "Arena owns product truth"
+        );
+        assert!(reopened.check_health().is_healthy);
+
+        let mut restored = MemoryStore::new(&restored_text)?;
+        restored.restore_from(&export_text)?;
+        assert_eq!(
+            restored.get_project_config(project)?,
+            "Arena owns product truth"
+        );
+        assert!(restored.check_health().is_healthy);
+
+        let mut repair = MemoryStore::new(&root.join("repair.db").to_string_lossy())?;
+        repair.add_project_memory(project, "decision", "repairable FTS row", None, None)?;
+        repair
+            .conn
+            .execute("DELETE FROM project_memory_fts", [])
+            .map_err(database_error)?;
+        assert!(
+            repair
+                .search_project_memory(project, "repairable", 5)?
+                .is_empty(),
+            "corrupted FTS index should stop returning the deleted row"
+        );
+        repair.repair_fts_index()?;
+        assert!(
+            !repair
+                .search_project_memory(project, "repairable", 5)?
+                .is_empty(),
+            "FTS repair should restore search results"
+        );
+        assert!(repair.check_health().is_healthy);
+
+        std::fs::remove_dir_all(root)
+            .map_err(|error| AgentError::DatabaseError(error.to_string()))?;
+        Ok(())
+    }
 }
