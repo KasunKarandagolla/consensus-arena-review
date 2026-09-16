@@ -54,17 +54,27 @@ The current source expects a DSH CLI invocation of
 `.arena-runtime/result.json` worker receipt. Arena's current qualified
 compatibility policy is exact DSH `0.1.5-rc.1` plus a successful
 `--profile headless --help` probe. The read-only `get_dsh_prerequisite`
-command and `start_delivery` admission both apply this policy before any
-Delivery worktree/session mutation.
+command and `start_delivery` admission apply this version/help probe before
+any Delivery worktree/session mutation. It does not verify Node, the frozen
+dependency tree, or a schema-1 worker result; the documented lock/runtime was
+not reconstructed and current two-run Muse repeatability is unproven.
 
 Arena does **not** currently install/package DSH.
 
-The reproducibility qualification found one exact top-level
+The earlier audit records one exact top-level
 `@deepseek-ai/dsh@0.1.5-rc.1` package with rc2 transitive components selected by
-declared semver ranges. The tested external runtime is reproducible from its
-package manifest and frozen pnpm lockfile, subject to registry/store and
-external profile availability. Arena does not treat the mixed tree as a reason
-to upgrade or downgrade DSH without a new qualification.
+declared semver ranges. In the 2026-09-16 closure attempt, pnpm `10.33.0` and
+`10.33.2` resolved the documented top-level DSH and `@mstar-harness/dsh@3.8.3`
+packages to lock SHA256
+`88a26a4d1f31bdffd465bf081f5d02638f0f42982aeb235ff7f4d1365a004773`, not the
+documented frozen SHA256
+`1297ec9257567a85c5a653734979256e6958a2c1235079c62fdc5bb9f2505887`. The
+candidate lock had 568 package records and 234 DSH rc2 records; the frozen audit
+describes 230. The exact original runtime/lock was not found. Do not run a
+model-backed qualification against the mismatched candidate or call the current
+baseline runtime-repeatable. The earlier successful Muse run remains historical
+single-run evidence only. See
+`audits/delivery-v1-backend-runtime-qualification.md`.
 
 ### 4. Acceptance authoring and freeze
 
@@ -86,10 +96,21 @@ Arena executes the frozen commands directly.
 
 Worker prose, worker exit code, or result summary **cannot** mark Verified.
 
+Verifier receipts now correlate the session, attempt ID, unique verification
+run ID, frozen acceptance SHA, candidate SHA, and verification-profile hash.
+Each verification gets a unique evidence subdirectory. The verifier compares
+candidate HEAD and Git-visible worktree status before and after checks, so
+persistent visible mutation cannot yield PASS. This does not prove that the
+candidate stayed unchanged at every instant: mutate-then-restore and ignored
+file changes can evade the sampled end state without stronger OS isolation.
+The supervisor marks the exact already-verified commit Verified and does not
+create a new candidate commit after checks pass.
+
 If protected acceptance content changes:
 
 - restore it from the acceptance commit;
-- fail the attempt.
+- fail the worker attempt; preserve the verifier's own receipt rather than
+  rewriting its PASS/FAIL result to represent Arena's separate policy decision.
 
 ### 6. Independent outcome handling
 
@@ -112,7 +133,7 @@ If protected acceptance content changes:
 
 ### 8. Durable owner question
 
-When worker output indicates `needs_user`:
+When worker output indicates `needs_user`, the production source path:
 
 - persist `WaitingForUser` first;
 - then emit the existing owner-question UI event;
@@ -120,17 +141,23 @@ When worker output indicates `needs_user`:
 - dismissal is recorded as `Cancelled` and fails safely;
 - restart recovery can re-emit the persisted delivery question.
 
-This intentionally avoids requiring a worker process/tool call to remain suspended across the human decision.
+This intentionally avoids requiring a worker process/tool call to remain
+suspended across the human decision. These persist/notify/recovery mechanics
+are implemented, but a production-service restart, answer, and continuation
+run has not been qualified in the current runtime matrix.
 
 ### 9. Abort
 
-`SessionRuntime` ownership protects exact-task abort semantics. Child ownership provides worker cleanup. State is marked Cancelled only after stopping the correct owner.
+`SessionRuntime` ownership protects exact-task abort semantics. Child ownership
+provides worker cleanup. State is marked Cancelled only after stopping the
+correct owner. Unit tests cover ownership semantics; killing/waiting for a
+real DSH descendant tree has not been runtime-qualified.
 
 ### 10. Verified candidate and Apply
 
 Verified work remains isolated until explicit user Apply.
 
-Apply requires:
+Apply source requires:
 
 - candidate is Verified;
 - original checkout is clean;
@@ -139,13 +166,21 @@ Apply requires:
 
 No merge conflict automation, push, or deployment in V1.
 
+Production Apply tests exercised dirty, changed-HEAD, and non-fast-forward
+refusals. Successful production Apply remains unproven because the only
+model-backed path that reaches it is opt-in and has not run.
+
 Worktree/evidence are intentionally retained.
 
 ## Security / secret handling
 
 Audit establishes:
 
-- no API key stored in delivery state, prompts, evidence, or logs;
+- no configured API key in structured delivery state, acceptance prompts, or
+  worker summaries;
+- raw verifier stdout/stderr are discarded after capture; their evidence files
+  contain only buffered-byte-count notices (which may include a truncation
+  marker), not command output or diagnostics;
 - DSH configuration under app data references an environment variable;
 - native paths and explicit argv are used;
 - no `/tmp`, shell pipeline, Unix-process-group, or platform-specific path assumption was added.
@@ -153,8 +188,11 @@ Audit establishes:
 ## Current known limitations
 
 - DSH must already be available and compatible; Arena does not
-  package/install it. Build setup reports a clear prerequisite state before
-  start and admission repeats the check defensively.
+  package/install it. Build setup reports prerequisite status before start and
+  admission repeats the check defensively. The frozen package tree remains
+  unreproduced in the current environment, so exact worker compatibility is a
+  release blocker until the documented lock/runtime is recovered or the audit
+  is corrected from new primary evidence.
 - DeepSeek V4 Flash `deepseek-ai/deepseek-v4-flash-0731` reached the NVIDIA
   model-list endpoint, but bounded inference timed out and its standalone DSH
   run did not produce a coding change or worker receipt. The single permitted
@@ -165,10 +203,30 @@ Audit establishes:
   blank in this qualification session. No genuine Delivery UI run was started
   and no middle-stage manual substitution was used.
 - Windows runtime parity remains a separate qualification requirement.
+- Windows verifier launch now routes `npm` through a resolved `node.exe` and
+  its `npm-cli.js`, avoiding direct execution of the `npm.cmd` shim. When an
+  npm verification command is used, the resolver fails closed unless Node is
+  `v22.22.2` and npm is `10.9.7`. This source change has not run on Windows;
+  other `.cmd`/`.bat` tools remain unqualified.
 - A source/test hardening pass now preserves an uncommitted candidate during
   INCONCLUSIVE verification resume, constrains receipt IDs, explicitly waits
   for DSH timeout cleanup, and filters delayed Delivery UI events by session.
-- Delivery V1 currently implements its own bounded orchestration. The post-gates strategy selects Dagu as a candidate to remove more durable workflow/wait/retry mechanics, but Dagu is not integrated.
+- Delivery V1 currently implements its own bounded orchestration. The Dagu
+  standalone gate now supports several durable run/wait/retry/history
+  mechanics, but overall remains **INCONCLUSIVE** because hard-interruption
+  reconciliation and successful Dagu→DSH continuation are unproven. Dagu is
+  not integrated; see `audits/dagu-standalone-qualification.md`.
+
+## Runtime qualification boundary
+
+The opt-in Rust test `delivery::tests::backend_qualification_runs_production_delivery_path`
+uses real production SessionRuntime admission, clean-base validation, Git
+worktree creation, acceptance authoring/freeze, DSH supervision, the Arena
+verifier, durable state/transcript writes, and production Apply. It is
+supporting **production-path backend Delivery runtime qualification**, not GUI
+E2E. It requires an explicitly supplied worker credential and the exact DSH
+runtime; no successful invocation has yet been recorded. Credential values
+must never be placed in test output, evidence, or Git.
 
 ## Next architecture candidate: Dagu
 
@@ -200,6 +258,7 @@ Any Delivery change must preserve:
 7. bounded attempts;
 8. owner question persisted before UI notification;
 9. abort stops the exact task/child;
-10. no secrets in durable/log/evidence state;
+10. no configured API key in structured durable state; raw verifier output is
+    discarded and other local evidence is treated as potentially sensitive;
 11. explicit Apply with unchanged clean base;
 12. native Linux/Windows-compatible path/process design.

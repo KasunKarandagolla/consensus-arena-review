@@ -54,12 +54,14 @@ The latest local post-implementation audit establishes a first Build vertical sl
 - DSH is currently a bounded external worker, not Arena's durable product authority.
 - Executable acceptance material is authored **before implementation**, frozen, protected by hashes, and verified independently from worker narration.
 - Required checks are rerun after repair; attempts are bounded.
-- `needs_user` is persisted before the existing AskUser event is emitted; restart can re-present the persisted question.
-- Apply is explicit and only fast-forwards a clean, unchanged original checkout to a verified candidate.
+- `needs_user` is persisted before the existing AskUser event is emitted; the source recovery path can re-present a persisted question after restart, but a separate production-service restart/answer runtime has not been qualified.
+- Apply is explicit and source guards reject dirty, moved, or non-fast-forward bases; the successful production Apply path has not been runtime-qualified.
 - DSH is not yet bundled/installed by Arena.
 - Build setup now performs a read-only DSH prerequisite check and blocks
-  Delivery admission unless the exact qualified `0.1.5-rc.1` executable
-  exposes the `headless` profile.
+  Delivery admission unless the expected `0.1.5-rc.1` executable exposes the
+  `headless` profile. This version/help probe does not establish the frozen
+  dependency tree or worker-result compatibility; the expected runtime is not
+  yet reproducible or runtime-qualified.
 - Native Linux Tauri launch was reconfirmed, but the managed WebView was blank
   during the latest qualification session, so no Delivery UI dogfood run was
   started in that session.
@@ -72,18 +74,35 @@ The current qualification record adds a direct DeepSeek V4 Flash provider
 sanity check and a real DSH comparison. V4 Flash reached model listing but
 bounded inference timed out; its standalone DSH task did not change a
 repository or emit a worker receipt. The single permitted Muse Glimmer control
-did change a repository and emit a schema-1 receipt through the same DSH
-boundary, so DSH remains promising while the requested V4 route remains
-unqualified. Full Arena Delivery E2E and runtime reliability branches remain
-unproven.
+did change a repository and emit a schema-1 receipt, but that is historical
+single-run evidence: the documented lock could not be reconstructed in the
+latest pass, and neither of the two required independent Muse runs was
+attempted. DSH repeatability, the complete Arena Delivery runtime path, and
+reliability branches therefore remain unproven.
 
 The 2026-09-16 programme qualification fixed the INCONCLUSIVE resume
 candidate-preservation defect, hardened evidence receipt IDs and DSH timeout
-cleanup, and added a stale Delivery-event guard. Native WebKitGTK still renders
-blank on the current Linux session because DRI/EGL authentication is
-unavailable; the tested software-rendering flags did not restore the Arena
-surface, and no UI-to-Apply run was claimed. See
+cleanup, and added a stale Delivery-event guard. A follow-up backend/runtime
+closure pass added a production-path dogfood boundary, bounded Git execution,
+immutable verifier/candidate correlation, real-Git admission/Apply/protected
+restoration tests, and a host qualification script. Its model-backed Delivery
+test remains opt-in and has not passed: the exact documented DSH lockfile could
+not be reconstructed, and two independent Muse runs were therefore not
+attempted. This is backend runtime evidence, not GUI E2E.
+
+Native WebKitGTK still renders blank on the current Linux session because
+`/dev/dri` is absent and EGL DRI2 authentication fails; prior software-rendering
+and compositing flags did not restore the Arena surface. The host script is at
+`/home/kasun/Music/arena/consensus-arena/scripts/qualify-linux-native-runtime.sh`.
+No UI-to-Apply run was claimed. See
 `/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/delivery-v1-programme-qualification-2026-09-16.md`.
+
+The standalone Dagu falsification gate has now been run without Arena
+integration. Its local durable-run, retry, and root-human-task mechanics were
+supported, but the Dagu→DSH composition and automatic reconciliation after a
+hard interruption were not proven. Overall verdict: **INCONCLUSIVE**; no Dagu
+integration or Astra consultation is authorized by this result. See
+`audits/dagu-standalone-qualification.md`.
 
 The follow-up prerequisite qualification is recorded in
 `/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/delivery-v1-prerequisite-qualification-2026-09-16.md`.
@@ -96,7 +115,7 @@ After seven substrate qualification sessions and a post-gates Astra consultation
 
 > Arena product authority + reusable durable workflow mechanics + bounded worker + independent deterministic verification.
 
-**Dagu** remains a deferred workflow-engine candidate because it offers local durable runs, retries/history, root human tasks, REST/CLI control, and an existing `harness.run` composition for DeepSeek Harness. **Dagu is not yet part of the current implemented Build lane and is not the next action from this qualification.** Finish Linux runtime reliability and genuine Delivery E2E with a proven worker profile before any Dagu validation.
+**Dagu** remains a deferred workflow-engine candidate because it offers local durable runs, retries/history, root human tasks, and REST/CLI control. Standalone mechanics are now partly qualified, but the current overall falsification verdict is inconclusive: successful DSH composition and crash reconciliation remain unproven. **Dagu is not part of the current implemented Build lane.** Resolve the exact DSH runtime and complete backend Delivery reliability evidence before reconsidering integration; native Linux GUI proof remains a separate final gate.
 
 ## Documentation maintenance
 

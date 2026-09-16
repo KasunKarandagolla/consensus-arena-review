@@ -88,7 +88,11 @@ Read `CONSULTATION.md`, `IPC.md`, `RELIABILITY.md`, and affected browser/session
 
 ## Dagu validation process
 
-Dagu is pending qualification. Do not call it current architecture until a real integrated slice passes.
+Dagu's standalone falsification gate has run and its overall result is
+**INCONCLUSIVE**. Do not call it current architecture: no Arena integration was
+attempted, and successful DSH composition plus automatic recovery after a hard
+interruption remain unproven. The supported standalone human-task mechanics
+are recorded in `audits/dagu-standalone-qualification.md`.
 
 The narrow validation should prove:
 
@@ -105,7 +109,12 @@ The narrow validation should prove:
 - process cleanup/resource use on Linux Lite;
 - later native Windows parity.
 
-If Dagu fails materially, preserve the work-order/worker/verifier contracts and test a small Arena controller instead. Do not restart the entire substrate search.
+The partial standalone result does not trigger broad Astra consultation or
+integration work. First recover/reproduce the exact DSH runtime, then complete
+the missing Dagu composition and interrupted-run gates. If those fail
+materially, preserve the work-order/worker/verifier contracts and test a small
+Arena controller instead.
+
 
 ## Audit storage
 

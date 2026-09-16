@@ -27,12 +27,16 @@ DSH is **not** selected as Arena's full durable product substrate. Multiple host
 
 ### Current role
 
-**Use narrowly** as the bounded coding/debugging/repair worker contract, but
-keep hosted model qualification explicit. The 2026-09-15/16 qualification
-proved the same DSH/OpenAI-completions boundary with the permitted Muse Glimmer
-control, while `deepseek-ai/deepseek-v4-flash-0731` timed out during bounded
-inference and did not complete the worker contract. DSH therefore remains
-promising but the current V4 route is not qualified.
+**Use narrowly** as the intended bounded coding/debugging/repair worker
+contract, but keep hosted model qualification explicit. One earlier
+`meta/muse-glimmer-30b` run completed a real DSH coding task and emitted an
+Arena-shaped schema-1 receipt; treat that as historical single-run evidence,
+not a repeatable baseline. In the 2026-09-16 closure pass the documented DSH
+lockfile/runtime could not be reconstructed, so neither required independent
+Muse run was attempted and current runtime repeatability remains unproven.
+`deepseek-ai/deepseek-v4-flash-0731` previously timed out during bounded
+inference and did not complete the worker contract. Neither route currently
+qualifies the frozen worker runtime.
 
 See `audits/delivery-dsh-v4-worker-and-e2e.md` for the route, receipt, and
 resource evidence.
@@ -71,7 +75,7 @@ Credible noninteractive worker and portability fallback. It is not the selected 
 
 Evaluated during substrate exploration but not selected as the current primary architecture. Do not reopen solely because it is lightweight; compare only if the proven DSH bounded-worker contract fails materially.
 
-## Dagu — selected next workflow candidate
+## Dagu — deferred workflow candidate; standalone gate inconclusive
 
 Why it is interesting:
 
@@ -94,7 +98,30 @@ Important discovered semantics:
 - if completion persists but enqueue/resume fails, explicit resume semantics exist and must be tested;
 - GPL/distribution terms require legal/product decision before bundling/embedding; initial validation should use external CLI/REST boundary.
 
-**Status:** Recommended next validation, not implemented.
+**Standalone gate status (2026-09-16): INCONCLUSIVE.** A Dagu 2.16.6 local
+Linux run supported dependency scheduling, retries/history, durable root human
+tasks, attempt release while waiting, pending-task discovery after controller
+restart, identical-answer idempotency, conflicting-answer rejection, resume,
+linked follow-up work orders, and REST/CLI control. It did not prove automatic
+reconciliation after a hard interruption during an active run, and two
+disposable Dagu→DSH composition attempts stopped before a worker result because
+the exact DSH runtime/credential boundary was unavailable. No Arena integration
+was attempted. The Windows archive was checksum/PE-inspected but not executed
+on Windows.
+
+Measured carrying costs in that local experiment were approximately 80–109 MiB
+server RSS, 1.1 MiB fixture state, and a 161 MiB Linux binary. Upstream
+documents GPL-3.0-or-later and distinguishes running CLI/server as a separate
+program from embedding/linking its Go API; distribution obligations require
+legal review before packaging. See
+`audits/dagu-standalone-qualification.md`, [official human-task semantics](https://docs.dagu.sh/writing-workflows/human-tasks),
+[official installation options](https://docs.dagu.sh/getting-started/installation/),
+and [upstream licensing](https://github.com/dagucloud/dagu/blob/main/LICENSING.md).
+
+**Current status:** not implemented and not yet qualified as an Arena
+workflow-engine candidate. Do not prepare an integration or broad Astra
+consultation from the partial mechanics alone. Revisit only after exact DSH
+runtime repeatability and the remaining Dagu composition/recovery tests.
 
 ## LangGraph / XState / DBOS
 

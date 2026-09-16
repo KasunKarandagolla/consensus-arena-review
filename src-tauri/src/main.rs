@@ -16,6 +16,7 @@ mod db_helpers;
 mod delivery;
 mod dsh_worker;
 mod errors;
+mod git_runtime;
 mod hackathon;
 mod memory_store;
 mod orchestrator;

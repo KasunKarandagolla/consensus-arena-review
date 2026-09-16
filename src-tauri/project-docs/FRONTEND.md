@@ -34,6 +34,12 @@ Existing consultation experience remains available for expert reasoning/blueprin
 
 ### Build / Delivery
 
+Build setup reads DSH prerequisite state and the saved Agent Brain's required
+API key, base URL, and model. Missing primary configuration is surfaced beside
+the existing Agent Brain controls; a rejected backend start must leave the
+owner on setup rather than switching to an empty Build progress surface. This
+is setup/error UX coverage only, not a native GUI runtime proof.
+
 The new lane should present product progress at a high level, for example:
 
 - preparing acceptance;

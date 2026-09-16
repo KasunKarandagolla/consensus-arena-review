@@ -79,7 +79,8 @@ integration remain unproven. See `MEMORY.md` and
 
 ### Delivery backend
 
-Latest audit establishes backend behavior including:
+Latest audit establishes source behavior and selected production-component
+tests, including:
 
 - clean repository admission;
 - app-data worktree creation;
@@ -87,16 +88,34 @@ Latest audit establishes backend behavior including:
 - acceptance freeze/protected hashes;
 - conservative verifier execution;
 - bounded repair;
-- durable `WaitingForUser` recovery;
-- explicit safe Apply.
+- persist-before-notify `WaitingForUser` handling and a source recovery path;
+- explicit Apply guards, with dirty/changed/non-fast-forward refusals tested.
+
+The production-service restart/answer/continue scenario and successful Apply
+have not been runtime-qualified in the current closure pass; see the scenario
+matrix in `audits/delivery-v1-backend-runtime-qualification.md`.
 
 See `DELIVERY.md`. Exact file/module/command names must come from current source; the supplied audit documents semantics, not a complete symbol table.
 
 Before Delivery admission, the backend checks the external DSH prerequisite
 without exposing credentials or mutating the user's system. The current
-qualified policy is DSH `0.1.5-rc.1` with a working `headless` profile; the
+source prerequisite probe expects DSH `0.1.5-rc.1` with a working `headless` profile; the
 frontend receives the serialized result of `get_dsh_prerequisite` for a
-progressive setup message.
+progressive setup message. The documented frozen DSH lockfile was not
+reconstructed in the latest qualification pass, and its semver-range
+resolution produced a different SHA/package count. Treat exact runtime
+compatibility and two-run worker repeatability as unproven until the frozen
+runtime is recovered or the contract is re-audited. The current probe checks
+only the reported DSH version and headless help command, not Node, the
+dependency tree, or worker-result compatibility.
+
+The backend dogfood qualification boundary invokes the production
+`SessionRuntime`, Delivery supervisor/services, persistence, verifier, and
+Apply logic without a Tauri `AppHandle`. It suppresses only UI event emission;
+it does not mock Git, DSH, verification, state, or Apply. The model-backed
+end-to-end backend test is opt-in and has no successful current run, so this is
+not a GUI E2E claim. Receipts correlate session, attempt, unique verification
+run, acceptance SHA, candidate SHA, and frozen profile hash.
 
 ## DB/async rules
 

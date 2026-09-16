@@ -21,12 +21,7 @@ async fn git_command(
     repo: &std::path::Path,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
-    tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .await
-        .map_err(|error| format!("run git {}: {error}", args.join(" ")))
+    crate::git_runtime::output(repo, args).await
 }
 
 async fn read_delivery_state(
@@ -100,12 +95,13 @@ async fn rollback_delivery_admission(
     previous_state_slot: Option<crate::delivery::DeliveryState>,
 ) {
     if worktree_created {
-        let _ = tokio::process::Command::new("git")
-            .args(["worktree", "remove", "--force"])
-            .arg(worktree)
-            .current_dir(repo)
-            .output()
-            .await;
+        let args = vec![
+            "worktree".into(),
+            "remove".into(),
+            "--force".into(),
+            worktree.as_os_str().to_os_string(),
+        ];
+        let _ = crate::git_runtime::output_owned(repo, &args).await;
     }
     if !branch_preexisted {
         let _ = git_command(repo, &["branch", "-D", branch]).await;
@@ -162,21 +158,7 @@ pub async fn start_delivery(
     if git_root.canonicalize().ok().as_ref() != Some(&repo) {
         return Err("Choose the repository root, not a subdirectory".to_string());
     }
-    let dirty = git_command(&repo, &["status", "--porcelain", "--untracked-files=all"]).await?;
-    if !dirty.status.success() {
-        return Err("Could not inspect the Git working tree".to_string());
-    }
-    if !dirty.stdout.is_empty() {
-        return Err(
-            "Delivery requires a clean base working tree; Arena will not stash or discard changes"
-                .to_string(),
-        );
-    }
-    let head = git_command(&repo, &["rev-parse", "HEAD"]).await?;
-    if !head.status.success() {
-        return Err("Could not resolve repository HEAD".to_string());
-    }
-    let base = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let base = crate::delivery::validate_clean_base(&repo).await?;
     let dsh = crate::dsh_worker::check_prerequisite().await;
     if !dsh.compatible {
         return Err(dsh.message);
@@ -228,16 +210,10 @@ pub async fn start_delivery(
     ) {
         return Err(format!("create delivery worktree directory: {error}"));
     }
-    let add = match tokio::process::Command::new("git")
-        .args(["worktree", "add", "-b", &branch])
-        .arg(&worktree)
-        .arg(&base)
-        .current_dir(&repo)
-        .output()
-        .await
-    {
-        Ok(output) => output,
+    match crate::delivery::create_candidate_worktree(&repo, &worktree, &branch, &base).await {
+        Ok(()) => {}
         Err(error) => {
+            let partially_created = worktree.exists();
             rollback_delivery_admission(
                 state.inner(),
                 &repo,
@@ -245,34 +221,14 @@ pub async fn start_delivery(
                 &branch,
                 &id,
                 branch_preexisted,
-                false,
+                partially_created,
                 false,
                 previous_state_file.as_deref(),
                 previous_state_slot.clone(),
             )
             .await;
-            return Err(format!("create isolated worktree: {error}"));
+            return Err(error);
         }
-    };
-    if !add.status.success() {
-        let partially_created = worktree.exists();
-        rollback_delivery_admission(
-            state.inner(),
-            &repo,
-            &worktree,
-            &branch,
-            &id,
-            branch_preexisted,
-            partially_created,
-            false,
-            previous_state_file.as_deref(),
-            previous_state_slot.clone(),
-        )
-        .await;
-        return Err(format!(
-            "could not create isolated worktree: {}",
-            String::from_utf8_lossy(&add.stderr).trim()
-        ));
     }
     let worktree_created = true;
     let id_for_db = id.clone();
@@ -498,39 +454,7 @@ pub async fn apply_delivery(
     if value.session_id != session_id {
         return Err("The requested delivery is not the current delivery".to_string());
     }
-    if value.phase != crate::delivery::DeliveryPhase::Verified {
-        return Err("Only a Verified delivery can be applied".to_string());
-    }
-    let candidate = value
-        .candidate_commit
-        .clone()
-        .ok_or_else(|| "Verified delivery has no candidate commit".to_string())?;
-    let source = std::path::Path::new(&value.source_workspace);
-    let clean = git_command(source, &["status", "--porcelain", "--untracked-files=all"]).await?;
-    if !clean.status.success() || !clean.stdout.is_empty() {
-        return Err("Cannot apply: the original repository is not clean".to_string());
-    }
-    let head = git_command(source, &["rev-parse", "HEAD"]).await?;
-    let current = String::from_utf8_lossy(&head.stdout).trim().to_string();
-    if current != value.base_commit {
-        return Err("Cannot apply: the original repository moved since Build started".to_string());
-    }
-    let exists = git_command(
-        source,
-        &["cat-file", "-e", &format!("{candidate}^{{commit}}")],
-    )
-    .await?;
-    if !exists.status.success() {
-        return Err("Cannot apply: the verified candidate commit is unavailable".to_string());
-    }
-    let ff = git_command(source, &["merge", "--ff-only", &candidate]).await?;
-    if !ff.status.success() {
-        return Err(format!(
-            "Cannot apply safely: {}",
-            String::from_utf8_lossy(&ff.stderr).trim()
-        ));
-    }
-    value.phase = crate::delivery::DeliveryPhase::Applied;
+    crate::delivery::apply_verified_candidate(&mut value).await?;
     crate::delivery::persist_state(
         &state.delivery_state_path,
         &state.delivery_state,

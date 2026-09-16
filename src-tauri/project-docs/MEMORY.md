@@ -24,6 +24,17 @@ assembly, FTS search and repair, store reopen persistence, and export/restore
 health checks. Native UI wiring, provider-driven writes through a live model
 run, and whole-app restart continuity remain unproven.
 
+The 2026-09-16 follow-up did not establish the wider continuity claim: no
+full-app lifecycle/router test was run, and no fake provider response was
+introduced. A read-only source review also identified
+two paths needing targeted follow-up: Consult AskUser adoption resolves the
+open-question key using a different prefix length from question creation, and
+Delivery answers are durable in DeliveryState but were not found flowing into
+MemoryStore product-truth adoption. These are source-review findings, not
+runtime-confirmed defects. Process-local Consult AskUser waiters also cannot
+survive a process restart by themselves. Keep whole-app restart, router-write,
+and owner-answer adoption claims open until tested through production code.
+
 Read current `memory_store.rs` before relying on exact table/field schema.
 
 ## Product boundary

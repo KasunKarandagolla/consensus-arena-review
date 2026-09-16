@@ -1,0 +1,70 @@
+name: Windows build and test qualification
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/arena-dev-temp
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build-test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+
+      - name: Set up Python for production verifier process tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up stable Rust and rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Record non-secret toolchain identity
+        shell: pwsh
+        run: |
+          Get-ComputerInfo -Property WindowsProductName,WindowsVersion,OsBuildNumber | Format-List
+          node --version
+          npm --version
+          python --version
+          rustc --version
+          cargo --version
+          git --version
+
+      - name: Install locked frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Run Rust test suite
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast
+
+      - name: Check Windows Rust application
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Build unsigned Windows NSIS package
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Retain unsigned installer as qualification artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-nsis-${{ github.sha }}
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14
