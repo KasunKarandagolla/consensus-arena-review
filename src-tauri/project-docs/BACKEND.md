@@ -88,6 +88,12 @@ Latest audit establishes backend behavior including:
 
 See `DELIVERY.md`. Exact file/module/command names must come from current source; the supplied audit documents semantics, not a complete symbol table.
 
+Before Delivery admission, the backend checks the external DSH prerequisite
+without exposing credentials or mutating the user's system. The current
+qualified policy is DSH `0.1.5-rc.1` with a working `headless` profile; the
+frontend receives the serialized result of `get_dsh_prerequisite` for a
+progressive setup message.
+
 ## DB/async rules
 
 - Never hold synchronous DB/file locks across `.await`.

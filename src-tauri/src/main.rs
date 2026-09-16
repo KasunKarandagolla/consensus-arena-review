@@ -100,6 +100,7 @@ fn main() {
             // Session management
             commands::start_session,
             commands::start_delivery,
+            commands::get_dsh_prerequisite,
             commands::get_delivery_state,
             commands::get_delivery_recovery_state,
             commands::resume_delivery,

@@ -177,6 +177,10 @@ pub async fn start_delivery(
         return Err("Could not resolve repository HEAD".to_string());
     }
     let base = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let dsh = crate::dsh_worker::check_prerequisite().await;
+    if !dsh.compatible {
+        return Err(dsh.message);
+    }
     let brain = state
         .settings_store
         .lock()
@@ -388,6 +392,12 @@ pub async fn start_delivery(
 #[tauri::command]
 pub async fn get_delivery_state(state: tauri::State<'_, AppState>) -> Result<String, String> {
     serde_json::to_string(&read_delivery_state(state.inner()).await?)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_dsh_prerequisite() -> Result<String, String> {
+    serde_json::to_string(&crate::dsh_worker::check_prerequisite().await)
         .map_err(|error| error.to_string())
 }
 

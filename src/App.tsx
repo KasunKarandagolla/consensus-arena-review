@@ -76,7 +76,7 @@ export default function App() {
         {activeMode === 'consult' && sessionStatus === 'idle' && <EmptyView />}
         {sessionStatus === 'setup' && <SetupView />}
         {(sessionStatus === 'priming' || sessionStatus === 'requirements') && <PrimingView />}
-        {isActive && <ActiveView />}
+        {activeMode === 'consult' && isActive && <ActiveView />}
       </main>
 
       {/* Overlays — always mounted, conditionally visible */}

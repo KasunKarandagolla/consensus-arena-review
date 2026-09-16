@@ -51,7 +51,11 @@ Optional existing DSH home may be supplied via `ARENA_DSH_HOME`.
 
 The current source expects a DSH CLI invocation of
 `--profile headless --patch <patch-file> <prompt>` and a schema-version-1
-`.arena-runtime/result.json` worker receipt. No DSH version is pinned by Arena.
+`.arena-runtime/result.json` worker receipt. Arena's current qualified
+compatibility policy is exact DSH `0.1.5-rc.1` plus a successful
+`--profile headless --help` probe. The read-only `get_dsh_prerequisite`
+command and `start_delivery` admission both apply this policy before any
+Delivery worktree/session mutation.
 
 Arena does **not** currently install/package DSH.
 
@@ -148,7 +152,9 @@ Audit establishes:
 
 ## Current known limitations
 
-- DSH must already be available; Arena does not package/install it.
+- DSH must already be available and compatible; Arena does not
+  package/install it. Build setup reports a clear prerequisite state before
+  start and admission repeats the check defensively.
 - DeepSeek V4 Flash `deepseek-ai/deepseek-v4-flash-0731` reached the NVIDIA
   model-list endpoint, but bounded inference timed out and its standalone DSH
   run did not produce a coding change or worker receipt. The single permitted

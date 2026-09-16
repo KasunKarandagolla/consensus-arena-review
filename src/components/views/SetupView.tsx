@@ -10,6 +10,7 @@ import Topbar from '@/components/layout/Topbar'
 type SessionType = 'architecture'|'mvp'|'api'|'security'|'custom'
 interface BrainConfig { api_key:string;base_url:string;model:string;system_prompt:string }
 interface ModelHealth { agent_id:string;is_available:boolean;error_count:number;last_error:string|null }
+interface DshPrerequisite { available:boolean;compatible:boolean;executable:string|null;version:string|null;message:string }
 const types:[SessionType,string][]=[['architecture','Architecture'],['mvp','MVP'],['api','API design'],['security','Security'],['custom','Custom']]
 
 export default function SetupView(){
@@ -21,6 +22,7 @@ export default function SetupView(){
   const [leader,setLeader]=useState<string>('claude')
   const [brain,setBrain]=useState<BrainConfig>({api_key:'',base_url:'',model:'',system_prompt:''})
   const [health,setHealth]=useState<Record<string,ModelHealth>>({})
+  const [dshPrerequisite,setDshPrerequisite]=useState<DshPrerequisite|null>(null)
   const [open,setOpen]=useState(false),[loading,setLoading]=useState(false),[error,setError]=useState('')
   const [hackathonEnabled, setHackathonEnabled] = useState(false)
 
@@ -34,10 +36,20 @@ export default function SetupView(){
     }catch{}
   })},[setHackathonConfig])
   useEffect(()=>{if(!selected.has(leader)){const first=participants.map(p=>p.agent_id).find(id=>selected.has(id));if(first)setLeader(first)}},[leader,selected,participants])
+  useEffect(()=>{
+    if(mode!=='delivery'){setDshPrerequisite(null);return}
+    let disposed=false
+    setDshPrerequisite(null)
+    invoke<string>('get_dsh_prerequisite').then(raw=>{
+      if(disposed)return
+      try{setDshPrerequisite(JSON.parse(raw) as DshPrerequisite)}catch{setDshPrerequisite({available:false,compatible:false,executable:null,version:null,message:'Could not inspect the external DSH build worker.'})}
+    }).catch(()=>{if(!disposed)setDshPrerequisite({available:false,compatible:false,executable:null,version:null,message:'Could not inspect the external DSH build worker.'})})
+    return()=>{disposed=true}
+  },[mode])
 
   function toggle(id:string){setSelected(current=>{const next=new Set(current);if(next.has(id)){if(next.size===2){setError('Select at least 2 participants.');return current}next.delete(id)}else next.add(id);setError('');return next})}
   const brainReady=Boolean(brain.api_key.trim()&&brain.base_url.trim()&&brain.model.trim()&&brain.system_prompt.trim())
-  const canStart=mode==='delivery' ? Boolean(setupBrief.trim()&&projectPath.trim()&&!loading) : Boolean(setupBrief.trim()&&selected.size>=2&&selected.has(leader)&&brainReady&&!loading)
+  const canStart=mode==='delivery' ? Boolean(setupBrief.trim()&&projectPath.trim()&&dshPrerequisite?.compatible&&!loading) : Boolean(setupBrief.trim()&&selected.size>=2&&selected.has(leader)&&brainReady&&!loading)
   async function chooseDirectory(){try{const chosen=await openDirectory({directory:true,multiple:false,title:'Choose a Git project'});if(typeof chosen==='string')setProjectPath(chosen)}catch(e){console.error(e);addToast('Could not open the folder picker')}}
   async function start(){if(!canStart){setError(mode==='delivery'?'Choose a project folder and describe the desired outcome.':'Complete the brief and agent brain configuration, then select at least 2 participants.');if(mode==='consult')setOpen(true);return}setLoading(true);setError('')
     try{if(mode==='delivery'){setActiveMode('delivery');const deliveryId=await invoke<string>('start_delivery',{objective:setupBrief.trim(),repo_path:projectPath.trim()});useAppStore.getState().setDeliveryState({session_id:deliveryId,phase:'preparing',attempt:0,objective:setupBrief.trim()});setSessionStatus('running')}else{setActiveMode('consult');await invoke('save_agent_brain_config',{api_key:brain.api_key,base_url:brain.base_url,model:brain.model,system_prompt:brain.system_prompt});const ids=participants.map(p=>p.agent_id).filter(id=>selected.has(id));const setupOrder=[leader,...ids.filter(id=>id!==leader)];await invoke('start_session',{project_brief:setupBrief.trim(),session_type:sessionType,agent_ids:ids,leader_agent_id:leader});setSessionAgentIds(setupOrder);setIsDraftSession(false);setSessionStatus('setup')}}
@@ -49,6 +61,7 @@ export default function SetupView(){
     <div className="fg"><label className="fl">Mode</label><div className="seg"><button className={`sgo${mode==='consult'?' on':''}`} onClick={()=>setMode('consult')}>Consult</button><button className={`sgo${mode==='delivery'?' on':''}`} onClick={()=>setMode('delivery')}>Build</button></div></div>
     <div className="fg"><label className="fl">{mode==='delivery'?'Desired outcome':'Project brief'}</label><textarea className="fi" style={{minHeight:104}} value={setupBrief} onChange={e=>setSetupBrief(e.target.value)} placeholder={mode==='delivery'?'Describe the change you want Arena to implement…':'Describe what you want to build. The more detail, the sharper the output.'}/></div>
     {mode==='delivery'&&<div className="fg"><label className="fl">Project folder</label><div style={{display:'flex',gap:8}}><input className="fi" value={projectPath} readOnly placeholder="Choose a clean Git repository"/><button className="sv-btn" onClick={()=>void chooseDirectory()}>Choose folder</button></div></div>}
+    {mode==='delivery'&&<div className="brain-note" role="status" style={{marginTop:4}}><Network size={15}/><span>{dshPrerequisite===null?'Checking the external build worker…':dshPrerequisite.compatible?`External build worker ready${dshPrerequisite.version?` · DSH ${dshPrerequisite.version}`:''}.`:dshPrerequisite.message}</span></div>}
     {mode==='consult'&&<div className="fg"><label className="fl">Session type</label><div className="seg">{types.map(([value,label])=><button className={`sgo${sessionType===value?' on':''}`} key={value} onClick={()=>setType(value)}>{label}</button>)}</div></div>}
     {mode==='consult'&&<div className="fg"><label className="fl">Participants <span className="fl-s">— pick 2 or more</span></label><div className="pcards">{participants.map(p=>{const on=selected.has(p.agent_id),available=health[p.agent_id]?.is_available;return <button className={`pc${on?' on':''}`} key={p.agent_id} onClick={()=>toggle(p.agent_id)}><span className={`pcd${p.is_custom?' custom':available?'':' off'}`}/><span>{p.display_name}</span><span className={`tgl${on?' on':''}`}/></button>})}
       <button className="pc pc-add" onClick={()=>setSettingsOpen(true)} title="Add a custom AI chat service by URL"><Plus size={15}/><span>Add custom AI</span></button>

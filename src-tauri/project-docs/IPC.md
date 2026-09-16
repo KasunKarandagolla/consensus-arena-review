@@ -46,6 +46,12 @@ The 2026-09-14 audits establish new IPC semantics for:
 - verified completion;
 - explicit Apply.
 
+The current Delivery prerequisite command is `get_dsh_prerequisite`. It
+returns a JSON-serialized string with `available`, `compatible`,
+`executable`, `version`, and owner-facing `message` fields. The frontend must
+`JSON.parse()` this command result. It does not return credentials or raw DSH
+output.
+
 The supplied audits do **not** provide a complete authoritative symbol/event-name list. Before touching this IPC, read the actual local source that implemented Delivery V1 and update this document if necessary.
 
 ## Serialization convention

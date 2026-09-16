@@ -6,9 +6,11 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
 pub const RESULT_SCHEMA_VERSION: u32 = 1;
+pub const QUALIFIED_DSH_VERSION: &str = "0.1.5-rc.1";
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const API_KEY_ENV: &str = "ARENA_DSH_API_KEY";
 const MAX_MODEL_OUTPUT_TOKENS: u32 = 4096;
+const DSH_PROBE_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct DshModelConfig {
@@ -65,8 +67,120 @@ pub struct WorkerExecution {
     pub result: Option<WorkerResultContract>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DshPrerequisiteStatus {
+    pub available: bool,
+    pub compatible: bool,
+    pub executable: Option<String>,
+    pub version: Option<String>,
+    pub message: String,
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn configured_executable() -> PathBuf {
+    std::env::var_os("ARENA_DSH_EXECUTABLE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("dsh"))
+}
+
+fn reported_version(output: &str) -> Option<String> {
+    output
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+        })
+        .filter_map(|token| token.strip_prefix('v').or(Some(token)))
+        .find(|token| {
+            token
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit())
+                && token.contains('.')
+        })
+        .map(str::to_string)
+}
+
+async fn run_probe(executable: &std::path::Path, args: &[&str]) -> Result<WorkerExecution, String> {
+    let mut child = Command::new(executable)
+        .args(args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    match tokio::time::timeout(
+        Duration::from_secs(DSH_PROBE_TIMEOUT_SECONDS),
+        collect_process(&mut child),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err("probe timed out".to_string())
+        }
+    }
+}
+
+pub async fn check_prerequisite() -> DshPrerequisiteStatus {
+    let executable = configured_executable();
+    let executable_text = executable.to_string_lossy().into_owned();
+    let version_probe = match run_probe(&executable, &["--version"]).await {
+        Ok(probe) => probe,
+        Err(_) => {
+            return DshPrerequisiteStatus {
+                available: false,
+                compatible: false,
+                executable: Some(executable_text),
+                version: None,
+                message: format!(
+                    "Arena needs the external DSH build worker before a build can start. Install DSH {QUALIFIED_DSH_VERSION} or configure ARENA_DSH_EXECUTABLE, then try again."
+                ),
+            };
+        }
+    };
+    let version = reported_version(&format!(
+        "{}\n{}",
+        version_probe.stdout, version_probe.stderr
+    ));
+    if version.as_deref() != Some(QUALIFIED_DSH_VERSION) {
+        return DshPrerequisiteStatus {
+            available: true,
+            compatible: false,
+            executable: Some(executable_text),
+            version,
+            message: format!(
+                "The configured DSH build worker is not compatible with Arena V1. Arena requires DSH {QUALIFIED_DSH_VERSION}."
+            ),
+        };
+    }
+
+    let profile_probe = run_probe(&executable, &["--profile", "headless", "--help"]).await;
+    let profile_ok = profile_probe
+        .as_ref()
+        .is_ok_and(|probe| probe.exit_code == Some(0));
+    if !profile_ok {
+        return DshPrerequisiteStatus {
+            available: true,
+            compatible: false,
+            executable: Some(executable_text),
+            version,
+            message: "The configured DSH build worker does not expose Arena's headless profile."
+                .to_string(),
+        };
+    }
+
+    DshPrerequisiteStatus {
+        available: true,
+        compatible: true,
+        executable: Some(executable_text),
+        version,
+        message: format!("DSH {QUALIFIED_DSH_VERSION} is ready for Arena V1 Build mode."),
+    }
 }
 
 fn bounded_text(mut bytes: Vec<u8>) -> String {
@@ -192,9 +306,7 @@ pub async fn run(
     let patch_path = patch_dir.join("headless.patch.yml");
     write_runtime_patch(&patch_path, model)?;
 
-    let executable = std::env::var_os("ARENA_DSH_EXECUTABLE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("dsh"));
+    let executable = configured_executable();
     let mut command = Command::new(executable);
     command
         .args(["--profile", "headless", "--patch"])
@@ -284,5 +396,25 @@ mod tests {
         assert!(patch.contains("maxTokens: 4096"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reports_supported_dsh_version_from_common_cli_output() {
+        assert_eq!(
+            reported_version("dsh 0.1.5-rc.1\n"),
+            Some("0.1.5-rc.1".to_string())
+        );
+        assert_eq!(
+            reported_version("v0.1.5-rc.1"),
+            Some("0.1.5-rc.1".to_string())
+        );
+    }
+
+    #[test]
+    fn does_not_accept_another_dsh_version() {
+        assert_ne!(
+            reported_version("dsh 0.1.5-rc.2"),
+            Some(QUALIFIED_DSH_VERSION.to_string())
+        );
     }
 }

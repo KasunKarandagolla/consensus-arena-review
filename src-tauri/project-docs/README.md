@@ -57,6 +57,9 @@ The latest local post-implementation audit establishes a first Build vertical sl
 - `needs_user` is persisted before the existing AskUser event is emitted; restart can re-present the persisted question.
 - Apply is explicit and only fast-forwards a clean, unchanged original checkout to a verified candidate.
 - DSH is not yet bundled/installed by Arena.
+- Build setup now performs a read-only DSH prerequisite check and blocks
+  Delivery admission unless the exact qualified `0.1.5-rc.1` executable
+  exposes the `headless` profile.
 - Native Linux Tauri launch was reconfirmed, but the managed WebView was blank
   during the latest qualification session, so no Delivery UI dogfood run was
   started in that session.
@@ -78,8 +81,12 @@ The 2026-09-16 programme qualification fixed the INCONCLUSIVE resume
 candidate-preservation defect, hardened evidence receipt IDs and DSH timeout
 cleanup, and added a stale Delivery-event guard. Native WebKitGTK still renders
 blank on the current Linux session because DRI/EGL authentication is
-unavailable; no UI-to-Apply run was claimed. See
+unavailable; the tested software-rendering flags did not restore the Arena
+surface, and no UI-to-Apply run was claimed. See
 `/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/delivery-v1-programme-qualification-2026-09-16.md`.
+
+The follow-up prerequisite qualification is recorded in
+`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/delivery-v1-prerequisite-qualification-2026-09-16.md`.
 
 See `audits/delivery-dsh-v4-worker-and-e2e.md` for the permanent evidence.
 
