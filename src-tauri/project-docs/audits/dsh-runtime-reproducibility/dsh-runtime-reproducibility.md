@@ -117,10 +117,10 @@ Consequences:
   probe, establish reproducibility, or meet the two-run gate.
 - The prior V4 Flash request timed out; it is not a substitute worker route.
 - Windows DSH package installation, executable resolution, and headless
-  capability remain unproven until the pending native runner result. Windows
-  npm `.cmd` shims now resolve to the package's Node entrypoint without a
-  shell; the runner exercises this production path. No provider secret was
-  made available to a Windows runner.
+  capability passed on the native runner (workflow 35200869335). Windows npm
+  `.cmd` shims resolve to the package's Node entrypoint without a shell. This
+  was prerequisite evidence only; no provider secret or model-backed Windows
+  worker run was used.
 - Current `kill_on_drop` evidence concerns the tracked direct child only.
   DSH descendant cleanup remains unproven on Linux and Windows.
 

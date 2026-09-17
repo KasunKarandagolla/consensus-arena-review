@@ -118,10 +118,11 @@ The production verifier now resolves Node and npm from the same host PATH
 installation (or explicit `NODE_EXE`) outside the candidate worktree, then
 checks exact Node `v22.22.2` and npm `10.9.7` before invoking `npm-cli.js`
 without a command shell. Candidate-controlled `where.exe`/npm shims are not
-used. The Windows-only smoke test is present but has not run on Windows; other
-`.cmd`/`.bat` verifier tools remain unqualified. Timeout cleanup kills and
-reaps the direct child with a bounded wait, but does not own/terminate a full
-Windows Job Object process tree; descendant termination remains unproven.
+used. Windows workflow 35200869335 now passes the Windows-only smoke tests,
+including the npm no-shell path, Job Object descendant fixtures, full Rust
+tests, and unsigned NSIS packaging. Other `.cmd`/`.bat` verifier tools remain
+unqualified. Model-backed Windows DSH and GUI/WebView2 behavior remain
+unproven.
 
 The real verifier PASS/FAIL/INCONCLUSIVE cases and real Git checks are
 production-component runtime evidence, but they are **not** the complete
