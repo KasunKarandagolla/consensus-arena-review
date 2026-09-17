@@ -601,7 +601,15 @@ async fn restore_protected_acceptance(
     for path in protected_paths {
         git_ok(
             worktree,
-            &["restore", "--source", acceptance_commit, "--", path],
+            &[
+                "restore",
+                "--source",
+                acceptance_commit,
+                "--staged",
+                "--worktree",
+                "--",
+                path,
+            ],
         )
         .await?;
     }
