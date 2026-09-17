@@ -74,9 +74,34 @@ Gate testing found Arena-critical defects for the required path:
 
 ## OpenCode
 
-Credible noninteractive worker and portability candidate. It is not selected or qualified for Arena's worker contract; consider it only through the required post-Trigger-A comparison.
+The 2026-09-17 OpenCode-first runtime qualification established a useful
+control-plane candidate but did not qualify an Arena worker. The local Linux
+binary (`1.17.18`, SHA256 recorded in
+`audits/product-os-transition/01-runtime-provider-foundation.md`) started a
+headless server and answered `/global/health` from a disposable Git workspace.
+Official documentation/source also confirms sessions, SSE events, abort,
+agents/subagents, MCP, skills, provider configuration, and OpenAI-compatible
+custom endpoints.
 
-**Current decision:** Watchlisted worker candidate, not another architecture to integrate in parallel.
+The hard worker gate remains **CONDITIONAL / NOT QUALIFIED**. No provider
+credential was used, the configured local Omniroute endpoint was unavailable,
+and no model-backed task, repository edit, shell/tool call, subagent result,
+MCP call, skill execution, or provider execution was proven. The local binary
+also took approximately 21 seconds to become healthy in the bounded probe;
+an earlier server probe observed approximately 315 MiB RSS. Native Windows,
+packaging, OpenCode descendant cleanup, and Arena-level cancellation remain
+unproven. OpenCode permissions remain tool policy, not an OS sandbox.
+
+Do not add a production adapter or replace DSH from this result. Preserve
+Arena's `SessionRuntime`, worktree, sanitized-environment, acceptance,
+independent-verifier, and Apply boundaries. The next qualification should use
+an isolated XDG/config/data/state environment, a pinned artifact, one permitted
+provider, a disposable repo with protected-acceptance and out-of-scope-write
+tests, MCP/skill evidence, cancellation/process-tree checks, and native
+Windows/package evidence before any worker adapter is selected.
+
+**Current decision:** Conditional candidate; no runtime integration yet. See
+`audits/product-os-transition/01-runtime-provider-foundation.md`.
 
 ## Pi
 
