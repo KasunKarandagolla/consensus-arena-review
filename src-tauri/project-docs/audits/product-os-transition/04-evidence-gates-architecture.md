@@ -3,8 +3,9 @@
 **Date:** 2026-09-17
 **Scope:** source-level evidence gates and founder-facing journey summary after
 the Milestone 03 consultation/reuse work.
-**Status:** bounded implementation complete; full architecture-competition
-closure remains limited by the independent-review wave recorded below.
+**Status:** bounded implementation and architecture-competition record
+complete; durable evidence persistence and external team integration remain
+deferred.
 
 ## Preflight closure
 
@@ -116,8 +117,8 @@ machine.
 
 ## Verification evidence
 
-Focused Rust tests cover stale package/evidence/fingerprint invalidation, missing/fake
-evidence, owner-decision authority, ambiguity, reuse BUILD evidence,
+Focused Rust tests cover stale package/evidence/fingerprint invalidation,
+missing/fake evidence, owner-decision authority, ambiguity, reuse BUILD evidence,
 architecture challenge requirements, current-candidate verifier correlation,
 and release evidence categories. The consultation budget regression and
 existing consultation tests remain green.
