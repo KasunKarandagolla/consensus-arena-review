@@ -106,6 +106,15 @@ SessionRuntime. GitHub MCP, pinned ECC/gstack procedures, and external
 consultation execution remain research capabilities rather than runtime-
 qualified features.
 
+Milestone 05 adds the bounded Arena-owned Build Package handoff: current
+authority records are assembled and fingerprinted in existing Delivery state,
+then rechecked before OpenCode admission. Existing SessionRuntime, candidate
+worktree, frozen acceptance, independent verifier, repair, and Safe Apply
+remain authoritative. The candidate directory is non-authoritative, not an OS
+or security sandbox. Windows, packaging, hostile same-user isolation, broad
+provider portability, GitHub MCP, ECC/gstack, and external consultation
+execution remain unproven.
+
 The current qualification record adds a direct DeepSeek V4 Flash provider
 sanity check and a real DSH comparison. V4 Flash reached model listing but
 bounded inference timed out; its standalone DSH task did not change a

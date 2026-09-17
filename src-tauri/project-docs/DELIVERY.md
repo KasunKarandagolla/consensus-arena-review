@@ -42,6 +42,10 @@ It is intentionally parallel to the old Consult/browser path.
 - Build does not require a leader or participant selection.
 - It does not open model WebViews.
 - Existing `SessionRuntime` is the task-ownership/concurrency guard.
+- When Product OS supplies an accepted Build Package, Arena assembles it from
+  current persisted authority records, binds its fingerprint to `DeliveryState`,
+  and rechecks Architecture and Build Readiness before OpenCode admission.
+  Worker/runtime summaries cannot supply those gate facts.
 
 ### 2. Repository isolation
 
@@ -158,8 +162,13 @@ create a new candidate commit after checks pass.
 If protected acceptance content changes:
 
 - restore it from the acceptance commit;
+- reject and discard the candidate before Arena creates a candidate commit;
 - fail the worker attempt; preserve the verifier's own receipt rather than
   rewriting its PASS/FAIL result to represent Arena's separate policy decision.
+
+The candidate worktree is a non-authoritative working directory, not an OS or
+security sandbox. Git worktrees and process cleanup do not prevent arbitrary
+same-user filesystem access.
 
 ### 6. Independent outcome handling
 

@@ -25,6 +25,7 @@ mod hackathon;
 mod memory_store;
 mod orchestrator;
 mod opencode_adapter;
+pub mod product_os;
 mod persona_manager;
 mod pipeline_ids;
 mod proxy_manager;

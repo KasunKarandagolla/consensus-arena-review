@@ -1,4 +1,5 @@
 use crate::dsh_worker;
+use crate::product_os::{assemble_build_package, BuildPackage, ProductAuthorityRecords};
 use crate::session_runtime::SessionOwner;
 use crate::settings_store::SettingsStore;
 use crate::transcript_store::TranscriptStore;
@@ -123,6 +124,12 @@ pub struct OpenCodeWorkOrder {
     pub verification_id: Option<String>,
     pub verification_status: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub build_package_id: Option<String>,
+    #[serde(default)]
+    pub build_package_revision: Option<u64>,
+    #[serde(default)]
+    pub build_package_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +161,10 @@ pub struct DeliveryState {
     pub work_order: Option<OpenCodeWorkOrder>,
     #[serde(default)]
     pub evidence: Vec<OpenCodeEvidence>,
+    #[serde(default)]
+    pub authority_records: Option<ProductAuthorityRecords>,
+    #[serde(default)]
+    pub build_package: Option<BuildPackage>,
     pub created_at: i64,
     pub updated_at: i64,
     pub message: String,
@@ -203,6 +214,41 @@ pub fn transition(phase: DeliveryPhase, next: DeliveryPhase) -> Result<DeliveryP
     }
 }
 
+/// Bind a current, Arena-assembled Product OS package to the existing
+/// Delivery state. This is the handoff seam; workers never supply gate facts
+/// or call this function.
+#[allow(dead_code)]
+pub fn bind_build_package(
+    state: &mut DeliveryState,
+    records: ProductAuthorityRecords,
+) -> Result<(), String> {
+    let package = assemble_build_package(&records)?;
+    let architecture = package.evaluate_current(
+        &records,
+        crate::evidence_gates::GateId::Architecture,
+    )?;
+    if architecture.status != crate::evidence_gates::GateStatus::Pass {
+        return Err(format!(
+            "architecture gate blocks Delivery admission: {}",
+            architecture.reason
+        ));
+    }
+    let readiness = package.evaluate_current(
+        &records,
+        crate::evidence_gates::GateId::BuildReadiness,
+    )?;
+    if readiness.status != crate::evidence_gates::GateStatus::Pass {
+        return Err(format!(
+            "Build Package is not actionable: {}",
+            readiness.reason
+        ));
+    }
+    state.objective = package.objective.clone();
+    state.authority_records = Some(records);
+    state.build_package = Some(package);
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryPresentation {
     pub schema_version: u32,
@@ -217,6 +263,8 @@ pub struct DeliveryPresentation {
     pub runtime: DeliveryRuntime,
     pub work_order: Option<OpenCodeWorkOrder>,
     pub evidence: Vec<OpenCodeEvidence>,
+    pub build_package_id: Option<String>,
+    pub build_package_ready: bool,
 }
 
 fn status_text(phase: &DeliveryPhase) -> &'static str {
@@ -255,6 +303,11 @@ pub fn presentation(state: &DeliveryState) -> DeliveryPresentation {
         runtime: state.runtime.clone(),
         work_order: state.work_order.clone(),
         evidence: state.evidence.clone(),
+        build_package_id: state
+            .build_package
+            .as_ref()
+            .map(|package| package.package_id.clone()),
+        build_package_ready: state.build_package.is_some() && state.authority_records.is_some(),
     }
 }
 
@@ -1228,6 +1281,7 @@ pub async fn apply_verified_candidate(state: &mut DeliveryState) -> Result<(), S
         if let Some(receipt) = &state.last_verification {
             if receipt.verdict != "pass"
                 || receipt.candidate_sha != candidate
+                || receipt.acceptance_commit != state.acceptance_commit.clone().unwrap_or_default()
                 || !receipt.candidate_tree_unchanged
                 || !receipt.protected_paths_unchanged
             {
@@ -1287,6 +1341,8 @@ async fn run_inner(
         if state.acceptance_commit.is_none() { return Err("delivery has no frozen acceptance commit".to_string()); }
         let profile = VerificationProfile { version: 1, commands: state.verification_commands.clone(), protected_paths: state.protected_files.clone() };
         verification::validate_profile(&profile, &worktree)?;
+        let canonical = PathBuf::from(&state.source_workspace);
+        let canonical_protected_before = verification::protected_hashes(&canonical, &state.protected_files)?;
         let acceptance_commit = state
             .acceptance_commit
             .clone()
@@ -1337,9 +1393,17 @@ async fn run_inner(
             state.last_worker_summary = Some(worker_summary(&execution, &secrets));
             let protected_before = state.protected_hashes.iter().map(|value| (value.path.clone(), value.sha256.clone())).collect::<Vec<_>>();
             let protected_changed = !verification::protected_files_unchanged(&worktree, &protected_before);
-            if protected_changed {
+            let canonical_changed = !verification::protected_files_unchanged(&canonical, &canonical_protected_before);
+            if protected_changed || canonical_changed {
                 restore_protected_acceptance(&worktree, &acceptance_commit, &state.protected_files).await?;
-                state.last_worker_summary = Some("worker attempted to modify protected acceptance files; restored from acceptance commit".to_string());
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some(if canonical_changed {
+                    "worker attempted to modify canonical protected acceptance; candidate was discarded before commit".to_string()
+                } else {
+                    "worker attempted to modify protected acceptance files; candidate was discarded before commit".to_string()
+                });
+                persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
+                break;
             } else if let Some(result) = execution.result {
                 if result.status == dsh_worker::WorkerStatus::NeedsUser {
                     let question = result.question.ok_or_else(|| "worker returned needs_user without a question".to_string())?;
@@ -1370,12 +1434,6 @@ async fn run_inner(
             if !receipt.candidate_tree_unchanged {
                 state.phase = DeliveryPhase::Failed;
                 state.last_worker_summary = Some("verification changed the candidate worktree; no repair or Verified transition was allowed".to_string());
-                persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
-                break;
-            }
-            if protected_changed {
-                state.phase = DeliveryPhase::Failed;
-                state.last_worker_summary = Some("worker attempted to modify protected acceptance files; restored from acceptance commit and rejected this attempt".to_string());
                 persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
                 break;
             }
@@ -1759,6 +1817,8 @@ mod tests {
             runtime: DeliveryRuntime::Dsh,
             work_order: None,
             evidence: Vec::new(),
+            authority_records: None,
+            build_package: None,
             created_at: 1,
             updated_at: 1,
             message: "Preparing project…".to_string(),
@@ -1959,6 +2019,8 @@ mod tests {
             runtime: DeliveryRuntime::Dsh,
             work_order: None,
             evidence: Vec::new(),
+            authority_records: None,
+            build_package: None,
             created_at: chrono::Utc::now().timestamp(),
             updated_at: chrono::Utc::now().timestamp(),
             message: "Preparing project…".to_string(),

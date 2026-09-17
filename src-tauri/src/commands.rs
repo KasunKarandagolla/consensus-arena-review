@@ -559,6 +559,8 @@ pub async fn start_delivery(
         },
         work_order: None,
         evidence: Vec::new(),
+        authority_records: None,
+        build_package: None,
         created_at: now,
         updated_at: now,
         message: "Preparing project…".to_string(),

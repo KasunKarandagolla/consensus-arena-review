@@ -83,6 +83,10 @@ decisions remain explicit, research outcomes remain bounded decisions rather
 than market-validation claims, and implementation evidence must name the
 candidate revision independently verified. Gate predicates do not replace
 Delivery admission, SessionRuntime lifecycle authority, or Safe Apply.
+The production package is assembled from current Arena-owned records through
+the existing Delivery state; worker and renderer summaries are proposals, not
+authority inputs. A candidate worktree is non-authoritative and is not an OS
+or security sandbox.
 
 ## Delivery-specific change process
 

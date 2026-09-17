@@ -120,6 +120,18 @@ replace owner decisions, the independent verifier, or Safe Apply. Durable
 journey persistence and full work-order lifecycle binding remain later work
 where the existing SessionRuntime/Delivery contracts can carry them safely.
 
+## D-2026-17 — Build Package admission is Arena-owned
+
+**Accepted for Milestone 05.** Product OS records are assembled into one
+versioned, fingerprinted Build Package through existing persisted Delivery
+state. Owner decisions and architecture evidence are referenced by identity;
+worker, renderer, consultation, and runtime completion claims cannot construct a
+passing package. A current package must pass the Architecture and Build
+Readiness predicates before existing Delivery/OpenCode execution is admitted.
+SessionRuntime remains live lifecycle authority; Delivery remains acceptance,
+independent-verification, repair, Verified, and Safe Apply authority. The
+candidate worktree is non-authoritative and is not a security sandbox.
+
 ---
 
 # Superseded / rejected assumptions

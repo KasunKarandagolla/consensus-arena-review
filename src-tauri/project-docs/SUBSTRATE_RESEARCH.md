@@ -115,6 +115,17 @@ out without a session/tool result. These observations do not widen the
 qualification and do not justify requesting NVIDIA credentials. Historical
 NVIDIA/DSH evidence is separate legacy-worker evidence.
 
+Milestone 05 added an Arena-owned `BuildPackage` assembler over the existing
+persisted Delivery state. Current authority records, owner decision IDs,
+architecture evidence references, and a deterministic fingerprint are checked
+before the package is handed to Delivery or OpenCode. Protected acceptance
+inspection in the DSH path now rejects before candidate commit, and the
+OpenCode Safe Apply path requires a current candidate worktree plus matching
+independent verification.
+This narrows the practical wording above; it does not make a candidate
+worktree an OS/security sandbox and does not prove Windows, packaging, hostile
+same-user isolation, or broad provider portability.
+
 ## Pi
 
 Evaluated during substrate exploration but not selected as the current primary architecture. The DSH worker assumption is now materially challenged, but do not start a parallel comparison before the required Astra Trigger A consultation.
