@@ -53,6 +53,14 @@ cannot prove either behavior.
 
 ## Evidence boundary
 
-The Linux source checks and frontend build pass, but no native Windows machine
-was available. This document separates source readiness from the runtime proof
-still required before Windows support is claimed.
+## Native Windows qualification update
+
+Workflow [35200869335](https://github.com/KasunKarandagolla/consensus-arena-review/actions/runs/35200869335)
+completed successfully on Windows Server 2025. It ran the full Rust suite
+(400 passed, 2 ignored), Windows `cargo check`, frontend build, formatting,
+the process containment fixtures, Git and SQLite path tests, and produced the
+unsigned NSIS installer artifact `Consensus Arena_0.1.0_x64-setup.exe`
+(5,568,641 uploaded bytes). The pinned Node `v22.22.2`/npm `10.9.7` DSH
+prerequisite install also passed without a provider credential. This proves
+Windows build/backend/packaging qualification; model-backed DSH execution and
+WebView2 GUI E2E remain unproven.

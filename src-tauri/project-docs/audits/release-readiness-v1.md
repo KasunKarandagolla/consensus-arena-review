@@ -96,3 +96,27 @@ crate was not reached, so this is not a Windows compile result. The focused
 Windows workflow is present but awaits a reviewed/pushed checkpoint. A final
 Debian package result, artifact size/dependencies, native Windows evidence,
 and final source SHA remain pending. No release is approved by this audit.
+
+## Qualification amendment — 2026-09-17
+
+The current DSH reproducibility gate established a clean-install A/B package
+tree match under the new lock documented in
+`audits/dsh-runtime-reproducibility/dsh-runtime-reproducibility.md`, but the
+headless help probe timed out and no model-backed Muse task was completed.
+The historical lock remains unreproduced; DSH is therefore materially
+challenged and triggers the Astra consultation packet rather than a durable
+external-prerequisite decision.
+
+Windows workflow [35200869335](https://github.com/KasunKarandagolla/consensus-arena-review/actions/runs/35200869335)
+passed the full Rust suite, Windows `cargo check`, frontend build, path and
+SQLite tests, process fixtures, the pinned Node/npm DSH prerequisite probe
+without credentials, and unsigned NSIS packaging. The uploaded installer was
+`Consensus Arena_0.1.0_x64-setup.exe` (5,568,641 bytes). This is Windows
+build/backend/package evidence; model-backed DSH and WebView2 GUI E2E remain
+unproven. The Linux Debian package build is still running on the qualification
+host and has not yet produced an install-tested artifact.
+
+The secure credential migration and diagnostics-retention work are covered by
+the permanent secure-storage audit. Linux native keyring round-trip passed;
+Windows keyring access and a real installed GUI remain separate evidence
+items. No release approval is implied by this amendment.
