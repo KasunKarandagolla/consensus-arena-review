@@ -74,34 +74,38 @@ Gate testing found Arena-critical defects for the required path:
 
 ## OpenCode
 
-The 2026-09-17 OpenCode-first runtime qualification established a useful
-control-plane candidate but did not qualify an Arena worker. The local Linux
-binary (`1.17.18`, SHA256 recorded in
-`audits/product-os-transition/01-runtime-provider-foundation.md`) started a
-headless server and answered `/global/health` from a disposable Git workspace.
-Official documentation/source also confirms sessions, SSE events, abort,
-agents/subagents, MCP, skills, provider configuration, and OpenAI-compatible
-custom endpoints.
+The 2026-09-17 qualification closure proved that the installed Linux
+OpenCode control plane can execute real OpenCode Zen work, but it did **not**
+qualify OpenCode for Linux Arena integration. The pinned local binary is
+`1.17.18` (SHA256 recorded in
+`audits/product-os-transition/01-runtime-provider-foundation.md`). The live
+provider registry identified the requested primary model as
+`opencode/muse-spark-1.2-contributor-free`; the bounded `opencode/big-pickle`
+fallback was not needed.
 
-The hard worker gate remains **CONDITIONAL / NOT QUALIFIED**. No provider
-credential was used, the configured local Omniroute endpoint was unavailable,
-and no model-backed task, repository edit, shell/tool call, subagent result,
-MCP call, skill execution, or provider execution was proven. The local binary
-also took approximately 21 seconds to become healthy in the bounded probe;
-an earlier server probe observed approximately 315 MiB RSS. Native Windows,
-packaging, OpenCode descendant cleanup, and Arena-level cancellation remain
-unproven. OpenCode permissions remain tool policy, not an OS sandbox.
+The qualification closure proved real model file work, correlated parent and
+two child sessions, a project-local skill, one bounded local MCP call,
+server-side abort of an active shell descendant, and session/message
+reconciliation after server restart. The Muse run observed 552,044 KiB maximum
+RSS on Linux. It also proved the decisive boundary failure: an OpenCode
+worker could directly overwrite a disposable protected acceptance file. No
+Arena-owned OpenCode adapter currently composes that worker call with
+`SessionRuntime`, frozen acceptance, independent verification, stale-result
+rejection, and Safe Apply authority, so the required authority invariant has
+not been proven at the integration boundary.
 
-Do not add a production adapter or replace DSH from this result. Preserve
-Arena's `SessionRuntime`, worktree, sanitized-environment, acceptance,
-independent-verifier, and Apply boundaries. The next qualification should use
-an isolated XDG/config/data/state environment, a pinned artifact, one permitted
-provider, a disposable repo with protected-acceptance and out-of-scope-write
-tests, MCP/skill evidence, cancellation/process-tree checks, and native
-Windows/package evidence before any worker adapter is selected.
+**Current decision:** **NOT QUALIFIED FOR LINUX INTEGRATION**. Do not add a
+production OpenCode adapter, replace DSH, or execute the Milestone 02 walking
+skeleton from this result. Preserve Arena's `SessionRuntime`, worktree,
+sanitized-environment, acceptance, independent-verifier, and Apply boundaries.
+The exact evidence and the narrow blocker are recorded in
+`audits/product-os-transition/02-opencode-qualification-closure.md`.
 
-**Current decision:** Conditional candidate; no runtime integration yet. See
-`audits/product-os-transition/01-runtime-provider-foundation.md`.
+An NVIDIA NIM-backed OpenCode experiment is **not justified yet**: Zen model
+execution and the required OpenCode primitives worked, so the blocker is the
+missing Arena-owned authority composition rather than the provider path. A
+NIM experiment becomes justified only if the bounded adapter test later shows
+that Zen availability or model execution is itself the limiting factor.
 
 ## Pi
 
