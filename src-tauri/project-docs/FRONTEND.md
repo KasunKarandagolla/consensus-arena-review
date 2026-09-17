@@ -1,5 +1,20 @@
 # Consensus Arena — Frontend Guide
 
+## Current release closure — 2026-09-17
+
+The Setup view displays the DSH prerequisite result and primary Agent Brain
+configuration requirement before Build can start. Current DSH installs pass
+version/root-help checks but time out on the headless profile check, so the
+UI stays blocked at setup; the owner sees plain status text with technical
+probe details behind a disclosure. Build launch failures use product-language
+guidance with the sanitized command error available as optional details. A
+model-backed run was not substituted or claimed.
+Agent Brain inputs return an empty key plus `api_key_configured`; a blank save
+keeps the saved OS credential, and Settings offers explicit removal. An
+unavailable or pending OS credential-store migration is shown as a setup
+status. Current key-storage details and qualification boundaries are in
+`audits/secure-credential-storage.md`.
+
 ## Current baseline
 
 The production frontend is React + TypeScript inside the Tauri application and was rebuilt from the project's `preview.html` reference. That visual baseline remains in force unless the user explicitly approves a redesign.

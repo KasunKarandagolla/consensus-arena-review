@@ -52,6 +52,34 @@ returns a JSON-serialized string with `available`, `compatible`,
 `JSON.parse()` this command result. It does not return credentials or raw DSH
 output.
 
+### Credential settings
+
+The `get_agent_brain_config`, `get_fallback_brain_config`, and
+`get_secondary_brain_config` commands return JSON-serialized strings. Their
+`api_key` field is always empty; `api_key_configured` reports whether a key
+is saved. The renderer must never receive an Agent Brain credential.
+`get_credential_storage_status` also returns a JSON-serialized string with
+`available`, `migration_pending`, and owner-facing `message` fields.
+
+`clear_brain_credential` accepts `{ kind }`, where `kind` is `primary`,
+`fallback`, or `secondary`; it returns no credential data. `get_hackathon_config`
+returns the frontend-safe projection without model API keys. Memory export and
+restore operate on `memory.db`, separate from settings and OS credentials.
+
+Diagnostic capture/export is available only after the owner enables
+Maintenance mode. `export_browser_diagnostics` returns a JSON-serialized
+string describing the locally saved export directory. Exports are retained in
+the app-data directory. Starting a new export prunes matching timestamped
+export directories so at most five matching directories are targeted for
+retention; Arena does not record a validity marker for each bundle. Dated
+application logs are pruned after 14 days. No diagnostic upload occurs.
+
+Saving a brain with a blank key preserves its saved key. The explicit
+`clear_brain_credential` command takes `{ kind }`, where `kind` is `primary`,
+`fallback`, or `secondary`, and removes that saved key from the operating
+system credential store. Hackathon keys are keyed by stable model ID and are
+removed when their model is deleted from `save_hackathon_config`.
+
 The supplied audits do **not** provide a complete authoritative symbol/event-name list. Before touching this IPC, read the actual local source that implemented Delivery V1 and update this document if necessary.
 
 ## Serialization convention

@@ -17,6 +17,18 @@ A worker may terminate at a blocker. Product continuity lives in repository/task
 
 ## DeepSeek Harness (DSH)
 
+### Current closure decision — 2026-09-16
+
+**Current worker assumption materially challenged — Astra Trigger A.** The
+historical one-run Muse result remains genuine single-run evidence, but the
+old lock was not reproducible. A newly pinned npm manifest/lock produced two
+matching clean installs and matching DSH version/root-help output; the exact
+Arena headless-profile probe timed out in both. No model-backed task ran, and
+the new lock is not a qualified worker baseline. Stop further DSH setup
+combinations and use the targeted Astra packet in
+`audits/dsh-runtime-reproducibility/dsh-runtime-reproducibility.md` before
+selecting DSH, a fork, or another bounded worker.
+
 ### Proven useful
 
 Gate testing proved real bounded autonomous implementation/repair with NVIDIA NIM on the current modest Linux Lite laptop. Resource measurement in the tested configuration was roughly 185 MB RSS during active DSH work.
@@ -27,16 +39,11 @@ DSH is **not** selected as Arena's full durable product substrate. Multiple host
 
 ### Current role
 
-**Use narrowly** as the intended bounded coding/debugging/repair worker
-contract, but keep hosted model qualification explicit. One earlier
-`meta/muse-glimmer-30b` run completed a real DSH coding task and emitted an
-Arena-shaped schema-1 receipt; treat that as historical single-run evidence,
-not a repeatable baseline. In the 2026-09-16 closure pass the documented DSH
-lockfile/runtime could not be reconstructed, so neither required independent
-Muse run was attempted and current runtime repeatability remains unproven.
-`deepseek-ai/deepseek-v4-flash-0731` previously timed out during bounded
-inference and did not complete the worker contract. Neither route currently
-qualifies the frozen worker runtime.
+DSH remains present in source as the bounded worker implementation, but it is
+not a current supported/qualified worker. Arena's prerequisite gate blocks
+before Build admission. Do not install or run DSH from an arbitrary lock as a
+qualification substitute. `deepseek-ai/deepseek-v4-flash-0731` also remains
+unqualified after its earlier bounded inference timeout.
 
 See `audits/delivery-dsh-v4-worker-and-e2e.md` for the route, receipt, and
 resource evidence.
@@ -67,13 +74,13 @@ Gate testing found Arena-critical defects for the required path:
 
 ## OpenCode
 
-Credible noninteractive worker and portability fallback. It is not the selected current worker because DSH has already been proven locally for bounded execution.
+Credible noninteractive worker and portability candidate. It is not selected or qualified for Arena's worker contract; consider it only through the required post-Trigger-A comparison.
 
-**Current decision:** Reserve worker fallback, not another architecture to integrate in parallel.
+**Current decision:** Watchlisted worker candidate, not another architecture to integrate in parallel.
 
 ## Pi
 
-Evaluated during substrate exploration but not selected as the current primary architecture. Do not reopen solely because it is lightweight; compare only if the proven DSH bounded-worker contract fails materially.
+Evaluated during substrate exploration but not selected as the current primary architecture. The DSH worker assumption is now materially challenged, but do not start a parallel comparison before the required Astra Trigger A consultation.
 
 ## Dagu — deferred workflow candidate; standalone gate inconclusive
 
@@ -98,7 +105,7 @@ Important discovered semantics:
 - if completion persists but enqueue/resume fails, explicit resume semantics exist and must be tested;
 - GPL/distribution terms require legal/product decision before bundling/embedding; initial validation should use external CLI/REST boundary.
 
-**Standalone gate status (2026-09-16): INCONCLUSIVE.** A Dagu 2.16.6 local
+**Standalone gate status (2026-09-16): INCONCLUSIVE — post-V1.** A Dagu 2.16.6 local
 Linux run supported dependency scheduling, retries/history, durable root human
 tasks, attempt release while waiting, pending-task discovery after controller
 restart, identical-answer idempotency, conflicting-answer rejection, resume,
@@ -107,7 +114,11 @@ reconciliation after a hard interruption during an active run, and two
 disposable Dagu→DSH composition attempts stopped before a worker result because
 the exact DSH runtime/credential boundary was unavailable. No Arena integration
 was attempted. The Windows archive was checksum/PE-inspected but not executed
-on Windows.
+on Windows. A controlled SIGKILL follow-up showed the active attempt stayed
+`Running` until Dagu restarted and reconciled it; explicit same-run retry then
+repeated the external step's first side effect. A persisted human task survived
+restart but needed an explicit retry after completion. The final evidence is in
+`audits/dagu-runtime-closure-2026-09-16.md`.
 
 Measured carrying costs in that local experiment were approximately 80–109 MiB
 server RSS, 1.1 MiB fixture state, and a 161 MiB Linux binary. Upstream
@@ -118,10 +129,10 @@ legal review before packaging. See
 [official installation options](https://docs.dagu.sh/getting-started/installation/),
 and [upstream licensing](https://github.com/dagucloud/dagu/blob/main/LICENSING.md).
 
-**Current status:** not implemented and not yet qualified as an Arena
-workflow-engine candidate. Do not prepare an integration or broad Astra
-consultation from the partial mechanics alone. Revisit only after exact DSH
-runtime repeatability and the remaining Dagu composition/recovery tests.
+**Current status:** not implemented and not qualified as an Arena workflow-
+engine candidate. Keep Dagu post-V1. The inconclusive result does not trigger
+Astra Trigger B; revisit only after the worker decision and a clear carrying-
+cost reason to resume the remaining Dagu gates.
 
 ## LangGraph / XState / DBOS
 

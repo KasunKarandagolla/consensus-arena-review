@@ -42,14 +42,18 @@ npm run build
 
 Use real project paths/source layout rather than assuming the historical command examples are exact.
 
-For hosted-worker qualification, first establish the installed provider
-adapter contract, then run a bounded direct provider sanity check and one
-deterministic standalone repository task. A model response or HTTP success is
-not worker proof: the task must make the repository change and emit the
-structured receipt consumed by Arena. Use one control model only when a
-primary route failure leaves DSH-versus-provider ownership ambiguous. Record
-route failures and runtime blockers in a new permanent audit; do not change
-Arena's default model or start Dagu from incomplete worker evidence.
+The 2026-09-16 bounded DSH gate established two matching clean installs, but
+Arena's exact headless capability probe timed out in both. Stop DSH setup
+recovery at that point. Do not start the Muse tasks or substitute another
+worker before the required Astra Trigger A consultation. The current evidence
+and question are preserved in
+`audits/dsh-runtime-reproducibility/dsh-runtime-reproducibility.md`.
+
+For any future worker qualification, a model response or HTTP success is not
+worker proof: each required disposable task must make the repository change,
+pass deterministic verification, emit the structured receipt consumed by
+Arena, and terminate cleanly. Keep the work-order, acceptance, verifier, and
+Apply contracts stable while selecting the implementation worker.
 
 ## Product-change discipline
 
@@ -88,11 +92,14 @@ Read `CONSULTATION.md`, `IPC.md`, `RELIABILITY.md`, and affected browser/session
 
 ## Dagu validation process
 
-Dagu's standalone falsification gate has run and its overall result is
-**INCONCLUSIVE**. Do not call it current architecture: no Arena integration was
-attempted, and successful DSH composition plus automatic recovery after a hard
-interruption remain unproven. The supported standalone human-task mechanics
-are recorded in `audits/dagu-standalone-qualification.md`.
+Dagu's standalone closure is **INCONCLUSIVE — post-V1**. Linux hard
+interruption required explicit stale-run reconciliation and demonstrated
+at-least-once side effects. DSH composition and Windows execution remain
+unproven. Finish only the currently authorized hard-interruption and native
+Windows standalone evidence gates, then record the final verdict. Do not
+integrate Dagu or broaden its V1 qualification scope. The supported mechanics
+and exact failure evidence are recorded in
+`audits/dagu-runtime-closure-2026-09-16.md`.
 
 The narrow validation should prove:
 
@@ -109,11 +116,10 @@ The narrow validation should prove:
 - process cleanup/resource use on Linux Lite;
 - later native Windows parity.
 
-The partial standalone result does not trigger broad Astra consultation or
-integration work. First recover/reproduce the exact DSH runtime, then complete
-the missing Dagu composition and interrupted-run gates. If those fail
-materially, preserve the work-order/worker/verifier contracts and test a small
-Arena controller instead.
+The inconclusive Dagu result does not trigger Astra Trigger B. The DSH gate
+does independently trigger Astra Trigger A; use only the targeted packet in
+the DSH reproducibility audit. Do not spend further sessions attempting to
+recover the historic lock or testing Dagu while the worker decision is open.
 
 
 ## Audit storage

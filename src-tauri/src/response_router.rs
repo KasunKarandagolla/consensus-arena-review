@@ -192,11 +192,11 @@ fn should_retry_after_failure(
     // turn/generation cannot suppress or authorize this turn's retry.
     if diagnostics.has_active_response_observed(agent_id, turn) {
         tracing::info!(
-            "[RETRY] {} not retrying — late response already observed after injection (attempt {}/{}): {}",
+            "[RETRY] {} not retrying — late response already observed after injection (attempt {}/{}), category={}",
             agent_id,
             attempt,
             MAX_RETRIES,
-            error
+            error.category()
         );
         return false;
     }
@@ -211,11 +211,11 @@ fn should_retry_after_failure(
     // this check, so we only need to decide retry vs bounded failure.
     if diagnostics.is_empty_shell_failure(agent_id) {
         tracing::warn!(
-            "[RETRY] {} page_state_hint=empty_shell_or_hydration_stuck — not retrying navigation (attempt {}/{}): {}",
+            "[RETRY] {} page_state_hint=empty_shell_or_hydration_stuck — not retrying navigation (attempt {}/{}), category={}",
             agent_id,
             attempt,
             MAX_RETRIES,
-            error
+            error.category()
         );
         return false;
     }
@@ -533,9 +533,10 @@ async fn confirm_active_submit(
             Err(e) => {
                 last_error = Some(e.to_string());
                 tracing::warn!(
-                    "[SUBMIT] {} turn {} ack error (attempt {attempt}): {e}",
+                    "[SUBMIT] {} turn {} ack error (attempt {attempt}) category={}",
                     context.agent_id,
-                    context.turn
+                    context.turn,
+                    e.category()
                 );
                 // DO NOT clear `early` merely because ACK proof failed: a
                 // failed submit report must not destroy a valid response
@@ -1376,9 +1377,9 @@ pub async fn run_agent_loop(
             Err(e) => {
                 let count = state.brain_fail_count.fetch_add(1, Ordering::SeqCst) + 1;
                 tracing::error!(
-                    "[BRAIN] decide() failed (consecutive failures: {}): {}",
+                    "[BRAIN] decide() failed (consecutive failures: {}) category={}",
                     count,
-                    e
+                    e.category()
                 );
                 // Update active brain to unavailable
                 {
@@ -1450,7 +1451,11 @@ pub async fn run_agent_loop(
         // itself fails.
 
         // D-040 [LOOP]
-        tracing::debug!("[LOOP] iter={} decision={:?}", iteration, decision);
+        tracing::debug!(
+            "[LOOP] iter={} action={}",
+            iteration,
+            crate::agent_brain::decision_action(&decision)
+        );
 
         if !pending_adoptions.is_empty() {
             let checks = std::mem::take(&mut pending_adoptions);
@@ -1476,10 +1481,9 @@ pub async fn run_agent_loop(
                         }
                     };
                     tracing::debug!(
-                        "[MEMORY] adoption check model={} topic={} prompt={}",
+                        "[MEMORY] adoption check model={} topic={}",
                         pending.model_id,
-                        pending.topic,
-                        pending.prompt_excerpt
+                        pending.topic
                     );
                     (pending.model_id, pending.topic, adopted)
                 })
@@ -1616,10 +1620,10 @@ pub async fn run_agent_loop(
                             return Err(error);
                         }
                         tracing::warn!(
-                            "[ROUTE] participant {} failed (iteration {}): {}",
+                            "[ROUTE] participant {} failed (iteration {}) category={}",
                             target_model,
                             iteration,
-                            error
+                            error.category()
                         );
                         let _ = app.emit(
                             "boss-message",
@@ -1810,10 +1814,10 @@ pub async fn run_agent_loop(
                         }
                         Err(error) => {
                             tracing::warn!(
-                                "[ROUTE_COMPARE] participant {} failed (iteration {}): {}",
+                                "[ROUTE_COMPARE] participant {} failed (iteration {}) category={}",
                                 target_model,
                                 iteration,
-                                error
+                                error.category()
                             );
                             combined.push_str(&format!(
                                 "[{} unavailable: {}]\n\n",
@@ -2151,16 +2155,23 @@ pub async fn run_agent_loop(
                     let session_id = config.session_id.clone();
                     let project_brief = config.project_brief.clone();
                     let question_for_memory = question.clone();
+                    let safe_question = !brain.contains_api_key(&question_for_memory)
+                        && !crate::memory_store::contains_credential_like_text(
+                            &question_for_memory,
+                        );
                     if let Err(e) = crate::db_helpers::run_blocking(move || {
                         let mut memory = memory_store
                             .lock()
                             .unwrap_or_else(|poison| poison.into_inner());
-                        memory.add_open_question(
-                            &session_id,
-                            &project_brief,
-                            &question_for_memory,
-                            iteration,
-                        )
+                        if safe_question {
+                            memory.add_open_question(
+                                &session_id,
+                                &project_brief,
+                                &question_for_memory,
+                                iteration,
+                            )?;
+                        }
+                        Ok(())
                     })
                     .await
                     {
@@ -2203,28 +2214,43 @@ pub async fn run_agent_loop(
                     let memory_store = state.memory_store.clone();
                     let project_brief = config.project_brief.clone();
                     let session_id = config.session_id.clone();
+                    let safe_to_adopt =
+                        !crate::memory_store::contains_credential_like_text(&question)
+                            && !crate::memory_store::contains_credential_like_text(&answer)
+                            && !brain.contains_api_key(&question)
+                            && !brain.contains_api_key(&answer);
+                    let safe_question = brain.redact_api_key(&question);
+                    let safe_answer = brain.redact_api_key(&answer);
                     let content = format!(
                         "User answered '{}': {}",
-                        crate::memory_store::safe_prefix(&question, 40),
-                        answer
+                        crate::memory_store::safe_prefix(&safe_question, 40),
+                        safe_answer
                     );
-                    let question_prefix = crate::memory_store::safe_prefix(&question, 30);
-                    let resolution = format!("User answered: {answer}");
+                    let resolution = if safe_to_adopt {
+                        format!("User answered: {safe_answer}")
+                    } else {
+                        "User supplied a sensitive value; it was omitted from product memory"
+                            .to_string()
+                    };
                     if let Err(e) = crate::db_helpers::run_blocking(move || {
                         let mut memory = memory_store
                             .lock()
                             .unwrap_or_else(|poison| poison.into_inner());
-                        memory.add_project_memory_with_source(
-                            &project_brief,
-                            "user_preference",
-                            &content,
-                            None,
-                            None,
-                            "user",
-                            "confirmed",
-                        )?;
+                        if safe_to_adopt {
+                            if let Err(e) = memory.add_project_memory_with_source(
+                                &project_brief,
+                                "user_preference",
+                                &content,
+                                None,
+                                None,
+                                "user",
+                                "confirmed",
+                            ) {
+                                eprintln!("[MEMORY] user preference adoption: {e}");
+                            }
+                        }
                         if let Err(e) =
-                            memory.resolve_question(&session_id, &question_prefix, &resolution)
+                            memory.resolve_question(&session_id, &safe_question, &resolution)
                         {
                             eprintln!("[MEMORY] question resolution: {e}");
                         }
@@ -2753,10 +2779,9 @@ async fn inject_and_wait_with_retry(
             attempt > 0 && diagnostics.can_skip_navigation_on_retry(target_model, &target_url);
         if skip_navigate {
             tracing::info!(
-                "[RETRY] skipping navigation for {} attempt {} — already at {} with composer_detected",
+                "[RETRY] skipping navigation for {} attempt {} — composer_detected",
                 target_model,
-                attempt,
-                target_url
+                attempt
             );
         } else if let Err(e) = crate::browser_backend::navigate_agent_window(
             app,
@@ -2773,10 +2798,10 @@ async fn inject_and_wait_with_retry(
                 return Err(e);
             }
             tracing::warn!(
-                "[RETRY] Navigation to {} failed (attempt {}): {}",
+                "[RETRY] navigation failed for {} (attempt {}) category={}",
                 target_model,
                 attempt,
-                e
+                e.category()
             );
             last_err = Some(e);
             continue;
@@ -2792,10 +2817,10 @@ async fn inject_and_wait_with_retry(
                         return Err(e);
                     }
                     tracing::warn!(
-                        "[RETRY] begin operation failed for {} attempt {}: {}",
+                        "[RETRY] begin operation failed for {} attempt {} category={}",
                         target_model,
                         attempt,
-                        e
+                        e.category()
                     );
                     last_err = Some(e);
                     continue;
@@ -2844,10 +2869,10 @@ async fn inject_and_wait_with_retry(
                     return Err(e);
                 }
                 tracing::warn!(
-                    "[RETRY] Injection to {} failed (attempt {}): {}",
+                    "[RETRY] injection failed for {} (attempt {}) category={}",
                     target_model,
                     attempt,
-                    e
+                    e.category()
                 );
                 last_err = Some(e);
                 continue;
@@ -2876,10 +2901,10 @@ async fn inject_and_wait_with_retry(
                             return Err(e);
                         }
                         tracing::warn!(
-                            "[RETRY] submit ack failed for {} attempt {}: {}",
+                            "[RETRY] submit ack failed for {} attempt {} category={}",
                             target_model,
                             attempt,
-                            e
+                            e.category()
                         );
                         last_err = Some(e);
                         continue;
@@ -3010,10 +3035,10 @@ async fn inject_and_wait_with_retry(
                                     return Err(e);
                                 }
                                 tracing::warn!(
-                                    "[RETRY] Wait for response from {} failed (attempt {}): {}",
+                                    "[RETRY] wait for response from {} failed (attempt {}) category={}",
                                     target_model,
                                     attempt,
-                                    e
+                                    e.category()
                                 );
                                 last_err = Some(e);
                                 continue;
@@ -3182,7 +3207,7 @@ async fn wait_for_response_until(
         match tokio::time::timeout_at(deadline, nav_rx.recv()).await {
             Ok(Some(event)) => {
                 // D-040 [NAV]
-                tracing::debug!("[NAV] {:?}", event);
+                tracing::debug!("[NAV] event received");
                 match event {
                     NavEvent::Response {
                         agent_id: ev_agent,
@@ -3289,10 +3314,9 @@ async fn wait_for_response_until(
                                 "challenge"
                             };
                             tracing::warn!(
-                                "[CHALLENGE] {} blocked by {}: {} — waiting for ResumeRequested (600s)",
+                                "[CHALLENGE] {} blocked by category={} — waiting for ResumeRequested (600s)",
                                 agent_id,
-                                kind,
-                                indicator
+                                kind
                             );
                             // R1.8: bounded challenge recovery — do NOT immediately
                             // terminate the live turn. Reuse the setup pattern:
@@ -3325,13 +3349,9 @@ async fn wait_for_response_until(
                                     }
                                     Ok(Some(NavEvent::ChallengeDetected(
                                         ch_id,
-                                        next_indicator,
+                                        _next_indicator,
                                     ))) if ch_id == agent_id => {
-                                        tracing::warn!(
-                                            "[CHALLENGE] {} still blocked: {}",
-                                            agent_id,
-                                            next_indicator
-                                        );
+                                        tracing::warn!("[CHALLENGE] {} still blocked", agent_id);
                                         continue;
                                     }
                                     Ok(Some(NavEvent::ManualResponse {
@@ -3592,8 +3612,8 @@ async fn wait_for_response_with_operation(
                         // Should not appear here (already consumed in ack), treat as protocol error if for same op
                         return Err(AgentError::ExtractionFailed("unexpected submit report during response wait".to_string()));
                     }
-                    other => {
-                        return Err(AgentError::ExtractionFailed(format!("unexpected critical event during response wait: {:?}", other)));
+                    _ => {
+                        return Err(AgentError::ExtractionFailed("unexpected critical event during response wait".to_string()));
                     }
                 }
             }
@@ -3608,7 +3628,7 @@ async fn wait_for_response_with_operation(
                         } else {
                             "challenge"
                         };
-                        tracing::warn!("[CHALLENGE] {} blocked by {}: {} — waiting for ResumeRequested (600s)", context.agent_id, kind, indicator);
+                        tracing::warn!("[CHALLENGE] {} blocked by category={} — waiting for ResumeRequested (600s)", context.agent_id, kind);
                         let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(600);
                         loop {
                             tokio::select! {
@@ -3657,8 +3677,8 @@ async fn wait_for_response_with_operation(
                                             tracing::info!("[CHALLENGE] {} ready after challenge, continuing wait (turn {})", context.agent_id, context.turn);
                                             break;
                                         }
-                                        Some(NavEvent::ChallengeDetected(ch_id, next_indicator)) if ch_id == context.agent_id => {
-                                            tracing::warn!("[CHALLENGE] {} still blocked: {}", context.agent_id, next_indicator);
+                                        Some(NavEvent::ChallengeDetected(ch_id, _next_indicator)) if ch_id == context.agent_id => {
+                                            tracing::warn!("[CHALLENGE] {} still blocked", context.agent_id);
                                             continue;
                                         }
                                         Some(NavEvent::ManualResponse { operation_id, agent_id, turn, response }) if operation_id == context.operation_id && agent_id == context.agent_id && turn == context.turn => {

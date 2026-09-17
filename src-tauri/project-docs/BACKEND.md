@@ -1,5 +1,22 @@
 # Consensus Arena — Backend Guide
 
+## 2026-09-17 release closure status
+
+The DSH source integration is blocked by its current external-worker probe:
+two matching clean npm installs timed out on Arena's exact headless profile
+check, and neither Muse task ran. The worker assumption is materially
+challenged; Astra Trigger A is pending. No full production-path Delivery run
+is claimed. The opt-in dogfood boundary remains available for a future
+qualified worker and omits only Tauri event emission.
+
+Agent Brain primary/fallback/secondary credentials and Hackathon model keys
+now pass through an injectable `CredentialStore` boundary backed in production
+by the OS credential store. SQLite legacy values migrate only after secure
+write/read-back; failures preserve access and set a visible pending status.
+Configuration commands serialize an empty API key plus a configured flag.
+See `audits/secure-credential-storage.md` for migration tests and separate
+native platform results.
+
 ## Current backend shape
 
 Rust/Tauri backend now supports two distinct product lanes:
@@ -99,15 +116,12 @@ See `DELIVERY.md`. Exact file/module/command names must come from current source
 
 Before Delivery admission, the backend checks the external DSH prerequisite
 without exposing credentials or mutating the user's system. The current
-source prerequisite probe expects DSH `0.1.5-rc.1` with a working `headless` profile; the
-frontend receives the serialized result of `get_dsh_prerequisite` for a
-progressive setup message. The documented frozen DSH lockfile was not
-reconstructed in the latest qualification pass, and its semver-range
-resolution produced a different SHA/package count. Treat exact runtime
-compatibility and two-run worker repeatability as unproven until the frozen
-runtime is recovered or the contract is re-audited. The current probe checks
-only the reported DSH version and headless help command, not Node, the
-dependency tree, or worker-result compatibility.
+source prerequisite probe expects DSH `0.1.5-rc.1` with a working `headless`
+profile; the frontend receives the serialized result of
+`get_dsh_prerequisite`. Two fresh installs from the new preserved manifest and
+lock matched, but both failed the exact headless probe by timeout. This is a
+current blocker and triggers Astra consultation; no replacement is selected.
+The probe does not establish worker-result compatibility.
 
 The backend dogfood qualification boundary invokes the production
 `SessionRuntime`, Delivery supervisor/services, persistence, verifier, and

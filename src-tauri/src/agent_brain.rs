@@ -121,6 +121,18 @@ pub enum BrainSource {
 }
 
 impl AgentBrain {
+    pub fn contains_api_key(&self, value: &str) -> bool {
+        !self.api_key.is_empty() && value.contains(&self.api_key)
+    }
+
+    pub fn redact_api_key(&self, value: &str) -> String {
+        if self.api_key.is_empty() {
+            value.to_string()
+        } else {
+            value.replace(&self.api_key, "[REDACTED]")
+        }
+    }
+
     pub fn model_name(&self) -> &str {
         &self.model
     }
@@ -223,8 +235,8 @@ impl AgentBrain {
                 ) {
                     (Some(fb_key), Some(fb_url), Some(fb_model)) => {
                         tracing::debug!(
-                            "[BRAIN] primary failed ({}); retrying with fallback",
-                            primary_err
+                            "[BRAIN] primary failed category={}; retrying with fallback",
+                            primary_err.category()
                         );
                         // HIGH-4: fallback client also gets the timeout — a
                         // hung fallback is exactly as fatal as a hung primary.
@@ -346,11 +358,7 @@ impl AgentBrain {
 
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-        tracing::debug!(
-            "[BRAIN] request started source={} endpoint={}",
-            source_label,
-            redact_endpoint(&url)
-        );
+        tracing::debug!("[BRAIN] request started source={}", source_label);
 
         let response = match client
             .post(&url)
@@ -476,13 +484,13 @@ impl AgentBrain {
             }
         };
 
-        // D-040 [BRAIN] parsed decision + Phase A5 observability.
+        // Keep observability at action level; decision fields can contain
+        // prompts, user questions, and model generated text.
         tracing::debug!(
-            "[BRAIN] decision source={} action={} latency_ms={} {:?}",
+            "[BRAIN] decision source={} action={} latency_ms={}",
             source_label,
             decision_action(&decision),
             started.elapsed().as_millis(),
-            decision,
         );
 
         Ok(decision)
@@ -490,7 +498,7 @@ impl AgentBrain {
 }
 
 /// Short, secret-free label for a successful decision's action variant.
-fn decision_action(decision: &AgentDecision) -> &'static str {
+pub(crate) fn decision_action(decision: &AgentDecision) -> &'static str {
     match decision {
         AgentDecision::Route { .. } => "route",
         AgentDecision::Blueprint { .. } => "blueprint",
@@ -500,12 +508,6 @@ fn decision_action(decision: &AgentDecision) -> &'static str {
         AgentDecision::AskUser { .. } => "ask_user",
         AgentDecision::Hackathon { .. } => "hackathon",
     }
-}
-
-/// Redacts a chat-completions endpoint for logging — the host/path are not
-/// sensitive, but this keeps any query string or token fragment out of logs.
-fn redact_endpoint(url: &str) -> String {
-    url.split('?').next().unwrap_or(url).to_string()
 }
 
 /// Classifies a reqwest Transport error into a secret-free category.
@@ -521,17 +523,18 @@ fn network_error_category(error: &reqwest::Error) -> &'static str {
     }
 }
 
-/// Hides transient request-local details (URL, address) from network errors.
-/// The returned string never includes a URL or a header.
+/// Returns a fixed safe description without formatting reqwest's source chain,
+/// which may include endpoint details or request-local values.
 fn redact_network_error(error: &reqwest::Error) -> String {
-    use std::error::Error as _;
     if error.is_timeout() {
         "request timed out".to_string()
+    } else if error.is_connect() {
+        "connection failed".to_string()
+    } else if error.is_request() {
+        "request failed".to_string()
     } else {
-        error
-            .source()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "request failed".to_string())
+        let _ = error;
+        "response transport failed".to_string()
     }
 }
 

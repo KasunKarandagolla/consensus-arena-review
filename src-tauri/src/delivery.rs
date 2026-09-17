@@ -7,9 +7,13 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 pub const DELIVERY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_IMPLEMENTATION_ATTEMPTS: u32 = 3;
+const MAX_CANDIDATE_SCAN_FILES: usize = 20_000;
+const MAX_CANDIDATE_SCAN_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CANDIDATE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 pub fn attempts_remaining(attempt: u32) -> bool {
     attempt < MAX_IMPLEMENTATION_ATTEMPTS
@@ -331,6 +335,264 @@ async fn clean_runtime(worktree: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+async fn staged_tree_objects(worktree: &std::path::Path) -> Result<Vec<String>, String> {
+    let listed = git_output(worktree, &["ls-files", "--stage", "-z"]).await?;
+    if !listed.status.success() {
+        return Err("could not enumerate staged candidate files for credential scan".to_string());
+    }
+    let mut objects = Vec::new();
+    for entry in listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let header = entry
+            .split(|byte| *byte == b'\t')
+            .next()
+            .ok_or_else(|| "invalid staged candidate index entry".to_string())?;
+        let header = std::str::from_utf8(header)
+            .map_err(|_| "invalid staged candidate index entry".to_string())?;
+        let mut fields = header.split_ascii_whitespace();
+        let _mode = fields.next();
+        let object = fields
+            .next()
+            .ok_or_else(|| "invalid staged candidate object entry".to_string())?;
+        if !object.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid staged candidate object identity".to_string());
+        }
+        objects.push(object.to_string());
+        if objects.len() > MAX_CANDIDATE_SCAN_FILES {
+            return Err("candidate exceeds the credential scan file limit".to_string());
+        }
+    }
+    Ok(objects)
+}
+
+async fn committed_tree_objects(
+    worktree: &std::path::Path,
+    commit: &str,
+) -> Result<Vec<String>, String> {
+    let listed = git_output(worktree, &["ls-tree", "-r", "-z", "--full-tree", commit]).await?;
+    if !listed.status.success() {
+        return Err(
+            "could not enumerate committed candidate files for credential scan".to_string(),
+        );
+    }
+    let mut objects = Vec::new();
+    for entry in listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let header = entry
+            .split(|byte| *byte == b'\t')
+            .next()
+            .ok_or_else(|| "invalid committed candidate tree entry".to_string())?;
+        let header = std::str::from_utf8(header)
+            .map_err(|_| "invalid committed candidate tree entry".to_string())?;
+        let mut fields = header.split_ascii_whitespace();
+        let _mode = fields.next();
+        let object_type = fields
+            .next()
+            .ok_or_else(|| "invalid committed candidate object entry".to_string())?;
+        let object = fields
+            .next()
+            .ok_or_else(|| "invalid committed candidate object entry".to_string())?;
+        if object_type == "blob" {
+            if !object.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("invalid committed candidate object identity".to_string());
+            }
+            objects.push(object.to_string());
+            if objects.len() > MAX_CANDIDATE_SCAN_FILES {
+                return Err("candidate exceeds the credential scan file limit".to_string());
+            }
+        }
+    }
+    Ok(objects)
+}
+
+async fn object_list_contains_secret(
+    worktree: &std::path::Path,
+    objects: &[String],
+    secrets: &[String],
+) -> Result<bool, String> {
+    let secrets = secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if secrets.is_empty() || objects.is_empty() {
+        return Ok(false);
+    }
+    if objects.len() > MAX_CANDIDATE_SCAN_FILES {
+        return Err("candidate exceeds the credential scan file limit".to_string());
+    }
+    let mut input = String::with_capacity(objects.len().saturating_mul(42));
+    for object in objects {
+        input.push_str(object);
+        input.push('\n');
+    }
+    let (status, contains) = crate::git_runtime::stream_with_input(
+        worktree,
+        &["cat-file", "--batch"],
+        input.into_bytes(),
+        move |stdout| async move { scan_git_blob_stream(stdout, &objects, &secrets).await },
+    )
+    .await?;
+    if !status.success() {
+        return Err("candidate credential scan failed".to_string());
+    }
+    Ok(contains)
+}
+
+async fn scan_git_blob_stream<R>(
+    stdout: R,
+    objects: &[String],
+    secrets: &[String],
+) -> Result<bool, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut stdout = BufReader::new(stdout);
+    let secret_bytes = secrets
+        .iter()
+        .map(|secret| secret.as_bytes())
+        .collect::<Vec<_>>();
+    let mut scanned_bytes = 0u64;
+    let mut contains = false;
+    for _ in objects {
+        let mut header = Vec::new();
+        if stdout
+            .read_until(b'\n', &mut header)
+            .await
+            .map_err(|_| "could not read candidate credential scan".to_string())?
+            == 0
+        {
+            return Err("candidate credential scan ended early".to_string());
+        }
+        let header = std::str::from_utf8(&header)
+            .map_err(|_| "invalid candidate credential scan response".to_string())?;
+        let mut fields = header.split_ascii_whitespace();
+        let _object = fields.next();
+        let object_type = fields.next();
+        let size = fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| "invalid candidate credential scan response".to_string())?;
+        if object_type != Some("blob") {
+            return Err("candidate credential scan returned a non-file object".to_string());
+        }
+        if size > MAX_CANDIDATE_FILE_BYTES {
+            return Err("candidate file exceeds the credential scan size limit".to_string());
+        }
+        scanned_bytes = scanned_bytes.saturating_add(size);
+        if scanned_bytes > MAX_CANDIDATE_SCAN_BYTES {
+            return Err("candidate exceeds the credential scan byte limit".to_string());
+        }
+        let mut remaining = size as usize;
+        let mut chunk = vec![0u8; 64 * 1024];
+        let mut overlap = vec![Vec::new(); secret_bytes.len()];
+        while remaining > 0 {
+            let read = remaining.min(chunk.len());
+            stdout
+                .read_exact(&mut chunk[..read])
+                .await
+                .map_err(|_| "could not read candidate credential scan".to_string())?;
+            for (index, secret) in secret_bytes.iter().enumerate() {
+                let mut window = std::mem::take(&mut overlap[index]);
+                window.extend_from_slice(&chunk[..read]);
+                contains |= window
+                    .windows(secret.len())
+                    .any(|candidate| candidate == *secret);
+                let keep = secret.len().saturating_sub(1).min(window.len());
+                overlap[index].extend_from_slice(&window[window.len() - keep..]);
+            }
+            remaining -= read;
+        }
+        let mut newline = [0u8; 1];
+        stdout
+            .read_exact(&mut newline)
+            .await
+            .map_err(|_| "could not read candidate credential scan".to_string())?;
+        if newline[0] != b'\n' {
+            return Err("invalid candidate credential scan boundary".to_string());
+        }
+    }
+    Ok(contains)
+}
+
+async fn staged_tree_contains_secret(
+    worktree: &std::path::Path,
+    secrets: &[String],
+) -> Result<bool, String> {
+    let objects = staged_tree_objects(worktree).await?;
+    object_list_contains_secret(worktree, &objects, secrets).await
+}
+
+async fn committed_tree_contains_secret(
+    worktree: &std::path::Path,
+    commit: &str,
+    secrets: &[String],
+) -> Result<bool, String> {
+    let objects = committed_tree_objects(worktree, commit).await?;
+    object_list_contains_secret(worktree, &objects, secrets).await
+}
+
+async fn worktree_contains_secret(
+    worktree: &std::path::Path,
+    secrets: &[String],
+) -> Result<bool, String> {
+    let root = worktree.to_path_buf();
+    let secrets = secrets.to_vec();
+    tokio::task::spawn_blocking(move || {
+        crate::commands::directory_contains_credentials(&root, &secrets)
+    })
+    .await
+    .map_err(|_| "could not finish the bounded candidate file scan".to_string())?
+}
+
+async fn discard_worker_files(
+    worktree: &std::path::Path,
+    expected_head: &str,
+) -> Result<(), String> {
+    git_ok(worktree, &["reset", "--hard", expected_head]).await?;
+    git_ok(worktree, &["clean", "-fdx"]).await
+}
+
+async fn inspect_worker_output(
+    worktree: &std::path::Path,
+    expected_head: &str,
+    secrets: &[String],
+) -> Result<Option<&'static str>, String> {
+    git_ok(worktree, &["add", "-A"]).await?;
+    let contains_secret = match staged_tree_contains_secret(worktree, secrets).await {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = discard_worker_files(worktree, expected_head).await;
+            return Err(error);
+        }
+    };
+    let worktree_contains_secret = match worktree_contains_secret(worktree, secrets).await {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = discard_worker_files(worktree, expected_head).await;
+            return Err(error);
+        }
+    };
+    let changed_head = verification::candidate_sha(worktree).await? != expected_head;
+    if contains_secret || worktree_contains_secret || changed_head {
+        discard_worker_files(worktree, expected_head).await?;
+        return Ok(Some(if contains_secret {
+            "worker output contained a configured model credential; its changes were discarded"
+        } else if worktree_contains_secret {
+            "worker files contained a configured model credential; its changes were discarded"
+        } else {
+            "worker created a Git commit; its changes were discarded"
+        }));
+    }
+    Ok(None)
+}
+
 async fn restore_protected_acceptance(
     worktree: &std::path::Path,
     acceptance_commit: &str,
@@ -369,7 +631,18 @@ async fn ask_user(
     state: &mut DeliveryState,
     question: PendingQuestion,
     resume_phase: DeliveryPhase,
+    secrets: &[String],
 ) -> Result<String, String> {
+    let question = PendingQuestion {
+        text: redact_known_secrets(&question.text, secrets),
+        options: question
+            .options
+            .iter()
+            .map(|value| redact_known_secrets(value, secrets))
+            .collect(),
+        allow_custom: question.allow_custom,
+        reason: redact_known_secrets(&question.reason, secrets),
+    };
     state.phase = DeliveryPhase::WaitingForUser;
     state.waiting_phase = Some(resume_phase.clone());
     state.pending_question = Some(question.clone());
@@ -400,9 +673,10 @@ async fn ask_user(
         .map_err(|_| "delivery answer channel closed".to_string())?;
     state.pending_question = None;
     state.waiting_phase = None;
+    let safe_answer = redact_known_secrets(&answer, secrets);
     state.user_answers.push(UserAnswer {
-        question: question.text,
-        answer: answer.clone(),
+        question: question.text.clone(),
+        answer: safe_answer.clone(),
         answered_at: chrono::Utc::now().timestamp(),
     });
     if answer.trim().eq_ignore_ascii_case("cancelled") {
@@ -413,16 +687,16 @@ async fn ask_user(
         state.phase = resume_phase;
     }
     persist_emit(app, state_path, delivery_slot, transcript, state).await?;
-    Ok(answer)
+    Ok(safe_answer)
 }
 
-fn worker_summary(execution: &dsh_worker::WorkerExecution, api_key: &str) -> String {
+fn worker_summary(execution: &dsh_worker::WorkerExecution, secrets: &[String]) -> String {
     match &execution.result {
         Some(result) => format!(
             "DSH exit {:?}; worker status {:?}; {}",
             execution.exit_code,
             result.status,
-            dsh_worker::redact_secret(&result.summary, api_key)
+            redact_known_secrets(&result.summary, secrets)
         ),
         None if execution.timed_out => "DSH timed out before producing a result".to_string(),
         None => format!(
@@ -432,12 +706,117 @@ fn worker_summary(execution: &dsh_worker::WorkerExecution, api_key: &str) -> Str
     }
 }
 
+fn worker_result_contains_secret(
+    result: &dsh_worker::WorkerResultContract,
+    secrets: &[String],
+) -> bool {
+    let contains = |value: &str| contains_any_secret(value, secrets);
+    contains(&result.summary)
+        || result.question.as_ref().is_some_and(|question| {
+            contains(&question.text)
+                || contains(&question.reason)
+                || question.options.iter().any(|option| contains(option))
+        })
+        || result
+            .acceptance
+            .iter()
+            .any(|item| contains(&item.id) || contains(&item.description))
+        || result.verification_commands.iter().any(|command| {
+            contains(&command.id)
+                || contains(&command.program)
+                || contains(&command.cwd)
+                || command.args.iter().any(|arg| contains(arg))
+        })
+}
+
+fn contains_any_secret(value: &str, secrets: &[String]) -> bool {
+    secrets
+        .iter()
+        .any(|secret| !secret.is_empty() && dsh_worker::contains_secret(value, secret))
+}
+
+fn redact_known_secrets(value: &str, secrets: &[String]) -> String {
+    secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(value.to_string(), |safe, secret| {
+            dsh_worker::redact_secret(&safe, secret)
+        })
+}
+
+fn configured_secrets(settings: &SettingsStore) -> Result<Vec<String>, String> {
+    if !settings.credential_storage_available() || settings.credential_migration_pending() {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    let mut secrets = ["brain_api_key", "brain_fallback_api_key", "brain2_api_key"]
+        .iter()
+        .map(|key| {
+            settings
+                .get(key)
+                .map_err(|_| crate::credentials::secure_storage_help().to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .filter(|secret| !secret.is_empty())
+        .collect::<Vec<_>>();
+    let hackathon = settings
+        .get_hackathon_config()
+        .map_err(|_| crate::credentials::secure_storage_help().to_string())?;
+    secrets.extend(
+        hackathon
+            .models
+            .into_iter()
+            .map(|model| model.api_key)
+            .filter(|secret| !secret.is_empty()),
+    );
+    secrets.sort();
+    secrets.dedup();
+    Ok(secrets)
+}
+
 async fn commit_candidate_snapshot(
     worktree: &std::path::Path,
     session_id: &str,
     attempt: u32,
+    expected_head: &str,
+    secrets: &[String],
 ) -> Result<String, String> {
+    if verification::candidate_sha(worktree).await? != expected_head {
+        discard_worker_files(worktree, expected_head).await?;
+        return Err(
+            "worker changed candidate HEAD before snapshot; its changes were discarded".to_string(),
+        );
+    }
+    let worktree_has_secret = match worktree_contains_secret(worktree, secrets).await {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = discard_worker_files(worktree, expected_head).await;
+            return Err(error);
+        }
+    };
+    if worktree_has_secret {
+        discard_worker_files(worktree, expected_head).await?;
+        return Err(
+            "candidate worktree files contained a configured model credential; the attempt was discarded"
+                .to_string(),
+        );
+    }
     git_ok(worktree, &["add", "-A"]).await?;
+    let staged_has_secret = match staged_tree_contains_secret(worktree, secrets).await {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = discard_worker_files(worktree, expected_head).await;
+            return Err(error);
+        }
+    };
+    if staged_has_secret {
+        discard_worker_files(worktree, expected_head).await?;
+        return Err(
+            "candidate contained a configured model credential; the attempt was discarded"
+                .to_string(),
+        );
+    }
     let staged = git_output(worktree, &["diff", "--cached", "--quiet"]).await?;
     if staged.status.code() == Some(1) {
         git_ok(
@@ -452,7 +831,22 @@ async fn commit_candidate_snapshot(
     } else if !staged.status.success() {
         return Err(String::from_utf8_lossy(&staged.stderr).trim().to_string());
     }
-    verification::candidate_sha(worktree).await
+    let candidate = verification::candidate_sha(worktree).await?;
+    if committed_tree_contains_secret(worktree, &candidate, secrets).await? {
+        discard_worker_files(worktree, expected_head).await?;
+        return Err(
+            "candidate commit contained a configured model credential; the attempt was discarded"
+                .to_string(),
+        );
+    }
+    if verification::candidate_sha(worktree).await? != candidate {
+        discard_worker_files(worktree, expected_head).await?;
+        return Err(
+            "candidate HEAD changed during credential validation; the attempt was discarded"
+                .to_string(),
+        );
+    }
+    Ok(candidate)
 }
 
 async fn finish_verified(
@@ -492,6 +886,7 @@ async fn freeze_acceptance(
     delivery_slot: &Arc<tokio::sync::Mutex<Option<DeliveryState>>>,
     transcript: &Arc<std::sync::Mutex<TranscriptStore>>,
     state: &mut DeliveryState,
+    secrets: &[String],
 ) -> Result<(), String> {
     let worktree = std::path::Path::new(&state.worktree_path);
     let changed = git_names(worktree, &state.base_commit).await?;
@@ -503,6 +898,20 @@ async fn freeze_acceptance(
     for path in &changed {
         git_ok(worktree, &["add", "--", path]).await?;
     }
+    if staged_tree_contains_secret(worktree, secrets).await? {
+        reset_worktree(state, &state.base_commit).await?;
+        return Err(
+            "acceptance contained a configured model credential; the attempt was discarded"
+                .to_string(),
+        );
+    }
+    if verification::candidate_sha(worktree).await? != state.base_commit {
+        reset_worktree(state, &state.base_commit).await?;
+        return Err(
+            "candidate HEAD changed during acceptance freeze; the attempt was discarded"
+                .to_string(),
+        );
+    }
     git_ok(
         worktree,
         &[
@@ -512,7 +921,22 @@ async fn freeze_acceptance(
         ],
     )
     .await?;
-    state.acceptance_commit = Some(verification::candidate_sha(worktree).await?);
+    let acceptance_commit = verification::candidate_sha(worktree).await?;
+    if committed_tree_contains_secret(worktree, &acceptance_commit, secrets).await? {
+        reset_worktree(state, &state.base_commit).await?;
+        return Err(
+            "frozen acceptance contained a configured model credential; the attempt was discarded"
+                .to_string(),
+        );
+    }
+    if verification::candidate_sha(worktree).await? != acceptance_commit {
+        reset_worktree(state, &state.base_commit).await?;
+        return Err(
+            "candidate HEAD changed during acceptance validation; the attempt was discarded"
+                .to_string(),
+        );
+    }
+    state.acceptance_commit = Some(acceptance_commit);
     state.protected_files = changed;
     state.protected_hashes = verification::protected_hashes(worktree, &state.protected_files)?
         .into_iter()
@@ -536,6 +960,7 @@ async fn run_acceptance_authoring(
     ask_tx: &Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     state: &mut DeliveryState,
     model: &dsh_worker::DshModelConfig,
+    secrets: &[String],
     patch_dir: &std::path::Path,
 ) -> Result<(), String> {
     loop {
@@ -554,6 +979,8 @@ async fn run_acceptance_authoring(
             ),
             None,
         );
+        let worker_base =
+            verification::candidate_sha(std::path::Path::new(&state.worktree_path)).await?;
         let execution = dsh_worker::run(
             std::path::Path::new(&state.worktree_path),
             &std::path::Path::new(&state.worktree_path).join(".arena-runtime"),
@@ -564,27 +991,39 @@ async fn run_acceptance_authoring(
         )
         .await?;
         clean_runtime(std::path::Path::new(&state.worktree_path)).await?;
-        state.last_worker_summary = Some(worker_summary(&execution, &model.api_key));
+        if let Some(reason) = inspect_worker_output(
+            std::path::Path::new(&state.worktree_path),
+            &worker_base,
+            secrets,
+        )
+        .await?
+        {
+            return Err(reason.to_string());
+        }
+        state.last_worker_summary = Some(worker_summary(&execution, secrets));
         let Some(result) = execution.result else {
             return Err(state
                 .last_worker_summary
                 .clone()
                 .unwrap_or_else(|| "acceptance authoring failed".to_string()));
         };
+        if worker_result_contains_secret(&result, secrets) {
+            return Err("worker result contained the configured credential; no result metadata was persisted".to_string());
+        }
         match result.status {
             dsh_worker::WorkerStatus::NeedsUser => {
                 let question = result
                     .question
                     .ok_or_else(|| "worker returned needs_user without a question".to_string())?;
                 let pending = PendingQuestion {
-                    text: dsh_worker::redact_secret(&question.text, &model.api_key),
+                    text: redact_known_secrets(&question.text, secrets),
                     options: question
                         .options
                         .iter()
-                        .map(|value| dsh_worker::redact_secret(value, &model.api_key))
+                        .map(|value| redact_known_secrets(value, secrets))
                         .collect(),
                     allow_custom: question.allow_custom,
-                    reason: dsh_worker::redact_secret(&question.reason, &model.api_key),
+                    reason: redact_known_secrets(&question.reason, secrets),
                 };
                 let _ = ask_user(
                     app,
@@ -595,6 +1034,7 @@ async fn run_acceptance_authoring(
                     state,
                     pending,
                     DeliveryPhase::AuthoringAcceptance,
+                    secrets,
                 )
                 .await?;
                 if state.phase == DeliveryPhase::Failed {
@@ -605,7 +1045,7 @@ async fn run_acceptance_authoring(
                 }
             }
             dsh_worker::WorkerStatus::Failed => {
-                return Err(dsh_worker::redact_secret(&result.summary, &model.api_key));
+                return Err(redact_known_secrets(&result.summary, secrets));
             }
             dsh_worker::WorkerStatus::Complete => {
                 if !execution.exit_code.is_some_and(|code| code == 0) {
@@ -617,15 +1057,6 @@ async fn run_acceptance_authoring(
                             .to_string(),
                     );
                 }
-                if result.verification_commands.iter().any(|command| {
-                    dsh_worker::contains_secret(&command.program, &model.api_key)
-                        || command
-                            .args
-                            .iter()
-                            .any(|arg| dsh_worker::contains_secret(arg, &model.api_key))
-                }) {
-                    return Err("acceptance worker attempted to place the Agent Brain secret in a verification command".to_string());
-                }
                 state.verification_commands = result.verification_commands;
                 state.contract = Some(DeliveryContract {
                     revision: 1,
@@ -635,10 +1066,7 @@ async fn run_acceptance_authoring(
                         .iter()
                         .map(|item| AcceptanceCriterion {
                             id: item.id.clone(),
-                            description: dsh_worker::redact_secret(
-                                &item.description,
-                                &model.api_key,
-                            ),
+                            description: redact_known_secrets(&item.description, secrets),
                         })
                         .collect(),
                     constraints: vec![
@@ -646,7 +1074,8 @@ async fn run_acceptance_authoring(
                     ],
                     worker_brief: "Acceptance tests are frozen before implementation".to_string(),
                 });
-                freeze_acceptance(app, state_path, delivery_slot, transcript, state).await?;
+                freeze_acceptance(app, state_path, delivery_slot, transcript, state, secrets)
+                    .await?;
                 return Ok(());
             }
         }
@@ -657,7 +1086,7 @@ async fn reset_worktree(state: &DeliveryState, commit: &str) -> Result<(), Strin
     let worktree = std::path::Path::new(&state.worktree_path);
     clean_runtime(worktree).await?;
     git_ok(worktree, &["reset", "--hard", commit]).await?;
-    git_ok(worktree, &["clean", "-fd"]).await
+    git_ok(worktree, &["clean", "-fdx"]).await
 }
 
 pub fn recovery_requires_worktree_reset(state: &DeliveryState, implementation: bool) -> bool {
@@ -733,8 +1162,16 @@ async fn run_inner(
     settings: Arc<tokio::sync::Mutex<SettingsStore>>,
 ) -> Result<DeliveryState, String> {
     let result = async {
-        let brain = settings.lock().await.get_agent_brain_config().map_err(|error| format!("read Agent Brain settings: {error}"))?;
+        let (brain, secrets) = {
+            let settings = settings.lock().await;
+            let brain = settings
+                .get_agent_brain_config()
+                .map_err(|_| crate::credentials::secure_storage_help().to_string())?;
+            let secrets = configured_secrets(&settings)?;
+            (brain, secrets)
+        };
         let model = dsh_worker::DshModelConfig { api_key: brain.api_key, base_url: brain.base_url, model: brain.model };
+        state.objective = redact_known_secrets(&state.objective, &secrets);
         let patch_dir = state_path.parent().unwrap_or(std::path::Path::new(".")).join("dsh-runtime").join(&state.session_id);
         let worktree = PathBuf::from(&state.worktree_path);
         if state.phase == DeliveryPhase::WaitingForUser {
@@ -744,12 +1181,12 @@ async fn run_inner(
             } else {
                 DeliveryPhase::AuthoringAcceptance
             });
-            let _ = ask_user(app, &state_path, &delivery_slot, &transcript, &ask_tx, &mut state, pending, resume_phase).await?;
+            let _ = ask_user(app, &state_path, &delivery_slot, &transcript, &ask_tx, &mut state, pending, resume_phase, &secrets).await?;
             if state.phase == DeliveryPhase::Failed { return Err("user cancelled delivery".to_string()); }
         }
         if matches!(state.phase, DeliveryPhase::Preparing | DeliveryPhase::AuthoringAcceptance) && state.acceptance_commit.is_none() {
             if state.phase == DeliveryPhase::Preparing { state.phase = DeliveryPhase::AuthoringAcceptance; }
-            run_acceptance_authoring(app, &state_path, &delivery_slot, &transcript, &ask_tx, &mut state, &model, &patch_dir).await?;
+            run_acceptance_authoring(app, &state_path, &delivery_slot, &transcript, &ask_tx, &mut state, &model, &secrets, &patch_dir).await?;
         }
         if state.acceptance_commit.is_none() { return Err("delivery has no frozen acceptance commit".to_string()); }
         let profile = VerificationProfile { version: 1, commands: state.verification_commands.clone(), protected_paths: state.protected_files.clone() };
@@ -792,9 +1229,16 @@ async fn run_inner(
             let answers = state.user_answers.iter().map(|answer| format!("{} => {}", answer.question, answer.answer)).collect::<Vec<_>>().join("\n");
             let evidence = state.last_verification.as_ref().map(|receipt| format!("verdict={} checks={:?}", receipt.verdict, receipt.checks)).unwrap_or_else(|| "acceptance checks failed".to_string());
             let prompt = dsh_worker::bounded_prompt(&state.objective, &format!("IMPLEMENTATION TASK. Frozen acceptance items are in the repository. Protected files: {}. User decisions:\n{answers}", state.protected_files.join(", ")), Some(&evidence));
+            let worker_base = verification::candidate_sha(&worktree).await?;
             let execution = dsh_worker::run(&worktree, &worktree.join(".arena-runtime"), &patch_dir, &model, &prompt, 1800).await?;
             clean_runtime(&worktree).await?;
-            state.last_worker_summary = Some(worker_summary(&execution, &model.api_key));
+            if let Some(reason) = inspect_worker_output(&worktree, &worker_base, &secrets).await? {
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some(reason.to_string());
+                persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
+                break;
+            }
+            state.last_worker_summary = Some(worker_summary(&execution, &secrets));
             let protected_before = state.protected_hashes.iter().map(|value| (value.path.clone(), value.sha256.clone())).collect::<Vec<_>>();
             let protected_changed = !verification::protected_files_unchanged(&worktree, &protected_before);
             if protected_changed {
@@ -804,12 +1248,12 @@ async fn run_inner(
                 if result.status == dsh_worker::WorkerStatus::NeedsUser {
                     let question = result.question.ok_or_else(|| "worker returned needs_user without a question".to_string())?;
                     let pending = PendingQuestion {
-                        text: dsh_worker::redact_secret(&question.text, &model.api_key),
-                        options: question.options.iter().map(|value| dsh_worker::redact_secret(value, &model.api_key)).collect(),
+                        text: redact_known_secrets(&question.text, &secrets),
+                        options: question.options.iter().map(|value| redact_known_secrets(value, &secrets)).collect(),
                         allow_custom: question.allow_custom,
-                        reason: dsh_worker::redact_secret(&question.reason, &model.api_key),
+                        reason: redact_known_secrets(&question.reason, &secrets),
                     };
-                    let _ = ask_user(app, &state_path, &delivery_slot, &transcript, &ask_tx, &mut state, pending, DeliveryPhase::Implementing).await?;
+                    let _ = ask_user(app, &state_path, &delivery_slot, &transcript, &ask_tx, &mut state, pending, DeliveryPhase::Implementing, &secrets).await?;
                     if state.phase == DeliveryPhase::Failed { return Err("user cancelled delivery".to_string()); }
                     state.attempt = state.attempt.saturating_sub(1);
                     continue;
@@ -817,7 +1261,7 @@ async fn run_inner(
             }
             // Persist the exact content snapshot before verification so the
             // receipt's candidate SHA and a later Verified candidate SHA agree.
-            let candidate_sha = commit_candidate_snapshot(&worktree, &state.session_id, state.attempt).await?;
+            let candidate_sha = commit_candidate_snapshot(&worktree, &state.session_id, state.attempt, &worker_base, &secrets).await?;
             state.phase = DeliveryPhase::Verifying;
             persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
             let hashes = state.protected_hashes.iter().map(|value| (value.path.clone(), value.sha256.clone())).collect::<Vec<_>>();
@@ -1011,6 +1455,126 @@ mod tests {
             .status()
             .expect("remove fixture worktree");
         assert!(removed.success());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[tokio::test]
+    async fn staged_and_worker_committed_blobs_are_scanned_before_candidate_admission() {
+        let (repo, _, _, _) = apply_guard_fixture("candidate credential scan");
+        let expected_head = git_fixture_success(&repo, &["rev-parse", "HEAD"]);
+        let key = "candidate-scan-synthetic-secret-7c8391";
+        let secrets = vec![key.to_string()];
+        let mut content = vec![b'x'; 64 * 1024 - 8];
+        content.extend_from_slice(key.as_bytes());
+        std::fs::write(repo.join("suspect.txt"), content).expect("write staged sentinel file");
+        git_fixture_success(&repo, &["add", "suspect.txt"]);
+        assert!(
+            staged_tree_contains_secret(&repo, &secrets)
+                .await
+                .expect("scan staged object")
+        );
+        git_fixture_success(&repo, &["commit", "-m", "untrusted worker commit"]);
+        let worker_commit = git_fixture_success(&repo, &["rev-parse", "HEAD"]);
+        assert!(
+            committed_tree_contains_secret(&repo, &worker_commit, &secrets)
+                .await
+                .expect("scan committed candidate tree")
+        );
+
+        let reason = inspect_worker_output(&repo, &expected_head, &secrets)
+            .await
+            .expect("inspect untrusted worker output")
+            .expect("credential-bearing candidate must be rejected");
+        assert!(reason.contains("credential"));
+        assert_eq!(
+            git_fixture_success(&repo, &["rev-parse", "HEAD"]),
+            expected_head
+        );
+        assert!(!repo.join("suspect.txt").exists());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[tokio::test]
+    async fn ignored_worker_credential_file_is_rejected_and_removed() {
+        let (repo, _, _, _) = apply_guard_fixture("ignored credential scan");
+        std::fs::write(repo.join(".gitignore"), "ignored-secret.txt\n")
+            .expect("write ignored-file rule");
+        git_fixture_success(&repo, &["add", ".gitignore"]);
+        git_fixture_success(&repo, &["commit", "-m", "ignore worker artifact"]);
+        let expected_head = git_fixture_success(&repo, &["rev-parse", "HEAD"]);
+        let secret = "ignored-worker-file-secret-18a4";
+        let ignored = repo.join("ignored-secret.txt");
+        std::fs::write(&ignored, format!("token={secret}\n"))
+            .expect("write ignored credential fixture");
+
+        let reason = inspect_worker_output(&repo, &expected_head, &[secret.to_string()])
+            .await
+            .expect("scan ignored worker output")
+            .expect("ignored credential file must be rejected");
+
+        assert!(reason.contains("credential"));
+        assert_eq!(
+            git_fixture_success(&repo, &["rev-parse", "HEAD"]),
+            expected_head
+        );
+        assert!(
+            !ignored.exists(),
+            "ignored credential artifact must be cleaned"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn worker_result_secret_scan_covers_persisted_metadata_fields() {
+        let secret = "worker-metadata-secret-5e26";
+        let mut result = dsh_worker::WorkerResultContract {
+            schema_version: 1,
+            status: dsh_worker::WorkerStatus::Complete,
+            summary: "implemented".to_string(),
+            question: None,
+            verification_commands: vec![verification::VerificationCommand {
+                id: "build".to_string(),
+                program: "cargo".to_string(),
+                args: vec!["check".to_string()],
+                cwd: ".".to_string(),
+                timeout_seconds: 120,
+            }],
+            acceptance: vec![dsh_worker::AcceptanceItem {
+                id: "AC-1".to_string(),
+                description: "Build succeeds".to_string(),
+            }],
+        };
+        let secrets = vec![secret.to_string()];
+        assert!(!worker_result_contains_secret(&result, &secrets));
+        result.acceptance[0].id = secret.to_string();
+        assert!(worker_result_contains_secret(&result, &secrets));
+        result.acceptance[0].id = "AC-1".to_string();
+        result.verification_commands[0].id = secret.to_string();
+        assert!(worker_result_contains_secret(&result, &secrets));
+        result.verification_commands[0].id = "build".to_string();
+        result.verification_commands[0].cwd = secret.to_string();
+        assert!(worker_result_contains_secret(&result, &secrets));
+    }
+
+    #[tokio::test]
+    async fn worker_created_commit_without_secret_is_still_rejected() {
+        let (repo, _, _, _) = apply_guard_fixture("unexpected worker commit");
+        let expected_head = git_fixture_success(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("worker.txt"), "ordinary worker output\n")
+            .expect("write ordinary output");
+        git_fixture_success(&repo, &["add", "worker.txt"]);
+        git_fixture_success(&repo, &["commit", "-m", "untrusted worker commit"]);
+        let reason =
+            inspect_worker_output(&repo, &expected_head, &["unrelated-sentinel".to_string()])
+                .await
+                .expect("inspect worker commit")
+                .expect("unexpected worker commits must be rejected");
+        assert!(reason.contains("Git commit"));
+        assert_eq!(
+            git_fixture_success(&repo, &["rev-parse", "HEAD"]),
+            expected_head
+        );
+        assert!(!repo.join("worker.txt").exists());
         let _ = std::fs::remove_dir_all(&repo);
     }
 

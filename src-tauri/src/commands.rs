@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -16,6 +17,239 @@ use serde::Serialize;
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
+
+fn redact_saved_credentials(text: &str, secrets: &[String]) -> String {
+    credential_scan_literals(secrets)
+        .iter()
+        .fold(text.to_string(), |safe, secret| {
+            crate::dsh_worker::redact_secret(&safe, secret)
+        })
+}
+
+fn credential_scan_literals(secrets: &[String]) -> Vec<String> {
+    let mut literals = Vec::new();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        literals.push(secret.clone());
+        if let Ok(encoded) = serde_json::to_string(secret) {
+            if encoded.len() >= 2 {
+                let encoded_contents = encoded[1..encoded.len() - 1].to_string();
+                if !encoded_contents.is_empty() {
+                    literals.push(encoded_contents);
+                }
+            }
+        }
+    }
+    literals.sort();
+    literals.dedup();
+    literals
+}
+
+fn configured_credentials(
+    store: &crate::settings_store::SettingsStore,
+) -> Result<Vec<String>, String> {
+    let mut secrets = Vec::new();
+    for key in ["brain_api_key", "brain_fallback_api_key", "brain2_api_key"] {
+        if let Some(secret) = store
+            .get(key)
+            .map_err(|_| crate::credentials::secure_storage_help().to_string())?
+            .filter(|secret| !secret.is_empty())
+        {
+            secrets.push(secret);
+        }
+    }
+    let config = store
+        .get_hackathon_config()
+        .map_err(|_| crate::credentials::secure_storage_help().to_string())?;
+    secrets.extend(
+        config
+            .models
+            .into_iter()
+            .map(|model| model.api_key)
+            .filter(|secret| !secret.is_empty()),
+    );
+    secrets.sort();
+    secrets.dedup();
+    Ok(secrets)
+}
+
+async fn diagnostic_credentials(state: &AppState) -> Result<Vec<String>, String> {
+    let store = state.settings_store.lock().await;
+    if !store.credential_storage_available() || store.credential_migration_pending() {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    configured_credentials(&store)
+}
+
+const MAX_CREDENTIAL_SCAN_BYTES: u64 = 512 * 1024 * 1024;
+
+fn file_contains_credentials(path: &std::path::Path, secrets: &[String]) -> Result<bool, String> {
+    let literals = credential_scan_literals(secrets);
+    let secrets = literals
+        .iter()
+        .map(|secret| secret.as_bytes())
+        .collect::<Vec<_>>();
+    if secrets.is_empty() {
+        return Ok(false);
+    }
+    let metadata = std::fs::metadata(path)
+        .map_err(|_| "could not inspect export for credentials".to_string())?;
+    if metadata.len() > MAX_CREDENTIAL_SCAN_BYTES {
+        return Err("export exceeds the credential scan size limit".to_string());
+    }
+    if secrets.iter().any(|secret| secret.len() > 16 * 1024) {
+        return Err("configured credential exceeds the export scan limit".to_string());
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|_| "could not read export for credential scan".to_string())?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut overlap = vec![Vec::new(); secrets.len()];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| "could not read export for credential scan".to_string())?;
+        if read == 0 {
+            return Ok(false);
+        }
+        for (index, secret) in secrets.iter().enumerate() {
+            let mut window = std::mem::take(&mut overlap[index]);
+            window.extend_from_slice(&buffer[..read]);
+            if window
+                .windows(secret.len())
+                .any(|candidate| candidate == *secret)
+            {
+                return Ok(true);
+            }
+            let keep = secret.len().saturating_sub(1).min(window.len());
+            overlap[index].extend_from_slice(&window[window.len() - keep..]);
+        }
+    }
+}
+
+pub(crate) fn directory_contains_credentials(
+    root: &std::path::Path,
+    secrets: &[String],
+) -> Result<bool, String> {
+    let literals = credential_scan_literals(secrets);
+    let mut stack = vec![root.to_path_buf()];
+    let mut count = 0usize;
+    let mut scanned_bytes = 0u64;
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .map_err(|_| "could not inspect export files for credentials".to_string())?
+        {
+            count = count.saturating_add(1);
+            if count > 20_000 {
+                return Err("export exceeds the credential scan file limit".to_string());
+            }
+            let entry =
+                entry.map_err(|_| "could not inspect export files for credentials".to_string())?;
+            let file_name = entry.file_name();
+            if file_name == ".git" {
+                continue;
+            }
+            let path_text = file_name.to_string_lossy();
+            if literals.iter().any(|secret| path_text.contains(secret)) {
+                return Ok(true);
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|_| "could not inspect export files for credentials".to_string())?;
+            if file_type.is_symlink() {
+                let path = entry.path().to_string_lossy().into_owned();
+                if literals.iter().any(|secret| path.contains(secret)) {
+                    return Ok(true);
+                }
+            } else if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                let metadata = entry
+                    .metadata()
+                    .map_err(|_| "could not inspect export files for credentials".to_string())?;
+                scanned_bytes = scanned_bytes.saturating_add(metadata.len());
+                if scanned_bytes > MAX_CREDENTIAL_SCAN_BYTES {
+                    return Err("export exceeds the credential scan size limit".to_string());
+                }
+                if file_contains_credentials(&entry.path(), secrets)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+struct ExportDirectoryGuard {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+
+struct ExportFileGuard {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+
+impl Drop for ExportFileGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to remove temporary export file"
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ExportDirectoryGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            if let Err(error) = std::fs::remove_dir_all(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = %error,
+                        "failed to remove temporary diagnostic export"
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl ExportFileGuard {
+    fn remove_now(&mut self) -> std::io::Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {
+                self.keep = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.keep = true;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl ExportDirectoryGuard {
+    fn remove_now(&mut self) -> std::io::Result<()> {
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {
+                self.keep = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.keep = true;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
 
 async fn git_command(
     repo: &std::path::Path,
@@ -139,7 +373,7 @@ pub async fn start_delivery(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<String, String> {
-    let objective = objective.trim().to_string();
+    let mut objective = objective.trim().to_string();
     if objective.is_empty() {
         return Err("Build objective is required".to_string());
     }
@@ -163,12 +397,20 @@ pub async fn start_delivery(
     if !dsh.compatible {
         return Err(dsh.message);
     }
-    let brain = state
-        .settings_store
-        .lock()
-        .await
-        .get_agent_brain_config()
-        .map_err(|error| format!("read Agent Brain settings: {error}"))?;
+    let (brain, saved_secrets, credentials_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            store
+                .get_agent_brain_config()
+                .map_err(|error| format!("read Agent Brain settings: {error}"))?,
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !credentials_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    objective = redact_saved_credentials(&objective, &saved_secrets);
     if brain.api_key.trim().is_empty()
         || brain.base_url.trim().is_empty()
         || brain.model.trim().is_empty()
@@ -587,12 +829,20 @@ pub async fn start_session(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    let custom = state
-        .settings_store
-        .lock()
-        .await
-        .get_custom_participants()
-        .map_err(|e| settings_command_error("Failed to read custom participants", e))?;
+    let (custom, saved_secrets, credentials_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            store
+                .get_custom_participants()
+                .map_err(|e| settings_command_error("Failed to read custom participants", e))?,
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !credentials_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    let project_brief = redact_saved_credentials(&project_brief, &saved_secrets);
     validate_session_agents(&agent_ids, &leader_agent_id, &custom)?;
 
     let stype = match session_type.as_str() {
@@ -1581,11 +1831,90 @@ pub async fn get_session_checkpoint(
 /// run_agent_loop.  Uses take() to atomically remove the sender and prevent
 /// any possibility of a double-send (RISK-ASKCHANNEL resolved).
 /// Returns Err if no question is currently pending.
+fn record_delivery_decision(
+    memory: &mut crate::memory_store::MemoryStore,
+    project_brief: &str,
+    session_id: &str,
+    question: &str,
+    answer: &str,
+    secrets: &[String],
+) -> Result<(), AgentError> {
+    let question = question.trim();
+    let answer = answer.trim();
+    if question.is_empty()
+        || answer.is_empty()
+        || answer.eq_ignore_ascii_case("cancelled")
+        || crate::memory_store::contains_credential_like_text(project_brief)
+        || crate::memory_store::contains_credential_like_text(question)
+        || crate::memory_store::contains_credential_like_text(answer)
+        || secrets.iter().any(|secret| {
+            !secret.is_empty()
+                && (project_brief.contains(secret.as_str())
+                    || question.contains(secret.as_str())
+                    || answer.contains(secret.as_str()))
+        })
+    {
+        return Ok(());
+    }
+    let question = question.chars().take(1_000).collect::<String>();
+    let answer = answer.chars().take(1_000).collect::<String>();
+    let content = format!("Owner decision: {question}\nAnswer: {answer}");
+    let provenance = format!("Delivery session {session_id}");
+    memory.add_project_memory_with_source(
+        project_brief,
+        "decision",
+        &content,
+        Some(&provenance),
+        None,
+        "owner",
+        "user",
+    )
+}
+
 #[tauri::command]
 pub async fn provide_user_answer(
     answer: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let (configured, secure_storage_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store),
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    let (secrets, secure_storage_ready) = match (configured, secure_storage_ready) {
+        (Ok(secrets), true) => (secrets, true),
+        _ => (Vec::new(), false),
+    };
+    let answer_contains_saved_secret = !secure_storage_ready
+        || secrets
+            .iter()
+            .any(|secret| !secret.is_empty() && answer.contains(secret));
+    let safe_answer = if secure_storage_ready {
+        redact_saved_credentials(&answer, &secrets)
+    } else {
+        "Cancelled".to_string()
+    };
+    let delivery_decision = {
+        let delivery = state.delivery_state.lock().await;
+        delivery.as_ref().and_then(|delivery| {
+            (delivery.phase == crate::delivery::DeliveryPhase::WaitingForUser
+                && state
+                    .session_runtime
+                    .is_active_session(&delivery.session_id))
+            .then(|| {
+                delivery.pending_question.as_ref().map(|question| {
+                    (
+                        delivery.objective.clone(),
+                        delivery.session_id.clone(),
+                        question.text.clone(),
+                    )
+                })
+            })
+            .flatten()
+        })
+    };
     // take() atomically removes the sender and clears the Option.
     let tx = {
         let mut lock = state.ask_user_tx.lock().await;
@@ -1593,9 +1922,41 @@ pub async fn provide_user_answer(
     }; // lock drops here
 
     match tx {
-        Some(sender) => sender
-            .send(answer)
-            .map_err(|_| "Answer channel dropped — session may have ended".to_string()),
+        Some(sender) => {
+            sender
+                .send(safe_answer.clone())
+                .map_err(|_| "Answer channel dropped — session may have ended".to_string())?;
+            if !secure_storage_ready {
+                tracing::warn!(
+                    "AskUser response was converted to cancellation because saved credentials could not be checked"
+                );
+            }
+            if let Some((project_brief, session_id, question)) = delivery_decision
+                && !answer_contains_saved_secret
+            {
+                let memory_store = state.memory_store.clone();
+                let answer_to_adopt = safe_answer.clone();
+                let decision_secrets = secrets.clone();
+                if let Err(error) = crate::db_helpers::run_blocking(move || {
+                    let mut memory = memory_store.lock().map_err(|_| {
+                        AgentError::DatabaseError("memory store lock poisoned".to_string())
+                    })?;
+                    record_delivery_decision(
+                        &mut memory,
+                        &project_brief,
+                        &session_id,
+                        &question,
+                        &answer_to_adopt,
+                        &decision_secrets,
+                    )
+                })
+                .await
+                {
+                    tracing::warn!("[MEMORY] Delivery decision adoption failed: {error}");
+                }
+            }
+            Ok(())
+        }
         None => Err("No pending ask_user question".to_string()),
     }
 }
@@ -1612,6 +1973,17 @@ pub async fn save_agent_brain_config(
     system_prompt: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let api_key = if api_key.trim().is_empty() {
+        state
+            .settings_store
+            .lock()
+            .await
+            .get("brain_api_key")
+            .map_err(|e| settings_command_error("Failed to read saved Agent Brain credential", e))?
+            .unwrap_or_default()
+    } else {
+        api_key
+    };
     validate_brain_fields(&base_url, &model)
         .map_err(|e| settings_command_error("Agent brain validation failed", e))?;
 
@@ -1653,17 +2025,24 @@ pub async fn save_agent_brain_config(
     // STEP C: Persist primary config to DB.
     {
         let mut store = state.settings_store.lock().await;
+        let config = crate::settings_store::AgentBrainConfig {
+            api_key: api_key.clone(),
+            base_url: base_url.clone(),
+            model: model.clone(),
+            system_prompt: system_prompt.clone(),
+            leader_priming_prompt: store
+                .get("prompt_leader_priming")
+                .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?
+                .unwrap_or_default(),
+            participant_priming_prompt: store
+                .get("prompt_participant_priming")
+                .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?
+                .unwrap_or_default(),
+            credential_storage_available: store.credential_storage_available(),
+            credential_migration_pending: store.credential_migration_pending(),
+        };
         store
-            .set("brain_api_key", &api_key)
-            .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
-        store
-            .set("brain_base_url", &base_url)
-            .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
-        store
-            .set("brain_model", &model)
-            .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
-        store
-            .set("brain_system_prompt", &system_prompt)
+            .save_agent_brain_config(&config)
             .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
     } // lock drops here
 
@@ -1982,6 +2361,17 @@ pub async fn save_secondary_brain_config(
     system_prompt: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let api_key = if api_key.trim().is_empty() {
+        state
+            .settings_store
+            .lock()
+            .await
+            .get("brain2_api_key")
+            .map_err(|e| settings_command_error("Failed to read saved secondary credential", e))?
+            .unwrap_or_default()
+    } else {
+        api_key
+    };
     validate_brain_fields(&base_url, &model)
         .map_err(|e| settings_command_error("Secondary brain validation failed", e))?;
 
@@ -1997,17 +2387,16 @@ pub async fn save_secondary_brain_config(
     // STEP B: Persist.
     {
         let mut store = state.settings_store.lock().await;
+        let config = crate::settings_store::SecondaryBrainConfig {
+            api_key: api_key.clone(),
+            base_url: base_url.clone(),
+            model: model.clone(),
+            system_prompt: system_prompt.clone(),
+            credential_storage_available: store.credential_storage_available(),
+            credential_migration_pending: store.credential_migration_pending(),
+        };
         store
-            .set("brain2_api_key", &api_key)
-            .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
-        store
-            .set("brain2_base_url", &base_url)
-            .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
-        store
-            .set("brain2_model", &model)
-            .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
-        store
-            .set("brain2_system_prompt", &system_prompt)
+            .save_secondary_brain_config(&config)
             .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
     }
 
@@ -2053,6 +2442,17 @@ pub async fn save_fallback_brain_config(
 ) -> Result<(), String> {
     let clears_fallback =
         api_key.trim().is_empty() && base_url.trim().is_empty() && model.trim().is_empty();
+    let api_key = if api_key.trim().is_empty() && !clears_fallback {
+        state
+            .settings_store
+            .lock()
+            .await
+            .get("brain_fallback_api_key")
+            .map_err(|e| settings_command_error("Failed to read saved fallback credential", e))?
+            .unwrap_or_default()
+    } else {
+        api_key
+    };
     if !clears_fallback {
         validate_brain_fields(&base_url, &model)
             .map_err(|e| settings_command_error("Fallback brain validation failed", e))?;
@@ -2068,6 +2468,8 @@ pub async fn save_fallback_brain_config(
         api_key: api_key.clone(),
         base_url: base_url.clone(),
         model: model.clone(),
+        credential_storage_available: true,
+        credential_migration_pending: false,
     };
 
     // STEP A: Persist.
@@ -2108,6 +2510,60 @@ pub async fn get_fallback_brain_config(
         .map_err(|e| e.to_string())?;
 
     serde_json::to_string(&config).map_err(|e| e.to_string())
+}
+
+/// Remove one saved Agent Brain credential from the operating system store.
+/// The kind is a closed product enum so renderer input cannot choose arbitrary
+/// credential-store accounts.
+#[tauri::command]
+pub async fn clear_brain_credential(
+    kind: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let account = match kind.as_str() {
+        "primary" => "brain_api_key",
+        "fallback" => "brain_fallback_api_key",
+        "secondary" => "brain2_api_key",
+        _ => return Err("Unknown Agent Brain credential".to_string()),
+    };
+    state
+        .settings_store
+        .lock()
+        .await
+        .clear_credential(account)
+        .map_err(|e| settings_command_error("Could not remove saved API key", e))?;
+
+    match kind.as_str() {
+        "primary" => *state.agent_brain.lock().await = None,
+        "secondary" => *state.agent_brain_2.lock().await = None,
+        "fallback" => {
+            let mut brain = state.agent_brain.lock().await;
+            if let Some(existing) = brain.take() {
+                *brain = Some(existing.without_fallback());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_credential_storage_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let store = state.settings_store.lock().await;
+    serde_json::to_string(&json!({
+        "available": store.credential_storage_available(),
+        "migration_pending": store.credential_migration_pending(),
+        "message": if !store.credential_storage_available() {
+            "Secure credential storage is unavailable. Unlock the system keyring or Credential Manager, then retry. Existing saved credentials have been kept."
+        } else if store.credential_migration_pending() {
+            "An older saved API key still needs to move into secure storage. Retry after the system keyring is available."
+        } else {
+            "API keys are stored in the system credential store."
+        }
+    }))
+    .map_err(|e| e.to_string())
 }
 
 /// P1: return the persisted custom participants as a JSON array string.
@@ -2314,14 +2770,16 @@ struct DiagnosticSnapshot {
     command_timestamp: String,
 }
 
-/// Secret-free runtime snapshot for diagnosing configuration and persistence
-/// failures. Configuration values are reduced to booleans before serialization.
+/// Runtime snapshot for diagnosing configuration and persistence failures.
+/// Configuration values are reduced to booleans, and saved credential literals
+/// are redacted from retained browser evidence before it is returned.
 #[tauri::command]
 pub async fn get_diagnostic_snapshot(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<String, String> {
     require_maintenance_enabled(&state).await?;
+    let secrets = diagnostic_credentials(&state).await?;
 
     let app_data_dir = app
         .path()
@@ -2480,12 +2938,13 @@ pub async fn get_diagnostic_snapshot(
         command_timestamp: chrono::Utc::now().to_rfc3339(),
     };
 
-    serde_json::to_string(&snapshot)
-        .map_err(|e| settings_command_error("Failed to serialize diagnostic snapshot", e))
+    let serialized = serde_json::to_string(&snapshot)
+        .map_err(|e| settings_command_error("Failed to serialize diagnostic snapshot", e))?;
+    Ok(redact_saved_credentials(&serialized, &secrets))
 }
 
-/// Compact, secret-free human/AI-facing diagnostic artifact. This is plain
-/// Markdown by design; callers must not JSON.parse it.
+/// Compact human/AI-facing diagnostic artifact. Saved credential literals
+/// are redacted before return. This is plain Markdown; callers must not JSON.parse it.
 #[tauri::command]
 pub async fn get_diagnostic_brief(
     state: tauri::State<'_, AppState>,
@@ -2497,6 +2956,10 @@ pub async fn get_diagnostic_brief(
 }
 
 async fn build_diagnostic_brief(state: &AppState, app: &AppHandle) -> Result<String, String> {
+    let secrets = diagnostic_credentials(state).await?;
+    let app_data_dir = app.path().app_data_dir().map_err(|error| {
+        settings_command_error("Failed to resolve diagnostic storage location", error)
+    })?;
     let (primary_configured, fallback_present, secondary_configured) = {
         let store = state.settings_store.lock().await;
         let primary = store
@@ -2570,11 +3033,12 @@ async fn build_diagnostic_brief(state: &AppState, app: &AppHandle) -> Result<Str
     let mut writer = crate::browser_harness::DiagnosticBriefWriter::new();
     writer.push("# Consensus Arena Diagnostic Brief\n\n");
     writer.push(&format!(
-        "timestamp: {}\nos_arch: {}/{}\napp_version: {}\nwebview_engine: {}\nsession_active: {}\nleader_registry_window: {}\nnav_registry_window: {}\n",
+        "timestamp: {}\nos_arch: {}/{}\napp_version: {}\napp_data_dir: {}\nwebview_engine: {}\nsession_active: {}\nleader_registry_window: {}\nnav_registry_window: {}\n",
         chrono::Utc::now().to_rfc3339(),
         std::env::consts::OS,
         std::env::consts::ARCH,
         env!("CARGO_PKG_VERSION"),
+        app_data_dir.display(),
         tauri::webview_version().unwrap_or_else(|_| "unavailable".to_string()),
         state.session_runtime.is_active(),
         leader_exists,
@@ -2642,7 +3106,7 @@ async fn build_diagnostic_brief(state: &AppState, app: &AppHandle) -> Result<Str
             writer.push(&format!("dropped_events.{}: {}\n", agent, count));
         }
     }
-    Ok(writer.finish())
+    Ok(redact_saved_credentials(&writer.finish(), &secrets))
 }
 
 /// Harness: return chronological timeline events as JSON string (spec 3-15)
@@ -2678,161 +3142,220 @@ pub async fn export_browser_diagnostics(
     app: AppHandle,
 ) -> Result<String, String> {
     require_maintenance_enabled(&state).await?;
-    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let export_dir = app_data_dir.join(format!(
-        "diagnostics_export_{}",
-        chrono::Utc::now().format("%Y%m%d_%H%M%S")
-    ));
-    std::fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
-    let brief_path = export_dir.join("DIAGNOSTIC_BRIEF.md");
-    let brief = build_diagnostic_brief(&state, &app).await?;
-    std::fs::write(&brief_path, brief).map_err(|e| e.to_string())?;
-    let (timeline, diagnostics, browser_diagnostics) = {
-        let browser = state.browser_state.lock().await;
+    let (secrets, secure_storage_ready) = {
+        let store = state.settings_store.lock().await;
         (
-            browser.diagnostics.timeline.all_events_sorted(),
-            browser.diagnostics.snapshot(),
-            browser.diagnostics.snapshot(),
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
         )
     };
-    // events.json
-    let events_path = export_dir.join("events.json");
-    std::fs::write(
-        &events_path,
-        serde_json::to_string_pretty(&timeline).map_err(|e| e.to_string())?,
+    if !secure_storage_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let export_dir = app_data_dir.join(format!(
+        "diagnostics_export_{}_{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+        &Uuid::new_v4().simple().to_string()[..8]
+    ));
+    crate::diagnostics_retention::prune_diagnostic_exports(
+        &app_data_dir,
+        crate::diagnostics_retention::MAX_DIAGNOSTIC_EXPORTS - 1,
     )
-    .map_err(|e| e.to_string())?;
-    // browser-diagnostics.json
-    let diag_path = export_dir.join("browser-diagnostics.json");
-    std::fs::write(
-        &diag_path,
-        serde_json::to_string_pretty(&browser_diagnostics).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    // navigation-history.json
-    let nav: Vec<_> = browser_diagnostics
-        .iter()
-        .flat_map(|r| r.navigation_diagnostics.clone())
-        .collect();
-    let nav_path = export_dir.join("navigation-history.json");
-    std::fs::write(
-        &nav_path,
-        serde_json::to_string_pretty(&nav).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    // console-errors.json
-    let console: Vec<_> = browser_diagnostics
-        .iter()
-        .flat_map(|r| r.console_diagnostics.clone())
-        .collect();
-    let console_path = export_dir.join("console-errors.json");
-    std::fs::write(
-        &console_path,
-        serde_json::to_string_pretty(&console).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    // Cross-platform forensics: lifecycle, dom, actions, intents
-    let (lifecycle, dom_snapshots, actions, intents, full_snapshot) = {
-        let browser = state.browser_state.lock().await;
-        let lc = browser
-            .diagnostics
-            .lifecycle_events
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .flat_map(|d| d.iter().cloned())
-            .collect::<Vec<_>>();
-        let dom = browser
-            .diagnostics
-            .safe_dom_snapshots
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .flat_map(|d| d.iter().cloned())
-            .collect::<Vec<_>>();
-        let acts = browser
-            .diagnostics
-            .action_records
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .flat_map(|d| d.iter().cloned())
-            .collect::<Vec<_>>();
-        let intents = browser
-            .diagnostics
-            .navigation_intents
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .flat_map(|d| d.iter().cloned())
-            .collect::<Vec<_>>();
-        // Full diagnostic snapshot for forensic file
-        let diag = browser.diagnostics.snapshot();
-        let tl = browser.diagnostics.timeline.all_events_sorted();
-        let snapshot = serde_json::json!({
-            "browser_diagnostics": diag,
-            "timeline": tl,
-            "lifecycle_events": lc.clone(),
-            "safe_dom_snapshots": dom.clone(),
-            "action_records": acts.clone(),
-            "navigation_intents": intents.clone(),
+    .map_err(|error| {
+        settings_command_error("Could not apply diagnostic export retention", error)
+    })?;
+    std::fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
+    let mut export_guard = ExportDirectoryGuard {
+        path: export_dir.clone(),
+        keep: false,
+    };
+    let export_result = async {
+        let brief_path = export_dir.join("DIAGNOSTIC_BRIEF.md");
+        let brief = build_diagnostic_brief(&state, &app).await?;
+        std::fs::write(&brief_path, brief).map_err(|e| e.to_string())?;
+        let (timeline, diagnostics, browser_diagnostics) = {
+            let browser = state.browser_state.lock().await;
+            (
+                browser.diagnostics.timeline.all_events_sorted(),
+                browser.diagnostics.snapshot(),
+                browser.diagnostics.snapshot(),
+            )
+        };
+        // events.json
+        let events_path = export_dir.join("events.json");
+        std::fs::write(
+            &events_path,
+            serde_json::to_string_pretty(&timeline).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // browser-diagnostics.json
+        let diag_path = export_dir.join("browser-diagnostics.json");
+        std::fs::write(
+            &diag_path,
+            serde_json::to_string_pretty(&browser_diagnostics).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // navigation-history.json
+        let nav: Vec<_> = browser_diagnostics
+            .iter()
+            .flat_map(|r| r.navigation_diagnostics.clone())
+            .collect();
+        let nav_path = export_dir.join("navigation-history.json");
+        std::fs::write(
+            &nav_path,
+            serde_json::to_string_pretty(&nav).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // console-errors.json
+        let console: Vec<_> = browser_diagnostics
+            .iter()
+            .flat_map(|r| r.console_diagnostics.clone())
+            .collect();
+        let console_path = export_dir.join("console-errors.json");
+        std::fs::write(
+            &console_path,
+            serde_json::to_string_pretty(&console).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // Cross-platform forensics: lifecycle, dom, actions, intents
+        let (lifecycle, dom_snapshots, actions, intents, full_snapshot) = {
+            let browser = state.browser_state.lock().await;
+            let lc = browser
+                .diagnostics
+                .lifecycle_events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .flat_map(|d| d.iter().cloned())
+                .collect::<Vec<_>>();
+            let dom = browser
+                .diagnostics
+                .safe_dom_snapshots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .flat_map(|d| d.iter().cloned())
+                .collect::<Vec<_>>();
+            let acts = browser
+                .diagnostics
+                .action_records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .flat_map(|d| d.iter().cloned())
+                .collect::<Vec<_>>();
+            let intents = browser
+                .diagnostics
+                .navigation_intents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .flat_map(|d| d.iter().cloned())
+                .collect::<Vec<_>>();
+            // Full diagnostic snapshot for forensic file
+            let diag = browser.diagnostics.snapshot();
+            let tl = browser.diagnostics.timeline.all_events_sorted();
+            let snapshot = serde_json::json!({
+                "browser_diagnostics": diag,
+                "timeline": tl,
+                "lifecycle_events": lc.clone(),
+                "safe_dom_snapshots": dom.clone(),
+                "action_records": acts.clone(),
+                "navigation_intents": intents.clone(),
+            });
+            (lc, dom, acts, intents, snapshot)
+        };
+        let lifecycle_path = export_dir.join("lifecycle-events.json");
+        std::fs::write(
+            &lifecycle_path,
+            serde_json::to_string_pretty(&lifecycle).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let dom_path = export_dir.join("safe-dom-snapshots.json");
+        std::fs::write(
+            &dom_path,
+            serde_json::to_string_pretty(&dom_snapshots).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let actions_path = export_dir.join("action-records.json");
+        std::fs::write(
+            &actions_path,
+            serde_json::to_string_pretty(&actions).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let intents_path = export_dir.join("navigation-intents.json");
+        std::fs::write(
+            &intents_path,
+            serde_json::to_string_pretty(&intents).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let snapshot_path = export_dir.join("diagnostic-snapshot.json");
+        std::fs::write(
+            &snapshot_path,
+            serde_json::to_string_pretty(&full_snapshot).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // BROWSER_RELIABILITY_REPORT.md
+        let timeline_obj = {
+            let browser = state.browser_state.lock().await;
+            browser.diagnostics.timeline.clone()
+        };
+        let report = crate::browser_harness::generate_reliability_report_markdown(
+            &timeline_obj,
+            &diagnostics,
+        );
+        let report_path = export_dir.join("BROWSER_RELIABILITY_REPORT.md");
+        std::fs::write(&report_path, &report).map_err(|e| e.to_string())?;
+        match directory_contains_credentials(&export_dir, &secrets) {
+            Ok(false) => {}
+            scan_result => {
+                return Err(match scan_result {
+                    Ok(true) => "Diagnostic export contained a saved model credential.".to_string(),
+                    Err(_) => "Diagnostic export could not be checked for saved model credentials."
+                        .to_string(),
+                    Ok(false) => "Diagnostic export produced an unexpected credential scan result."
+                        .to_string(),
+                });
+            }
+        }
+        let result = serde_json::json!({
+            "export_dir": export_dir.to_string_lossy(),
+            "diagnostic_brief": brief_path.to_string_lossy(),
+            "report": report_path.to_string_lossy(),
+            "events": events_path.to_string_lossy(),
+            "browser_diagnostics": diag_path.to_string_lossy(),
+            "navigation_history": nav_path.to_string_lossy(),
+            "console_errors": console_path.to_string_lossy(),
+            "lifecycle_events": lifecycle_path.to_string_lossy(),
+            "safe_dom_snapshots": dom_path.to_string_lossy(),
+            "action_records": actions_path.to_string_lossy(),
+            "navigation_intents": intents_path.to_string_lossy(),
+            "diagnostic_snapshot": snapshot_path.to_string_lossy(),
         });
-        (lc, dom, acts, intents, snapshot)
-    };
-    let lifecycle_path = export_dir.join("lifecycle-events.json");
-    std::fs::write(
-        &lifecycle_path,
-        serde_json::to_string_pretty(&lifecycle).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let dom_path = export_dir.join("safe-dom-snapshots.json");
-    std::fs::write(
-        &dom_path,
-        serde_json::to_string_pretty(&dom_snapshots).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let actions_path = export_dir.join("action-records.json");
-    std::fs::write(
-        &actions_path,
-        serde_json::to_string_pretty(&actions).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let intents_path = export_dir.join("navigation-intents.json");
-    std::fs::write(
-        &intents_path,
-        serde_json::to_string_pretty(&intents).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let snapshot_path = export_dir.join("diagnostic-snapshot.json");
-    std::fs::write(
-        &snapshot_path,
-        serde_json::to_string_pretty(&full_snapshot).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    // BROWSER_RELIABILITY_REPORT.md
-    let timeline_obj = {
-        let browser = state.browser_state.lock().await;
-        browser.diagnostics.timeline.clone()
-    };
-    let report =
-        crate::browser_harness::generate_reliability_report_markdown(&timeline_obj, &diagnostics);
-    let report_path = export_dir.join("BROWSER_RELIABILITY_REPORT.md");
-    std::fs::write(&report_path, &report).map_err(|e| e.to_string())?;
-    let result = serde_json::json!({
-        "export_dir": export_dir.to_string_lossy(),
-        "diagnostic_brief": brief_path.to_string_lossy(),
-        "report": report_path.to_string_lossy(),
-        "events": events_path.to_string_lossy(),
-        "browser_diagnostics": diag_path.to_string_lossy(),
-        "navigation_history": nav_path.to_string_lossy(),
-        "console_errors": console_path.to_string_lossy(),
-        "lifecycle_events": lifecycle_path.to_string_lossy(),
-        "safe_dom_snapshots": dom_path.to_string_lossy(),
-        "action_records": actions_path.to_string_lossy(),
-        "navigation_intents": intents_path.to_string_lossy(),
-        "diagnostic_snapshot": snapshot_path.to_string_lossy(),
-    });
-    Ok(serde_json::to_string(&result).map_err(|e| e.to_string())?)
+        let serialized = serde_json::to_string(&result).map_err(|e| e.to_string())?;
+        Ok(serialized)
+    }
+    .await;
+    match export_result {
+        Ok(serialized) => {
+            export_guard.keep = true;
+            Ok(serialized)
+        }
+        Err(export_error) => {
+            let export_error = redact_saved_credentials(&export_error, &secrets);
+            match export_guard.remove_now() {
+                Ok(()) => Err(export_error),
+                Err(cleanup_error) => Err(redact_saved_credentials(
+                    &format!(
+                        "{export_error}; cleanup could not be confirmed, so a partial diagnostic export may remain at {}: {cleanup_error}",
+                        export_guard.path.display()
+                    ),
+                    &secrets,
+                )),
+            }
+        }
+    }
 }
 
 /// Dev-only single-model diagnostic (spec 19) – probe one agent without full arena loop
@@ -3039,7 +3562,7 @@ pub async fn export_blueprint(
     let store = state.blueprint_store.clone();
     let sid = resolved_session_id.clone();
     let fmt = format.clone();
-    let content = crate::db_helpers::run_blocking(move || {
+    let mut content = crate::db_helpers::run_blocking(move || {
         let guard = store
             .lock()
             .map_err(|_| AgentError::DatabaseError("blueprint store lock poisoned".to_string()))?;
@@ -3051,6 +3574,18 @@ pub async fn export_blueprint(
     })
     .await
     .map_err(|e| e.to_string())?;
+
+    let (export_secrets, secure_storage_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !secure_storage_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    content = redact_saved_credentials(&content, &export_secrets);
 
     let ext = if format == "markdown" { "md" } else { "txt" };
     let id_prefix_len = resolved_session_id.len().min(8);
@@ -3441,11 +3976,8 @@ where
                             diagnostics.readiness_timeout_message(&id, display_name)
                         ));
                     }
-                    NavEvent::UnshowableUrl(id, url) if id == expected_agent_id => {
-                        return Err(format!(
-                            "{} navigated to an unshowable URL: {}",
-                            display_name, url
-                        ));
+                    NavEvent::UnshowableUrl(id, _url) if id == expected_agent_id => {
+                        return Err(format!("{} navigated to an unshowable page", display_name));
                     }
                     NavEvent::SessionAborted => return Err("Session aborted".to_string()),
                     _ => {}
@@ -3664,7 +4196,10 @@ pub async fn launch_connected_account(
             // Non-fatal readiness error (e.g., timeout with page_state_hint) —
             // window is still visible; surface diagnostics but don't fail the
             // command so user can still interact (login, retry).
-            tracing::warn!("[LAUNCH] readiness wait for {}: {}", agent_id, msg);
+            tracing::warn!(
+                "[LAUNCH] readiness wait for {} ended with a recoverable failure",
+                agent_id
+            );
             let _ = app.emit(
                 "boss-message",
                 serde_json::json!({
@@ -3870,15 +4405,74 @@ pub async fn export_memory(
     state: tauri::State<'_, AppState>,
     destination_path: String,
 ) -> Result<(), String> {
+    let (secrets, secure_storage_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !secure_storage_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
     let memory_store = state.memory_store.clone();
-    crate::db_helpers::run_blocking(move || {
+    let export_path = std::path::PathBuf::from(destination_path.clone());
+    let scan_secrets = secrets.clone();
+    let result = crate::db_helpers::run_blocking(move || {
+        let parent = export_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let name = export_path
+            .file_name()
+            .ok_or_else(|| {
+                AgentError::DatabaseError("memory export destination has no file name".to_string())
+            })?
+            .to_string_lossy();
+        let staging_path = parent.join(format!(".{name}.arena-export-{}.tmp", Uuid::new_v4()));
+        let mut staging_guard = ExportFileGuard {
+            path: staging_path.clone(),
+            keep: false,
+        };
         let memory = memory_store
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        memory.export_to(&destination_path)
+        let export_result = (|| {
+            memory.export_to(&staging_path.to_string_lossy())?;
+            match file_contains_credentials(&staging_path, &scan_secrets) {
+                Ok(false) => {
+                    std::fs::rename(&staging_path, &export_path).map_err(|error| {
+                        AgentError::DatabaseError(format!(
+                            "could not publish verified memory export: {error}"
+                        ))
+                    })?;
+                    Ok(())
+                }
+                Ok(true) => Err(AgentError::DatabaseError(
+                    "memory export contained a saved model credential".to_string(),
+                )),
+                Err(error) => Err(AgentError::DatabaseError(format!(
+                    "memory export could not be checked for saved model credentials: {error}"
+                ))),
+            }
+        })();
+        match export_result {
+            Ok(()) => {
+                staging_guard.keep = true;
+                Ok(())
+            }
+            Err(export_error) => match staging_guard.remove_now() {
+                Ok(()) => Err(export_error),
+                Err(cleanup_error) => Err(AgentError::DatabaseError(format!(
+                    "{export_error}; cleanup could not be confirmed, so a temporary memory export may remain at {}: {cleanup_error}",
+                    staging_guard.path.display()
+                ))),
+            },
+        }
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    result.map_err(|error| redact_saved_credentials(&error, &secrets))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -3893,13 +4487,28 @@ pub async fn restore_memory(
         );
     }
 
+    let (secrets, secure_storage_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !secure_storage_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    if file_contains_credentials(std::path::Path::new(&source_path), &secrets)? {
+        return Err("Memory backup contains a saved model credential. Review the backup before restoring it.".to_string());
+    }
+
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let backup_dir = app_data_dir.join("memory_backups");
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
     let pre_restore_path = backup_dir.join(format!("pre_restore_{timestamp}.db"));
     let memory_store = state.memory_store.clone();
+    let scan_secrets = secrets.clone();
 
-    crate::db_helpers::run_blocking(move || {
+    let result = crate::db_helpers::run_blocking(move || {
         std::fs::create_dir_all(&backup_dir).map_err(|e| {
             AgentError::DatabaseError(format!("could not create memory backup directory: {e}"))
         })?;
@@ -3907,8 +4516,51 @@ pub async fn restore_memory(
         let mut memory = memory_store
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        memory.export_to(&pre_restore_path)?;
-        memory.restore_from(&source_path)?;
+        let mut backup_guard = ExportFileGuard {
+            path: std::path::PathBuf::from(&pre_restore_path),
+            keep: false,
+        };
+        if let Err(export_error) = memory.export_to(&pre_restore_path) {
+            return match backup_guard.remove_now() {
+                Ok(()) => Err(export_error),
+                Err(cleanup_error) => Err(AgentError::DatabaseError(format!(
+                    "{export_error}; cleanup could not be confirmed, so a partial pre-restore backup may remain at {}: {cleanup_error}",
+                    backup_guard.path.display()
+                ))),
+            };
+        }
+        match file_contains_credentials(std::path::Path::new(&pre_restore_path), &scan_secrets) {
+            Ok(false) => backup_guard.keep = true,
+            Ok(true) => {
+                let error = AgentError::DatabaseError(
+                    "pre-restore backup contained a saved model credential".to_string(),
+                );
+                return match backup_guard.remove_now() {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(AgentError::DatabaseError(format!(
+                        "{error}; cleanup could not be confirmed, so a credential-bearing pre-restore backup may remain at {}: {cleanup_error}",
+                        backup_guard.path.display()
+                    ))),
+                };
+            }
+            Err(scan_error) => {
+                let error = AgentError::DatabaseError(format!(
+                    "pre-restore backup could not be checked for saved model credentials: {scan_error}"
+                ));
+                return match backup_guard.remove_now() {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(AgentError::DatabaseError(format!(
+                        "{error}; cleanup could not be confirmed, so an unchecked pre-restore backup may remain at {}: {cleanup_error}",
+                        backup_guard.path.display()
+                    ))),
+                };
+            }
+        }
+        if let Err(error) = memory.restore_from(&source_path) {
+            return Err(AgentError::DatabaseError(format!(
+                "memory restore failed: {error}. Pre-restore backup saved at {pre_restore_path}"
+            )));
+        }
         let health = memory.check_health();
         if !health.is_healthy {
             return Err(AgentError::DatabaseError(format!(
@@ -3920,7 +4572,8 @@ pub async fn restore_memory(
         Ok(())
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    result.map_err(|error| redact_saved_credentials(&error, &secrets))
 }
 
 // ── Hackathon Mode ──────────────────────────────────────────────────────────
@@ -4726,6 +5379,130 @@ pub async fn run_hackathon(
 mod tests {
     use super::*;
     use crate::settings_store::CustomParticipant;
+
+    #[test]
+    fn credential_enumeration_fails_closed_on_malformed_hackathon_settings() {
+        let path = std::env::temp_dir().join(format!(
+            "arena-configured-credentials-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let mut store = crate::settings_store::SettingsStore::new_with_credential_store(
+            path.to_str().expect("temp path is utf8"),
+            std::sync::Arc::new(crate::credentials::MemoryCredentialStore::default()),
+        )
+        .expect("open isolated settings store");
+        store
+            .set("hackathon_config", "{")
+            .expect("seed malformed Hackathon metadata");
+
+        assert!(configured_credentials(&store).is_err());
+        assert!(!store.credential_storage_available());
+        assert!(store.credential_migration_pending());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn diagnostic_text_redacts_exact_saved_credentials() {
+        let secret = "synthetic-diagnostic-secret-7d3c";
+        let diagnostic = format!("browser last_error: provider returned {secret}");
+        let safe = redact_saved_credentials(&diagnostic, &[secret.to_string()]);
+        assert!(!safe.contains(secret));
+        assert!(safe.contains("[REDACTED]"));
+
+        let unusual_secret = "quoted\"\\line\nbreak";
+        let encoded = serde_json::to_string(&serde_json::json!({
+            "evidence": format!("provider returned {unusual_secret}")
+        }))
+        .expect("serialize diagnostic evidence");
+        let safe_encoded = redact_saved_credentials(&encoded, &[unusual_secret.to_string()]);
+        let variants = credential_scan_literals(&[unusual_secret.to_string()]);
+        assert!(
+            !variants
+                .iter()
+                .any(|literal| safe_encoded.contains(literal))
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "arena-escaped-secret-scan-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, &encoded).expect("write encoded evidence");
+        assert!(
+            file_contains_credentials(&path, &[unusual_secret.to_string()])
+                .expect("scan encoded evidence")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn export_credential_scanner_catches_binary_data_across_chunk_boundary() {
+        let path = std::env::temp_dir().join(format!(
+            "arena-export-secret-scan-{}.bin",
+            std::process::id()
+        ));
+        let secret = "synthetic-export-secret-boundary-91f3".to_string();
+        let mut bytes = vec![0xa5; 64 * 1024 - 7];
+        bytes.extend_from_slice(secret.as_bytes());
+        std::fs::write(&path, bytes).expect("write synthetic export");
+        assert!(file_contains_credentials(&path, &[secret.clone()]).expect("scan export"));
+        std::fs::write(&path, b"safe export bytes").expect("replace synthetic export");
+        assert!(!file_contains_credentials(&path, &[secret]).expect("scan safe export"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delivery_owner_answers_are_adopted_as_product_decisions_but_secrets_are_skipped() {
+        let mut memory = crate::memory_store::MemoryStore::new_empty();
+        record_delivery_decision(
+            &mut memory,
+            "Arena delivery project",
+            "delivery-123",
+            "Which launch target should the settings page use?",
+            "Use the first-run setup page.",
+            &[],
+        )
+        .expect("persist delivery decision");
+        record_delivery_decision(
+            &mut memory,
+            "Arena delivery project",
+            "delivery-124",
+            "Which API key should we use?",
+            "synthetic-secret-that-must-not-enter-memory",
+            &["synthetic-secret-that-must-not-enter-memory".to_string()],
+        )
+        .expect("skip credential decision without failing");
+        record_delivery_decision(
+            &mut memory,
+            "Delivery objective contains abcdefgh12345678901234567890 for staging",
+            "delivery-125",
+            "Which launch target should the settings page use?",
+            "Use the first-run setup page.",
+            &[],
+        )
+        .expect("skip credential-bearing project identity without failing");
+        assert!(
+            memory
+                .get_project_memory(
+                    "Delivery objective contains abcdefgh12345678901234567890 for staging"
+                )
+                .expect("check sensitive project identity")
+                .is_empty()
+        );
+
+        let entries = memory
+            .get_project_memory("Arena delivery project")
+            .expect("read adopted project decisions");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].category, "decision");
+        assert!(entries[0].content.contains("Use the first-run setup page."));
+        assert_eq!(entries[0].source_agent, "owner");
+        assert_eq!(entries[0].source_type, "user");
+        assert!(
+            !entries[0]
+                .content
+                .contains("synthetic-secret-that-must-not-enter-memory")
+        );
+    }
 
     fn participant(agent_id: &str, name: &str, url: &str) -> CustomParticipant {
         CustomParticipant {

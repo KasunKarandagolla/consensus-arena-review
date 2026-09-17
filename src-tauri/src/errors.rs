@@ -25,6 +25,23 @@ pub enum AgentError {
 }
 
 impl AgentError {
+    /// A bounded category safe for persistent logs. The Display message can
+    /// contain provider, browser, or user supplied text.
+    pub fn category(&self) -> &'static str {
+        match self {
+            AgentError::InjectionFailed(_) => "injection_failed",
+            AgentError::ExtractionFailed(_) => "extraction_failed",
+            AgentError::Timeout(_) => "timeout",
+            AgentError::CaptchaRequired(_) => "captcha_required",
+            AgentError::ContextLimitReached(_) => "context_limit",
+            AgentError::SessionExpired(_) => "session_expired",
+            AgentError::NavigationFailed(_) => "navigation_failed",
+            AgentError::DatabaseError(_) => "database_error",
+            AgentError::NetworkError(_) => "network_error",
+            AgentError::UnknownError(_) => "unknown_error",
+        }
+    }
+
     /// Classify this error so callers can decide whether to retry.
     ///
     /// Default is Permanent — unknown errors should not be silently retried.

@@ -1,6 +1,6 @@
 # Consensus Arena — Active Decisions
 
-**Last refreshed:** 2026-09-15
+**Last refreshed:** 2026-09-17
 This file contains **current durable decisions**, not the full historical diary. Historical details belong in audits and source history.
 
 ## D-2026-01 — Arena is now dual-lane
@@ -46,17 +46,26 @@ The worker may propose changes to requirements/tests, but cannot silently redefi
 
 ## D-2026-07 — Bounded workers, not a monolithic substrate
 
-**Accepted.** DSH is currently retained narrowly as a bounded coding/debug/repair worker because real gate testing proved useful execution with NVIDIA NIM on modest hardware.
+**Architecture accepted; DSH selection reopened by current evidence.** Arena
+should use a bounded worker rather than a monolithic execution substrate. DSH
+previously completed one real Muse task, but the latest clean-install pair
+reproduced only package resolution and root CLI help: the exact Arena
+headless-profile probe timed out in both installs. No current DSH worker
+baseline is qualified, and DSH materially challenges its current worker
+assumption. Trigger A consultation is required before selecting DSH, a fork,
+or another worker. Keep Arena's work-order, frozen-acceptance, verifier, and
+Apply contracts stable during that decision.
 
 DSH is **not** the owner of Arena product decisions, acceptance authority, or durable workflow policy.
 
-## D-2026-08 — Dagu is the next workflow-engine candidate, not current implementation
+## D-2026-08 — Dagu is a post-V1 workflow-engine candidate, not current implementation
 
-**Accepted as next validation direction. Not implemented yet.** Dagu is attractive because it provides local durable runs, retries/history, processless root human tasks, REST/CLI control, and an existing DSH harness composition.
+**Not implemented; keep post-V1.** Dagu is attractive because it provides local durable runs, retries/history, processless root human tasks, REST/CLI control, and an existing DSH harness composition. The completed standalone closure remains **INCONCLUSIVE**: after a hard interruption the attempt required explicit reconciliation and repeated an external side effect; DSH composition and native Windows execution remain unproven.
 
-Do not code Dagu into Arena without first passing the standalone falsification
-gate, followed by a focused integrated slice proving the actual
-wait/restart/duplicate-answer/repair semantics on Linux and then Windows.
+Complete only the currently authorized hard-interruption and standalone
+Windows qualification gates before recording a final verdict. Do not integrate
+Dagu or broaden V1 qualification work. The inconclusive result does not
+trigger Astra Trigger B. Preserve Dagu as a post-V1 candidate.
 
 If Dagu fails materially, keep the stable work-order/worker/verifier contracts and fall back to a small Arena-owned controller. Do not reopen the entire agent-substrate search automatically.
 

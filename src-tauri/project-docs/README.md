@@ -1,6 +1,6 @@
 # Consensus Arena — Project Documentation Index
 
-**Last refreshed:** 2026-09-16
+**Last refreshed:** 2026-09-17
 **Purpose:** Small, modular source-of-truth documents for humans, ChatGPT, and Codex working on Consensus Arena.
 
 ## Current product in one paragraph
@@ -8,7 +8,7 @@
 Consensus Arena is a native Tauri 2 desktop application evolving from an AI expert-panel blueprint tool into a **product-authority and delivery system for a nontechnical product owner**. It now has two deliberately separate lanes:
 
 1. **Consult** — the existing leader-driven frontier-model consultation system using authenticated consumer web chats and an OpenAI-compatible orchestration brain.
-2. **Build / Delivery** — a new parallel lane that can take bounded product work into an isolated Git worktree, use a bounded DSH worker, freeze executable acceptance material, verify independently, repair with bounded attempts, persist owner questions, and apply only a verified candidate under strict Git preconditions.
+2. **Build / Delivery** — a new parallel lane whose current source can take bounded product work into an isolated Git worktree, author and freeze executable acceptance material, verify independently, repair with bounded attempts, persist owner questions, and apply only a verified candidate under strict Git preconditions. Its DSH worker prerequisite is currently materially challenged and blocks Build before admission.
 
 The long-term direction is not to turn Arena into another coding-agent platform. Arena should own **product intent, owner decisions, progression policy, and acceptance authority**, while reusing external workers, workflow engines, Git, test runners, browser/native automation, deployment tools, and other commodity infrastructure.
 
@@ -23,7 +23,8 @@ When sources disagree, use this order:
 
 Do not preserve a doc claim because it is written here. Correct the docs when current source proves otherwise.
 
-The post-gates Delivery audits dated 2026-09-14 supersede the older consultation-only status language in the previous project docs.
+The current programme audits through 2026-09-17 supersede older consultation-
+only status language and earlier provisional substrate assumptions.
 
 ## Read only what the task needs
 
@@ -46,22 +47,43 @@ Do **not** load every project document for a narrow task. This documentation is 
 
 ## Current verified transition point
 
+### Worker gate update — 2026-09-16
+
+Two fresh npm installs from the newly preserved manifest/lock reproduced the
+same dependency graph, DSH version, and root help output. Both then hung on
+Arena's exact five-second `headless --help` prerequisite probe and were killed
+by the bounded probe. The new lock is not the irrecoverable historical lock;
+no model-backed task ran. The current worker decision is **DSH materially
+challenged — Astra Trigger A**. The consultation packet is in
+`audits/dsh-runtime-reproducibility/dsh-runtime-reproducibility.md`; no Astra
+consultation response is claimed. Do not treat DSH as a qualified or durable
+V1 prerequisite while this decision is open.
+
+The final standalone Dagu closure also remains **INCONCLUSIVE — post-V1**.
+Linux hard-interruption testing found an at-least-once side-effect risk and
+required explicit recovery; Windows execution and DSH composition remain
+unproven. No Dagu integration or Astra Trigger B consultation is justified.
+
+The Linux host probe still reports no `/dev/dri`, llvmpipe, and no running
+Arena/Vite process. Use the graphics-capable desktop procedure in
+`RELIABILITY.md`; no GUI E2E is claimed.
+
 The latest local post-implementation audit establishes a first Build vertical slice with these invariants at source/test level:
 
 - Consult mode remains separate and unchanged.
 - Build mode does not require leader/participants or model WebViews.
 - Work occurs in an isolated `arena-delivery/<short-id>` Git worktree created from a clean base.
-- DSH is currently a bounded external worker, not Arena's durable product authority.
+- The source contains a DSH bounded-worker adapter, but the current worker assumption is materially challenged and Build is blocked before admission.
 - Executable acceptance material is authored **before implementation**, frozen, protected by hashes, and verified independently from worker narration.
 - Required checks are rerun after repair; attempts are bounded.
 - `needs_user` is persisted before the existing AskUser event is emitted; the source recovery path can re-present a persisted question after restart, but a separate production-service restart/answer runtime has not been qualified.
 - Apply is explicit and source guards reject dirty, moved, or non-fast-forward bases; the successful production Apply path has not been runtime-qualified.
 - DSH is not yet bundled/installed by Arena.
-- Build setup now performs a read-only DSH prerequisite check and blocks
+- Build setup performs a read-only DSH prerequisite check and blocks
   Delivery admission unless the expected `0.1.5-rc.1` executable exposes the
-  `headless` profile. This version/help probe does not establish the frozen
-  dependency tree or worker-result compatibility; the expected runtime is not
-  yet reproducible or runtime-qualified.
+  `headless` profile. A newly preserved manifest/lock reproduces across two
+  clean installs, but both hit the probe timeout. This runtime is not
+  worker-qualified and the exact historical lock remains unavailable.
 - Native Linux Tauri launch was reconfirmed, but the managed WebView was blank
   during the latest qualification session, so no Delivery UI dogfood run was
   started in that session.
@@ -97,25 +119,27 @@ and compositing flags did not restore the Arena surface. The host script is at
 No UI-to-Apply run was claimed. See
 `/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/delivery-v1-programme-qualification-2026-09-16.md`.
 
-The standalone Dagu falsification gate has now been run without Arena
-integration. Its local durable-run, retry, and root-human-task mechanics were
-supported, but the Dagu→DSH composition and automatic reconciliation after a
-hard interruption were not proven. Overall verdict: **INCONCLUSIVE**; no Dagu
-integration or Astra consultation is authorized by this result. See
-`audits/dagu-standalone-qualification.md`.
+The standalone Dagu closure remains **INCONCLUSIVE — post-V1**. After hard
+interruption, the active attempt required explicit reconciliation and repeated
+an external side effect. Human-task recovery also needed explicit retry after
+restart. DSH composition and Windows execution remain unproven. See
+`audits/dagu-runtime-closure-2026-09-16.md`.
 
 The follow-up prerequisite qualification is recorded in
 `/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/delivery-v1-prerequisite-qualification-2026-09-16.md`.
 
 See `audits/delivery-dsh-v4-worker-and-e2e.md` for the permanent evidence.
 
-## Current strategic next layer
+## Current strategic boundary
 
-After seven substrate qualification sessions and a post-gates Astra consultation, the accepted architecture is **not** a monolithic agent substrate. The current recommendation is:
+After the substrate gates and prior Astra consultation, the accepted
+architecture is **not** a monolithic agent substrate. Arena keeps product
+authority, frozen acceptance, independent verification, and safe Apply; its
+bounded worker selection is now open under required Astra Trigger A.
 
-> Arena product authority + reusable durable workflow mechanics + bounded worker + independent deterministic verification.
+> Arena product authority + reusable execution/workflow mechanics where proven useful + a bounded worker + independent deterministic verification.
 
-**Dagu** remains a deferred workflow-engine candidate because it offers local durable runs, retries/history, root human tasks, and REST/CLI control. Standalone mechanics are now partly qualified, but the current overall falsification verdict is inconclusive: successful DSH composition and crash reconciliation remain unproven. **Dagu is not part of the current implemented Build lane.** Resolve the exact DSH runtime and complete backend Delivery reliability evidence before reconsidering integration; native Linux GUI proof remains a separate final gate.
+**Dagu** remains a post-V1 workflow-engine candidate because it offers local durable runs, retries/history, root human tasks, and REST/CLI control. Its standalone result is **INCONCLUSIVE**: a hard interruption required explicit reconciliation and repeated an external side effect; DSH composition and Windows execution remain unproven. **Dagu is not part of the current Build lane.** Do not spend further V1 release effort on Dagu integration. The current DSH failure independently triggers the targeted Astra consultation recorded in its audit.
 
 ## Documentation maintenance
 

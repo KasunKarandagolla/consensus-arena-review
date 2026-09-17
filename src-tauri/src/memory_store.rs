@@ -306,6 +306,13 @@ impl MemoryStore {
         source_agent: &str,
         source_type: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || contains_credential_like_text(category)
+            || contains_credential_like_text(content)
+            || skill_name.is_some_and(contains_credential_like_text)
+        {
+            return Ok(());
+        }
         self.conn
             .execute(
                 "INSERT INTO session_memory
@@ -369,6 +376,16 @@ impl MemoryStore {
         source_agent: &str,
         source_type: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || contains_credential_like_text(category)
+            || contains_credential_like_text(content)
+            || trigger_desc.is_some_and(contains_credential_like_text)
+            || skill_name.is_some_and(contains_credential_like_text)
+            || contains_credential_like_text(source_agent)
+            || contains_credential_like_text(source_type)
+        {
+            return Ok(());
+        }
         let now = chrono::Utc::now().timestamp();
         self.conn
             .execute(
@@ -426,6 +443,9 @@ impl MemoryStore {
         project_brief: &str,
         content: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief) || contains_credential_like_text(content) {
+            return Ok(());
+        }
         let content = safe_prefix(content, 2_000);
         let project_brief = project_brief.to_string();
         self.with_transaction(|tx| {
@@ -592,6 +612,9 @@ impl MemoryStore {
         question: &str,
         raised_iteration: u32,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief) || contains_credential_like_text(question) {
+            return Ok(());
+        }
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO open_questions
@@ -618,6 +641,9 @@ impl MemoryStore {
         question_prefix: &str,
         resolution: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(resolution) {
+            return Ok(());
+        }
         self.conn
             .execute(
                 "UPDATE open_questions
@@ -660,6 +686,13 @@ impl MemoryStore {
         adopted: bool,
         session_id: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || contains_credential_like_text(model_id)
+            || contains_credential_like_text(topic)
+            || contains_credential_like_text(session_id)
+        {
+            return Ok(());
+        }
         self.conn
             .execute(
                 "INSERT INTO model_reliability
@@ -725,6 +758,13 @@ impl MemoryStore {
         pattern_action: &str,
         pattern_outcome: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || contains_credential_like_text(pattern_condition)
+            || contains_credential_like_text(pattern_action)
+            || contains_credential_like_text(pattern_outcome)
+        {
+            return Ok(());
+        }
         let now = chrono::Utc::now().timestamp();
         self.conn
             .execute(
@@ -809,6 +849,14 @@ impl MemoryStore {
         models_consulted: &[String],
         iterations_since_last_section: u32,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || contains_credential_like_text(section_title)
+            || models_consulted
+                .iter()
+                .any(|model| contains_credential_like_text(model))
+        {
+            return Ok(());
+        }
         let topic = detect_topic(section_title).to_string();
         let models_joined = models_consulted.join(", ");
         let title_lower = section_title.to_lowercase();
@@ -885,6 +933,24 @@ impl MemoryStore {
         sections_finalized: u32,
         total_iterations: u32,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || summary
+                .investigated
+                .iter()
+                .chain(&summary.completed)
+                .chain(&summary.learned)
+                .chain(&summary.next_steps)
+                .any(|item| contains_credential_like_text(item))
+            || open_questions.iter().any(|question| {
+                contains_credential_like_text(&question.question)
+                    || question
+                        .resolution
+                        .as_deref()
+                        .is_some_and(contains_credential_like_text)
+            })
+        {
+            return Ok(());
+        }
         let project_brief = project_brief.to_string();
         self.with_transaction(|tx| {
             let now = chrono::Utc::now().timestamp();
@@ -1203,6 +1269,77 @@ pub fn safe_prefix(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// Conservative filter for owner-provided values before they enter durable
+/// product memory. Credential-like content is omitted rather than guessed at.
+pub fn contains_credential_like_text(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if [
+        "api_key",
+        "apikey",
+        "api key",
+        "password",
+        "passphrase",
+        "secret",
+        "bearer ",
+        "access token",
+        "refresh token",
+        "private key",
+        "credential",
+        "token=",
+        "authorization",
+        "nvapi-",
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "xoxb-",
+        "eyj",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    value.split_whitespace().any(|token| {
+        let compact = token
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            .collect::<String>();
+        let has_letters = compact
+            .chars()
+            .any(|character| character.is_ascii_alphabetic());
+        let has_digits = compact.chars().any(|character| character.is_ascii_digit());
+        compact.len() >= 24 && ((has_letters && has_digits) || compact.len() >= 32)
+    })
+}
+
+#[cfg(test)]
+mod credential_text_tests {
+    use super::contains_credential_like_text;
+
+    #[test]
+    fn detects_common_credential_markers_and_long_bare_tokens() {
+        for value in [
+            "API key: synthetic-value",
+            "Bearer synthetic-value",
+            "nvapi-synthetic-value",
+            "ghp_synthetic-value",
+            "syntheticcredentialtokenvalue123456",
+            "Use abcdefgh12345678901234567890 for staging",
+        ] {
+            assert!(contains_credential_like_text(value), "missed {value}");
+        }
+        assert!(!contains_credential_like_text(
+            "Choose the first-run setup page"
+        ));
+        assert!(!contains_credential_like_text(
+            "Use the encrypted system vault"
+        ));
+        assert!(!contains_credential_like_text(
+            "Keep the long term product setting"
+        ));
+    }
+}
+
 pub fn normalize_question_key(question: &str) -> String {
     question
         .to_lowercase()
@@ -1353,6 +1490,12 @@ fn upsert_transaction_project_memory(
     content: &str,
     now: i64,
 ) -> Result<(), AgentError> {
+    if contains_credential_like_text(project_brief)
+        || contains_credential_like_text(category)
+        || contains_credential_like_text(content)
+    {
+        return Ok(());
+    }
     tx.execute(
         "INSERT INTO project_memory
          (id, project_brief, category, content, importance, hard_pinned,
@@ -1469,6 +1612,51 @@ mod tests {
         assert_eq!(journal_mode, "wal");
         assert!(user_version >= MEMORY_SCHEMA_VERSION);
         eprintln!("memory smoke database: {}", path.display());
+        Ok(())
+    }
+
+    #[test]
+    fn full_ask_user_question_resolves_its_normalized_open_question_key() -> Result<(), AgentError>
+    {
+        let path = std::env::temp_dir().join(format!(
+            "consensus-arena-memory-question-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let mut store = MemoryStore::new(&path.to_string_lossy())?;
+        let session_id = "memory-question-resolution";
+        let project = "memory question resolution";
+        let question = "Which of these launch options should we use for the first setup flow?";
+
+        store.add_open_question(session_id, project, question, 1)?;
+        store.resolve_question(session_id, question, "Use the first setup option")?;
+
+        assert!(store.get_open_questions(project)?.is_empty());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        Ok(())
+    }
+
+    #[test]
+    fn open_question_storage_skips_credential_like_briefs_questions_and_resolutions()
+    -> Result<(), AgentError> {
+        let mut store = MemoryStore::new_empty();
+        let sensitive_brief = "project abcdefgh12345678901234567890 staging";
+        let sensitive_question = "Use abcdefgh12345678901234567890 for staging?";
+        store.add_open_question("session", sensitive_brief, "Which release target?", 1)?;
+        store.add_open_question("session", "safe project", sensitive_question, 1)?;
+        store.add_open_question("session", "safe project", "Which release target?", 1)?;
+        store.resolve_question(
+            "session",
+            "Which release target?",
+            "Set abcdefgh12345678901234567890",
+        )?;
+
+        assert!(store.get_open_questions(sensitive_brief)?.is_empty());
+        let questions = store.get_open_questions("safe project")?;
+        assert_eq!(questions.len(), 1);
+        assert!(!questions[0].resolved);
         Ok(())
     }
 

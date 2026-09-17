@@ -11,9 +11,11 @@ mod capability_registry;
 mod checkpoint;
 mod commands;
 mod context_manager;
+mod credentials;
 mod critical_transport;
 mod db_helpers;
 mod delivery;
+mod diagnostics_retention;
 mod dsh_worker;
 mod errors;
 mod git_runtime;
@@ -39,6 +41,15 @@ use orchestrator::AppState;
 use tauri::{Emitter, Manager};
 
 fn main() {
+    #[cfg(unix)]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--arena-internal-process-group-guard"))
+    {
+        loop {
+            std::thread::park();
+        }
+    }
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -48,16 +59,25 @@ fn main() {
                 .expect("could not resolve app data directory");
             std::fs::create_dir_all(&data_dir)
                 .expect("could not create app data directory");
+            if let Err(error) = crate::diagnostics_retention::prune_diagnostic_logs(
+                &data_dir,
+                std::time::SystemTime::now(),
+            ) {
+                eprintln!("[DIAGNOSTICS] Could not prune expired app logs: {error}");
+            }
 
             // ── IMP-8: File-backed tracing (rolling daily log) ────────────────
-            let file_appender =
-                tracing_appender::rolling::daily(&data_dir, "consensus-arena.log");
+            let file_appender = tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("consensus-arena.log")
+                .max_log_files(15)
+                .build(&data_dir)?;
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
                 )
                 .with_writer(non_blocking)
                 .with_ansi(false) // no ANSI colour codes in log files
@@ -134,6 +154,8 @@ fn main() {
             commands::get_secondary_brain_config,   // D-039
             commands::save_fallback_brain_config,   // Task 5 (HIGH-3)
             commands::get_fallback_brain_config,    // Task 5 (HIGH-3)
+            commands::clear_brain_credential,
+            commands::get_credential_storage_status,
             commands::save_custom_participants,     // P1
             commands::get_custom_participants,      // P1
             commands::get_participants,             // P3 unified registry

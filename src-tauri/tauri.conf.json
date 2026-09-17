@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "identifier": "com.consensus.arena",
   "build": {
-    "beforeDevCommand": "cd src && npm run dev",
+    "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "cd src && npm run build",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
   "app": {

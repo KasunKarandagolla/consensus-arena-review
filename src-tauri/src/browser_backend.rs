@@ -47,10 +47,11 @@ fn linux_webkit_context_mode_for_mode(mode: Option<&str>) -> LinuxWebkitContextM
 #[cfg(target_os = "linux")]
 fn linux_webkit_context_mode() -> LinuxWebkitContextMode {
     let mode = std::env::var("CONSENSUS_ARENA_WEBKIT_CONTEXT").ok();
-    if let Some(other) = mode.as_deref().filter(|value| *value != "epiphany-like") {
-        tracing::warn!(
-            "[DIAGNOSTIC] ignoring unknown CONSENSUS_ARENA_WEBKIT_CONTEXT={other}; using default context"
-        );
+    if mode
+        .as_deref()
+        .is_some_and(|value| value != "epiphany-like" && value != "default")
+    {
+        tracing::warn!("[DIAGNOSTIC] ignoring unknown WebKit context mode; using default context");
     }
     linux_webkit_context_mode_for_mode(mode.as_deref())
 }
@@ -573,7 +574,11 @@ impl BrowserDiagnostics {
         self.emit_harness_event(agent_id, et, &self.current_phase_str(agent_id), &operation_id, url, serde_json::json!({ "lifecycle": event_type, "title": crate::browser_harness::sanitize_details_value(title) }));
     }
 
-    pub fn record_safe_dom_forensics(&self, agent_id: &str, forensics: SafeDomForensics) {
+    pub fn record_safe_dom_forensics(&self, agent_id: &str, mut forensics: SafeDomForensics) {
+        // The DOM collector supplies the current URL directly. Redact it at the
+        // retention boundary so every later diagnostic/export path receives
+        // only the credential-safe representation.
+        forensics.url = crate::browser_harness::redact_url(&forensics.url);
         let mut map = self
             .safe_dom_snapshots
             .lock()
@@ -1557,11 +1562,9 @@ impl BrowserDiagnostics {
             }
             // If this is an unexpected page navigation while setup is incomplete, increment recovery count later via explicit call
             tracing::warn!(
-                "[NAV] {} {} {} -> {} cause={} gen={} phase={}",
+                "[NAV] agent={} window={} unexpected navigation cause={} gen={} phase={}",
                 agent_id,
                 window_label,
-                from_url_sanitized,
-                to_url_sanitized,
                 cause,
                 setup_generation,
                 phase
@@ -1941,7 +1944,10 @@ pub fn record_browser_error(
         record.current_phase = "error".to_string();
         record.last_error = Some(message.to_string());
     }) {
-        tracing::error!("[BROWSER] {}: {}", agent_id, message);
+        tracing::error!(
+            "[BROWSER] {} operation failed category=browser_operation",
+            agent_id
+        );
         emit_browser_diagnostic(app, &record, "Model window failed");
     }
 }
@@ -3311,15 +3317,10 @@ pub fn record_console_diagnostic(
         .filter(|active| !active.is_empty())
         .unwrap_or_else(|| reported_agent_id.to_string());
 
-    // If reported differs from active, log but still use active for attribution.
+    // If reported differs from active, keep the mismatch visible without
+    // logging browser-controlled identity or category fields.
     if !reported_agent_id.is_empty() && attributed_agent != reported_agent_id {
-        tracing::warn!(
-            "[CONSOLE] attribution mismatch window={} reported={} active={} category={}",
-            window_label,
-            reported_agent_id,
-            attributed_agent,
-            category
-        );
+        tracing::warn!("[CONSOLE] browser event attribution mismatch; using active window owner");
     }
 
     let agent_id = attributed_agent;
@@ -3387,7 +3388,7 @@ pub fn record_console_diagnostic(
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let Some(record) = records.get_mut(&agent_id) else {
-        tracing::warn!("[CONSOLE] no diagnostic record for agent {}", agent_id);
+        tracing::warn!("[CONSOLE] browser event received without an active diagnostic record");
         return;
     };
 
@@ -3474,13 +3475,9 @@ pub fn record_console_diagnostic(
         record.last_error = Some(format!("[{}] {}", category, message));
     }
     tracing::warn!(
-        "[CONSOLE] {} {} {} {} {} {}",
+        "[CONSOLE] agent={} window={} browser evidence recorded",
         agent_id,
-        window_label,
-        category,
-        severity,
-        source,
-        message
+        window_label
     );
     // Harness: classified error + timeline
     let classified = browser_harness::classify_console_error(&category, &message, &source);
@@ -3590,8 +3587,8 @@ pub fn display_name_for(agent_id: &str) -> &'static str {
         "qwen" => "Qwen",
         "glm" => "GLM",
         "kimi" => "Kimi",
-        other => {
-            eprintln!("[MEMORY] display_name_for: unknown agent_id '{other}'");
+        _ => {
+            eprintln!("[MEMORY] display_name_for: unknown agent id");
             "Unknown Model"
         }
     }
@@ -4471,10 +4468,7 @@ impl BrowserState {
                         record_nav_event(&bridge_app_crit, &diagnostics_crit, &diagnostic_event);
                     }
                 } else {
-                    tracing::warn!(
-                        "[CRITICAL] received non-critical event on critical ingress: {:?}",
-                        event
-                    );
+                    tracing::warn!("[CRITICAL] received non-critical event on critical ingress");
                     // Preserve prior diagnostic observation for non-critical
                     // payloads on this channel; the exact-operation guard
                     // exempts events without an OperationId.
@@ -4938,11 +4932,11 @@ fn activate_automation_after_page_load(
         } => (token, policy, effective_origin),
         FinishDecision::Passive { reason } => {
             record_automation_activation(diagnostics, agent_id, "deferred");
-            tracing::debug!("[LIFECYCLE] Finished stays PASSIVE ({reason}): {url}");
+            tracing::debug!("[LIFECYCLE] Finished stays PASSIVE reason={reason}");
             return;
         }
         FinishDecision::Stale => {
-            tracing::debug!("[LIFECYCLE] stale/ambiguous Finished ignored: {url}");
+            tracing::debug!("[LIFECYCLE] stale or ambiguous Finished ignored");
             return;
         }
     };
@@ -4985,7 +4979,10 @@ fn activate_automation_after_page_load(
         return;
     }
     record_automation_activation(diagnostics, agent_id, "installed");
-    tracing::debug!("[AUTOMATION] installed after provider page load: {url}");
+    tracing::debug!(
+        "[AUTOMATION] installed after provider page load for {}",
+        agent_id
+    );
 }
 
 pub fn navigate_agent_window(
@@ -5218,11 +5215,10 @@ fn handle_page_load(
         record.current_phase = phase_str.to_string();
     }) {
         tracing::debug!(
-            "[BROWSER] {} {} page load {:?}: {}",
+            "[BROWSER] {} {} page load {:?}",
             window_label,
             agent_id,
-            event,
-            url
+            event
         );
         if event == PageLoadEvent::Finished {
             emit_browser_diagnostic(
@@ -5431,7 +5427,7 @@ async fn wait_for_ready(
                     id
                 )));
             }
-            Some(NavEvent::ChallengeDetected(id, indicator)) if id == agent_id => loop {
+            Some(NavEvent::ChallengeDetected(id, _indicator)) if id == agent_id => loop {
                 match nav_rx.recv().await {
                     Some(NavEvent::Ready(ready_id)) if ready_id == agent_id => return Ok(()),
                     Some(NavEvent::ResumeRequested(resume_id)) if resume_id == agent_id => {
@@ -5444,11 +5440,7 @@ async fn wait_for_ready(
                     Some(NavEvent::ChallengeDetected(challenge_id, _))
                         if challenge_id == agent_id =>
                     {
-                        tracing::info!(
-                            "[CHALLENGE] {} verification remains active: {}",
-                            agent_id,
-                            indicator
-                        );
+                        tracing::info!("[CHALLENGE] {} verification remains active", agent_id);
                         continue;
                     }
                     Some(NavEvent::Error(error_id)) if error_id == agent_id => {
@@ -5998,16 +5990,11 @@ fn handle_arena_url(ingress: BrowserEventIngress, window_label: &'static str, ur
         }
         // D-040 Tier 2: WebView JS errors forwarded via arena://log/{level}/{msg}
         // No async, no lock, no nav_tx capture — tracing macros only per spec.
-        ("log", [level, encoded_msg]) => {
-            let msg = urlencoding::decode(encoded_msg)
-                .unwrap_or_default()
-                .into_owned();
-            match level.as_str() {
-                "error" => tracing::error!("[WEBVIEW] {}", msg),
-                "warn" => tracing::warn!("[WEBVIEW] {}", msg),
-                _ => tracing::info!("[WEBVIEW {}] {}", level.to_uppercase(), msg),
-            }
-        }
+        ("log", [level, _encoded_msg]) => match level.as_str() {
+            "error" => tracing::error!("[WEBVIEW] browser diagnostic reported an error"),
+            "warn" => tracing::warn!("[WEBVIEW] browser diagnostic reported a warning"),
+            _ => tracing::info!("[WEBVIEW] browser diagnostic reported an event"),
+        },
         // Console diagnostics bridge: arena://console/<agent_id>/<category>/<severity>/<source>/<msg>/<url>
         ("console", args) => {
             // Expected 6 args: agent_id, category, severity, encoded_source, encoded_msg, encoded_url
@@ -7581,6 +7568,49 @@ mod tests {
             serde_json::from_str::<crate::browser_harness::SafeDomForensics>(&naive).is_err(),
             "naive slice should be invalid JSON"
         );
+    }
+
+    #[test]
+    fn retained_and_exported_safe_dom_forensics_redacts_auth_query_values() {
+        let diagnostics = super::BrowserDiagnostics::new();
+        let sentinel = "snapshot-auth-token-sentinel";
+        let forensics = crate::browser_harness::SafeDomForensics {
+            url: format!("https://example.test/path?code={sentinel}&view=compact"),
+            title: "Sign in".to_string(),
+            active_element: crate::browser_harness::SafeElement {
+                tag: "BUTTON".to_string(),
+                role: "button".to_string(),
+                aria_label: "Continue".to_string(),
+                name: "Continue".to_string(),
+                enabled: true,
+                visible: true,
+                bounding_rect: None,
+            },
+            button_labels: vec![],
+            input_types: vec![],
+            input_placeholders: vec![],
+            link_labels: vec![],
+            candidate_login_buttons: vec![],
+            candidate_next_buttons: vec![],
+            candidate_send_buttons: vec![],
+            candidate_attachment_buttons: vec![],
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            operation_id: "op-auth-redaction".to_string(),
+        };
+
+        diagnostics.record_safe_dom_forensics("chatgpt", forensics);
+        let retained = diagnostics
+            .safe_dom_snapshots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get("chatgpt")
+            .and_then(|snapshots| snapshots.back())
+            .cloned()
+            .expect("safe DOM snapshot is retained");
+        let exported_json = serde_json::to_string(&retained).expect("serialize export snapshot");
+        assert!(!exported_json.contains(sentinel));
+        assert!(exported_json.contains("REDACTED"));
+        assert!(exported_json.contains("view=compact"));
     }
 
     // RC1-H1: high-frequency readiness probes must be summarized, not spammed
@@ -11585,11 +11615,8 @@ pub fn create_windows(
             record.current_phase = "queued".to_string();
             record.last_error = None;
         });
-        let intended_url = resolve_participant(agent_id, custom)
-            .map(|info| info.base_url)
-            .unwrap_or_default();
         tracing::info!(
-            "[SETUP] generation={} session_id={} agent_id={} selected_leader_id={} selected_agent_ids={:?} setup_order={:?} assigned_window_label={} assigned_window_kind={} intended_url={} is_selected_leader={}",
+            "[SETUP] generation={} session_id={} agent_id={} selected_leader_id={} selected_agent_ids={:?} setup_order={:?} assigned_window_label={} assigned_window_kind={} is_selected_leader={}",
             setup_generation,
             session_id,
             agent_id,
@@ -11598,7 +11625,6 @@ pub fn create_windows(
             setup_order,
             label,
             kind,
-            intended_url,
             agent_id == leader_agent_id
         );
     }

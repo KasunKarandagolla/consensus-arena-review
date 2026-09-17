@@ -6,6 +6,23 @@
 `audits/delivery-loop-v1-linux-runtime-qualification.md` and
 `audits/delivery-loop-v1-post.md` retained as preceding audits.
 
+## Current worker and release gate — 2026-09-17
+
+Two fresh npm installs from the same preserved manifest/lock produced matching
+dependency graphs and DSH version/root-help output, but both timed out on
+Arena's exact headless-profile probe. Neither required Muse task ran. The
+current worker decision is **DSH materially challenged — Astra Trigger A**;
+Arena Build is blocked before session/worktree admission on this baseline.
+The new lock is reproducible but is not the unrecoverable historical lock or a
+qualified worker runtime. See
+`audits/dsh-runtime-reproducibility/dsh-runtime-reproducibility.md`.
+
+No production-path Delivery run was performed. The acceptance freeze,
+correlation, verifier, and Apply boundaries below remain source/test-backed;
+do not describe them as a model-backed Delivery E2E. Dagu remains
+**INCONCLUSIVE — post-V1**; see
+`audits/dagu-runtime-closure-2026-09-16.md`.
+
 ## Purpose
 
 Build/Delivery is the first concrete implementation of Arena's new product philosophy:
@@ -33,13 +50,27 @@ It is intentionally parallel to the old Consult/browser path.
 
 ### 3. Bounded worker
 
-Current worker is DSH in headless mode:
+Current source still contains a DSH headless worker integration, but it is
+**not currently qualified for use**. Preserve its work-order/result contract
+for the Astra Trigger A review; the failed headless probe blocks Build before
+admission.
+
+The source worker boundary is:
 
 - independent `tokio::process::Command`;
 - candidate worktree as `cwd`;
 - explicit argv/process launch rather than shell wrapper;
 - bounded output/timeouts;
-- `kill_on_drop(true)` cleanup;
+- `process-wrap` cleanup: on Unix, an internal Arena guard anchors the worker
+  process group; normal leader exit and timeout signal that group and wait for
+  the guard. Abort/drop requests group termination but cannot await from the
+  destructor. Windows uses a Job Object with kill-on-drop. Linux
+  synthetic descendant fixtures exercise timeout, normal leader exit, drop,
+  and the `SessionRuntime` owner-abort path. This cleans ordinary descendants
+  that remain in the group; it is not a sandbox against `setsid` or group
+  escape. Waiting for the direct worker and guard does not prove all orphaned
+  descendants have exited or been reaped. No real DSH process tree has been
+  observed, and Windows fixtures still need native CI.
 - current worker-session resume is not used/required.
 
 Executable resolution:
@@ -51,30 +82,25 @@ Optional existing DSH home may be supplied via `ARENA_DSH_HOME`.
 
 The current source expects a DSH CLI invocation of
 `--profile headless --patch <patch-file> <prompt>` and a schema-version-1
-`.arena-runtime/result.json` worker receipt. Arena's current qualified
-compatibility policy is exact DSH `0.1.5-rc.1` plus a successful
-`--profile headless --help` probe. The read-only `get_dsh_prerequisite`
-command and `start_delivery` admission apply this version/help probe before
-any Delivery worktree/session mutation. It does not verify Node, the frozen
-dependency tree, or a schema-1 worker result; the documented lock/runtime was
-not reconstructed and current two-run Muse repeatability is unproven.
+`.arena-runtime/result.json` worker receipt. Arena's source guard still
+requires exact DSH `0.1.5-rc.1` plus a successful `--profile headless --help`
+probe. `get_dsh_prerequisite` and `start_delivery` apply this guard before
+worktree/session mutation. Both clean installs from the current preserved npm
+lock passed `--version` and root `--help`, then timed out on the five-second
+headless probe. Node/npm, the current package tree, and root help are
+reproducible; headless capability, worker results, and two-run Muse
+repeatability are not. This blocks admission and is not a compatibility
+qualification.
 
 Arena does **not** currently install/package DSH.
 
-The earlier audit records one exact top-level
-`@deepseek-ai/dsh@0.1.5-rc.1` package with rc2 transitive components selected by
-declared semver ranges. In the 2026-09-16 closure attempt, pnpm `10.33.0` and
-`10.33.2` resolved the documented top-level DSH and `@mstar-harness/dsh@3.8.3`
-packages to lock SHA256
-`88a26a4d1f31bdffd465bf081f5d02638f0f42982aeb235ff7f4d1365a004773`, not the
-documented frozen SHA256
-`1297ec9257567a85c5a653734979256e6958a2c1235079c62fdc5bb9f2505887`. The
-candidate lock had 568 package records and 234 DSH rc2 records; the frozen audit
-describes 230. The exact original runtime/lock was not found. Do not run a
-model-backed qualification against the mismatched candidate or call the current
-baseline runtime-repeatable. The earlier successful Muse run remains historical
-single-run evidence only. See
-`audits/delivery-v1-backend-runtime-qualification.md`.
+The historical lock SHA256
+`1297ec9257567a85c5a653734979256e6958a2c1235079c62fdc5bb9f2505887` remains
+unreproducible. The bounded current npm manifest and lock SHA256
+`563f454a9e732e1090be474dfde3261fc479b648fa295ad0809f88056f712582` are
+preserved under the reproducibility audit; installs A and B matched, but the
+headless probe failed in both. The earlier successful Muse run remains
+historical single-run evidence only.
 
 ### 4. Acceptance authoring and freeze
 
@@ -174,25 +200,47 @@ Worktree/evidence are intentionally retained.
 
 ## Security / secret handling
 
+Agent Brain primary, fallback, secondary, and Hackathon model keys now use the
+OS credential store in source. Legacy settings migrate only after secure-store
+write/read-back; failed migration keeps the SQLite values and surfaces a
+pending setup issue. Renderer config serialization returns an empty `api_key`
+and a configured boolean. See `audits/secure-credential-storage.md`; native
+credential-store results must be reported separately for Linux and Windows.
+
 Audit establishes:
 
-- no configured API key in structured delivery state, acceptance prompts, or
-  worker summaries;
+- the current primary, fallback, secondary, and Hackathon credential values
+  are redacted or rejected in structured delivery state, worker results,
+  candidate blobs, frozen verification metadata, and owner-answer memory
+  adoption;
+- the DSH child environment is cleared and rebuilt from an OS/runtime
+  allowlist plus the configured Agent Brain key under `ARENA_DSH_API_KEY`;
+  unrelated inherited provider/cloud credentials are excluded;
 - raw verifier stdout/stderr are discarded after capture; their evidence files
   contain only buffered-byte-count notices (which may include a truncation
   marker), not command output or diagnostics;
 - DSH configuration under app data references an environment variable;
 - native paths and explicit argv are used;
-- no `/tmp`, shell pipeline, Unix-process-group, or platform-specific path assumption was added.
+- the Unix worker group guard launches from the Arena executable with a cleared
+  environment and only the OS dynamic-loader path variables needed to relaunch
+  it. The worker and inherited descendants stay in the group until cleanup
+  after normal leader exit, timeout, or abort. Windows uses a Job Object
+  boundary. Neither mechanism isolates filesystem or network access.
+
+Candidate blob scans use the bounded Git runner and check all currently
+configured credentials before verification and Apply. Linked worktrees share
+the source repository's object database, so a rejected secret-bearing blob can
+remain as an unreachable local Git object after Arena resets the candidate.
+This guard blocks verification and Apply; it does not scrub shared objects.
+Isolated candidate object storage remains a release-security gate.
 
 ## Current known limitations
 
-- DSH must already be available and compatible; Arena does not
-  package/install it. Build setup reports prerequisite status before start and
-  admission repeats the check defensively. The frozen package tree remains
-  unreproduced in the current environment, so exact worker compatibility is a
-  release blocker until the documented lock/runtime is recovered or the audit
-  is corrected from new primary evidence.
+- DSH remains unqualified: clean install A and B reproduced, but the exact
+  headless profile probe timed out in both. Arena does not package/install
+  DSH. Build setup reports prerequisite status before start and admission
+  repeats the check defensively. The two Muse tasks and model-backed Delivery
+  remain unrun; the Astra Trigger A packet is prepared.
 - DeepSeek V4 Flash `deepseek-ai/deepseek-v4-flash-0731` reached the NVIDIA
   model-list endpoint, but bounded inference timed out and its standalone DSH
   run did not produce a coding change or worker receipt. The single permitted
@@ -202,6 +250,10 @@ Audit establishes:
 - Native X11 launch was reconfirmed, but the managed `tauri dev` WebView was
   blank in this qualification session. No genuine Delivery UI run was started
   and no middle-stage manual substitution was used.
+- The current native Linux host probe reports GTK 3.24.33, WebKitGTK 2.50.4,
+  no `/dev/dri`, llvmpipe, and no running Vite/Tauri process. A real graphics-
+  capable desktop and a later qualified worker are both still required for UI
+  E2E.
 - Windows runtime parity remains a separate qualification requirement.
 - Windows verifier launch now routes `npm` through a resolved `node.exe` and
   its `npm-cli.js`, avoiding direct execution of the `npm.cmd` shim. When an
@@ -228,13 +280,20 @@ E2E. It requires an explicitly supplied worker credential and the exact DSH
 runtime; no successful invocation has yet been recorded. Credential values
 must never be placed in test output, evidence, or Git.
 
-## Next architecture candidate: Dagu
+## Deferred workflow candidate: Dagu (post-V1)
 
-Accepted research direction:
+The standalone result is **INCONCLUSIVE** and does not justify integration in
+V1. The measured Linux behavior shows stale-run reconciliation after restart,
+but explicit retry was required and duplicated an external side effect. The
+root human task survived restart, while answer completion required an
+explicit retry before downstream continuation. DSH composition and Windows
+execution remain unproven. There is no Astra Trigger B.
+
+Mechanics that may be useful in a future review:
 
 - Dagu owns durable run/wait/retry/history mechanics;
 - root human tasks own pending-answer mechanics;
-- DSH remains a bounded worker;
+- a separately qualified bounded worker would perform implementation;
 - Arena owns product decision meaning and acceptance;
 - project-native tools own verification.
 

@@ -1,0 +1,11 @@
+{
+  "name": "arena-dsh-runtime-qualification",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "npm@10.9.7",
+  "engines": { "node": "22.22.2" },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.5-rc.1",
+    "@mstar-harness/dsh": "3.8.3"
+  }
+}

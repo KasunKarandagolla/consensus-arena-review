@@ -528,16 +528,13 @@ pub fn build_group_system_prompt(group_name: &str, member_names: &[String]) -> S
 
 // ── Error helpers ───────────────────────────────────────────────────────────
 
-pub fn redact_api_key_logs(text: &str) -> String {
-    // Minimal redaction — replace api_key values
-    text.replace("api_key", "[REDACTED]")
+fn safe_model_request_failure(text: &str) -> String {
+    // Never preserve provider-controlled error text in a log or failure record.
+    let _ = text;
+    "model request failed".to_string()
 }
 
 // ── HTTP helpers shared with API engine ─────────────────────────────────────
-
-pub fn redact_endpoint(url: &str) -> String {
-    url.split('?').next().unwrap_or(url).to_string()
-}
 
 // ── HTTP Client ─────────────────────────────────────────────────────────────
 
@@ -587,7 +584,7 @@ pub async fn call_hackathon_model(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        .map_err(|_| "failed to build HTTP client".to_string())?;
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let req_messages: Vec<HackathonChatMessageSer> = messages
@@ -604,11 +601,7 @@ pub async fn call_hackathon_model(
         max_tokens: 1024,
     };
 
-    tracing::debug!(
-        "[HACKATHON] calling model={} endpoint={}",
-        model_name,
-        redact_endpoint(&url)
-    );
+    tracing::debug!("[HACKATHON] calling model={}", model_name);
 
     let response = client
         .post(&url)
@@ -621,9 +614,9 @@ pub async fn call_hackathon_model(
             if e.is_timeout() {
                 "request timed out".to_string()
             } else if e.is_connect() {
-                format!("connect error: {}", e)
+                "connection failed".to_string()
             } else {
-                format!("request failed: {}", e)
+                "request failed".to_string()
             }
         })?;
 
@@ -647,7 +640,7 @@ pub async fn call_hackathon_model(
     let chat_response: HackathonChatResponse = response
         .json()
         .await
-        .map_err(|e| format!("Failed to parse API response: {}", e))?;
+        .map_err(|_| "invalid response body".to_string())?;
 
     let content = chat_response
         .choices
@@ -860,7 +853,7 @@ pub async fn run_single_group(
                     current_leader,
                     run_id,
                     group.group_name,
-                    redact_api_key_logs(&e)
+                    safe_model_request_failure(&e)
                 );
                 // Mark leader failed, fallback
                 live_set.remove(&current_leader);
@@ -878,7 +871,7 @@ pub async fn run_single_group(
                             content: format!(
                                 "[Leader {} became unavailable: {}. Leadership passed to {}.]",
                                 current_leader,
-                                redact_api_key_logs(&e),
+                                safe_model_request_failure(&e),
                                 next
                             ),
                         });
@@ -976,11 +969,9 @@ pub async fn run_single_group(
                 ) {
                     consecutive_invalid = consecutive_invalid.saturating_add(1);
                     tracing::warn!(
-                        "[HACKATHON] invalid route from leader {} to {} (run {}): {}",
+                        "[HACKATHON] invalid route from leader {} (run {}) category=route_validation",
                         current_leader,
-                        target_model,
-                        run_id,
-                        validation_err
+                        run_id
                     );
                     if consecutive_invalid >= 2 {
                         live_set.remove(&current_leader);
@@ -1078,7 +1069,7 @@ pub async fn run_single_group(
                     {
                         Ok(r) => r,
                         Err(e) => {
-                            let err_msg = redact_api_key_logs(&e);
+                            let err_msg = safe_model_request_failure(&e);
                             tracing::warn!(
                                 "[HACKATHON] teammate {} failed (run {}, group {}): {}",
                                 target_model,

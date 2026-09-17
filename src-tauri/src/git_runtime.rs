@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::Path;
 use std::process::{ExitStatus, Output};
 use std::time::Duration;
@@ -136,6 +137,95 @@ pub async fn output_owned(repo: &Path, args: &[OsString]) -> Result<Output, Stri
         stdout,
         stderr,
     })
+}
+
+/// Run a bounded Git subprocess whose stdin is supplied by Arena and whose
+/// stdout is consumed incrementally. The consumer must drain the stream; its
+/// allocation policy remains with the caller. Child cleanup is explicit on
+/// errors and timeout, including kill followed by wait.
+pub async fn stream_with_input<T, F, Fut>(
+    repo: &Path,
+    args: &[&str],
+    input: Vec<u8>,
+    consume_stdout: F,
+) -> Result<(ExitStatus, T), String>
+where
+    F: FnOnce(tokio::process::ChildStdout) -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let owned = args.iter().map(OsString::from).collect::<Vec<_>>();
+    let mut child = Command::new("git")
+        .args(&owned)
+        .current_dir(repo)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("run git {}: {error}", display_args(&owned)))?;
+
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (Some(mut stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err("git streaming process pipes were unavailable".to_string());
+    };
+
+    let mut writer_task = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        stdin
+            .write_all(&input)
+            .await
+            .map_err(|error| format!("write git stdin: {error}"))?;
+        stdin
+            .shutdown()
+            .await
+            .map_err(|error| format!("close git stdin: {error}"))
+    });
+    let mut stderr_task = tokio::spawn(read_bounded(stderr));
+    let consume = consume_stdout(stdout);
+    let operation = async {
+        let ((), consumed) = tokio::try_join!(
+            async {
+                (&mut writer_task)
+                    .await
+                    .map_err(|error| format!("join git stdin writer: {error}"))??;
+                Ok::<(), String>(())
+            },
+            consume,
+        )?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| format!("wait for git {}: {error}", display_args(&owned)))?;
+        (&mut stderr_task)
+            .await
+            .map_err(|error| format!("join git stderr reader: {error}"))??;
+        Ok::<(ExitStatus, T), String>((status, consumed))
+    };
+
+    match tokio::time::timeout(Duration::from_secs(GIT_TIMEOUT_SECONDS), operation).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            writer_task.abort();
+            stderr_task.abort();
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(error)
+        }
+        Err(_) => {
+            writer_task.abort();
+            stderr_task.abort();
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(format!(
+                "git command timed out after {GIT_TIMEOUT_SECONDS}s: {}",
+                display_args(&owned)
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

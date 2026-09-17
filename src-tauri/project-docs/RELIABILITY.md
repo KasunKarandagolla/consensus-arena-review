@@ -6,6 +6,36 @@ Runtime/source evidence > latest audit > docs > old plans.
 
 Permanent audits are never deleted. They record what was actually proven at a point in time.
 
+## Current programme closure — 2026-09-17
+
+- **DSH worker:** materially challenged. Two clean current installs matched,
+  but Arena's five-second headless profile probe timed out twice. Neither Muse
+  task nor model-backed Delivery ran. Trigger A is ready; no Astra response is
+  claimed.
+- **Delivery:** source/targeted-test boundaries are retained, but the complete
+  production path and worker-dependent reliability matrix remain unrun.
+  Production Git tests cover clean admission/worktree paths, protected-file
+  restoration, and dirty/changed/non-fast-forward Apply refusals.
+- **Process containment:** Arena clears the DSH environment and forwards an
+  allowlist plus its configured Agent Brain credential. Unix workers run in a
+  process group held by a live guard until group termination; Windows workers
+  use a Job Object. Linux synthetic tests cover normal leader exit with an
+  orphan descendant, timeout termination, drop, and SessionRuntime owner
+  abort. The fixture descendant stopped within the test's three-second poll
+  after collect returned; this does not prove every descendant was reaped or
+  had stopped before return. Process groups and Job Objects are cleanup
+  boundaries, not sandboxes against a same-user worker that escapes or kills
+  the guard. No real DSH process tree was observed. Windows process tests
+  remain pending native CI.
+- **Credentials:** primary, fallback, secondary, and Hackathon model secrets
+  are migrated to OS credential storage by source. Mock-store tests cover
+  successful and failed migration, safe serialization, preservation, and
+  removal. Native Windows coverage awaits CI; native Linux Secret Service
+  requires an active unlocked desktop session.
+- **Dagu:** standalone result is **INCONCLUSIVE — post-V1**. Linux recovery
+  needed explicit reconciliation after hard interruption and repeated an
+  external side effect. Windows and DSH composition remain unproven.
+
 ## Consult-lane named risks
 
 ### BLOCKING
@@ -71,10 +101,11 @@ Abort exact `SessionRuntime` owner and clean up child worker before final cancel
 Arena does not put the configured API key in structured Delivery state,
 acceptance prompts, or worker summaries. Raw verifier stdout/stderr are not
 persisted; evidence files contain only a buffered-byte-count notice (possibly
-including a truncation marker) plus command status and exit metadata. Timeout
-cleanup has a bounded direct-child kill/reap attempt; descendant process-tree
-termination is not yet proven on Windows. This does not establish that every
-other evidence source is secret-free.
+including a truncation marker) plus command status and exit metadata. The DSH
+worker path uses a Unix process-group guard and a Windows Job Object; Linux
+synthetic descendant tests cover normal exit, timeout, and owner abort, while
+native Windows process-tree execution remains unproven. This does not establish
+that every other evidence source is secret-free.
 
 ### SAFEAPPLY
 Apply only verified candidate, clean original checkout, unchanged original HEAD, successful non-forcing fast-forward.
@@ -134,7 +165,11 @@ When using external workflow tools, verify their approval semantics rather than 
 
 Git worktrees isolate repository history, not the operating system.
 
-Do not claim untrusted-code safety without a real OS containment boundary. Reuse an existing sandbox where practical; Windows parity remains a qualification item.
+The DSH process group and Windows Job Object provide process cleanup boundaries,
+not a sandbox for untrusted code: a same-user worker can attempt to leave its
+group or interfere with the guard. Use a stronger filesystem/network sandbox
+before claiming hostile-code safety. Windows cleanup parity also needs native
+runtime qualification.
 
 ## Native Linux host qualification
 
@@ -156,3 +191,31 @@ For a graphics-capable native desktop follow this reproducible sequence:
 The script reports GTK/WebKitGTK versions, `/dev/dri`, GL renderer, Vite HTTP
 health, and process presence. It applies no rendering workaround flags and is
 not a product startup change.
+
+### Final Linux native dogfood instructions
+
+This is pending until both a graphics-capable desktop and a qualified bounded
+worker are available. On the logged-in Linux desktop:
+
+1. From `/home/kasun/Music/arena/consensus-arena`, run `npm run tauri dev`.
+2. In a second terminal run
+   `/home/kasun/Music/arena/consensus-arena/scripts/qualify-linux-native-runtime.sh`.
+   Confirm the leader and shared participant windows render and first frontend
+   IPC calls complete. Record GTK/WebKit versions and GL renderer.
+3. Create a new disposable Git repository whose parent directory contains
+   spaces. Add one tiny deterministic test, commit a clean initial state, and
+   keep the fixture outside the product repository.
+4. In the rendered Arena Build UI, choose that repository and request one
+   bounded, observable change. Do not invoke middle-stage commands manually.
+5. Capture the actual Delivery/session ID, original HEAD, acceptance-authoring
+   worker result, acceptance file paths, freeze commit, protected paths and
+   hashes, verification profile/hash, later candidate commit, verifier receipt
+   identity/verdict, and Apply result. Confirm the original checkout stayed
+   clean and at its original HEAD until Apply, then fast-forwarded only after
+   Arena showed Verified.
+6. Record screenshots and sanitized app logs locally. Do not place credentials
+   or raw provider output in the audit. This test proves GUI E2E only if the
+   complete sequence is driven through the visible app and actual OS dialogs.
+
+The current host does not satisfy these prerequisites. This procedure is
+prepared for the final dogfood block and is not qualification evidence.
