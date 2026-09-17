@@ -956,8 +956,17 @@ mod tests {
         });
         permit_old.commit(handle_old, activate_tx).unwrap();
         rt.mark_completed(&owner_old);
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        // After handle finished, is_active will reap to Idle, so we can acquire new
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !rt.is_active() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("finished owner should be reaped promptly");
+        // After handle finished, is_active reaps to Idle, so we can acquire new.
         assert!(!rt.is_active());
         let permit_new = rt.try_acquire_start("new".to_string()).unwrap();
         let owner_new = permit_new.owner();

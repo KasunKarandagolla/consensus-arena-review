@@ -1613,7 +1613,11 @@ mod tests {
             git_fixture_success(&worktree, &["rev-parse", "HEAD"]),
             frozen_sha
         );
-        assert!(git_fixture_success(&worktree, &["status", "--porcelain"]).is_empty());
+        let status = git_fixture_success(&worktree, &["status", "--porcelain"]);
+        assert!(
+            status.is_empty(),
+            "restored worktree remained dirty: {status:?}"
+        );
         let _ = std::process::Command::new("git")
             .args(["worktree", "remove", "--force"])
             .arg(&worktree)

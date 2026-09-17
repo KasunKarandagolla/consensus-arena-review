@@ -539,7 +539,14 @@ async fn windows_probe_version(
         Vec::new()
     };
     if !exit.success() {
-        let detail = String::from_utf8_lossy(&error_output).trim().to_string();
+        let detail = [
+            String::from_utf8_lossy(&error_output).trim().to_string(),
+            String::from_utf8_lossy(&output).trim().to_string(),
+        ]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
         return Err(if detail.is_empty() {
             format!("resolved Windows {label} version probe failed")
         } else {
