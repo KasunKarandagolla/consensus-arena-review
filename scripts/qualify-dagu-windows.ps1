@@ -48,16 +48,16 @@ function Wait-ForDaguServer {
             throw "Dagu server exited during $Phase with code $($Process.ExitCode)."
         }
         try {
-            $null = Invoke-WebRequest -Uri $baseUrl -TimeoutSec 2
+            # The HTTP listener is the durable readiness contract. Log wording
+            # has changed across Dagu releases, so do not gate qualification on
+            # an internal message such as "Scheduler started".
+            $response = Invoke-WebRequest -Uri $baseUrl -TimeoutSec 2
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
+                return
+            }
         } catch {
             Start-Sleep -Seconds 1
             continue
-        }
-        if (Test-Path -LiteralPath $StdoutPath) {
-            $serverLog = Get-Content -LiteralPath $StdoutPath -Raw
-            if ($serverLog -match 'Scheduler started') {
-                return
-            }
         }
         Start-Sleep -Seconds 1
     }

@@ -1835,6 +1835,10 @@ mod tests {
         );
         assert!(repair.check_health().is_healthy);
 
+        drop(repair);
+        drop(restored);
+        drop(reopened);
+        drop(shared);
         std::fs::remove_dir_all(root)
             .map_err(|error| AgentError::DatabaseError(error.to_string()))?;
         Ok(())

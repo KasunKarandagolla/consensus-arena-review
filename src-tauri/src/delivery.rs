@@ -1605,10 +1605,10 @@ mod tests {
         restore_protected_acceptance(&worktree, &frozen_sha, &["acceptance.test".to_string()])
             .await
             .expect("restore protected file from acceptance commit");
-        assert_eq!(
-            std::fs::read_to_string(&acceptance).expect("read restored acceptance"),
-            "frozen requirement\n"
-        );
+        let restored = std::fs::read_to_string(&acceptance)
+            .expect("read restored acceptance")
+            .replace("\r\n", "\n");
+        assert_eq!(restored, "frozen requirement\n");
         assert_eq!(
             git_fixture_success(&worktree, &["rev-parse", "HEAD"]),
             frozen_sha

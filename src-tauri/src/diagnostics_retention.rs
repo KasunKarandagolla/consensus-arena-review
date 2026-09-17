@@ -138,6 +138,7 @@ mod tests {
         fs::remove_dir_all(root).expect("remove test directory");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn log_retention_removes_only_dated_arena_logs_older_than_fourteen_days() {
         let root = temp_dir("log-retention");

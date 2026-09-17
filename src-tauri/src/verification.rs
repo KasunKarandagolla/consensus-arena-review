@@ -506,12 +506,17 @@ async fn windows_probe_version(
             "Windows {label} version probe has no stdout pipe; cleanup: {cleanup:?}"
         ));
     };
+    let stderr = child.stderr.take();
     let mut stdout_task = tokio::spawn(read_bounded(stdout));
+    let mut stderr_task = stderr.map(|pipe| tokio::spawn(read_bounded(pipe)));
     let exit = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
         Ok(Ok(exit)) => exit,
         Ok(Err(error)) => {
             let cleanup = terminate_and_reap(&mut child, "Windows version probe child").await;
             stdout_task.abort();
+            if let Some(task) = stderr_task.take() {
+                task.abort();
+            }
             return Err(format!(
                 "could not wait for Windows {label} version probe: {error}; cleanup: {cleanup:?}"
             ));
@@ -519,14 +524,27 @@ async fn windows_probe_version(
         Err(_) => {
             let cleanup = terminate_and_reap(&mut child, "Windows version probe child").await;
             stdout_task.abort();
+            if let Some(task) = stderr_task.take() {
+                task.abort();
+            }
             return Err(format!(
                 "timed out checking the resolved Windows {label} version; cleanup: {cleanup:?}"
             ));
         }
     };
     let output = collect_bounded_output(&mut stdout_task).await;
+    let error_output = if let Some(mut task) = stderr_task.take() {
+        collect_bounded_output(&mut task).await
+    } else {
+        Vec::new()
+    };
     if !exit.success() {
-        return Err(format!("resolved Windows {label} version probe failed"));
+        let detail = String::from_utf8_lossy(&error_output).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("resolved Windows {label} version probe failed")
+        } else {
+            format!("resolved Windows {label} version probe failed: {detail}")
+        });
     }
     Ok(String::from_utf8_lossy(&output).trim().to_string())
 }

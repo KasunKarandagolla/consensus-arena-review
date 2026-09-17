@@ -1165,7 +1165,13 @@ mod tests {
             .expect("resolve npm shim to Node entrypoint");
 
         assert_eq!(program, PathBuf::from("node"));
-        assert_eq!(args.first(), Some(&script.into_os_string()));
+        let resolved_script = args
+            .first()
+            .expect("resolved entrypoint argument")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let expected_script = script.to_string_lossy().replace('\\', "/");
+        assert_eq!(resolved_script, expected_script);
         std::fs::remove_dir_all(root).expect("remove test tree");
     }
 
