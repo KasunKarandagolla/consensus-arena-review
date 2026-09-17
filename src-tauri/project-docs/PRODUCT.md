@@ -20,6 +20,22 @@ The system should carry as much of the technical journey as practical:
 
 The user should not remain the routine prompt courier, build runner, screenshot messenger, log collector, or coordinator between AI tools.
 
+## Evidence-gated progression
+
+The product journey uses lightweight Arena-owned exit contracts rather than
+assuming that activity is progress. Vision, problem research, positioning,
+ambiguity, and reuse are discovery evidence; architecture and build
+readiness are decision evidence; implementation requires the existing
+independent verifier; release requires actual candidate, package, install,
+security, and QA evidence. Missing or stale evidence reopens the relevant
+gate.
+
+Research may recommend `stop`, `pivot`, a validation experiment, or a narrow
+build. It is not market validation by itself. Worker, MCP, skill, or future
+consultation output is evidence only after Arena correlates it with the
+current project/work-order authority; it cannot expand disclosure, acceptance,
+verification, or release authority.
+
 ## Two product lanes
 
 ### Consult
@@ -35,12 +51,13 @@ Use frontier consumer chat models when independent high-quality reasoning materi
 
 Consultation is selective. A committee is not the default for routine mechanical work.
 
-The same advisory capability may be requested from a bounded Delivery
+The same advisory capability is a future option for a bounded Delivery
 research, engineering, or reviewer work order when the question benefits from
-frontier reasoning. Arena admits the request, selects the permitted provider
-and disclosure scope, and treats the response as evidence. The owner-facing
-product state remains Arena-owned; a consultation cannot mark a candidate
-accepted, verified, or eligible for Apply.
+frontier reasoning. A future Arena-owned caller must admit the request, derive
+the permitted provider and disclosure scope, and reconcile its lifecycle
+before treating the response as evidence. The owner-facing product state
+remains Arena-owned; a consultation cannot mark a candidate accepted,
+verified, or eligible for Apply.
 
 ### Build / Delivery
 

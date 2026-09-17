@@ -67,6 +67,12 @@ The new lane should present product progress at a high level, for example:
 
 Exact labels/events must match current source rather than this conceptual list.
 
+The current Delivery surface includes a minimal founder journey summary with
+four broad steps: Intent, Build, Verify, and Apply. It is a status aid, not a
+second workflow state machine. Failure and cancellation remain visibly
+terminal, while evidence and technical identifiers stay in the existing
+details/status areas.
+
 Do not turn Build into an IDE. Technical evidence may be inspectable behind a details surface.
 
 ## Existing frontend foundations to preserve

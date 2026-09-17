@@ -105,6 +105,21 @@ No automatic merge/push/deploy in V1.
 
 Likewise, do not rewrite useful code merely for theoretical elegance.
 
+## D-2026-16 — Evidence gates are lightweight Arena-owned exit contracts
+
+**Accepted for the week-one Product OS architecture.** Use one versioned
+Arena-owned evidence package and deterministic predicates for Vision, Problem
+Research, Positioning, Ambiguity, Reuse, Architecture, Build Readiness,
+Implementation, and Release. Keep these gates inside the existing
+Discover/Decide/Deliver/Release phases; do not introduce nine services, a
+generic workflow engine, or a parallel authority model.
+
+Stale or missing evidence fails closed. Worker, MCP, skill, and consultation
+output may supply evidence but cannot authorize a gate, expand disclosure, or
+replace owner decisions, the independent verifier, or Safe Apply. Durable
+journey persistence and full work-order lifecycle binding remain later work
+where the existing SessionRuntime/Delivery contracts can carry them safely.
+
 ---
 
 # Superseded / rejected assumptions

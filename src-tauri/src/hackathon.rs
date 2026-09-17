@@ -581,25 +581,34 @@ pub async fn call_hackathon_model(
     messages: &[HackathonMessage],
     timeout_secs: u64,
 ) -> Result<String, String> {
+    call_hackathon_model_with_max_tokens(
+        base_url,
+        api_key,
+        model_name,
+        messages,
+        timeout_secs,
+        1024,
+    )
+    .await
+}
+
+/// Consultation-only bounded variant. Existing Hackathon callers retain the
+/// historical 1024-token default through `call_hackathon_model`.
+pub async fn call_hackathon_model_with_max_tokens(
+    base_url: &str,
+    api_key: &str,
+    model_name: &str,
+    messages: &[HackathonMessage],
+    timeout_secs: u64,
+    max_tokens: u32,
+) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
         .map_err(|_| "failed to build HTTP client".to_string())?;
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let req_messages: Vec<HackathonChatMessageSer> = messages
-        .iter()
-        .map(|m| HackathonChatMessageSer {
-            role: m.role.clone(),
-            content: m.content.clone(),
-        })
-        .collect();
-
-    let request = HackathonChatRequest {
-        model: model_name.to_string(),
-        messages: req_messages,
-        max_tokens: 1024,
-    };
+    let request = build_hackathon_chat_request(model_name, messages, max_tokens);
 
     tracing::debug!("[HACKATHON] calling model={}", model_name);
 
@@ -655,6 +664,26 @@ pub async fn call_hackathon_model(
     }
 
     Ok(content)
+}
+
+fn build_hackathon_chat_request(
+    model_name: &str,
+    messages: &[HackathonMessage],
+    max_tokens: u32,
+) -> HackathonChatRequest {
+    let req_messages: Vec<HackathonChatMessageSer> = messages
+        .iter()
+        .map(|m| HackathonChatMessageSer {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect();
+
+    HackathonChatRequest {
+        model: model_name.to_string(),
+        messages: req_messages,
+        max_tokens,
+    }
 }
 
 // ── Group Execution ─────────────────────────────────────────────────────────
@@ -1664,5 +1693,19 @@ mod tests {
         assert!(!json.contains("secret123"));
         assert!(json.contains("llama"));
         assert!(json.contains("https://example.com/v1"));
+    }
+
+    #[test]
+    fn bounded_chat_request_uses_requested_output_limit() {
+        let request = build_hackathon_chat_request(
+            "model-1",
+            &[HackathonMessage {
+                role: "user".to_string(),
+                content: "bounded question".to_string(),
+            }],
+            37,
+        );
+
+        assert_eq!(request.max_tokens, 37);
     }
 }

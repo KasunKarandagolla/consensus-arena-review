@@ -69,7 +69,7 @@ Do not invoke a panel for deterministic build/test/log/file operations.
 
 ## Shared frontier consultation seam
 
-Consultation is also an optional Arena capability that an authorized
+Consultation is also an optional Arena capability that a future Arena-owned
 research, engineering, or reviewer work order may request. The current
 implementation is the narrow `consultation` domain module, which reuses the
 existing Hackathon OpenAI-compatible chat transport. It does not create a new
@@ -91,7 +91,8 @@ verification, release, or Safe Apply authority.
 The current operation is a callable domain seam, not yet a durable work-order
 runtime. Its Arena-owned caller must bind admission, cancellation/supersession,
 candidate/version identity, and result persistence/reconciliation before
-invoking it.
+invoking it. The declared `origin` and disclosure scope are not authorization;
+workers and renderers cannot use them to grant themselves access.
 
 The existing consumer-web Consult journey remains the current browser
 transport. The shared seam does not make consumer websites critical path and

@@ -1,4 +1,6 @@
-use crate::hackathon::{HackathonConfig, HackathonMessage, call_hackathon_model};
+use crate::hackathon::{
+    HackathonConfig, HackathonMessage, call_hackathon_model_with_max_tokens,
+};
 use crate::orchestrator::AppState;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -203,8 +205,11 @@ fn redact_request(request: &ConsultationRequest, secrets: &[String]) -> Consulta
     }
 }
 
-/// Executes the existing bounded Hackathon chat transport for any authorized Arena origin.
-/// The request contains only an Arena model configuration ID; credentials stay in secure settings.
+/// Executes the existing bounded Hackathon chat transport for an Arena-owned
+/// internal caller. `origin` is descriptive metadata, not authorization; this
+/// operation is not exposed as a renderer or worker authority endpoint.
+/// The request contains only an Arena model configuration ID; credentials stay
+/// in secure settings.
 pub async fn execute(
     request: ConsultationRequest,
     state: &AppState,
@@ -231,12 +236,13 @@ pub async fn execute(
     };
     let mut result = base_result(&request, &model.model_name);
     let timeout_secs = request.deadline_ms.div_ceil(1_000).clamp(1, 120);
-    match call_hackathon_model(
+    match call_hackathon_model_with_max_tokens(
         &model.base_url,
         &model.api_key,
         &model.model_name,
         &build_messages(&request),
         timeout_secs,
+        request.budget_tokens,
     )
     .await
     {

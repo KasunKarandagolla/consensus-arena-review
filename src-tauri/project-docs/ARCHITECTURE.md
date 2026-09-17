@@ -78,6 +78,32 @@ The worker cannot mark its own work Verified.
 
 See `DELIVERY.md`.
 
+## Evidence-gated project journey — Milestone 04
+
+Arena now has a small, pure evidence-gate contract for the product journey.
+The nine gate identifiers are records and deterministic predicates inside the
+existing four broad phases; they are not nine services and do not introduce a
+workflow engine:
+
+```text
+Discover: Vision → Problem research → Positioning → Ambiguity → Reuse
+Decide:   Architecture → Build readiness
+Deliver:  Implementation (current candidate + independent verifier)
+Release:  Release (candidate/package/install/security/QA evidence)
+```
+
+The evaluator accepts only a current Arena-owned package. Stale package or
+evidence revisions, missing evidence, unresolved owner decisions, unresolved
+high ambiguity, incomplete architecture challenge, and verifier results tied
+to another candidate revision fail closed. It does not persist the journey,
+authorize a worker, or replace `SessionRuntime`, Delivery, the verifier, or
+Safe Apply. Those boundaries remain the responsibility of the existing Arena
+authority kernel and are future integration work.
+
+The owner-facing Delivery view adds only a calm four-step summary — Intent,
+Build, Verify, Apply. Technical evidence remains progressively disclosed by
+the existing Delivery details rather than becoming the primary experience.
+
 ## Durable state ownership
 
 ### Arena owns

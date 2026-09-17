@@ -18,6 +18,7 @@ mod db_helpers;
 mod delivery;
 mod diagnostics_retention;
 mod dsh_worker;
+pub mod evidence_gates;
 mod errors;
 mod git_runtime;
 mod hackathon;

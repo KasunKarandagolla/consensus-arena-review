@@ -74,6 +74,16 @@ Before building a new subsystem ask:
 
 Do not protect sunk-cost code. Do not aggregate tools for their own sake.
 
+## Evidence-gate discipline
+
+For Product OS work, represent readiness as one current Arena-owned evidence
+package and evaluate the applicable gate deterministically. A package
+revision or evidence item that is stale is not eligible for a pass. Owner
+decisions remain explicit, research outcomes remain bounded decisions rather
+than market-validation claims, and implementation evidence must name the
+candidate revision independently verified. Gate predicates do not replace
+Delivery admission, SessionRuntime lifecycle authority, or Safe Apply.
+
 ## Delivery-specific change process
 
 Any Delivery change must explicitly audit the invariants in `DELIVERY.md` / `RELIABILITY.md`:

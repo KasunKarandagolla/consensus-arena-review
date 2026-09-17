@@ -98,6 +98,14 @@ It qualifies only the installed Linux OpenCode 1.17.18 + Muse Spark path for
 bounded candidate execution. Windows, packaging, unrestricted authority, and
 production-scale performance remain unproven.
 
+Milestone 04 adds a source-level evidence-gate evaluator and a minimal
+founder-facing Intent → Build → Verify → Apply summary. The evaluator is a
+pure Arena-owned contract with stale/missing-evidence fail-closed behavior;
+it is not yet a durable journey store or a replacement for Delivery and
+SessionRuntime. GitHub MCP, pinned ECC/gstack procedures, and external
+consultation execution remain research capabilities rather than runtime-
+qualified features.
+
 The current qualification record adds a direct DeepSeek V4 Flash provider
 sanity check and a real DSH comparison. V4 Flash reached model listing but
 bounded inference timed out; its standalone DSH task did not change a

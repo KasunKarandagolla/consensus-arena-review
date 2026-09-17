@@ -79,7 +79,10 @@ over product intent, acceptance, verification, candidate identity, or Apply.
 Disclosure scope is validated before provider invocation, and known stored
 credentials are redacted from the prompt and returned answer. The contract is
 callable by Delivery research, engineering, reviewer, or Consult origins; it
-does not synthesize a top-level Consult session.
+does not synthesize a top-level Consult session. Its validated
+`budget_tokens` is passed to a consultation-specific transport variant as the
+provider `max_tokens` limit; unrelated Hackathon callers retain the historical
+1024-token default.
 
 The seam is contract/runtime-source proven, not provider-runtime proven: no
 configured Hackathon model was invoked during this milestone. It is not yet a

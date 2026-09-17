@@ -62,9 +62,10 @@ contains `request_id`, `work_order_id`, `origin`, `question`, curated evidence,
 answer, source references, conversation reference, timestamp, status, and a
 sanitized error.
 
-The current source exposes this as a Rust domain operation for callers that
-Arena has authorized; it is not a renderer-owned authority command. The caller
-must bind the operation to current Arena admission and lifecycle state. If a
+The current source exposes this as a Rust domain operation for an Arena-owned
+internal caller; it is not a renderer- or worker-owned authority command. The
+declared `origin` and disclosure scope are metadata and are not authorization.
+The caller must bind the operation to current Arena admission and lifecycle state. If a
 Tauri command is added later, it must use the same serde contract and must
 persist or reconcile the result before emitting any notification. Unknown, cancelled,
 superseded, or mismatched results must fail closed. Do not reuse uncorrelated
