@@ -294,6 +294,17 @@ pub struct WorkerExecution {
     pub result: Option<WorkerResultContract>,
 }
 
+/// Output from a generic contained child process. The Delivery lane uses the
+/// same process-group/Job Object boundary for non-DSH workers so external
+/// runtimes cannot outlive Arena-owned cancellation.
+#[derive(Debug)]
+pub struct ContainedExecution {
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DshPrerequisiteStatus {
     pub available: bool,
@@ -687,6 +698,60 @@ async fn terminate_child(child: &mut dyn ChildWrapper) -> Result<(), String> {
         Ok(Err(error)) => Err(format!("could not reap DSH child: {error}")),
         Err(_) => Err("timed out while waiting for the DSH child to exit".to_string()),
     }
+}
+
+/// Run a bounded external command with Arena's existing process containment
+/// and sanitized environment. This is deliberately generic so a replaceable
+/// runtime such as OpenCode does not require a second process manager.
+pub async fn run_contained_command(
+    program: &Path,
+    args: &[OsString],
+    current_dir: &Path,
+    timeout: Duration,
+) -> Result<ContainedExecution, String> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(current_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    apply_sanitized_environment(&mut command, None);
+    command.env("OPENCODE_DISABLE_AUTOUPDATE", "1");
+    let mut child = spawn_contained(command)
+        .map_err(|error| format!("could not start contained worker: {error}"))?;
+    let (mut stdout_task, mut stderr_task) =
+        spawn_output_readers_or_terminate(&mut *child).await?;
+    let execution = match tokio::time::timeout(
+        timeout,
+        collect_process(&mut *child, &mut stdout_task, &mut stderr_task),
+    )
+    .await
+    {
+        Ok(Ok(result)) => ContainedExecution {
+            exit_code: result.exit_code,
+            timed_out: result.timed_out,
+            stdout: result.stdout,
+            stderr: result.stderr,
+        },
+        Ok(Err(error)) => {
+            stop_output_readers(&mut stdout_task, &mut stderr_task).await;
+            if let Err(cleanup_error) = terminate_child(&mut *child).await {
+                return Err(format!("{error}; {cleanup_error}"));
+            }
+            return Err(error);
+        }
+        Err(_) => {
+            stop_output_readers(&mut stdout_task, &mut stderr_task).await;
+            terminate_child(&mut *child).await?;
+            ContainedExecution {
+                exit_code: None,
+                timed_out: true,
+                stdout: String::new(),
+                stderr: "contained worker timed out".to_string(),
+            }
+        }
+    };
+    Ok(execution)
 }
 
 fn yaml_string(value: &str) -> String {

@@ -54,7 +54,9 @@ export interface ActiveBrainStatus {
   model: string
 }
 export type DeliveryPhase = 'preparing'|'authoring_acceptance'|'waiting_for_user'|'acceptance_ready'|'implementing'|'verifying'|'repairing'|'verified'|'applied'|'cancelled'|'failed'
-export interface DeliveryState { session_id:string; phase:DeliveryPhase; status_text?:string; message?:string; attempt:number; objective:string; verification_summary?:string|null; candidate_commit?:string|null; branch_name?:string; contract?:{revision:number;acceptance_criteria:{id:string;description:string}[]}; last_verification?:unknown }
+export interface DeliveryEvidence { evidence_id:string; kind:string; summary:string; result_ref:string }
+export interface DeliveryWorkOrder { work_order_id:string; project_id:string; root_session_id?:string|null; candidate_id:string; candidate_revision:number; authority_version:string; task_state:string; evidence_ref?:string|null; result_ref?:string|null; cancellation_state?:string|null; verification_id?:string|null; verification_status?:string|null; error?:string|null }
+export interface DeliveryState { session_id:string; phase:DeliveryPhase; status_text?:string; message?:string; attempt:number; objective:string; verification_summary?:string|null; candidate_commit?:string|null; branch_name?:string; runtime?:'dsh'|'open_code'; work_order?:DeliveryWorkOrder|null; evidence?:DeliveryEvidence[]; contract?:{revision:number;acceptance_criteria:{id:string;description:string}[]}; last_verification?:unknown }
 
 // ── Hackathon types (frontend-safe) ────────────────────────────────────────────
 

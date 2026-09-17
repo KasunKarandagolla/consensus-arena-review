@@ -1,6 +1,7 @@
 # Consensus Arena — Build / Delivery Lane
 
-**Current evidence:** `audits/delivery-v1-programme-qualification-2026-09-16.md`
+**Current evidence:** `audits/product-os-transition/02-product-os-authority-walking-skeleton.md`
+(2026-09-17), with `audits/delivery-v1-programme-qualification-2026-09-16.md`
 (2026-09-15 to 2026-09-16), with
 `audits/delivery-dsh-tool-loop-and-linux-e2e.md`,
 `audits/delivery-loop-v1-linux-runtime-qualification.md` and
@@ -17,9 +18,12 @@ The new lock is reproducible but is not the unrecoverable historical lock or a
 qualified worker runtime. See
 `audits/dsh-runtime-reproducibility/dsh-runtime-reproducibility.md`.
 
-No production-path Delivery run was performed. The acceptance freeze,
-correlation, verifier, and Apply boundaries below remain source/test-backed;
-do not describe them as a model-backed Delivery E2E. Dagu remains
+The DSH path remains blocked before admission. The opt-in OpenCode path now
+provides the first model-backed bounded candidate exercise behind an
+Arena-owned authority adapter; it does not replace the DSH path by default.
+The acceptance freeze, correlation, verifier, and Apply boundaries below
+remain source/test-backed for the legacy path and are exercised end-to-end
+for the OpenCode candidate adapter in the Milestone 02 audit. Dagu remains
 **INCONCLUSIVE — post-V1**; see
 `audits/dagu-runtime-closure-2026-09-16.md`.
 
@@ -93,6 +97,25 @@ repeatability are not. This blocks admission and is not a compatibility
 qualification.
 
 Arena does **not** currently install/package DSH.
+
+#### OpenCode authority adapter — opt-in Milestone 02 path
+
+When `ARENA_OPENCODE_ADAPTER=1`, Build admission uses the installed OpenCode
+CLI and the configured/default model identifier
+`opencode/muse-spark-1.2-contributor-free`. Arena creates the existing Git
+candidate worktree first; OpenCode never receives the canonical checkout as
+its current directory. The adapter persists one work-order identity with the
+project, candidate, candidate revision, acceptance/profile authority version,
+OpenCode root session, evidence reference, task state, and verification
+identity.
+
+The adapter uses the existing contained child-process boundary and the
+existing independent verifier. OpenCode output is evidence only: Arena
+rejects unknown, stale, cancelled, mismatched, or protected-path-violating
+results. Apply additionally re-reads the candidate HEAD and current verifier
+receipt, so a post-verification candidate edit cannot inherit PASS. The path
+is qualified only for bounded Linux candidate execution; Windows, packaging,
+and production-scale performance remain unproven.
 
 The historical lock SHA256
 `1297ec9257567a85c5a653734979256e6958a2c1235079c62fdc5bb9f2505887` remains

@@ -73,7 +73,7 @@ The latest local post-implementation audit establishes a first Build vertical sl
 - Consult mode remains separate and unchanged.
 - Build mode does not require leader/participants or model WebViews.
 - Work occurs in an isolated `arena-delivery/<short-id>` Git worktree created from a clean base.
-- The source contains a DSH bounded-worker adapter, but the current worker assumption is materially challenged and Build is blocked before admission.
+- The default DSH bounded-worker path remains materially challenged and blocked before admission; an opt-in OpenCode path now provides bounded Linux candidate execution behind an Arena-owned authority adapter.
 - Executable acceptance material is authored **before implementation**, frozen, protected by hashes, and verified independently from worker narration.
 - Required checks are rerun after repair; attempts are bounded.
 - `needs_user` is persisted before the existing AskUser event is emitted; the source recovery path can re-present a persisted question after restart, but a separate production-service restart/answer runtime has not been qualified.
@@ -91,6 +91,12 @@ The latest local post-implementation audit establishes a first Build vertical sl
 See `DELIVERY.md`, `audits/delivery-loop-v1-linux-runtime-qualification.md`,
 and the current qualification record in
 `audits/delivery-dsh-v4-worker-and-e2e.md`.
+
+The current OpenCode authority-adapter and walking-skeleton evidence is in
+`audits/product-os-transition/02-product-os-authority-walking-skeleton.md`.
+It qualifies only the installed Linux OpenCode 1.17.18 + Muse Spark path for
+bounded candidate execution. Windows, packaging, unrestricted authority, and
+production-scale performance remain unproven.
 
 The current qualification record adds a direct DeepSeek V4 Flash provider
 sanity check and a real DSH comparison. V4 Flash reached model listing but

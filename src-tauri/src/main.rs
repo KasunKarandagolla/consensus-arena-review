@@ -22,6 +22,7 @@ mod git_runtime;
 mod hackathon;
 mod memory_store;
 mod orchestrator;
+mod opencode_adapter;
 mod persona_manager;
 mod pipeline_ids;
 mod proxy_manager;

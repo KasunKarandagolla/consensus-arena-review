@@ -67,6 +67,64 @@ pub struct ProtectedFileHash {
     pub path: String,
     pub sha256: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryRuntime {
+    Dsh,
+    OpenCode,
+}
+
+impl Default for DeliveryRuntime {
+    fn default() -> Self {
+        Self::Dsh
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenCodeTaskState {
+    Admitted,
+    Running,
+    EvidenceReady,
+    Verified,
+    Invalid,
+    Cancelled,
+    Failed,
+}
+
+impl Default for OpenCodeTaskState {
+    fn default() -> Self {
+        Self::Admitted
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenCodeEvidence {
+    pub evidence_id: String,
+    pub kind: String,
+    pub summary: String,
+    pub result_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenCodeWorkOrder {
+    pub work_order_id: String,
+    pub project_id: String,
+    pub root_session_id: Option<String>,
+    pub candidate_id: String,
+    pub candidate_revision: u64,
+    pub authority_version: String,
+    pub acceptance_commit: String,
+    pub task_state: OpenCodeTaskState,
+    pub evidence_ref: Option<String>,
+    pub result_ref: Option<String>,
+    pub cancellation_state: Option<String>,
+    pub verification_id: Option<String>,
+    pub verification_status: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryState {
     pub schema_version: u32,
@@ -90,6 +148,12 @@ pub struct DeliveryState {
     pub candidate_commit: Option<String>,
     pub last_worker_summary: Option<String>,
     pub last_verification: Option<VerificationReceipt>,
+    #[serde(default)]
+    pub runtime: DeliveryRuntime,
+    #[serde(default)]
+    pub work_order: Option<OpenCodeWorkOrder>,
+    #[serde(default)]
+    pub evidence: Vec<OpenCodeEvidence>,
     pub created_at: i64,
     pub updated_at: i64,
     pub message: String,
@@ -150,6 +214,9 @@ pub struct DeliveryPresentation {
     pub verification_summary: Option<String>,
     pub candidate_commit: Option<String>,
     pub branch_name: String,
+    pub runtime: DeliveryRuntime,
+    pub work_order: Option<OpenCodeWorkOrder>,
+    pub evidence: Vec<OpenCodeEvidence>,
 }
 
 fn status_text(phase: &DeliveryPhase) -> &'static str {
@@ -185,6 +252,9 @@ pub fn presentation(state: &DeliveryState) -> DeliveryPresentation {
         }),
         candidate_commit: state.candidate_commit.clone(),
         branch_name: state.branch_name.clone(),
+        runtime: state.runtime.clone(),
+        work_order: state.work_order.clone(),
+        evidence: state.evidence.clone(),
     }
 }
 
@@ -616,7 +686,7 @@ async fn restore_protected_acceptance(
     Ok(())
 }
 
-async fn persist_emit(
+pub(crate) async fn persist_emit(
     app: Option<&AppHandle>,
     state_path: &PathBuf,
     delivery_slot: &Arc<tokio::sync::Mutex<Option<DeliveryState>>>,
@@ -1149,6 +1219,24 @@ pub async fn apply_verified_candidate(state: &mut DeliveryState) -> Result<(), S
     if !exists.status.success() {
         return Err("Cannot apply: the verified candidate commit is unavailable".to_string());
     }
+    let candidate_worktree = std::path::Path::new(&state.worktree_path);
+    if state.runtime == DeliveryRuntime::OpenCode || candidate_worktree.exists() {
+        let candidate_head = verification::candidate_sha(candidate_worktree).await?;
+        if candidate_head != candidate {
+            return Err("Cannot apply: the candidate changed after verification".to_string());
+        }
+        if let Some(receipt) = &state.last_verification {
+            if receipt.verdict != "pass"
+                || receipt.candidate_sha != candidate
+                || !receipt.candidate_tree_unchanged
+                || !receipt.protected_paths_unchanged
+            {
+                return Err("Cannot apply: the current verification is not valid for this candidate".to_string());
+            }
+        } else if state.runtime == DeliveryRuntime::OpenCode {
+            return Err("Cannot apply: the candidate has no current independent verification".to_string());
+        }
+    }
     let ff = git_output(source, &["merge", "--ff-only", &candidate]).await?;
     if !ff.status.success() {
         return Err(format!(
@@ -1328,16 +1416,28 @@ pub async fn run(
     ask_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     settings: Arc<tokio::sync::Mutex<SettingsStore>>,
 ) {
-    let _ = run_inner(
-        Some(&app),
-        state,
-        state_path,
-        delivery_slot,
-        transcript,
-        ask_tx,
-        settings,
-    )
-    .await;
+    if state.runtime == DeliveryRuntime::OpenCode {
+        let _ = crate::opencode_adapter::run_delivery(
+            Some(&app),
+            state,
+            state_path,
+            delivery_slot,
+            transcript,
+            settings,
+        )
+        .await;
+    } else {
+        let _ = run_inner(
+            Some(&app),
+            state,
+            state_path,
+            delivery_slot,
+            transcript,
+            ask_tx,
+            settings,
+        )
+        .await;
+    }
     runtime.mark_completed(&owner);
 }
 
@@ -1656,6 +1756,9 @@ mod tests {
             candidate_commit: None,
             last_worker_summary: None,
             last_verification: None,
+            runtime: DeliveryRuntime::Dsh,
+            work_order: None,
+            evidence: Vec::new(),
             created_at: 1,
             updated_at: 1,
             message: "Preparing project…".to_string(),
@@ -1853,6 +1956,9 @@ mod tests {
             candidate_commit: None,
             last_worker_summary: None,
             last_verification: None,
+            runtime: DeliveryRuntime::Dsh,
+            work_order: None,
+            evidence: Vec::new(),
             created_at: chrono::Utc::now().timestamp(),
             updated_at: chrono::Utc::now().timestamp(),
             message: "Preparing project…".to_string(),

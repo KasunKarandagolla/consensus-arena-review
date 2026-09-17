@@ -75,37 +75,35 @@ Gate testing found Arena-critical defects for the required path:
 ## OpenCode
 
 The 2026-09-17 qualification closure proved that the installed Linux
-OpenCode control plane can execute real OpenCode Zen work, but it did **not**
-qualify OpenCode for Linux Arena integration. The pinned local binary is
-`1.17.18` (SHA256 recorded in
-`audits/product-os-transition/01-runtime-provider-foundation.md`). The live
-provider registry identified the requested primary model as
-`opencode/muse-spark-1.2-contributor-free`; the bounded `opencode/big-pickle`
-fallback was not needed.
+OpenCode control plane can execute real OpenCode Zen work. The subsequent
+Milestone 02 authority-adapter exercise proved the required composition for
+bounded candidate work. The pinned local binary is `1.17.18` (SHA256 recorded
+in `audits/product-os-transition/01-runtime-provider-foundation.md`). The
+tested primary model was `opencode/muse-spark-1.2-contributor-free`; Big
+Pickle was not needed.
 
-The qualification closure proved real model file work, correlated parent and
-two child sessions, a project-local skill, one bounded local MCP call,
-server-side abort of an active shell descendant, and session/message
-reconciliation after server restart. The Muse run observed 552,044 KiB maximum
-RSS on Linux. It also proved the decisive boundary failure: an OpenCode
-worker could directly overwrite a disposable protected acceptance file. No
-Arena-owned OpenCode adapter currently composes that worker call with
-`SessionRuntime`, frozen acceptance, independent verification, stale-result
-rejection, and Safe Apply authority, so the required authority invariant has
-not been proven at the integration boundary.
+The combined evidence proves real model file work, correlated parent and two
+child sessions, a project-local skill, one bounded local MCP call,
+server-side abort of an active shell descendant, restart reconciliation, and
+the Arena-owned candidate boundary. In the real Milestone 02 attack, Muse
+changed only the disposable candidate copy of a protected acceptance file;
+the canonical file remained byte-for-byte unchanged, the independent
+verifier rejected the candidate, and the result was not eligible for Apply.
+A real legitimate candidate change then produced correlated evidence and an
+independent verifier PASS. The measured integrated test used 542,240 KiB
+maximum RSS on Linux; the earlier qualification run observed 552,044 KiB.
 
-**Current decision:** **NOT QUALIFIED FOR LINUX INTEGRATION**. Do not add a
-production OpenCode adapter, replace DSH, or execute the Milestone 02 walking
-skeleton from this result. Preserve Arena's `SessionRuntime`, worktree,
-sanitized-environment, acceptance, independent-verifier, and Apply boundaries.
-The exact evidence and the narrow blocker are recorded in
-`audits/product-os-transition/02-opencode-qualification-closure.md`.
+**Current decision:** **QUALIFIED FOR BOUNDED LINUX CANDIDATE EXECUTION
+BEHIND THE ARENA-OWNED AUTHORITY ADAPTER**. This is not a general OpenCode or
+Windows/packaging qualification. Arena retains `SessionRuntime`, isolated
+candidate worktrees, sanitized process containment, protected-path/version
+checks, independent verification, stale-result rejection, and Safe Apply
+authority. Exact Milestone 02 evidence is recorded in
+`audits/product-os-transition/02-product-os-authority-walking-skeleton.md`.
 
-An NVIDIA NIM-backed OpenCode experiment is **not justified yet**: Zen model
-execution and the required OpenCode primitives worked, so the blocker is the
-missing Arena-owned authority composition rather than the provider path. A
-NIM experiment becomes justified only if the bounded adapter test later shows
-that Zen availability or model execution is itself the limiting factor.
+An NVIDIA NIM-backed OpenCode experiment remains **not justified**: the
+already-available Zen path executed the real model work and the blocker was
+authority composition, which is now bounded by Arena.
 
 ## Pi
 

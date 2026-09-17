@@ -393,16 +393,23 @@ pub async fn start_delivery(
         return Err("Choose the repository root, not a subdirectory".to_string());
     }
     let base = crate::delivery::validate_clean_base(&repo).await?;
-    let dsh = crate::dsh_worker::check_prerequisite().await;
-    if !dsh.compatible {
-        return Err(dsh.message);
+    let use_opencode = crate::opencode_adapter::enabled();
+    if use_opencode {
+        let opencode = crate::opencode_adapter::runtime_status().await;
+        if !opencode.compatible {
+            return Err(opencode.message);
+        }
+    } else {
+        let dsh = crate::dsh_worker::check_prerequisite().await;
+        if !dsh.compatible {
+            return Err(dsh.message);
+        }
     }
-    let (brain, saved_secrets, credentials_ready) = {
+    let (saved_secrets, credentials_ready) = if use_opencode {
+        (Vec::new(), true)
+    } else {
         let store = state.settings_store.lock().await;
         (
-            store
-                .get_agent_brain_config()
-                .map_err(|error| format!("read Agent Brain settings: {error}"))?,
             configured_credentials(&store)?,
             store.credential_storage_available() && !store.credential_migration_pending(),
         )
@@ -411,11 +418,19 @@ pub async fn start_delivery(
         return Err(crate::credentials::secure_storage_help().to_string());
     }
     objective = redact_saved_credentials(&objective, &saved_secrets);
-    if brain.api_key.trim().is_empty()
-        || brain.base_url.trim().is_empty()
-        || brain.model.trim().is_empty()
-    {
-        return Err("Configure the primary Agent Brain before starting Build mode".to_string());
+    if !use_opencode {
+        let brain = {
+            let store = state.settings_store.lock().await;
+            store
+                .get_agent_brain_config()
+                .map_err(|error| format!("read Agent Brain settings: {error}"))?
+        };
+        if brain.api_key.trim().is_empty()
+            || brain.base_url.trim().is_empty()
+            || brain.model.trim().is_empty()
+        {
+            return Err("Configure the primary Agent Brain before starting Build mode".to_string());
+        }
     }
     let previous_state_file = match std::fs::read(&state.delivery_state_path) {
         Ok(contents) => Some(contents),
@@ -535,6 +550,13 @@ pub async fn start_delivery(
         candidate_commit: None,
         last_worker_summary: None,
         last_verification: None,
+        runtime: if use_opencode {
+            crate::delivery::DeliveryRuntime::OpenCode
+        } else {
+            crate::delivery::DeliveryRuntime::Dsh
+        },
+        work_order: None,
+        evidence: Vec::new(),
         created_at: now,
         updated_at: now,
         message: "Preparing project…".to_string(),
@@ -595,7 +617,11 @@ pub async fn get_delivery_state(state: tauri::State<'_, AppState>) -> Result<Str
 
 #[tauri::command]
 pub async fn get_dsh_prerequisite() -> Result<String, String> {
-    serde_json::to_string(&crate::dsh_worker::check_prerequisite().await)
+    if crate::opencode_adapter::enabled() {
+        serde_json::to_string(&crate::opencode_adapter::runtime_status().await)
+    } else {
+        serde_json::to_string(&crate::dsh_worker::check_prerequisite().await)
+    }
         .map_err(|error| error.to_string())
 }
 
@@ -670,6 +696,11 @@ pub async fn abort_delivery(
             *state.ask_user_tx.lock().await = None;
             let mut cancelled = value;
             cancelled.phase = crate::delivery::DeliveryPhase::Cancelled;
+            if cancelled.runtime == crate::delivery::DeliveryRuntime::OpenCode {
+                if let Some(work_order) = cancelled.work_order.as_mut() {
+                    crate::opencode_adapter::cancel(work_order);
+                }
+            }
             crate::delivery::persist_state(
                 &state.delivery_state_path,
                 &state.delivery_state,
