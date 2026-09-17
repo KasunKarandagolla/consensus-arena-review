@@ -121,8 +121,9 @@ Consequences:
   `.cmd` shims resolve to the package's Node entrypoint without a shell. This
   was prerequisite evidence only; no provider secret or model-backed Windows
   worker run was used.
-- Current `kill_on_drop` evidence concerns the tracked direct child only.
-  DSH descendant cleanup remains unproven on Linux and Windows.
+- Ordinary descendant cleanup is now covered by the Linux process-group fixture
+  and Windows Job Object fixtures. Hostile same-user escape from those
+  containment boundaries remains outside this qualification.
 
 ## Earlier evidence and rejected/watchlisted alternatives
 
