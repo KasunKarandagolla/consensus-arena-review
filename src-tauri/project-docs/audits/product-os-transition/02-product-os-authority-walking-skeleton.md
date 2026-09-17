@@ -46,9 +46,11 @@ It performed two real OpenCode Zen runs against disposable Git worktrees:
    `after`.
 
 Both runs returned real OpenCode JSON output with a root session identity. The
-first run changed the candidate copy, left the canonical acceptance file
-byte-for-byte unchanged, produced a protected-path verifier failure, and was
-not ingestible as a current result. The second run produced a candidate Git
+first run's changed candidate copy was detected before staging or committing;
+the adapter persisted only sanitized failure metadata, marked the work order
+invalid, and reset/discarded the candidate to its pre-task HEAD. The canonical
+acceptance file remained byte-for-byte unchanged, and a verifier result could
+not rescue the invalid work order. The second run produced a candidate Git
 commit and correlated evidence; the existing independent Python verifier
 returned `pass`, and the adapter accepted the result as the current verified
 candidate. The model did not receive the canonical checkout as its cwd and no
@@ -96,6 +98,7 @@ frontend build passed; no packaged or Windows UI run was performed.
 - Apply revalidation against the current candidate and verifier receipt;
 - persisted work-order identity round-trip;
 - real legitimate candidate change with independent PASS;
+- rejected protected attack received no Arena-created candidate commit;
 - process containment regression suite;
 - frontend build and Rust `cargo check`.
 
@@ -108,6 +111,9 @@ frontend build passed; no packaged or Windows UI run was performed.
   prior qualification audit proved the OpenCode server primitive separately;
   this walking skeleton intentionally uses one bounded root task);
 - a full packaged Tauri UI dogfood run;
+- provider-neutrality through an owner-relevant external provider; bounded
+  Gemini and DeepSeek attempts were made from the installed OpenCode registry,
+  but neither completed a real file task;
 - a real model-error and interactive stop during this specific adapter test;
   cancellation/result terminal semantics are covered by focused state tests
   and the existing contained-process/SessionRuntime tests.
@@ -118,3 +124,9 @@ OpenCode is **QUALIFIED FOR BOUNDED LINUX CANDIDATE EXECUTION BEHIND THE
 ARENA-OWNED AUTHORITY ADAPTER**. It is not generally qualified for Arena,
 Windows, packaging, or unrestricted authoritative file mutation. NVIDIA NIM
 is not justified by this evidence and was neither requested nor used.
+
+The candidate worktree is a non-authoritative working directory, not an OS or
+security sandbox. Git worktree/history separation, protected-state detection,
+process-cleanup containment, independent verification, and Safe Apply
+authority do not prove isolation from arbitrary same-user filesystem access or
+shared Git object-store access.

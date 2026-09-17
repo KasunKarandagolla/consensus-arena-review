@@ -149,6 +149,11 @@ async fn git_ok(repo: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
+async fn discard_candidate_changes(candidate: &Path, base: &str) -> Result<(), String> {
+    git_ok(candidate, &["reset", "--hard", base]).await?;
+    git_ok(candidate, &["clean", "-fdx"]).await
+}
+
 async fn changed_paths(repo: &Path, base: &str) -> Result<Vec<String>, String> {
     let tracked = git_output(repo, &["diff", "--name-only", base]).await?;
     let untracked = git_output(repo, &["ls-files", "--others", "--exclude-standard"]).await?;
@@ -225,7 +230,11 @@ fn persist_evidence(
         tool_count: execution.tool_count,
         protected_violation: execution.protected_violation,
         canonical_violation: execution.canonical_violation,
-        summary: "OpenCode completed a bounded candidate task; Arena retained only sanitized metadata.".to_string(),
+        summary: if execution.protected_violation || execution.canonical_violation {
+            "OpenCode result rejected by Arena protected-state checks; only sanitized failure metadata was retained.".to_string()
+        } else {
+            "OpenCode completed a bounded candidate task; Arena retained only sanitized metadata.".to_string()
+        },
     };
     std::fs::write(
         &path,
@@ -305,6 +314,31 @@ pub async fn execute_candidate(
     }
     let protected_violation = !verification::protected_files_unchanged(candidate, candidate_protected_before);
     let canonical_violation = !verification::protected_files_unchanged(canonical, canonical_protected_before);
+    if protected_violation || canonical_violation {
+        let provisional = OpenCodeExecution {
+            candidate_sha: before_head.clone(),
+            root_session_id,
+            tool_count,
+            protected_violation,
+            canonical_violation,
+            evidence_ref: String::new(),
+        };
+        let evidence_ref = persist_evidence(evidence_dir, work_order, &provisional, &model)?;
+        let execution = OpenCodeExecution {
+            evidence_ref,
+            ..provisional
+        };
+        work_order.evidence_ref = Some(execution.evidence_ref.clone());
+        work_order.result_ref = Some(execution.evidence_ref.clone());
+        work_order.task_state = OpenCodeTaskState::Invalid;
+        work_order.error = Some(if canonical_violation {
+            "OpenCode changed canonical protected state".to_string()
+        } else {
+            "OpenCode changed protected candidate state".to_string()
+        });
+        discard_candidate_changes(candidate, &before_head).await?;
+        return Ok(execution);
+    }
     git_ok(candidate, &["add", "-A"]).await?;
     let staged = git_output(candidate, &["diff", "--cached", "--quiet"]).await?;
     if staged.status.code() != Some(1) {
@@ -333,17 +367,7 @@ pub async fn execute_candidate(
     };
     work_order.evidence_ref = Some(execution.evidence_ref.clone());
     work_order.result_ref = Some(execution.evidence_ref.clone());
-    work_order.task_state = if protected_violation || canonical_violation {
-        OpenCodeTaskState::Invalid
-    } else {
-        OpenCodeTaskState::EvidenceReady
-    };
-    if protected_violation {
-        work_order.error = Some("OpenCode changed protected candidate state".to_string());
-    }
-    if canonical_violation {
-        work_order.error = Some("OpenCode changed canonical protected state".to_string());
-    }
+    work_order.task_state = OpenCodeTaskState::EvidenceReady;
     Ok(execution)
 }
 
@@ -697,10 +721,15 @@ mod tests {
         .await
         .expect("real OpenCode attack should return evidence");
         assert!(attack_order.root_session_id.is_some(), "real root session identity required");
-        assert!(
-            std::fs::read(attack.join("acceptance.txt")).expect("read attack acceptance")
-                != canonical_acceptance,
-            "the adversarial worker did not create the required candidate mutation"
+        assert_eq!(
+            verification::candidate_sha(&attack).await.expect("read attack candidate head"),
+            base,
+            "the rejected attack must not receive an Arena-created candidate commit"
+        );
+        assert_eq!(
+            std::fs::read(attack.join("acceptance.txt")).expect("read attack acceptance"),
+            canonical_acceptance,
+            "the rejected candidate must be discarded after protected-state inspection"
         );
         assert_eq!(
             std::fs::read(canonical.join("acceptance.txt")).expect("read canonical acceptance after attack"),
@@ -722,15 +751,18 @@ mod tests {
         .await
         .expect("attack verifier should produce a receipt");
         assert_ne!(attack_receipt.verdict, "pass");
-        assert!(!attack_receipt.protected_paths_unchanged);
+        assert!(attack_receipt.protected_paths_unchanged);
         let attack_authority = attack_order.authority_version.clone();
-        assert!(ingest_verification(
-            &mut attack_order,
-            &attack_execution.candidate_sha,
-            &attack_authority,
-            &attack_receipt
-        )
-        .is_err());
+        assert!(
+            ingest_verification(
+                &mut attack_order,
+                &attack_execution.candidate_sha,
+                &attack_authority,
+                &attack_receipt
+            )
+            .is_err(),
+            "a verifier PASS after cleanup must not rescue the already-invalid protected-state result"
+        );
         git(&canonical, &["worktree", "remove", "--force", attack.to_str().expect("attack path")]);
         let _ = std::fs::remove_dir_all(&attack);
 

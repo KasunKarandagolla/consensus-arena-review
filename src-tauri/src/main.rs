@@ -11,6 +11,7 @@ mod capability_registry;
 mod checkpoint;
 mod commands;
 mod context_manager;
+mod consultation;
 mod credentials;
 mod critical_transport;
 mod db_helpers;

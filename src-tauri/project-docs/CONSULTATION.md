@@ -67,6 +67,37 @@ Use Consult when the extra reasoning quality is worth latency/fragility, such as
 
 Do not invoke a panel for deterministic build/test/log/file operations.
 
+## Shared frontier consultation seam
+
+Consultation is also an optional Arena capability that an authorized
+research, engineering, or reviewer work order may request. The current
+implementation is the narrow `consultation` domain module, which reuses the
+existing Hackathon OpenAI-compatible chat transport. It does not create a new
+browser, MCP, search, or workflow runtime.
+
+The Arena-owned request contract carries a request ID, work-order ID, origin,
+bounded question, curated evidence, disclosure scope, selected provider
+configuration ID, allowed transport, deadline, and response budget. The result
+returns the same correlation IDs plus provider/transport, answer, curated
+source references, timestamp, terminal status, and a sanitized failure reason.
+
+Disclosure is fail-closed: evidence requiring a broader scope than the request
+is rejected before provider invocation. Known stored credentials are redacted
+from the provider prompt and returned answer, while credentials remain in
+secure settings and are never part of the request/result contract. Provider
+output is advisory evidence; it cannot change acceptance, candidate identity,
+verification, release, or Safe Apply authority.
+
+The current operation is a callable domain seam, not yet a durable work-order
+runtime. Its Arena-owned caller must bind admission, cancellation/supersession,
+candidate/version identity, and result persistence/reconciliation before
+invoking it.
+
+The existing consumer-web Consult journey remains the current browser
+transport. The shared seam does not make consumer websites critical path and
+does not assume that legacy `agent-message` or Hackathon events are sufficient
+for non-Consult result correlation.
+
 ## AskUser
 
 The existing AskUser path remains a reusable product primitive:

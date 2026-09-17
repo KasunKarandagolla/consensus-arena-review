@@ -18,12 +18,16 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
-fn redact_saved_credentials(text: &str, secrets: &[String]) -> String {
+pub(crate) fn redact_saved_credentials(text: &str, secrets: &[String]) -> String {
     credential_scan_literals(secrets)
         .iter()
         .fold(text.to_string(), |safe, secret| {
             crate::dsh_worker::redact_secret(&safe, secret)
         })
+}
+
+fn prepare_delivery_objective(objective: &str, secrets: &[String]) -> String {
+    redact_saved_credentials(objective, secrets)
 }
 
 fn credential_scan_literals(secrets: &[String]) -> Vec<String> {
@@ -44,7 +48,7 @@ fn credential_scan_literals(secrets: &[String]) -> Vec<String> {
     literals
 }
 
-fn configured_credentials(
+pub(crate) fn configured_credentials(
     store: &crate::settings_store::SettingsStore,
 ) -> Result<Vec<String>, String> {
     let mut secrets = Vec::new();
@@ -405,9 +409,7 @@ pub async fn start_delivery(
             return Err(dsh.message);
         }
     }
-    let (saved_secrets, credentials_ready) = if use_opencode {
-        (Vec::new(), true)
-    } else {
+    let (saved_secrets, credentials_ready) = {
         let store = state.settings_store.lock().await;
         (
             configured_credentials(&store)?,
@@ -417,7 +419,7 @@ pub async fn start_delivery(
     if !credentials_ready {
         return Err(crate::credentials::secure_storage_help().to_string());
     }
-    objective = redact_saved_credentials(&objective, &saved_secrets);
+    objective = prepare_delivery_objective(&objective, &saved_secrets);
     if !use_opencode {
         let brain = {
             let store = state.settings_store.lock().await;
@@ -5462,6 +5464,30 @@ mod tests {
             file_contains_credentials(&path, &[unusual_secret.to_string()])
                 .expect("scan encoded evidence")
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn opencode_objective_redacts_configured_secret_before_worker_invocation() {
+        let path = std::env::temp_dir().join(format!(
+            "arena-opencode-objective-redaction-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let mut store = crate::settings_store::SettingsStore::new_with_credential_store(
+            path.to_str().expect("temp path is utf8"),
+            std::sync::Arc::new(crate::credentials::MemoryCredentialStore::default()),
+        )
+        .expect("open isolated settings store");
+        let secret = format!("arena-runtime-secret-{}", uuid::Uuid::new_v4());
+        store
+            .set("brain_api_key", &secret)
+            .expect("store synthetic credential securely");
+        let saved = configured_credentials(&store).expect("enumerate configured credentials");
+        let objective = format!("Update the candidate using this incidental text: {secret}");
+        let prepared = prepare_delivery_objective(&objective, &saved);
+
+        assert!(!prepared.contains(&secret));
+        assert!(prepared.contains("[REDACTED]"));
         let _ = std::fs::remove_file(path);
     }
 

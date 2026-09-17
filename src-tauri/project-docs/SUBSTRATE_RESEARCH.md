@@ -105,6 +105,16 @@ An NVIDIA NIM-backed OpenCode experiment remains **not justified**: the
 already-available Zen path executed the real model work and the blocker was
 authority composition, which is now bounded by Arena.
 
+Provider portability remains a separate, unproven claim. The current runtime
+qualification covers only Linux OpenCode 1.17.18 with OpenCode Zen and
+`opencode/muse-spark-1.2-contributor-free` behind the Arena adapter. A bounded
+Gemini attempt (`google/gemini-2.5-flash`, unavailable to new users) and a
+current Gemini attempt (`google/gemini-3.6-flash`, timed out) did not execute a
+file task; a bounded DeepSeek attempt (`deepseek/deepseek-flash`) also timed
+out without a session/tool result. These observations do not widen the
+qualification and do not justify requesting NVIDIA credentials. Historical
+NVIDIA/DSH evidence is separate legacy-worker evidence.
+
 ## Pi
 
 Evaluated during substrate exploration but not selected as the current primary architecture. The DSH worker assumption is now materially challenged, but do not start a parallel comparison before the required Astra Trigger A consultation.

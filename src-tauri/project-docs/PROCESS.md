@@ -29,6 +29,13 @@ For a normal task:
 7. **Review** — show diff and result.
 8. **Checkpoint** — Git commit only after verification and user approval when approval is reserved.
 
+For research/reuse milestones, record each decision-critical claim with its
+source, version/date/scope, origin, contradictory references, verification
+status, revisit trigger, and decision impact. Distinguish documented upstream
+capability from source confirmation and runtime proof. A provider-neutral
+architecture claim must not be upgraded to cross-provider runtime evidence
+without a bounded real task.
+
 ## Verification baseline
 
 Typical checks:

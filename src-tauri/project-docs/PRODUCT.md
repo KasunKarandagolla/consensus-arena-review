@@ -35,6 +35,13 @@ Use frontier consumer chat models when independent high-quality reasoning materi
 
 Consultation is selective. A committee is not the default for routine mechanical work.
 
+The same advisory capability may be requested from a bounded Delivery
+research, engineering, or reviewer work order when the question benefits from
+frontier reasoning. Arena admits the request, selects the permitted provider
+and disclosure scope, and treats the response as evidence. The owner-facing
+product state remains Arena-owned; a consultation cannot mark a candidate
+accepted, verified, or eligible for Apply.
+
 ### Build / Delivery
 
 Use bounded programmatic workers and deterministic tools to carry product work forward. Current V1 already proves the core separation:

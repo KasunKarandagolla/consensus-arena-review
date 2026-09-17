@@ -52,6 +52,24 @@ returns a JSON-serialized string with `available`, `compatible`,
 `JSON.parse()` this command result. It does not return credentials or raw DSH
 output.
 
+### Shared frontier consultation
+
+The backend `consultation` domain contract is provider-neutral at the Arena
+boundary and transport-specific only inside the selected adapter. A request
+contains `request_id`, `work_order_id`, `origin`, `question`, curated evidence,
+`disclosure_scope`, `allowed_provider`, `allowed_transport`, `deadline_ms`, and
+`budget_tokens`. A result contains the correlation IDs, provider, transport,
+answer, source references, conversation reference, timestamp, status, and a
+sanitized error.
+
+The current source exposes this as a Rust domain operation for callers that
+Arena has authorized; it is not a renderer-owned authority command. The caller
+must bind the operation to current Arena admission and lifecycle state. If a
+Tauri command is added later, it must use the same serde contract and must
+persist or reconcile the result before emitting any notification. Unknown, cancelled,
+superseded, or mismatched results must fail closed. Do not reuse uncorrelated
+legacy Consult events as the authoritative result channel.
+
 ### Credential settings
 
 The `get_agent_brain_config`, `get_fallback_brain_config`, and

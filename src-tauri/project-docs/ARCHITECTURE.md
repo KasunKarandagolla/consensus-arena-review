@@ -17,7 +17,7 @@ Current implementation is transitional: the old Consult lane is mature and retai
         CONSULT                      BUILD
            │                           │
  frontier web models            isolated worktree
- + agent brain                  + bounded DSH worker
++ agent brain                  + bounded worker adapter
            │                           │
  expert reasoning               frozen acceptance
            │                           │
@@ -62,7 +62,7 @@ author acceptance material
   ↓
 freeze acceptance commit + protected hashes
   ↓
-bounded DSH implementation attempt
+bounded worker implementation attempt
   ↓
 Arena runs frozen verification commands itself
   ├─ PASS → Verified candidate
@@ -154,7 +154,7 @@ Owner ↔ Arena product authority
             │
        bounded work order
             ↓
-       DSH worker
+       replaceable worker adapter
             │
        candidate/blocker
             ↓

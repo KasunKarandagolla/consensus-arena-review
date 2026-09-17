@@ -66,7 +66,7 @@ export default function SetupView(){
   const openCodeReady=dshPrerequisite?.runtime==='opencode'
   const deliveryBrainReady=openCodeReady||Boolean(hasBrainKey&&brain.base_url.trim()&&brain.model.trim())
   const secureStorageReady=Boolean(credentialStorageStatus?.available&&!credentialStorageStatus.migration_pending)
-  const deliveryStorageReady=openCodeReady||secureStorageReady
+  const deliveryStorageReady=secureStorageReady
   const canStart=mode==='delivery' ? Boolean(setupBrief.trim()&&projectPath.trim()&&dshPrerequisite?.compatible&&deliveryBrainReady&&deliveryStorageReady&&!loading) : Boolean(setupBrief.trim()&&selected.size>=2&&selected.has(leader)&&brainReady&&secureStorageReady&&!loading)
   useEffect(()=>{if(mode==='delivery'&&!deliveryBrainReady&&!openCodeReady)setOpen(true)},[mode,deliveryBrainReady,openCodeReady])
   async function chooseDirectory(){try{const chosen=await openDirectory({directory:true,multiple:false,title:'Choose a Git project'});if(typeof chosen==='string')setProjectPath(chosen)}catch(e){console.error(e);addToast('Could not open the folder picker')}}
