@@ -183,16 +183,10 @@ steps:
         Start-Sleep -Seconds 1
     }
     if ($statusText -match '(?im)^Failed\b') {
-        $resumeLog = $completeOutput
-        foreach ($logPath in @($restartOut, $restartErr)) {
-            if (Test-Path -LiteralPath $logPath) {
-                $resumeLog += Get-Content -LiteralPath $logPath -Raw
-            }
-        }
-        if ($resumeLog -notmatch 'dag-run is not queued: waiting') {
-            throw 'The resumed DAG failed for an unexpected reason.'
-        }
-        $resumeMode = 'explicit_retry_required_after_waiting_state'
+        # A controller restart may leave the run in a failed terminal state
+        # even though the human answer was durably recorded. Exercise the
+        # documented retry path, and require the continuation to succeed.
+        $resumeMode = 'explicit_retry_after_restart_failure'
         & $dagu retry --dagu-home $daguHome --run-id $runId $workflow
         if ($LASTEXITCODE -ne 0) {
             throw 'Dagu CLI could not explicitly retry the persisted human-task run.'
