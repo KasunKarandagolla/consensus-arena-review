@@ -425,6 +425,14 @@ fn windows_path_is_within(path: &Path, root: &Path) -> bool {
 }
 
 #[cfg(windows)]
+fn windows_process_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    text.strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+        .unwrap_or(path)
+}
+
+#[cfg(windows)]
 fn windows_node_npm_pair(directory: &Path, worktree_root: &Path) -> Option<(PathBuf, PathBuf)> {
     let node = directory.join("node.exe").canonicalize().ok()?;
     if !node.is_file() || windows_path_is_within(&node, worktree_root) {
@@ -445,8 +453,10 @@ fn windows_node_npm_pair(directory: &Path, worktree_root: &Path) -> Option<(Path
     ];
     npm_layouts.into_iter().find_map(|path| {
         let cli = path.canonicalize().ok()?;
-        (cli.is_file() && !windows_path_is_within(&cli, worktree_root))
-            .then_some((node.clone(), cli))
+        (cli.is_file() && !windows_path_is_within(&cli, worktree_root)).then_some((
+            windows_process_path(node.clone()),
+            windows_process_path(cli),
+        ))
     })
 }
 

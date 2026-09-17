@@ -43,8 +43,12 @@ An independent workflow and PowerShell harness were added at
 the official Windows amd64 archive SHA256
 `65193670d974ece9e14b2fd9c61a06dd3073f0b03a553445623ca03f162be7b8`, and is
 designed to run a basic workflow from a path with spaces, a root human task,
-controller restart, history, and continuation. YAML parsing passed. It has
-not run on a Windows runner; native Dagu execution remains unproven.
+controller restart, history, and continuation. YAML parsing passed. Workflow
+run [35198945289](https://github.com/KasunKarandagolla/consensus-arena-review/actions/runs/35198945289)
+then passed on Windows Server 2025 with Dagu `2.16.6` and the pinned archive
+hash. The fixture path contained spaces; the root human task survived
+controller restart, required the explicit retry recovery path, and the
+continuation completed. The run did not use Arena integration or DSH.
 
 ## Recommendation
 
