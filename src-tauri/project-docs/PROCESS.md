@@ -36,6 +36,13 @@ capability from source confirmation and runtime proof. A provider-neutral
 architecture claim must not be upgraded to cross-provider runtime evidence
 without a bounded real task.
 
+The 05A research path is intentionally narrow: direct read-only official
+source retrieval may create an Arena evidence proposal, but it cannot mark the
+claim independently verified. A separate Arena verifier records the source
+identity and verification disposition. GitHub MCP, browser/search MCP, and
+upstream skill procedures remain optional integrations until their actual
+runtime and permission boundaries are qualified.
+
 ## Verification baseline
 
 Typical checks:

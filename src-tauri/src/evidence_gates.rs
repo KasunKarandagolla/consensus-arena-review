@@ -45,6 +45,54 @@ pub enum EvidenceProvenance {
     Inferred,
 }
 
+/// Where a research claim entered Arena. These values describe provenance;
+/// none of them is an authorization to pass a gate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceOrigin {
+    AgentClaim,
+    GitHub,
+    Web,
+    Consultation,
+    Owner,
+    Verifier,
+}
+
+/// Arena-owned disposition of a claim after independent checking.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceVerification {
+    Unverified,
+    IndependentlyVerified,
+    Contradicted,
+    Unresolved,
+    Rejected,
+}
+
+/// The narrow roles needed to prove architecture and research gates without
+/// embedding transcripts in a gate package.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    ResearchClaim,
+    ArchitectureProposal,
+    ReuseReview,
+    ConstraintsReview,
+    RiskExperiment,
+    RedTeamReview,
+    Dissent,
+    General,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceSource {
+    pub reference: String,
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub checked_at: String,
+    pub version_or_scope: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AmbiguitySeverity {
@@ -72,6 +120,24 @@ pub struct EvidenceItem {
     pub summary: String,
     pub provenance: EvidenceProvenance,
     pub current: bool,
+    /// Optional on legacy records; required by the research proposal/finalize
+    /// helpers before a claim can become independently verified evidence.
+    #[serde(default)]
+    pub origin: Option<EvidenceOrigin>,
+    #[serde(default)]
+    pub verification: Option<EvidenceVerification>,
+    #[serde(default)]
+    pub kind: Option<EvidenceKind>,
+    #[serde(default)]
+    pub source: Option<EvidenceSource>,
+    #[serde(default)]
+    pub verifier_work_order_id: Option<String>,
+    #[serde(default)]
+    pub contradiction_ids: Vec<String>,
+    #[serde(default)]
+    pub decision_impact: bool,
+    #[serde(default)]
+    pub revisit_trigger: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +255,15 @@ fn missing_required_evidence(input: &GateInput) -> Option<String> {
         .cloned()
 }
 
+fn research_evidence_is_verified(item: &EvidenceItem) -> bool {
+    item.current
+        && item.kind == Some(EvidenceKind::ResearchClaim)
+        && item.verification == Some(EvidenceVerification::IndependentlyVerified)
+        && item.source.is_some()
+        && item.verifier_work_order_id.is_some()
+        && item.contradiction_ids.is_empty()
+}
+
 fn has_open_high_ambiguity(input: &GateInput) -> bool {
     input.ambiguities.iter().any(|item| {
         item.affected_commitment
@@ -298,11 +373,16 @@ pub fn evaluate(input: &GateInput) -> GateDecision {
             ),
         },
         GateId::ProblemResearch | GateId::Positioning => {
-            if input.evidence.is_empty() {
+            let verified = input
+                .evidence
+                .iter()
+                .filter(|item| research_evidence_is_verified(item))
+                .collect::<Vec<_>>();
+            if verified.is_empty() {
                 decision(
                     input,
                     GateStatus::MissingEvidence,
-                    "decision-relevant evidence is missing",
+                    "independently verified research evidence is missing",
                 )
             } else if input.decision_outcome.is_none() {
                 decision(
@@ -480,6 +560,20 @@ mod tests {
                 summary: "current evidence".to_string(),
                 provenance: EvidenceProvenance::SourceConfirmed,
                 current: true,
+                origin: Some(EvidenceOrigin::Web),
+                verification: Some(EvidenceVerification::IndependentlyVerified),
+                kind: Some(EvidenceKind::ResearchClaim),
+                source: Some(EvidenceSource {
+                    reference: "source-1".to_string(),
+                    url: Some("https://example.invalid/source-1".to_string()),
+                    title: Some("Fixture source".to_string()),
+                    checked_at: "2026-09-17T00:00:00Z".to_string(),
+                    version_or_scope: "fixture".to_string(),
+                }),
+                verifier_work_order_id: Some("reviewer-1".to_string()),
+                contradiction_ids: Vec::new(),
+                decision_impact: false,
+                revisit_trigger: None,
             }],
             ambiguities: Vec::new(),
             next_irreversible_commitment: Some("commitment-1".to_string()),

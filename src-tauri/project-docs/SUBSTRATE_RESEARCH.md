@@ -115,6 +115,24 @@ out without a session/tool result. These observations do not widen the
 qualification and do not justify requesting NVIDIA credentials. Historical
 NVIDIA/DSH evidence is separate legacy-worker evidence.
 
+### Milestone 05A research/release preflight
+
+The first narrow real research route is direct read-only retrieval from the
+official GitHub public API/raw source and official web documentation. Arena now
+stores research origin, evidence kind, source identity, verification
+disposition, contradiction references, verifier work-order ID, scope, and
+revisit trigger in the existing Product OS records. Search output or worker
+consensus is not a verified fact. The official GitHub MCP server was reviewed
+from upstream documentation but is not installed or runtime-qualified.
+
+The same preflight added a canonical checkout snapshot around external worker
+execution. This detects tracked/untracked canonical mutation and fails closed
+before candidate commit, Verified, or Apply. It is not an OS/security sandbox,
+does not solve hostile same-user filesystem access, and does not isolate the
+shared Git object store. ECC/gstack, shared consultation, and non-Zen provider
+runtime portability remain unproven. See
+`audits/product-os-transition/05A-research-runtime-release-preflight.md`.
+
 Milestone 05 added an Arena-owned `BuildPackage` assembler over the existing
 persisted Delivery state. Current authority records, owner decision IDs,
 architecture evidence references, and a deterministic fingerprint are checked

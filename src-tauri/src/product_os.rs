@@ -1,6 +1,7 @@
 use crate::evidence_gates::{
     self, AmbiguityItem, AmbiguitySeverity, AmbiguityStatus, DecisionOutcome, EvidenceItem,
-    GateDecision, GateId, GateInput, ReviewerRestatement,
+    EvidenceKind, EvidenceOrigin, EvidenceSource, EvidenceVerification, GateDecision, GateId,
+    GateInput, ReviewerRestatement,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -184,6 +185,20 @@ fn referenced_many(records: &ProductAuthorityRecords, ids: &[String]) -> Result<
     Ok(())
 }
 
+fn referenced_kind(
+    records: &ProductAuthorityRecords,
+    evidence_id: &str,
+    expected: EvidenceKind,
+) -> Result<(), String> {
+    let evidence = referenced_evidence(records, evidence_id)?;
+    if evidence.kind != Some(expected) {
+        return Err(format!(
+            "authoritative evidence reference has the wrong role: {evidence_id}"
+        ));
+    }
+    Ok(())
+}
+
 fn adopted_owner_decision<'a>(
     records: &'a ProductAuthorityRecords,
     decision_id: &str,
@@ -218,6 +233,9 @@ fn validate_owner_ambiguities(records: &ProductAuthorityRecords) -> Result<(), S
 
 fn validate_architecture(records: &ProductAuthorityRecords) -> Result<Vec<String>, String> {
     let architecture = &records.architecture;
+    if architecture.proposal_a_evidence_id == architecture.proposal_b_evidence_id {
+        return Err("architecture requires two distinct independent proposals".to_string());
+    }
     let ids = vec![
         architecture.proposal_a_evidence_id.clone(),
         architecture.proposal_b_evidence_id.clone(),
@@ -226,10 +244,39 @@ fn validate_architecture(records: &ProductAuthorityRecords) -> Result<Vec<String
         architecture.red_team_evidence_id.clone(),
         architecture.dissent_evidence_id.clone(),
     ];
-    for id in &ids {
-        referenced_evidence(records, id)?;
+    referenced_kind(
+        records,
+        &architecture.proposal_a_evidence_id,
+        EvidenceKind::ArchitectureProposal,
+    )?;
+    referenced_kind(
+        records,
+        &architecture.proposal_b_evidence_id,
+        EvidenceKind::ArchitectureProposal,
+    )?;
+    referenced_kind(
+        records,
+        &architecture.reuse_review_evidence_id,
+        EvidenceKind::ReuseReview,
+    )?;
+    referenced_kind(
+        records,
+        &architecture.constraints_review_evidence_id,
+        EvidenceKind::ConstraintsReview,
+    )?;
+    referenced_kind(
+        records,
+        &architecture.red_team_evidence_id,
+        EvidenceKind::RedTeamReview,
+    )?;
+    referenced_kind(
+        records,
+        &architecture.dissent_evidence_id,
+        EvidenceKind::Dissent,
+    )?;
+    for id in &architecture.risk_experiment_evidence_ids {
+        referenced_kind(records, id, EvidenceKind::RiskExperiment)?;
     }
-    referenced_many(records, &architecture.risk_experiment_evidence_ids)?;
     for id in &architecture.unresolved_high_blocker_evidence_ids {
         referenced_evidence(records, id)?;
     }
@@ -265,6 +312,72 @@ fn current_evidence_ids(records: &ProductAuthorityRecords) -> Vec<String> {
         .filter(|item| item.current)
         .map(|item| item.evidence_id.clone())
         .collect()
+}
+
+/// Admit a worker/researcher proposal as unverified evidence. This reuses the
+/// existing Product OS evidence vector; it never advances a gate or package.
+pub fn submit_research_proposal(
+    records: &mut ProductAuthorityRecords,
+    mut proposal: EvidenceItem,
+) -> Result<(), String> {
+    if proposal.evidence_id.trim().is_empty()
+        || proposal.claim.trim().is_empty()
+        || proposal.origin.is_none()
+        || proposal.kind != Some(EvidenceKind::ResearchClaim)
+    {
+        return Err(
+            "research proposal requires identity, claim, origin, and research kind".to_string(),
+        );
+    }
+    if proposal.origin == Some(EvidenceOrigin::Verifier)
+        || proposal.verification == Some(EvidenceVerification::IndependentlyVerified)
+    {
+        return Err("research proposals cannot self-declare independent verification".to_string());
+    }
+    proposal.current = true;
+    proposal.verification = Some(EvidenceVerification::Unverified);
+    records
+        .evidence
+        .retain(|item| item.evidence_id != proposal.evidence_id);
+    records.evidence.push(proposal);
+    Ok(())
+}
+
+/// Finalize one current research claim from an Arena-owned reviewer work order
+/// and primary-source reference. A contradiction is retained as evidence but
+/// cannot satisfy the research gate.
+pub fn finalize_research_claim(
+    records: &mut ProductAuthorityRecords,
+    evidence_id: &str,
+    verifier_work_order_id: &str,
+    source: EvidenceSource,
+    verification: EvidenceVerification,
+) -> Result<(), String> {
+    if verifier_work_order_id.trim().is_empty()
+        || source.reference.trim().is_empty()
+        || source.checked_at.trim().is_empty()
+        || source.version_or_scope.trim().is_empty()
+        || !matches!(
+            verification,
+            EvidenceVerification::IndependentlyVerified
+                | EvidenceVerification::Contradicted
+                | EvidenceVerification::Unresolved
+        )
+    {
+        return Err("research verification requires reviewer identity, source scope, and a bounded disposition".to_string());
+    }
+    let item = records
+        .evidence
+        .iter_mut()
+        .find(|item| item.evidence_id == evidence_id && item.current)
+        .ok_or_else(|| "research evidence is unknown or stale".to_string())?;
+    if item.kind != Some(EvidenceKind::ResearchClaim) {
+        return Err("only research claims can be independently finalized".to_string());
+    }
+    item.source = Some(source);
+    item.verifier_work_order_id = Some(verifier_work_order_id.to_string());
+    item.verification = Some(verification);
+    Ok(())
 }
 
 /// Assemble the only production-facing Build Package path. The summaries
@@ -399,7 +512,11 @@ fn input_for_records(
         evidence: records
             .evidence
             .iter()
-            .filter(|item| item.current)
+            .filter(|item| {
+                item.current
+                    && (!matches!(gate_id, GateId::ProblemResearch | GateId::Positioning)
+                        || item.kind == Some(EvidenceKind::ResearchClaim))
+            })
             .cloned()
             .collect(),
         ambiguities,
@@ -473,6 +590,20 @@ mod tests {
             summary: summary.to_string(),
             provenance: EvidenceProvenance::RuntimeProven,
             current: true,
+            origin: Some(EvidenceOrigin::Verifier),
+            verification: Some(EvidenceVerification::IndependentlyVerified),
+            kind: None,
+            source: Some(EvidenceSource {
+                reference: format!("source:{id}"),
+                url: None,
+                title: None,
+                checked_at: "2026-09-17T00:00:00Z".to_string(),
+                version_or_scope: "test fixture".to_string(),
+            }),
+            verifier_work_order_id: Some("test-work-order".to_string()),
+            contradiction_ids: Vec::new(),
+            decision_impact: false,
+            revisit_trigger: None,
         }
     }
 
@@ -495,9 +626,19 @@ mod tests {
                 success_condition: "Verifier passes the current candidate".to_string(),
                 invented_behaviors: Vec::new(),
             }),
-            evidence: (1..=8)
-                .map(|index| evidence(&format!("e{index}"), "current evidence"))
-                .collect(),
+            evidence: {
+                let mut values = (1..=8)
+                    .map(|index| evidence(&format!("e{index}"), "current evidence"))
+                    .collect::<Vec<_>>();
+                values[1].kind = Some(EvidenceKind::ReuseReview);
+                values[2].kind = Some(EvidenceKind::ArchitectureProposal);
+                values[3].kind = Some(EvidenceKind::ArchitectureProposal);
+                values[4].kind = Some(EvidenceKind::ConstraintsReview);
+                values[5].kind = Some(EvidenceKind::RiskExperiment);
+                values[6].kind = Some(EvidenceKind::RedTeamReview);
+                values[7].kind = Some(EvidenceKind::Dissent);
+                values
+            },
             owner_decisions: vec![OwnerDecisionRecord {
                 decision_id: "d1".to_string(),
                 question_id: "q1".to_string(),
@@ -566,6 +707,14 @@ mod tests {
     }
 
     #[test]
+    fn architecture_cannot_reuse_one_proposal_as_two_independent_proposals() {
+        let mut records = records();
+        records.architecture.proposal_b_evidence_id =
+            records.architecture.proposal_a_evidence_id.clone();
+        assert!(assemble_build_package(&records).is_err());
+    }
+
+    #[test]
     fn stale_owner_decision_cannot_resolve_owner_ambiguity() {
         let mut records = records();
         records.owner_decisions[0].status = DecisionStatus::Stale;
@@ -628,6 +777,14 @@ mod tests {
             summary: "superseded".to_string(),
             provenance: EvidenceProvenance::Documented,
             current: false,
+            origin: None,
+            verification: None,
+            kind: None,
+            source: None,
+            verifier_work_order_id: None,
+            contradiction_ids: Vec::new(),
+            decision_impact: false,
+            revisit_trigger: None,
         });
         assert!(package.is_current_for(&changed).expect("fingerprint"));
         assert_eq!(
@@ -636,6 +793,84 @@ mod tests {
                 .expect("evaluate")
                 .status,
             GateStatus::Pass
+        );
+    }
+
+    #[test]
+    fn research_proposal_requires_independent_primary_source_verification() {
+        let mut records = records();
+        let mut proposal = evidence("research-1", "the bounded source claim");
+        proposal.origin = Some(EvidenceOrigin::AgentClaim);
+        proposal.kind = Some(EvidenceKind::ResearchClaim);
+        proposal.verification = None;
+        proposal.source = None;
+        proposal.verifier_work_order_id = None;
+        submit_research_proposal(&mut records, proposal).expect("admit unverified proposal");
+
+        let package = assemble_build_package(&records).expect("package still assembles");
+        assert_eq!(
+            package
+                .evaluate_current(&records, GateId::ProblemResearch)
+                .expect("evaluate research gate")
+                .status,
+            GateStatus::MissingEvidence
+        );
+
+        finalize_research_claim(
+            &mut records,
+            "research-1",
+            "reviewer-work-order-1",
+            EvidenceSource {
+                reference: "github:github/github-mcp-server".to_string(),
+                url: Some("https://github.com/github/github-mcp-server".to_string()),
+                title: Some("GitHub MCP Server".to_string()),
+                checked_at: "2026-09-18T00:00:00Z".to_string(),
+                version_or_scope: "public repository metadata".to_string(),
+            },
+            EvidenceVerification::IndependentlyVerified,
+        )
+        .expect("finalize independently checked claim");
+        let current_package = assemble_build_package(&records).expect("reassemble current package");
+        assert_eq!(
+            current_package
+                .evaluate_current(&records, GateId::ProblemResearch)
+                .expect("evaluate verified research gate")
+                .status,
+            GateStatus::Pass
+        );
+    }
+
+    #[test]
+    fn contradicted_research_claim_remains_evidence_but_cannot_pass() {
+        let mut records = records();
+        let mut proposal = evidence("research-2", "a contradicted claim");
+        proposal.origin = Some(EvidenceOrigin::Web);
+        proposal.kind = Some(EvidenceKind::ResearchClaim);
+        proposal.verification = None;
+        proposal.source = None;
+        proposal.verifier_work_order_id = None;
+        submit_research_proposal(&mut records, proposal).expect("admit proposal");
+        finalize_research_claim(
+            &mut records,
+            "research-2",
+            "reviewer-work-order-2",
+            EvidenceSource {
+                reference: "web:contradictory-primary-source".to_string(),
+                url: Some("https://example.invalid/primary".to_string()),
+                title: Some("Contradictory source".to_string()),
+                checked_at: "2026-09-18T00:00:00Z".to_string(),
+                version_or_scope: "bounded contradiction check".to_string(),
+            },
+            EvidenceVerification::Contradicted,
+        )
+        .expect("retain contradiction disposition");
+        let package = assemble_build_package(&records).expect("package remains inspectable");
+        assert_eq!(
+            package
+                .evaluate_current(&records, GateId::ProblemResearch)
+                .expect("evaluate contradicted research")
+                .status,
+            GateStatus::MissingEvidence
         );
     }
 }

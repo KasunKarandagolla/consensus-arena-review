@@ -1,5 +1,5 @@
 use crate::dsh_worker;
-use crate::product_os::{assemble_build_package, BuildPackage, ProductAuthorityRecords};
+use crate::product_os::{BuildPackage, ProductAuthorityRecords, assemble_build_package};
 use crate::session_runtime::SessionOwner;
 use crate::settings_store::SettingsStore;
 use crate::transcript_store::TranscriptStore;
@@ -223,20 +223,16 @@ pub fn bind_build_package(
     records: ProductAuthorityRecords,
 ) -> Result<(), String> {
     let package = assemble_build_package(&records)?;
-    let architecture = package.evaluate_current(
-        &records,
-        crate::evidence_gates::GateId::Architecture,
-    )?;
+    let architecture =
+        package.evaluate_current(&records, crate::evidence_gates::GateId::Architecture)?;
     if architecture.status != crate::evidence_gates::GateStatus::Pass {
         return Err(format!(
             "architecture gate blocks Delivery admission: {}",
             architecture.reason
         ));
     }
-    let readiness = package.evaluate_current(
-        &records,
-        crate::evidence_gates::GateId::BuildReadiness,
-    )?;
+    let readiness =
+        package.evaluate_current(&records, crate::evidence_gates::GateId::BuildReadiness)?;
     if readiness.status != crate::evidence_gates::GateStatus::Pass {
         return Err(format!(
             "Build Package is not actionable: {}",
@@ -364,6 +360,38 @@ async fn git_ok(repo: &std::path::Path, args: &[&str]) -> Result<(), String> {
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalCheckoutSnapshot {
+    pub head: String,
+    pub status: String,
+}
+
+/// Capture the canonical checkout around an external worker. This is a
+/// defense-in-depth authority check, not a filesystem sandbox.
+pub(crate) async fn snapshot_canonical_checkout(
+    repo: &std::path::Path,
+) -> Result<CanonicalCheckoutSnapshot, String> {
+    let head = git_output(repo, &["rev-parse", "HEAD"]).await?;
+    if !head.status.success() {
+        return Err("could not snapshot canonical checkout HEAD".to_string());
+    }
+    let status = git_output(repo, &["status", "--porcelain=v2", "--untracked-files=all"]).await?;
+    if !status.status.success() {
+        return Err("could not snapshot canonical checkout status".to_string());
+    }
+    Ok(CanonicalCheckoutSnapshot {
+        head: String::from_utf8_lossy(&head.stdout).trim().to_string(),
+        status: String::from_utf8_lossy(&status.stdout).into_owned(),
+    })
+}
+
+pub(crate) fn canonical_checkout_changed(
+    before: &CanonicalCheckoutSnapshot,
+    after: &CanonicalCheckoutSnapshot,
+) -> bool {
+    before != after
 }
 
 pub async fn validate_clean_base(repo: &std::path::Path) -> Result<String, String> {
@@ -1112,7 +1140,12 @@ async fn run_acceptance_authoring(
         );
         let worker_base =
             verification::candidate_sha(std::path::Path::new(&state.worktree_path)).await?;
-        let execution = dsh_worker::run(
+        let canonical = std::path::Path::new(&state.source_workspace);
+        let canonical_before = snapshot_canonical_checkout(canonical).await?;
+        if !canonical_before.status.is_empty() {
+            return Err("canonical Arena checkout was not clean at worker admission".to_string());
+        }
+        let execution_result = dsh_worker::run(
             std::path::Path::new(&state.worktree_path),
             &std::path::Path::new(&state.worktree_path).join(".arena-runtime"),
             patch_dir,
@@ -1120,7 +1153,15 @@ async fn run_acceptance_authoring(
             &prompt,
             1800,
         )
-        .await?;
+        .await;
+        let canonical_after = snapshot_canonical_checkout(canonical).await?;
+        if canonical_checkout_changed(&canonical_before, &canonical_after) {
+            return Err(
+                "worker execution changed the canonical Arena checkout; acceptance was rejected"
+                    .to_string(),
+            );
+        }
+        let execution = execution_result?;
         clean_runtime(std::path::Path::new(&state.worktree_path)).await?;
         if let Some(reason) = inspect_worker_output(
             std::path::Path::new(&state.worktree_path),
@@ -1285,10 +1326,15 @@ pub async fn apply_verified_candidate(state: &mut DeliveryState) -> Result<(), S
                 || !receipt.candidate_tree_unchanged
                 || !receipt.protected_paths_unchanged
             {
-                return Err("Cannot apply: the current verification is not valid for this candidate".to_string());
+                return Err(
+                    "Cannot apply: the current verification is not valid for this candidate"
+                        .to_string(),
+                );
             }
         } else if state.runtime == DeliveryRuntime::OpenCode {
-            return Err("Cannot apply: the candidate has no current independent verification".to_string());
+            return Err(
+                "Cannot apply: the candidate has no current independent verification".to_string(),
+            );
         }
     }
     let ff = git_output(source, &["merge", "--ff-only", &candidate]).await?;
@@ -1382,7 +1428,22 @@ async fn run_inner(
             let evidence = state.last_verification.as_ref().map(|receipt| format!("verdict={} checks={:?}", receipt.verdict, receipt.checks)).unwrap_or_else(|| "acceptance checks failed".to_string());
             let prompt = dsh_worker::bounded_prompt(&state.objective, &format!("IMPLEMENTATION TASK. Frozen acceptance items are in the repository. Protected files: {}. User decisions:\n{answers}", state.protected_files.join(", ")), Some(&evidence));
             let worker_base = verification::candidate_sha(&worktree).await?;
-            let execution = dsh_worker::run(&worktree, &worktree.join(".arena-runtime"), &patch_dir, &model, &prompt, 1800).await?;
+            let canonical_before = snapshot_canonical_checkout(&canonical).await?;
+            if !canonical_before.status.is_empty() {
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some("canonical Arena checkout was not clean at worker admission".to_string());
+                persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
+                break;
+            }
+            let execution_result = dsh_worker::run(&worktree, &worktree.join(".arena-runtime"), &patch_dir, &model, &prompt, 1800).await;
+            let canonical_after = snapshot_canonical_checkout(&canonical).await?;
+            if canonical_checkout_changed(&canonical_before, &canonical_after) {
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some("worker execution changed the canonical Arena checkout; candidate was rejected before commit".to_string());
+                persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
+                break;
+            }
+            let execution = execution_result?;
             clean_runtime(&worktree).await?;
             if let Some(reason) = inspect_worker_output(&worktree, &worker_base, &secrets).await? {
                 state.phase = DeliveryPhase::Failed;
@@ -1621,6 +1682,27 @@ mod tests {
             .status()
             .expect("remove fixture worktree");
         assert!(removed.success());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[tokio::test]
+    async fn canonical_snapshot_detects_unprotected_tracked_mutation() {
+        let (repo, _, _, _) = apply_guard_fixture("canonical mutation guard");
+        let before = snapshot_canonical_checkout(&repo)
+            .await
+            .expect("snapshot clean canonical checkout");
+        assert!(before.status.is_empty());
+        std::fs::write(repo.join("base.txt"), "worker-like canonical mutation\n")
+            .expect("mutate canonical tracked file");
+        let after = snapshot_canonical_checkout(&repo)
+            .await
+            .expect("snapshot canonical mutation");
+        assert!(canonical_checkout_changed(&before, &after));
+        assert!(!after.status.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("base.txt")).expect("read canonical mutation"),
+            "worker-like canonical mutation\n"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 

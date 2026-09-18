@@ -1,6 +1,6 @@
 # Consensus Arena — Project Documentation Index
 
-**Last refreshed:** 2026-09-17
+**Last refreshed:** 2026-09-18
 **Purpose:** Small, modular source-of-truth documents for humans, ChatGPT, and Codex working on Consensus Arena.
 
 ## Current product in one paragraph
@@ -11,6 +11,26 @@ Consensus Arena is a native Tauri 2 desktop application evolving from an AI expe
 2. **Build / Delivery** — a new parallel lane whose current source can take bounded product work into an isolated Git worktree, author and freeze executable acceptance material, verify independently, repair with bounded attempts, persist owner questions, and apply only a verified candidate under strict Git preconditions. Its DSH worker prerequisite is currently materially challenged and blocks Build before admission.
 
 The long-term direction is not to turn Arena into another coding-agent platform. Arena should own **product intent, owner decisions, progression policy, and acceptance authority**, while reusing external workers, workflow engines, Git, test runners, browser/native automation, deployment tools, and other commodity infrastructure.
+
+## Milestone 05A current status
+
+The 2026-09-18 preflight adds typed research provenance to the existing
+Product OS evidence records and a canonical-checkout `HEAD`/complete-status
+snapshot around external Delivery workers. Research proposals are unverified
+until Arena records an independent verifier work-order and source metadata;
+contradicted or stale claims cannot satisfy research gates. A candidate
+working directory remains non-authoritative and is not an OS/security sandbox.
+
+The narrow real research capability proven so far is direct read-only official
+GitHub/web-source retrieval outside the Product OS runtime; the typed
+proposal/finalization seam is not yet exposed through a durable Arena command
+or founder-facing research store. The official GitHub MCP server, integrated
+web search, ECC/gstack runtime procedures, shared consultation, and non-Zen
+provider portability remain unqualified. Linux package production is proven
+through the existing Tauri path, but installation/GUI launch are not claimed;
+Windows current-SHA qualification and
+native GUI launch remain unproven. See
+`audits/product-os-transition/05A-research-runtime-release-preflight.md`.
 
 ## Reality hierarchy
 

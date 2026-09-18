@@ -29,7 +29,12 @@ pub struct OpenCodeRuntimeStatus {
 pub fn enabled() -> bool {
     std::env::var("ARENA_OPENCODE_ADAPTER")
         .ok()
-        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
 }
 
 pub fn executable() -> PathBuf {
@@ -125,7 +130,7 @@ pub struct OpenCodeExecution {
 struct PersistedOpenCodeEvidence {
     pub evidence_id: String,
     pub work_order_id: String,
-    pub root_session_id: String,
+    pub root_session_id: Option<String>,
     pub candidate_id: String,
     pub candidate_revision: u64,
     pub authority_version: String,
@@ -222,7 +227,7 @@ fn persist_evidence(
     let record = PersistedOpenCodeEvidence {
         evidence_id: evidence_id.clone(),
         work_order_id: work_order.work_order_id.clone(),
-        root_session_id: execution.root_session_id.clone(),
+        root_session_id: Some(execution.root_session_id.clone()),
         candidate_id: work_order.candidate_id.clone(),
         candidate_revision: work_order.candidate_revision,
         authority_version: work_order.authority_version.clone(),
@@ -233,7 +238,8 @@ fn persist_evidence(
         summary: if execution.protected_violation || execution.canonical_violation {
             "OpenCode result rejected by Arena protected-state checks; only sanitized failure metadata was retained.".to_string()
         } else {
-            "OpenCode completed a bounded candidate task; Arena retained only sanitized metadata.".to_string()
+            "OpenCode completed a bounded candidate task; Arena retained only sanitized metadata."
+                .to_string()
         },
     };
     std::fs::write(
@@ -241,6 +247,36 @@ fn persist_evidence(
         serde_json::to_vec_pretty(&record).map_err(|error| error.to_string())?,
     )
     .map_err(|error| format!("write OpenCode evidence: {error}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn persist_containment_failure(
+    evidence_dir: &Path,
+    work_order: &OpenCodeWorkOrder,
+    model: &str,
+) -> Result<String, String> {
+    std::fs::create_dir_all(evidence_dir)
+        .map_err(|error| format!("create OpenCode evidence directory: {error}"))?;
+    let evidence_id = format!("opencode-{}", safe_evidence_id(&work_order.work_order_id));
+    let path = evidence_dir.join(format!("{evidence_id}.json"));
+    let record = PersistedOpenCodeEvidence {
+        evidence_id: evidence_id.clone(),
+        work_order_id: work_order.work_order_id.clone(),
+        root_session_id: None,
+        candidate_id: work_order.candidate_id.clone(),
+        candidate_revision: work_order.candidate_revision,
+        authority_version: work_order.authority_version.clone(),
+        model: model.to_string(),
+        tool_count: 0,
+        protected_violation: false,
+        canonical_violation: true,
+        summary: "OpenCode execution was rejected because the canonical Arena checkout changed; only sanitized containment-failure metadata was retained.".to_string(),
+    };
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&record).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("write OpenCode containment evidence: {error}"))?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -262,6 +298,13 @@ pub async fn execute_candidate(
     if canonical_root == candidate_root {
         return Err("OpenCode candidate must not be the canonical Arena checkout".to_string());
     }
+    let canonical_before = crate::delivery::snapshot_canonical_checkout(canonical).await?;
+    if !canonical_before.status.is_empty() {
+        work_order.task_state = OpenCodeTaskState::Invalid;
+        work_order.error =
+            Some("canonical Arena checkout was not clean at worker admission".to_string());
+        return Err("canonical Arena checkout was not clean at worker admission".to_string());
+    }
     work_order.task_state = OpenCodeTaskState::Running;
     let before_head = verification::candidate_sha(candidate).await?;
     let model = model_identifier();
@@ -276,29 +319,89 @@ pub async fn execute_candidate(
         OsString::from("json"),
         OsString::from(bounded_prompt),
     ];
-    let output = dsh_worker::run_contained_command(
+    let output_result = dsh_worker::run_contained_command(
         &executable(),
         &args,
         candidate,
         Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
     )
-    .await?;
+    .await;
+    let canonical_after = crate::delivery::snapshot_canonical_checkout(canonical).await?;
+    let canonical_changed =
+        crate::delivery::canonical_checkout_changed(&canonical_before, &canonical_after);
+    let output = match output_result {
+        Ok(output) => output,
+        Err(_error) if canonical_changed => {
+            work_order.task_state = OpenCodeTaskState::Invalid;
+            let evidence_ref = persist_containment_failure(evidence_dir, work_order, &model)?;
+            work_order.evidence_ref = Some(evidence_ref.clone());
+            work_order.result_ref = Some(evidence_ref);
+            work_order.error =
+                Some("OpenCode changed the canonical Arena checkout during execution".to_string());
+            let _ = discard_candidate_changes(candidate, &before_head).await;
+            return Err(
+                "OpenCode changed the canonical Arena checkout during execution".to_string(),
+            );
+        }
+        Err(error) => return Err(error),
+    };
     if output.timed_out {
+        if canonical_changed {
+            work_order.task_state = OpenCodeTaskState::Invalid;
+            let evidence_ref = persist_containment_failure(evidence_dir, work_order, &model)?;
+            work_order.evidence_ref = Some(evidence_ref.clone());
+            work_order.result_ref = Some(evidence_ref);
+            work_order.error =
+                Some("OpenCode changed the canonical Arena checkout during execution".to_string());
+            let _ = discard_candidate_changes(candidate, &before_head).await;
+            return Err(
+                "OpenCode changed the canonical Arena checkout during execution".to_string(),
+            );
+        }
         work_order.task_state = OpenCodeTaskState::Failed;
         work_order.error = Some("OpenCode task timed out".to_string());
         return Err("OpenCode task timed out".to_string());
     }
     let (root_session_id, tool_count) = parse_run_output(&output.stdout);
     let Some(root_session_id) = root_session_id else {
+        if canonical_changed {
+            work_order.task_state = OpenCodeTaskState::Invalid;
+            let evidence_ref = persist_containment_failure(evidence_dir, work_order, &model)?;
+            work_order.evidence_ref = Some(evidence_ref.clone());
+            work_order.result_ref = Some(evidence_ref);
+            work_order.error =
+                Some("OpenCode changed the canonical Arena checkout during execution".to_string());
+            discard_candidate_changes(candidate, &before_head).await?;
+            return Err(
+                "OpenCode changed the canonical Arena checkout during execution".to_string(),
+            );
+        }
         work_order.task_state = OpenCodeTaskState::Failed;
         work_order.error = Some("OpenCode returned no correlated root session ID".to_string());
         return Err("OpenCode returned no correlated root session ID".to_string());
     };
     work_order.root_session_id = Some(root_session_id.clone());
-    if output.exit_code != Some(0) {
-        work_order.task_state = OpenCodeTaskState::Failed;
-        work_order.error = Some("OpenCode returned a non-zero exit status".to_string());
-        return Err("OpenCode returned a non-zero exit status".to_string());
+    if canonical_changed {
+        let provisional = OpenCodeExecution {
+            candidate_sha: before_head.clone(),
+            root_session_id,
+            tool_count,
+            protected_violation: false,
+            canonical_violation: true,
+            evidence_ref: String::new(),
+        };
+        let evidence_ref = persist_evidence(evidence_dir, work_order, &provisional, &model)?;
+        let execution = OpenCodeExecution {
+            evidence_ref,
+            ..provisional
+        };
+        work_order.evidence_ref = Some(execution.evidence_ref.clone());
+        work_order.result_ref = Some(execution.evidence_ref.clone());
+        work_order.task_state = OpenCodeTaskState::Invalid;
+        work_order.error =
+            Some("OpenCode changed the canonical Arena checkout during execution".to_string());
+        discard_candidate_changes(candidate, &before_head).await?;
+        return Ok(execution);
     }
     let after_head = verification::candidate_sha(candidate).await?;
     if before_head != after_head {
@@ -312,8 +415,10 @@ pub async fn execute_candidate(
         work_order.error = Some("OpenCode produced no candidate change".to_string());
         return Err("OpenCode produced no candidate change".to_string());
     }
-    let protected_violation = !verification::protected_files_unchanged(candidate, candidate_protected_before);
-    let canonical_violation = !verification::protected_files_unchanged(canonical, canonical_protected_before);
+    let protected_violation =
+        !verification::protected_files_unchanged(candidate, candidate_protected_before);
+    let canonical_violation =
+        !verification::protected_files_unchanged(canonical, canonical_protected_before);
     if protected_violation || canonical_violation {
         let provisional = OpenCodeExecution {
             candidate_sha: before_head.clone(),
@@ -338,6 +443,11 @@ pub async fn execute_candidate(
         });
         discard_candidate_changes(candidate, &before_head).await?;
         return Ok(execution);
+    }
+    if output.exit_code != Some(0) {
+        work_order.task_state = OpenCodeTaskState::Failed;
+        work_order.error = Some("OpenCode returned a non-zero exit status".to_string());
+        return Err("OpenCode returned a non-zero exit status".to_string());
     }
     git_ok(candidate, &["add", "-A"]).await?;
     let staged = git_output(candidate, &["diff", "--cached", "--quiet"]).await?;
@@ -391,7 +501,8 @@ pub fn ingest_verification(
         || receipt.profile_hash != expected_profile_hash
     {
         work_order.task_state = OpenCodeTaskState::Invalid;
-        work_order.error = Some("OpenCode result is stale or does not match the admitted identity".to_string());
+        work_order.error =
+            Some("OpenCode result is stale or does not match the admitted identity".to_string());
         return Err("OpenCode result is stale or does not match the admitted identity".to_string());
     }
     if receipt.verification_id.trim().is_empty()
@@ -399,7 +510,8 @@ pub fn ingest_verification(
         || !receipt.protected_paths_unchanged
     {
         work_order.task_state = OpenCodeTaskState::Invalid;
-        work_order.error = Some("verification receipt failed candidate/protected-state checks".to_string());
+        work_order.error =
+            Some("verification receipt failed candidate/protected-state checks".to_string());
         return Err("verification receipt failed candidate/protected-state checks".to_string());
     }
     work_order.verification_id = Some(receipt.verification_id.clone());
@@ -480,9 +592,18 @@ pub async fn run_delivery(
             verification_id: None,
             verification_status: None,
             error: None,
-            build_package_id: state.build_package.as_ref().map(|package| package.package_id.clone()),
-            build_package_revision: state.build_package.as_ref().map(|package| package.package_revision),
-            build_package_fingerprint: state.build_package.as_ref().map(|package| package.authority_fingerprint.clone()),
+            build_package_id: state
+                .build_package
+                .as_ref()
+                .map(|package| package.package_id.clone()),
+            build_package_revision: state
+                .build_package
+                .as_ref()
+                .map(|package| package.package_revision),
+            build_package_fingerprint: state
+                .build_package
+                .as_ref()
+                .map(|package| package.authority_fingerprint.clone()),
         });
     }
     if let Some(work_order) = state.work_order.as_mut() {
@@ -523,12 +644,13 @@ pub async fn run_delivery(
         .collect();
     state.acceptance_commit = Some(state.base_commit.clone());
     state.phase = DeliveryPhase::Implementing;
-    crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
+    crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+        .await?;
     let evidence_dir = match state_path.parent() {
         Some(parent) => parent.join("delivery-evidence").join(&state.session_id),
         None => return Err("delivery state path has no parent directory".to_string()),
     };
-    let execution = {
+    let execution_result = {
         let work_order = state
             .work_order
             .as_mut()
@@ -542,7 +664,23 @@ pub async fn run_delivery(
             &canonical_before,
             &evidence_dir,
         )
-        .await?
+        .await
+    };
+    let execution = match execution_result {
+        Ok(execution) => execution,
+        Err(error) => {
+            state.phase = DeliveryPhase::Failed;
+            state.last_worker_summary = Some(error);
+            crate::delivery::persist_emit(
+                app,
+                &state_path,
+                &delivery_slot,
+                &transcript,
+                &mut state,
+            )
+            .await?;
+            return Ok(state);
+        }
     };
     state.last_worker_summary = Some(format!(
         "OpenCode returned correlated evidence with {} tool call(s).",
@@ -555,7 +693,8 @@ pub async fn run_delivery(
         result_ref: execution.evidence_ref.clone(),
     });
     state.phase = DeliveryPhase::Verifying;
-    crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
+    crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+        .await?;
     let receipt = verification::verify(
         &state.session_id,
         &format!("{}/attempt/{}", state.session_id, state.attempt),
@@ -573,31 +712,48 @@ pub async fn run_delivery(
             .work_order
             .as_mut()
             .ok_or_else(|| "OpenCode work order was lost before verification".to_string())?;
-        ingest_verification(work_order, &execution.candidate_sha, &authority_version, &receipt)
+        ingest_verification(
+            work_order,
+            &execution.candidate_sha,
+            &authority_version,
+            &receipt,
+        )
     };
     if execution.protected_violation || execution.canonical_violation || ingest.is_err() {
         state.phase = DeliveryPhase::Failed;
         if let Some(work_order) = state.work_order.as_mut() {
             if work_order.error.is_none() {
-                work_order.error = Some("OpenCode candidate was rejected by Arena authority checks".to_string());
+                work_order.error =
+                    Some("OpenCode candidate was rejected by Arena authority checks".to_string());
             }
         }
-        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
+        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+            .await?;
         return Ok(state);
     }
-    let clean = git_output(&candidate, &["status", "--porcelain", "--untracked-files=all"]).await?;
-    if !clean.status.success() || !clean.stdout.is_empty() || verification::candidate_sha(&candidate).await? != execution.candidate_sha {
+    let clean = git_output(
+        &candidate,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )
+    .await?;
+    if !clean.status.success()
+        || !clean.stdout.is_empty()
+        || verification::candidate_sha(&candidate).await? != execution.candidate_sha
+    {
         state.phase = DeliveryPhase::Failed;
         if let Some(work_order) = state.work_order.as_mut() {
             work_order.task_state = OpenCodeTaskState::Invalid;
-            work_order.error = Some("candidate changed after verification; result is stale".to_string());
+            work_order.error =
+                Some("candidate changed after verification; result is stale".to_string());
         }
-        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
+        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+            .await?;
         return Ok(state);
     }
     state.candidate_commit = Some(execution.candidate_sha.clone());
     state.phase = DeliveryPhase::Verified;
-    crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state).await?;
+    crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+        .await?;
     Ok(state)
 }
 
@@ -648,7 +804,15 @@ mod tests {
         let mut order = work_order();
         advance_candidate_revision(&mut order);
         order.task_state = OpenCodeTaskState::EvidenceReady;
-        assert!(ingest_verification(&mut order, "candidate-1", "acceptance-1:profile-1", &receipt("pass", true)).is_err());
+        assert!(
+            ingest_verification(
+                &mut order,
+                "candidate-1",
+                "acceptance-1:profile-1",
+                &receipt("pass", true)
+            )
+            .is_err()
+        );
         assert_eq!(order.task_state, OpenCodeTaskState::Invalid);
     }
 
@@ -657,7 +821,10 @@ mod tests {
         let mut order = work_order();
         let mut pass = receipt("pass", false);
         pass.candidate_sha = "candidate-1".to_string();
-        assert!(ingest_verification(&mut order, "candidate-1", "acceptance-1:profile-1", &pass).is_err());
+        assert!(
+            ingest_verification(&mut order, "candidate-1", "acceptance-1:profile-1", &pass)
+                .is_err()
+        );
         assert_eq!(order.task_state, OpenCodeTaskState::Invalid);
     }
 
@@ -665,7 +832,15 @@ mod tests {
     fn cancellation_is_terminal_and_cannot_ingest_late_result() {
         let mut order = work_order();
         cancel(&mut order);
-        assert!(ingest_verification(&mut order, "candidate-1", "acceptance-1:profile-1", &receipt("pass", true)).is_err());
+        assert!(
+            ingest_verification(
+                &mut order,
+                "candidate-1",
+                "acceptance-1:profile-1",
+                &receipt("pass", true)
+            )
+            .is_err()
+        );
         assert_eq!(order.task_state, OpenCodeTaskState::Cancelled);
     }
 
@@ -709,8 +884,11 @@ mod tests {
         };
         std::fs::write(canonical.join("acceptance.txt"), b"frozen requirement\n")
             .expect("write acceptance fixture");
-        std::fs::write(canonical.join("greet.py"), b"def greet():\n    return 'before'\n")
-            .expect("write source fixture");
+        std::fs::write(
+            canonical.join("greet.py"),
+            b"def greet():\n    return 'before'\n",
+        )
+        .expect("write source fixture");
         let profile = serde_json::json!({
             "version": 1,
             "commands": [{
@@ -728,12 +906,16 @@ mod tests {
         )
         .expect("write verification profile");
         git(&canonical, &["init", "-b", "main"]);
-        git(&canonical, &["config", "user.email", "arena-test@example.invalid"]);
+        git(
+            &canonical,
+            &["config", "user.email", "arena-test@example.invalid"],
+        );
         git(&canonical, &["config", "user.name", "Consensus Arena test"]);
         git(&canonical, &["add", "."]);
         git(&canonical, &["commit", "-m", "fixture"]);
         let base = git(&canonical, &["rev-parse", "HEAD"]);
-        let canonical_acceptance = std::fs::read(canonical.join("acceptance.txt")).expect("read canonical acceptance");
+        let canonical_acceptance =
+            std::fs::read(canonical.join("acceptance.txt")).expect("read canonical acceptance");
         let evidence_root = root.join("evidence");
         let make_order = |candidate_id: &str| OpenCodeWorkOrder {
             work_order_id: format!("m05-{candidate_id}"),
@@ -760,11 +942,14 @@ mod tests {
             .await
             .expect("create attack candidate");
         let attack_profile = verification::load_profile(&attack).expect("load attack profile");
-        let attack_profile_hash = verification::profile_hash(&attack_profile).expect("hash attack profile");
-        let attack_protected = verification::protected_hashes(&attack, &attack_profile.protected_paths)
-            .expect("hash attack protected paths");
-        let canonical_protected = verification::protected_hashes(&canonical, &attack_profile.protected_paths)
-            .expect("hash canonical protected paths");
+        let attack_profile_hash =
+            verification::profile_hash(&attack_profile).expect("hash attack profile");
+        let attack_protected =
+            verification::protected_hashes(&attack, &attack_profile.protected_paths)
+                .expect("hash attack protected paths");
+        let canonical_protected =
+            verification::protected_hashes(&canonical, &attack_profile.protected_paths)
+                .expect("hash canonical protected paths");
         let mut attack_order = make_order("attack");
         attack_order.authority_version = format!("{base}:{attack_profile_hash}");
         let attack_execution = execute_candidate(
@@ -778,9 +963,14 @@ mod tests {
         )
         .await
         .expect("real OpenCode attack should return evidence");
-        assert!(attack_order.root_session_id.is_some(), "real root session identity required");
+        assert!(
+            attack_order.root_session_id.is_some(),
+            "real root session identity required"
+        );
         assert_eq!(
-            verification::candidate_sha(&attack).await.expect("read attack candidate head"),
+            verification::candidate_sha(&attack)
+                .await
+                .expect("read attack candidate head"),
             base,
             "the rejected attack must not receive an Arena-created candidate commit"
         );
@@ -790,7 +980,8 @@ mod tests {
             "the rejected candidate must be discarded after protected-state inspection"
         );
         assert_eq!(
-            std::fs::read(canonical.join("acceptance.txt")).expect("read canonical acceptance after attack"),
+            std::fs::read(canonical.join("acceptance.txt"))
+                .expect("read canonical acceptance after attack"),
             canonical_acceptance,
             "canonical Arena authority changed"
         );
@@ -821,7 +1012,15 @@ mod tests {
             .is_err(),
             "a verifier PASS after cleanup must not rescue the already-invalid protected-state result"
         );
-        git(&canonical, &["worktree", "remove", "--force", attack.to_str().expect("attack path")]);
+        git(
+            &canonical,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                attack.to_str().expect("attack path"),
+            ],
+        );
         let _ = std::fs::remove_dir_all(&attack);
 
         // Two independent roles run in parallel on disposable candidates. They
@@ -837,14 +1036,22 @@ mod tests {
             .expect("create role B candidate");
         let role_a_profile = verification::load_profile(&role_a).expect("load role A profile");
         let role_b_profile = verification::load_profile(&role_b).expect("load role B profile");
-        let role_a_protected = verification::protected_hashes(&role_a, &role_a_profile.protected_paths)
-            .expect("hash role A protected paths");
-        let role_b_protected = verification::protected_hashes(&role_b, &role_b_profile.protected_paths)
-            .expect("hash role B protected paths");
+        let role_a_protected =
+            verification::protected_hashes(&role_a, &role_a_profile.protected_paths)
+                .expect("hash role A protected paths");
+        let role_b_protected =
+            verification::protected_hashes(&role_b, &role_b_profile.protected_paths)
+                .expect("hash role B protected paths");
         let mut role_a_order = make_order("role-a");
         let mut role_b_order = make_order("role-b");
-        role_a_order.authority_version = format!("{base}:{}", verification::profile_hash(&role_a_profile).expect("role A hash"));
-        role_b_order.authority_version = format!("{base}:{}", verification::profile_hash(&role_b_profile).expect("role B hash"));
+        role_a_order.authority_version = format!(
+            "{base}:{}",
+            verification::profile_hash(&role_a_profile).expect("role A hash")
+        );
+        role_b_order.authority_version = format!(
+            "{base}:{}",
+            verification::profile_hash(&role_b_profile).expect("role B hash")
+        );
         let (role_a_result, role_b_result) = tokio::join!(
             execute_candidate(
                 &canonical,
@@ -872,21 +1079,44 @@ mod tests {
         assert_ne!(role_a_order.root_session_id, role_b_order.root_session_id);
         assert!(role_a_order.evidence_ref.is_some());
         assert!(role_b_order.evidence_ref.is_some());
-        git(&canonical, &["worktree", "remove", "--force", role_a.to_str().expect("role A path")]);
-        git(&canonical, &["worktree", "remove", "--force", role_b.to_str().expect("role B path")]);
+        git(
+            &canonical,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                role_a.to_str().expect("role A path"),
+            ],
+        );
+        git(
+            &canonical,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                role_b.to_str().expect("role B path"),
+            ],
+        );
 
         // The root/integrator role owns the only candidate that can reach the
         // existing independent verifier.
         let candidate = root.join("candidate");
-        crate::delivery::create_candidate_worktree(&canonical, &candidate, "arena-m05-normal", &base)
-            .await
-            .expect("create normal candidate");
+        crate::delivery::create_candidate_worktree(
+            &canonical,
+            &candidate,
+            "arena-m05-normal",
+            &base,
+        )
+        .await
+        .expect("create normal candidate");
         let normal_profile = verification::load_profile(&candidate).expect("load normal profile");
         let normal_hash = verification::profile_hash(&normal_profile).expect("hash normal profile");
-        let normal_protected = verification::protected_hashes(&candidate, &normal_profile.protected_paths)
-            .expect("hash normal protected paths");
-        let canonical_protected = verification::protected_hashes(&canonical, &normal_profile.protected_paths)
-            .expect("hash normal canonical protected paths");
+        let normal_protected =
+            verification::protected_hashes(&candidate, &normal_profile.protected_paths)
+                .expect("hash normal protected paths");
+        let canonical_protected =
+            verification::protected_hashes(&canonical, &normal_profile.protected_paths)
+                .expect("hash normal canonical protected paths");
         let mut normal_order = make_order("normal");
         normal_order.authority_version = format!("{base}:{normal_hash}");
         let normal_execution = execute_candidate(
@@ -923,8 +1153,20 @@ mod tests {
         )
         .expect("Arena should ingest the current passing result");
         assert_eq!(normal_order.task_state, OpenCodeTaskState::Verified);
-        assert_eq!(std::fs::read(canonical.join("acceptance.txt")).expect("read final canonical acceptance"), canonical_acceptance);
-        git(&canonical, &["worktree", "remove", "--force", candidate.to_str().expect("candidate path")]);
+        assert_eq!(
+            std::fs::read(canonical.join("acceptance.txt"))
+                .expect("read final canonical acceptance"),
+            canonical_acceptance
+        );
+        git(
+            &canonical,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                candidate.to_str().expect("candidate path"),
+            ],
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

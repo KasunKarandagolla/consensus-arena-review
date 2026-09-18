@@ -118,8 +118,25 @@ existing independent verifier. OpenCode output is evidence only: Arena
 rejects unknown, stale, cancelled, mismatched, or protected-path-violating
 results. Apply additionally re-reads the candidate HEAD and current verifier
 receipt, so a post-verification candidate edit cannot inherit PASS. The path
-is qualified only for bounded Linux candidate execution; Windows, packaging,
-and production-scale performance remain unproven.
+is qualified only for bounded Linux candidate execution. The existing Linux
+`.deb` build and metadata inspection are proven by the 05A preflight, but
+installation/launch, Windows packaging, and production-scale performance
+remain unproven.
+
+Before and after every external OpenCode/DSH candidate execution, Arena also
+records the canonical checkout `HEAD` and complete
+`git status --porcelain=v2 --untracked-files=all`. Any change to that
+canonical snapshot is a containment/authority failure: the work order is
+invalid, the candidate cannot receive an Arena-created commit, and Apply or
+Verified is unavailable. Arena does not silently reset or clean the canonical
+checkout. This is defense-in-depth detection, not a same-user filesystem
+sandbox; linked worktrees and a shared Git object store do not prevent hostile
+same-user access.
+
+Research evidence follows the same authority boundary. Worker and web/GitHub
+outputs are proposals with source references and verification state. Only a
+current Arena-owned independently verified claim can satisfy a Product OS
+research gate.
 
 The historical lock SHA256
 `1297ec9257567a85c5a653734979256e6958a2c1235079c62fdc5bb9f2505887` remains

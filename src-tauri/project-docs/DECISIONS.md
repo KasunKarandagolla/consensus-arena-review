@@ -132,6 +132,27 @@ SessionRuntime remains live lifecycle authority; Delivery remains acceptance,
 independent-verification, repair, Verified, and Safe Apply authority. The
 candidate worktree is non-authoritative and is not a security sandbox.
 
+## D-2026-18 — Research evidence requires Arena provenance and independent verification
+
+**Accepted for Milestone 05A.** Research workers and external read-only tools
+may propose claims and source references, but they cannot construct a verified
+fact or expand authority. The existing Product OS evidence records carry the
+claim origin, kind, source identity, verification disposition, contradiction
+references, verifier work-order identity, scope, and revisit trigger. Research
+gates accept only current independently verified claims with reconciled source
+metadata. Direct official-source retrieval is the current narrow proven route;
+GitHub MCP, integrated web search, consultation execution, and broad provider
+portability remain separate qualification work.
+
+## D-2026-19 — External workers must detect canonical checkout mutation
+
+**Accepted for Milestone 05A.** Arena snapshots canonical `HEAD` and complete
+Git status before and after external worker execution. Any canonical mutation
+invalidates the work order and blocks candidate commit, Verified, and Apply.
+Arena does not silently repair the canonical checkout. This is an authority
+and detection guard, not a same-user security sandbox or Git-object-store
+isolation mechanism.
+
 ---
 
 # Superseded / rejected assumptions
