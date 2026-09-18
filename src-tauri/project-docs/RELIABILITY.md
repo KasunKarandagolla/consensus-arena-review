@@ -154,6 +154,16 @@ This milestone proves the Product OS research boundary on Linux. It does not
 claim a same-user filesystem sandbox, Windows parity, package qualification,
 or a complete research-only-to-BuildPackage/Delivery gate run.
 
+## Product OS package currentness — Milestone 05C
+
+The package handoff is fail-closed: reviewed scope invalidates a previously
+adopted NarrowBuild direction; a current package requires the corresponding
+adopted Owner decision, current typed architecture/reuse/risk references, and
+the existing fingerprint/revision check. M05C proves the seven applicable
+pre-implementation gates from reopened durable authority and proves a material
+scope change returns the old package evaluation as `Stale`. It does not
+qualify Delivery execution, GUI, Windows, packaging, or same-user sandboxing.
+
 ## Verification semantics
 
 Use three outcomes conceptually:

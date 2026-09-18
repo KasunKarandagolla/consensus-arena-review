@@ -161,6 +161,10 @@ pub struct ProductAuthorityRecords {
     pub risks: Vec<String>,
     pub acceptance_scenarios: Vec<String>,
     pub decision_outcome: Option<DecisionOutcome>,
+    /// The adopted Arena owner decision that authorizes `decision_outcome`.
+    /// A bare serialized enum is never sufficient to admit a Build Package.
+    #[serde(default)]
+    pub product_direction_decision_id: Option<String>,
     pub reviewer_restatement: Option<ReviewerRestatement>,
     pub evidence: Vec<EvidenceItem>,
     pub owner_decisions: Vec<OwnerDecisionRecord>,
@@ -172,6 +176,22 @@ pub struct ProductAuthorityRecords {
     pub reuse_decisions: Vec<ReuseDecisionRecord>,
     pub architecture: ArchitectureEvidenceRecords,
     pub acceptance_profile_version: Option<u64>,
+}
+
+/// A bounded, reviewed product scope admission. This is intentionally typed
+/// rather than a raw ProductAuthorityRecords update so callers cannot smuggle
+/// gate facts or a decision outcome into authoritative state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProductScopeAdmission {
+    pub objective: String,
+    pub target_user: String,
+    pub requirements: Vec<String>,
+    pub constraints: Vec<String>,
+    pub non_goals: Vec<String>,
+    pub interfaces: Vec<String>,
+    pub risks: Vec<String>,
+    pub acceptance_scenarios: Vec<String>,
+    pub reviewer_restatement: ReviewerRestatement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,6 +233,72 @@ fn require_list(values: &[String], field: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Admit a reviewed bounded scope. A material scope update invalidates a
+/// previously adopted direction; the owner must make a new current decision.
+pub fn admit_product_scope(
+    records: &mut ProductAuthorityRecords,
+    scope: ProductScopeAdmission,
+) -> Result<(), String> {
+    non_empty(&scope.objective, "objective")?;
+    non_empty(&scope.target_user, "target user")?;
+    require_list(&scope.requirements, "requirements")?;
+    require_list(&scope.constraints, "constraints")?;
+    require_list(&scope.non_goals, "non-goals")?;
+    require_list(&scope.interfaces, "implementation interfaces")?;
+    require_list(&scope.risks, "known risks")?;
+    require_list(&scope.acceptance_scenarios, "acceptance scenarios")?;
+    non_empty(
+        &scope.reviewer_restatement.intended_outcome,
+        "reviewer restatement outcome",
+    )?;
+    non_empty(
+        &scope.reviewer_restatement.success_condition,
+        "reviewer restatement success condition",
+    )?;
+
+    records.objective = scope.objective;
+    records.target_user = scope.target_user;
+    records.requirements = scope.requirements;
+    records.constraints = scope.constraints;
+    records.non_goals = scope.non_goals;
+    records.interfaces = scope.interfaces;
+    records.risks = scope.risks;
+    records.acceptance_scenarios = scope.acceptance_scenarios;
+    records.reviewer_restatement = Some(scope.reviewer_restatement);
+    records.decision_outcome = None;
+    records.product_direction_decision_id = None;
+    records.vision_version = records.vision_version.saturating_add(1);
+    records.project_revision = records.project_revision.saturating_add(1);
+    Ok(())
+}
+
+/// Adopt an owner-approved bounded product direction. This is the only
+/// Product OS operation that can set a current NarrowBuild direction.
+pub fn adopt_product_direction(
+    records: &mut ProductAuthorityRecords,
+    selected_option: String,
+) -> Result<String, String> {
+    if selected_option.trim() != "narrow_build" {
+        return Err("Build Package admission requires the owner option narrow_build".to_string());
+    }
+    let decision_id = format!(
+        "product-direction:{}:{}",
+        records.project_id, records.project_revision
+    );
+    records.owner_decisions.push(OwnerDecisionRecord {
+        decision_id: decision_id.clone(),
+        question_id: format!("product-direction:{}", records.project_id),
+        selected_option,
+        revision: records.project_revision,
+        status: DecisionStatus::Adopted,
+        authority: DecisionAuthority::Owner,
+    });
+    records.decision_outcome = Some(DecisionOutcome::NarrowBuild);
+    records.product_direction_decision_id = Some(decision_id.clone());
+    records.project_revision = records.project_revision.saturating_add(1);
+    Ok(decision_id)
 }
 
 fn referenced_evidence<'a>(
@@ -340,7 +426,9 @@ pub fn admit_ambiguity(
     for evidence_id in &evidence_ids {
         referenced_evidence(records, evidence_id)?;
     }
-    records.ambiguities.retain(|item| item.ambiguity_id != ambiguity_id);
+    records
+        .ambiguities
+        .retain(|item| item.ambiguity_id != ambiguity_id);
     records
         .owner_required_ambiguity_ids
         .retain(|id| id != &ambiguity_id);
@@ -588,6 +676,21 @@ pub fn assemble_build_package(records: &ProductAuthorityRecords) -> Result<Build
             "only an owner-approved NarrowBuild outcome can create a Build Package".to_string(),
         );
     }
+    let direction_id = records
+        .product_direction_decision_id
+        .as_deref()
+        .ok_or_else(|| {
+            "NarrowBuild outcome lacks an Arena-adopted product direction decision".to_string()
+        })?;
+    let direction = adopted_owner_decision(records, direction_id)
+        .ok_or_else(|| "NarrowBuild outcome lacks a current owner decision".to_string())?;
+    if direction.question_id != format!("product-direction:{}", records.project_id)
+        || direction.selected_option != "narrow_build"
+    {
+        return Err(
+            "NarrowBuild outcome is not bound to the current product direction".to_string(),
+        );
+    }
 
     if records.reuse_decisions.is_empty() {
         return Err("Build Package requires reuse decisions".to_string());
@@ -812,6 +915,7 @@ mod tests {
             risks: vec!["worker output is untrusted".to_string()],
             acceptance_scenarios: vec!["candidate verifier passes".to_string()],
             decision_outcome: Some(DecisionOutcome::NarrowBuild),
+            product_direction_decision_id: Some("product-direction:project-1:1".to_string()),
             reviewer_restatement: Some(ReviewerRestatement {
                 intended_outcome: "Make the bounded candidate change".to_string(),
                 success_condition: "Verifier passes the current candidate".to_string(),
@@ -830,17 +934,27 @@ mod tests {
                 values[7].kind = Some(EvidenceKind::Dissent);
                 values
             },
-        owner_decisions: vec![OwnerDecisionRecord {
-                decision_id: "d1".to_string(),
+            owner_decisions: vec![
+                OwnerDecisionRecord {
+                    decision_id: "product-direction:project-1:1".to_string(),
+                    question_id: "product-direction:project-1".to_string(),
+                    selected_option: "narrow_build".to_string(),
+                    revision: 1,
+                    status: DecisionStatus::Adopted,
+                    authority: DecisionAuthority::Owner,
+                },
+                OwnerDecisionRecord {
+                    decision_id: "d1".to_string(),
+                    question_id: "q1".to_string(),
+                    selected_option: "proceed".to_string(),
+                    revision: 1,
+                    status: DecisionStatus::Adopted,
+                    authority: DecisionAuthority::Owner,
+                },
+            ],
+            ambiguities: vec![AuthorityAmbiguityRecord {
+                ambiguity_id: "a1".to_string(),
                 question_id: "q1".to_string(),
-                selected_option: "proceed".to_string(),
-                revision: 1,
-                status: DecisionStatus::Adopted,
-            authority: DecisionAuthority::Owner,
-        }],
-        ambiguities: vec![AuthorityAmbiguityRecord {
-            ambiguity_id: "a1".to_string(),
-            question_id: "q1".to_string(),
                 question: "Proceed?".to_string(),
                 affected_commitment: "build".to_string(),
                 severity: AmbiguitySeverity::Low,
@@ -849,11 +963,11 @@ mod tests {
                 owner_decision_id: Some("d1".to_string()),
                 mitigation: None,
                 revisit_trigger: None,
-            evidence_ids: vec!["e1".to_string()],
-            arena_admitted: true,
-            admitted_revision: 1,
-        }],
-        owner_required_ambiguity_ids: vec!["a1".to_string()],
+                evidence_ids: vec!["e1".to_string()],
+                arena_admitted: true,
+                admitted_revision: 1,
+            }],
+            owner_required_ambiguity_ids: vec!["a1".to_string()],
             reuse_decisions: vec![ReuseDecisionRecord {
                 capability: "Delivery".to_string(),
                 classification: ReuseClassification::Reuse,
@@ -933,6 +1047,41 @@ mod tests {
     }
 
     #[test]
+    fn bare_narrow_build_enum_cannot_admit_a_package() {
+        let mut records = records();
+        records.product_direction_decision_id = None;
+        assert!(assemble_build_package(&records).is_err());
+        let decision_id = adopt_product_direction(&mut records, "narrow_build".to_string())
+            .expect("owner direction");
+        assert_eq!(records.product_direction_decision_id, Some(decision_id));
+        assert!(assemble_build_package(&records).is_ok());
+    }
+
+    #[test]
+    fn material_scope_change_invalidates_adopted_direction() {
+        let mut records = records();
+        let scope = ProductScopeAdmission {
+            objective: "Changed bounded candidate".to_string(),
+            target_user: "founder".to_string(),
+            requirements: vec!["one changed requirement".to_string()],
+            constraints: vec!["no deployment".to_string()],
+            non_goals: vec!["no redesign".to_string()],
+            interfaces: vec!["existing Delivery".to_string()],
+            risks: vec!["worker output is untrusted".to_string()],
+            acceptance_scenarios: vec!["candidate verifier passes".to_string()],
+            reviewer_restatement: ReviewerRestatement {
+                intended_outcome: "Changed bounded candidate".to_string(),
+                success_condition: "Verifier passes the changed candidate".to_string(),
+                invented_behaviors: Vec::new(),
+            },
+        };
+        admit_product_scope(&mut records, scope).expect("scope admission");
+        assert_eq!(records.decision_outcome, None);
+        assert_eq!(records.product_direction_decision_id, None);
+        assert!(assemble_build_package(&records).is_err());
+    }
+
+    #[test]
     fn technical_record_cannot_satisfy_owner_required_decision() {
         let mut records = records();
         records.owner_decisions[0].authority = DecisionAuthority::Technical;
@@ -964,13 +1113,10 @@ mod tests {
         .expect("Arena admits ambiguity");
         assert_eq!(records.ambiguities[0].resolver, AmbiguityResolver::Owner);
         assert_eq!(records.project_revision, starting_revision + 1);
-        assert!(adopt_owner_decision(
-            &mut records,
-            "a2",
-            "wrong-question",
-            "proceed".to_string(),
-        )
-        .is_err());
+        assert!(
+            adopt_owner_decision(&mut records, "a2", "wrong-question", "proceed".to_string(),)
+                .is_err()
+        );
         adopt_owner_decision(&mut records, "a2", "q2", "proceed".to_string())
             .expect("current owner decision");
         assert!(assemble_build_package(&records).is_ok());

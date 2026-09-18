@@ -103,6 +103,12 @@ Arena should own the semantics that generic execution tools cannot safely infer:
 - concise product history/continuity;
 - a simple owner experience.
 
+M05C proves this ownership on an internal validation slice: source-backed
+research can survive reopen, inform a bounded product direction, and enter a
+current Build Package only through Arena-owned review, owner-decision, and
+gate operations. This is not a market-validation claim or the final
+founder-to-release experience.
+
 ## What Arena should not rebuild
 
 Prefer mature existing infrastructure for:

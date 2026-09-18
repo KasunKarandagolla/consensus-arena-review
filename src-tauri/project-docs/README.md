@@ -49,12 +49,15 @@ Arena-owned and conservatively owner-required; renderer and worker payloads
 cannot downgrade that classification. Delivery displays the resulting
 evidence/ambiguity state through the existing calm view.
 
-M06 remains **blocked** at the narrow BuildPackage-backed gate criterion: the
-real research project intentionally does not fabricate architecture, accepted
-scope, or a Build Package, so the full production seam has not yet shown a
-verified research result passing the appropriate assembled gate after reopen.
-See the permanent audit at
-`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/05B-durable-research-authority.md`.
+M05C closes the narrow BuildPackage-backed gate criterion on a clearly marked
+internal validation project: real official-source research and independent
+verification survive reopen; Arena-owned scope, review, reuse, architecture,
+and owner-direction operations assemble a current package; Vision,
+ProblemResearch, Positioning, Ambiguity, Reuse, Architecture, and
+BuildReadiness pass. A later material scope change makes the prior package and
+gate evaluation stale. This is not market validation or final founder dogfood.
+See
+`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/05C-research-buildpackage-gate-handoff.md`.
 
 ## Reality hierarchy
 
@@ -164,9 +167,9 @@ research. Existing TranscriptStore tables persist ProductAuthority records
 and Arena work orders; SessionRuntime owns the live lease. Research proposals
 are always unverified until a distinct current Arena Fact Verifier work order
 rechecks the source. Owner-required ambiguities and adopted decisions are
-bound to question IDs and authority revisions. The production seam and
-restart/reconciliation tests are proven on Linux, but the complete
-research-to-accepted-BuildPackage gate handoff remains the M06 blocker.
+bound to question IDs and authority revisions. M05C now proves the complete
+research-to-accepted-BuildPackage pre-implementation gate handoff on an
+internal Linux validation slice; final founder dogfood remains separate.
 
 The current qualification record adds a direct DeepSeek V4 Flash provider
 sanity check and a real DSH comparison. V4 Flash reached model listing but

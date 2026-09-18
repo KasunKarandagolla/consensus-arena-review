@@ -133,10 +133,13 @@ question; only an adopted owner decision for the current question and
 authority revision can resolve it.
 
 The current runtime dogfood uses direct read-only official GitHub HTTPS
-retrieval and does not claim GitHub MCP. It proves durable research authority
-on Linux, but the research-only project intentionally does not fabricate an
-accepted architecture or Build Package. The complete research-to-assembled-
-gate handoff remains the M06 admission blocker. A candidate directory and
+retrieval and does not claim GitHub MCP. M05C extends that Linux proof through
+a real internal validation project: reopened verified research, typed
+Product-Director scope/review evidence, reuse, a real bounded risk spike,
+distinct architecture proposals, adopted owner direction, current Build
+Package assembly, and pre-implementation gate evaluation. A material scope
+update invalidates the old package. This is not market validation or final
+founder dogfood. A candidate directory and
 Git worktree remain non-authoritative working locations, not OS/security
 sandboxes.
 

@@ -52,10 +52,11 @@ assuming completion. Treat ambiguity classification as Arena authority and
 require the current owner decision for the exact question/revision.
 
 The Linux dogfood uses the official GitHub API directly and records the source
-scope without claiming GitHub MCP. It proves proposal → independent verifier
-→ persisted truth, but the complete research-to-accepted-BuildPackage gate
-handoff remains blocked until it is exercised with real current Product OS
-records.
+scope without claiming GitHub MCP. M05C proves proposal → independent verifier
+→ reopened truth → typed product scope/review/reuse/architecture admission →
+owner-adopted direction → current Build Package → applicable
+pre-implementation gates. A material scope change must invalidate the old
+package rather than carry its gate result forward.
 
 ## Verification baseline
 

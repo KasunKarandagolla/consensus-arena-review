@@ -166,6 +166,17 @@ owner-required; only a current adopted owner decision bound to the exact
 question and authority revision can resolve it. This does not yet claim a
 complete durable research-to-BuildPackage gate or M06 readiness.
 
+## D-2026-21 — Build direction must bind an adopted owner decision
+
+**Accepted for Milestone 05C.** A serialized `NarrowBuild` enum cannot admit
+a Build Package by itself. Arena's typed scope admission invalidates any prior
+direction, and the only current NarrowBuild path records an adopted Owner
+decision bound to the project-direction question and authority revision.
+Product Director work orders may admit typed scope/review evidence only after
+current work-order validation; they cannot submit raw ProductAuthority records
+or gate inputs. Current architecture/reuse/risk references are assembled from
+those durable records and evaluated through the existing pure evaluator.
+
 ---
 
 # Superseded / rejected assumptions

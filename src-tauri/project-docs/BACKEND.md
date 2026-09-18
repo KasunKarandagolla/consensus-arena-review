@@ -153,6 +153,17 @@ run, acceptance SHA, candidate SHA, and frozen profile hash.
 - No `blocking_lock()` in async or browser navigation callbacks.
 - Handle poisoned sync mutexes deliberately; current code sometimes recovers via `into_inner()` where appropriate.
 
+## Product OS package handoff
+
+M05C keeps Product OS handoff backend-owned. Typed Product Director work
+orders admit reviewed scope and evidence by current project revision; reuse and
+architecture operations accept only current typed evidence references. The
+only NarrowBuild operation creates an adopted Owner decision record. The
+renderer has no raw `ProductAuthorityRecords` or `GateInput` mutation
+command. Existing `assemble_build_package()` and
+`evaluate_current_preimplementation_gates()` derive the package and gate
+facts from reopened `TranscriptStore` authority.
+
 ## Command return convention
 
 Historical project pattern: many Tauri commands return JSON-serialized strings rather than typed Tauri objects. Frontend callers must inspect the **real command signature** before deciding whether to `JSON.parse()`.

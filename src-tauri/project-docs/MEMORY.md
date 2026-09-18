@@ -43,8 +43,10 @@ authority and lifecycle records, not recalled context. Research proposals,
 source scope, verification disposition, owner-required ambiguity, and adopted
 owner decision are persisted by identity and revision; whole model
 conversations are not authority. Reopen/reconciliation is fail-closed for
-pending work. The full Product OS research-to-BuildPackage gate handoff is
-not yet runtime-qualified.
+pending work. M05C runtime-proves that reopened authority can assemble a
+Build Package and pass the applicable pre-implementation gates; a material
+scope update invalidates the prior package/direction rather than retaining
+stale truth.
 
 ## Product boundary
 
