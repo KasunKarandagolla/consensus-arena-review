@@ -12,7 +12,7 @@ Consensus Arena is a native Tauri 2 desktop application evolving from an AI expe
 
 The long-term direction is not to turn Arena into another coding-agent platform. Arena should own **product intent, owner decisions, progression policy, and acceptance authority**, while reusing external workers, workflow engines, Git, test runners, browser/native automation, deployment tools, and other commodity infrastructure.
 
-## Milestone 05A current status
+## Milestone 05A historical boundary
 
 The 2026-09-18 preflight adds typed research provenance to the existing
 Product OS evidence records and a canonical-checkout `HEAD`/complete-status
@@ -31,6 +31,30 @@ through the existing Tauri path, but installation/GUI launch are not claimed;
 Windows current-SHA qualification and
 native GUI launch remain unproven. See
 `audits/product-os-transition/05A-research-runtime-release-preflight.md`.
+
+## Milestone 05B current status
+
+Milestone 05B now admits the narrow real research path through an
+Arena-owned, durable Product OS work order. The existing `TranscriptStore`
+holds authoritative Product OS records and work-order metadata; `SessionRuntime`
+remains the live ownership authority. Researcher output is persisted only as
+unverified evidence. A distinct current Fact Verifier work order must
+independently recheck the primary source before Arena can record
+`IndependentlyVerified`.
+
+The Linux runtime dogfood survives store reopen, preserves verifier and owner
+decision identity, rejects wrong-role/cancelled/stale results, and reconciles
+pending work without fabricating completion. Ambiguity admission is
+Arena-owned and conservatively owner-required; renderer and worker payloads
+cannot downgrade that classification. Delivery displays the resulting
+evidence/ambiguity state through the existing calm view.
+
+M06 remains **blocked** at the narrow BuildPackage-backed gate criterion: the
+real research project intentionally does not fabricate architecture, accepted
+scope, or a Build Package, so the full production seam has not yet shown a
+verified research result passing the appropriate assembled gate after reopen.
+See the permanent audit at
+`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/05B-durable-research-authority.md`.
 
 ## Reality hierarchy
 
@@ -134,6 +158,15 @@ remain authoritative. The candidate directory is non-authoritative, not an OS
 or security sandbox. Windows, packaging, hostile same-user isolation, broad
 provider portability, GitHub MCP, ECC/gstack, and external consultation
 execution remain unproven.
+
+Milestone 05B extends the same authority boundary to durable Product OS
+research. Existing TranscriptStore tables persist ProductAuthority records
+and Arena work orders; SessionRuntime owns the live lease. Research proposals
+are always unverified until a distinct current Arena Fact Verifier work order
+rechecks the source. Owner-required ambiguities and adopted decisions are
+bound to question IDs and authority revisions. The production seam and
+restart/reconciliation tests are proven on Linux, but the complete
+research-to-accepted-BuildPackage gate handoff remains the M06 blocker.
 
 The current qualification record adds a direct DeepSeek V4 Flash provider
 sanity check and a real DSH comparison. V4 Flash reached model listing but

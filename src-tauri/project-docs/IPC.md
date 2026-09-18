@@ -52,6 +52,32 @@ returns a JSON-serialized string with `available`, `compatible`,
 `JSON.parse()` this command result. It does not return credentials or raw DSH
 output.
 
+### Product OS research authority
+
+The current source exposes these JSON-string commands for the bounded durable
+research seam:
+
+- `create_product_research_work_order`
+- `run_product_research_work_order`
+- `create_product_fact_verifier_work_order`
+- `run_product_fact_verifier_work_order`
+- `cancel_product_work_order`
+- `get_product_os_snapshot`
+- `get_latest_product_os_snapshot`
+- `admit_product_ambiguity`
+- `provide_product_owner_decision`
+
+All multiword arguments use the snake-case command rename convention. These
+operations validate Arena-owned work-order/project identity and persist
+sanitized records through the existing backend store. A researcher can submit
+only an unverified proposal; the renderer cannot set verification, resolver,
+authority, or gate fields. The verifier and owner-decision commands are
+semantic Arena operations, not direct ProductAuthority record mutation.
+
+The current runtime proof uses direct official GitHub HTTPS retrieval, not
+GitHub MCP. The complete research-only-to-accepted-BuildPackage gate flow is
+still pending, so these commands do not claim M06 readiness.
+
 ### Shared frontier consultation
 
 The backend `consultation` domain contract is provider-neutral at the Arena

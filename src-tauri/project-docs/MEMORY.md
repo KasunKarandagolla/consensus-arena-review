@@ -36,6 +36,16 @@ of a persisted owner question remain unproven.
 
 Read current `memory_store.rs` before relying on exact table/field schema.
 
+Milestone 05B keeps Product OS authority separate from `MemoryStore`. Current
+ProductAuthority records and research/fact-verifier work orders are persisted
+in the existing `TranscriptStore` database because they are current product
+authority and lifecycle records, not recalled context. Research proposals,
+source scope, verification disposition, owner-required ambiguity, and adopted
+owner decision are persisted by identity and revision; whole model
+conversations are not authority. Reopen/reconciliation is fail-closed for
+pending work. The full Product OS research-to-BuildPackage gate handoff is
+not yet runtime-qualified.
+
 ## Product boundary
 
 Arena memory should primarily preserve **product truth and useful continuity**, not become a generic autonomous-agent memory platform.

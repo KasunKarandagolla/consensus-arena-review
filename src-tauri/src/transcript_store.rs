@@ -57,6 +57,19 @@ impl TranscriptStore {
                 session_id TEXT PRIMARY KEY,
                 state_json TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS product_authority (
+                project_id TEXT PRIMARY KEY,
+                records_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS product_work_orders (
+                work_order_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                role TEXT NOT NULL,
+                work_order_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
             );",
             )
             .map_err(AgentError::from)
@@ -105,6 +118,160 @@ impl TranscriptStore {
             params![session_id],
         )?;
         Ok(())
+    }
+
+    pub fn save_product_authority(
+        &mut self,
+        project_id: &str,
+        records_json: &str,
+        updated_at: i64,
+    ) -> Result<(), AgentError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO product_authority (project_id, records_json, updated_at) VALUES (?1, ?2, ?3)",
+            params![project_id, records_json, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_product_authority(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<String>, AgentError> {
+        match self.conn.query_row(
+            "SELECT records_json FROM product_authority WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(SqliteError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(AgentError::from(error)),
+        }
+    }
+
+    pub fn save_product_work_order(
+        &mut self,
+        work_order: &crate::product_os::ProductWorkOrder,
+    ) -> Result<(), AgentError> {
+        let work_order_json = serde_json::to_string(work_order).map_err(|error| {
+            AgentError::DatabaseError(format!("serialize Product OS work order: {error}"))
+        })?;
+        let status = serde_json::to_string(&work_order.status)
+            .map_err(|error| AgentError::DatabaseError(format!("serialize work-order status: {error}")))?
+            .trim_matches('"')
+            .to_string();
+        let role = serde_json::to_string(&work_order.role)
+            .map_err(|error| AgentError::DatabaseError(format!("serialize work-order role: {error}")))?
+            .trim_matches('"')
+            .to_string();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO product_work_orders (work_order_id, project_id, status, role, work_order_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                work_order.work_order_id,
+                work_order.project_id,
+                status,
+                role,
+                work_order_json,
+                work_order.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_product_authority_and_work_order(
+        &mut self,
+        project_id: &str,
+        records_json: &str,
+        work_order: &crate::product_os::ProductWorkOrder,
+    ) -> Result<(), AgentError> {
+        let work_order_json = serde_json::to_string(work_order).map_err(|error| {
+            AgentError::DatabaseError(format!("serialize Product OS work order: {error}"))
+        })?;
+        let status = serde_json::to_string(&work_order.status)
+            .map_err(|error| AgentError::DatabaseError(format!("serialize work-order status: {error}")))?
+            .trim_matches('"')
+            .to_string();
+        let role = serde_json::to_string(&work_order.role)
+            .map_err(|error| AgentError::DatabaseError(format!("serialize work-order role: {error}")))?
+            .trim_matches('"')
+            .to_string();
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO product_authority (project_id, records_json, updated_at) VALUES (?1, ?2, ?3)",
+            params![project_id, records_json, work_order.updated_at],
+        )?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO product_work_orders (work_order_id, project_id, status, role, work_order_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                work_order.work_order_id,
+                work_order.project_id,
+                status,
+                role,
+                work_order_json,
+                work_order.updated_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_product_projects(&self) -> Result<Vec<String>, AgentError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT project_id FROM product_authority ORDER BY project_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut projects = Vec::new();
+        for row in rows {
+            projects.push(row.map_err(AgentError::from)?);
+        }
+        Ok(projects)
+    }
+
+    pub fn get_latest_product_project(&self) -> Result<Option<String>, AgentError> {
+        match self.conn.query_row(
+            "SELECT project_id FROM product_authority ORDER BY updated_at DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(SqliteError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(AgentError::from(error)),
+        }
+    }
+
+    pub fn get_product_work_order(
+        &self,
+        work_order_id: &str,
+    ) -> Result<Option<crate::product_os::ProductWorkOrder>, AgentError> {
+        match self.conn.query_row(
+            "SELECT work_order_json FROM product_work_orders WHERE work_order_id = ?1",
+            params![work_order_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(raw) => serde_json::from_str(&raw).map(Some).map_err(|error| {
+                AgentError::DatabaseError(format!("parse Product OS work order: {error}"))
+            }),
+            Err(SqliteError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(AgentError::from(error)),
+        }
+    }
+
+    pub fn list_product_work_orders(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<crate::product_os::ProductWorkOrder>, AgentError> {
+        let mut statement = self.conn.prepare(
+            "SELECT work_order_json FROM product_work_orders WHERE project_id = ?1 ORDER BY updated_at, work_order_id",
+        )?;
+        let rows = statement.query_map(params![project_id], |row| row.get::<_, String>(0))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let raw = row.map_err(AgentError::from)?;
+            let value = serde_json::from_str(&raw).map_err(|error| {
+                AgentError::DatabaseError(format!("parse Product OS work order: {error}"))
+            })?;
+            result.push(value);
+        }
+        Ok(result)
     }
 
     pub fn create_session(&mut self, config: &SessionConfig) -> Result<(), AgentError> {

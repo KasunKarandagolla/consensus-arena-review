@@ -153,6 +153,19 @@ Arena does not silently repair the canonical checkout. This is an authority
 and detection guard, not a same-user security sandbox or Git-object-store
 isolation mechanism.
 
+## D-2026-20 — Durable research authority composes existing stores and runtime
+
+**Accepted for Milestone 05B.** Research and fact-verification tasks use one
+Arena-owned Product OS work-order record persisted in the existing
+`TranscriptStore` database; live ownership remains `SessionRuntime`. Research
+workers submit only sanitized unverified proposals. Arena resolves a distinct
+current Fact Verifier work order before adopting an independent verification
+disposition. Unknown, wrong-role, cancelled, stale, superseded, or mismatched
+results fail closed. Ambiguity classification is Arena-owned and defaults to
+owner-required; only a current adopted owner decision bound to the exact
+question and authority revision can resolve it. This does not yet claim a
+complete durable research-to-BuildPackage gate or M06 readiness.
+
 ---
 
 # Superseded / rejected assumptions

@@ -46,6 +46,8 @@ pub enum AmbiguityResolver {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthorityAmbiguityRecord {
     pub ambiguity_id: String,
+    #[serde(default)]
+    pub question_id: String,
     pub question: String,
     pub affected_commitment: String,
     pub severity: AmbiguitySeverity,
@@ -55,6 +57,57 @@ pub struct AuthorityAmbiguityRecord {
     pub mitigation: Option<String>,
     pub revisit_trigger: Option<String>,
     pub evidence_ids: Vec<String>,
+    /// Only Arena's admission path may set this marker. A serialized record
+    /// without it is not allowed to satisfy an owner-authority gate.
+    #[serde(default)]
+    pub arena_admitted: bool,
+    #[serde(default)]
+    pub admitted_revision: u64,
+}
+
+/// The small set of Product OS work-order roles needed by research. This is
+/// deliberately not a general role/capability framework.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductWorkOrderRole {
+    Researcher,
+    FactVerifier,
+    ProductDirector,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductWorkOrderStatus {
+    Admitted,
+    Running,
+    Completed,
+    Cancelled,
+    Superseded,
+    Failed,
+    ReconciliationRequired,
+}
+
+/// Durable metadata for an Arena-owned Product OS task. The live process
+/// lease remains SessionRuntime's responsibility; this record is the restart
+/// and result-correlation boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProductWorkOrder {
+    pub work_order_id: String,
+    pub project_id: String,
+    pub session_id: String,
+    pub run_generation: u64,
+    pub role: ProductWorkOrderRole,
+    pub status: ProductWorkOrderStatus,
+    pub project_revision: u64,
+    pub question: Option<String>,
+    pub source_ref: Option<String>,
+    pub parent_work_order_id: Option<String>,
+    pub evidence_id: Option<String>,
+    pub result_ref: Option<String>,
+    pub cancellation_reason: Option<String>,
+    pub superseded_by: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,6 +165,10 @@ pub struct ProductAuthorityRecords {
     pub evidence: Vec<EvidenceItem>,
     pub owner_decisions: Vec<OwnerDecisionRecord>,
     pub ambiguities: Vec<AuthorityAmbiguityRecord>,
+    /// Arena-owned classification memory. A caller changing the serialized
+    /// resolver field cannot remove an owner gate through a worker payload.
+    #[serde(default)]
+    pub owner_required_ambiguity_ids: Vec<String>,
     pub reuse_decisions: Vec<ReuseDecisionRecord>,
     pub architecture: ArchitectureEvidenceRecords,
     pub acceptance_profile_version: Option<u64>,
@@ -211,24 +268,150 @@ fn adopted_owner_decision<'a>(
 }
 
 fn validate_owner_ambiguities(records: &ProductAuthorityRecords) -> Result<(), String> {
+    for ambiguity_id in &records.owner_required_ambiguity_ids {
+        let ambiguity = records
+            .ambiguities
+            .iter()
+            .find(|item| item.ambiguity_id == *ambiguity_id)
+            .ok_or_else(|| format!("owner-required ambiguity is missing: {ambiguity_id}"))?;
+        if ambiguity.resolver != AmbiguityResolver::Owner || !ambiguity.arena_admitted {
+            return Err(format!(
+                "owner-required ambiguity classification was weakened: {}",
+                ambiguity.ambiguity_id
+            ));
+        }
+        let decision_id = ambiguity.owner_decision_id.as_deref().ok_or_else(|| {
+            format!(
+                "owner-required ambiguity lacks a decision record: {}",
+                ambiguity.ambiguity_id
+            )
+        })?;
+        let decision = adopted_owner_decision(records, decision_id);
+        if decision.is_none_or(|decision| {
+            decision.question_id != ambiguity.question_id
+                || decision.revision != ambiguity.admitted_revision
+                || ambiguity.status != AmbiguityStatus::Resolved
+        }) {
+            return Err(format!(
+                "owner-required ambiguity lacks a current adopted decision: {}",
+                ambiguity.ambiguity_id
+            ));
+        }
+    }
     for ambiguity in &records.ambiguities {
-        if ambiguity.resolver == AmbiguityResolver::Owner {
-            let decision_id = ambiguity.owner_decision_id.as_deref().ok_or_else(|| {
-                format!(
-                    "owner-required ambiguity lacks a decision record: {}",
-                    ambiguity.ambiguity_id
-                )
-            })?;
-            if adopted_owner_decision(records, decision_id).is_none() {
-                return Err(format!(
-                    "owner-required ambiguity lacks a current adopted decision: {}",
-                    ambiguity.ambiguity_id
-                ));
-            }
+        if ambiguity.resolver == AmbiguityResolver::Owner
+            && !records
+                .owner_required_ambiguity_ids
+                .iter()
+                .any(|id| id == &ambiguity.ambiguity_id)
+        {
+            return Err(format!(
+                "owner-required ambiguity lacks Arena classification: {}",
+                ambiguity.ambiguity_id
+            ));
         }
         referenced_many(records, &ambiguity.evidence_ids)?;
     }
     Ok(())
+}
+
+/// Admit an ambiguity proposal through Arena. The caller's resolver
+/// classification is intentionally ignored: uncertain ambiguity is
+/// conservative owner-required authority, not an agent-controlled field.
+pub fn admit_ambiguity(
+    records: &mut ProductAuthorityRecords,
+    ambiguity_id: String,
+    question_id: String,
+    question: String,
+    affected_commitment: String,
+    severity: AmbiguitySeverity,
+    evidence_ids: Vec<String>,
+) -> Result<(), String> {
+    if ambiguity_id.trim().is_empty()
+        || question_id.trim().is_empty()
+        || question.trim().is_empty()
+        || affected_commitment.trim().is_empty()
+    {
+        return Err("ambiguity admission requires identity, question, and commitment".to_string());
+    }
+    if evidence_ids.iter().any(|id| id.trim().is_empty()) {
+        return Err("ambiguity evidence references must be non-empty".to_string());
+    }
+    for evidence_id in &evidence_ids {
+        referenced_evidence(records, evidence_id)?;
+    }
+    records.ambiguities.retain(|item| item.ambiguity_id != ambiguity_id);
+    records
+        .owner_required_ambiguity_ids
+        .retain(|id| id != &ambiguity_id);
+    let admitted_revision = records.project_revision.saturating_add(1);
+    records.ambiguities.push(AuthorityAmbiguityRecord {
+        ambiguity_id,
+        question_id,
+        question,
+        affected_commitment,
+        severity,
+        status: AmbiguityStatus::Open,
+        resolver: AmbiguityResolver::Owner,
+        owner_decision_id: None,
+        mitigation: None,
+        revisit_trigger: None,
+        evidence_ids,
+        arena_admitted: true,
+        admitted_revision,
+    });
+    records.owner_required_ambiguity_ids.push(
+        records
+            .ambiguities
+            .last()
+            .map(|item| item.ambiguity_id.clone())
+            .ok_or_else(|| "ambiguity admission failed".to_string())?,
+    );
+    records.project_revision = records.project_revision.saturating_add(1);
+    Ok(())
+}
+
+/// Adopt a human owner decision against the exact current admitted question.
+/// Renderer payloads do not carry authority/status fields into this function.
+pub fn adopt_owner_decision(
+    records: &mut ProductAuthorityRecords,
+    ambiguity_id: &str,
+    question_id: &str,
+    selected_option: String,
+) -> Result<String, String> {
+    if selected_option.trim().is_empty() {
+        return Err("owner decision requires a selected option".to_string());
+    }
+    let ambiguity_index = records
+        .ambiguities
+        .iter()
+        .position(|item| item.ambiguity_id == ambiguity_id)
+        .ok_or_else(|| "owner ambiguity is unknown".to_string())?;
+    let ambiguity = &records.ambiguities[ambiguity_index];
+    if !ambiguity.arena_admitted
+        || ambiguity.resolver != AmbiguityResolver::Owner
+        || ambiguity.question_id != question_id
+        || ambiguity.status != AmbiguityStatus::Open
+        || records.project_revision != ambiguity.admitted_revision
+    {
+        return Err("owner decision is stale, mismatched, or not owner-required".to_string());
+    }
+    let decision_id = format!("{ambiguity_id}:owner-decision:{}", records.project_revision);
+    let admitted_revision = ambiguity.admitted_revision;
+    records.owner_decisions.push(OwnerDecisionRecord {
+        decision_id: decision_id.clone(),
+        question_id: question_id.to_string(),
+        selected_option,
+        revision: admitted_revision,
+        status: DecisionStatus::Adopted,
+        authority: DecisionAuthority::Owner,
+    });
+    if let Some(ambiguity) = records.ambiguities.get_mut(ambiguity_index) {
+        ambiguity.owner_decision_id = Some(decision_id.clone());
+        ambiguity.status = AmbiguityStatus::Resolved;
+    }
+    records.project_revision = records.project_revision.saturating_add(1);
+    Ok(decision_id)
 }
 
 fn validate_architecture(records: &ProductAuthorityRecords) -> Result<Vec<String>, String> {
@@ -336,10 +519,15 @@ pub fn submit_research_proposal(
     }
     proposal.current = true;
     proposal.verification = Some(EvidenceVerification::Unverified);
-    records
+    if records
         .evidence
-        .retain(|item| item.evidence_id != proposal.evidence_id);
+        .iter()
+        .any(|item| item.evidence_id == proposal.evidence_id && item.current)
+    {
+        return Err("current research evidence identity already exists".to_string());
+    }
     records.evidence.push(proposal);
+    records.project_revision = records.project_revision.saturating_add(1);
     Ok(())
 }
 
@@ -483,7 +671,10 @@ fn input_for_records(
             status: ambiguity.status,
             mitigation: ambiguity.mitigation.clone(),
             revisit_trigger: ambiguity.revisit_trigger.clone(),
-            owner_decision_required: ambiguity.resolver == AmbiguityResolver::Owner,
+            owner_decision_required: records
+                .owner_required_ambiguity_ids
+                .iter()
+                .any(|id| id == &ambiguity.ambiguity_id),
             owner_decision_recorded: ambiguity
                 .owner_decision_id
                 .as_deref()
@@ -639,16 +830,17 @@ mod tests {
                 values[7].kind = Some(EvidenceKind::Dissent);
                 values
             },
-            owner_decisions: vec![OwnerDecisionRecord {
+        owner_decisions: vec![OwnerDecisionRecord {
                 decision_id: "d1".to_string(),
                 question_id: "q1".to_string(),
                 selected_option: "proceed".to_string(),
                 revision: 1,
                 status: DecisionStatus::Adopted,
-                authority: DecisionAuthority::Owner,
-            }],
-            ambiguities: vec![AuthorityAmbiguityRecord {
-                ambiguity_id: "a1".to_string(),
+            authority: DecisionAuthority::Owner,
+        }],
+        ambiguities: vec![AuthorityAmbiguityRecord {
+            ambiguity_id: "a1".to_string(),
+            question_id: "q1".to_string(),
                 question: "Proceed?".to_string(),
                 affected_commitment: "build".to_string(),
                 severity: AmbiguitySeverity::Low,
@@ -657,8 +849,11 @@ mod tests {
                 owner_decision_id: Some("d1".to_string()),
                 mitigation: None,
                 revisit_trigger: None,
-                evidence_ids: vec!["e1".to_string()],
-            }],
+            evidence_ids: vec!["e1".to_string()],
+            arena_admitted: true,
+            admitted_revision: 1,
+        }],
+        owner_required_ambiguity_ids: vec!["a1".to_string()],
             reuse_decisions: vec![ReuseDecisionRecord {
                 capability: "Delivery".to_string(),
                 classification: ReuseClassification::Reuse,
@@ -742,6 +937,43 @@ mod tests {
         let mut records = records();
         records.owner_decisions[0].authority = DecisionAuthority::Technical;
         assert!(assemble_build_package(&records).is_err());
+    }
+
+    #[test]
+    fn owner_required_ambiguity_cannot_be_downgraded_in_a_payload() {
+        let mut records = records();
+        records.ambiguities[0].resolver = AmbiguityResolver::Technical;
+        assert!(assemble_build_package(&records).is_err());
+    }
+
+    #[test]
+    fn arena_ambiguity_admission_forces_owner_and_binds_decision() {
+        let mut records = records();
+        records.ambiguities.clear();
+        records.owner_required_ambiguity_ids.clear();
+        let starting_revision = records.project_revision;
+        admit_ambiguity(
+            &mut records,
+            "a2".to_string(),
+            "q2".to_string(),
+            "Which option?".to_string(),
+            "build".to_string(),
+            AmbiguitySeverity::High,
+            vec!["e1".to_string()],
+        )
+        .expect("Arena admits ambiguity");
+        assert_eq!(records.ambiguities[0].resolver, AmbiguityResolver::Owner);
+        assert_eq!(records.project_revision, starting_revision + 1);
+        assert!(adopt_owner_decision(
+            &mut records,
+            "a2",
+            "wrong-question",
+            "proceed".to_string(),
+        )
+        .is_err());
+        adopt_owner_decision(&mut records, "a2", "q2", "proceed".to_string())
+            .expect("current owner decision");
+        assert!(assemble_build_package(&records).is_ok());
     }
 
     #[test]

@@ -126,6 +126,34 @@ Output-reader failure is an error, never an empty/clean status. Killing the
 direct Git process is not proof that hooks/helpers or other descendants have
 terminated; native Windows process-tree qualification remains open.
 
+## Product OS research authority invariants — Milestone 05B
+
+### RESEARCHPROPOSAL
+Researcher output enters Product OS only through Arena admission and is forced
+to current `ResearchClaim` + `Unverified`. It cannot self-declare a verified
+fact or write accepted authority directly.
+
+### FACTVERIFIER
+Finalization requires a distinct current Arena Fact Verifier work order in the
+same project, source scope, authority revision, and lifecycle. Unknown,
+wrong-role, cancelled, stale, superseded, or mismatched work fails closed.
+
+### OWNERAMBIGUITY
+Ambiguity admission is Arena-owned and conservatively owner-required. A
+serialized resolver value or worker recommendation cannot downgrade the
+Arena-owned classification. Only an adopted owner decision for the exact
+question and admission revision can resolve it.
+
+### PRODUCTRESTART
+Product OS records and work-order metadata are persisted in the existing
+`TranscriptStore`. On reopen, persisted work without a live `SessionRuntime`
+lease becomes `ReconciliationRequired`; no completion or evidence adoption is
+fabricated. A late result cannot attach to a cancelled or stale record.
+
+This milestone proves the Product OS research boundary on Linux. It does not
+claim a same-user filesystem sandbox, Windows parity, package qualification,
+or a complete research-only-to-BuildPackage/Delivery gate run.
+
 ## Verification semantics
 
 Use three outcomes conceptually:

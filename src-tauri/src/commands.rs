@@ -76,6 +76,23 @@ pub(crate) fn configured_credentials(
     Ok(secrets)
 }
 
+async fn product_os_safe_text(
+    value: String,
+    state: &AppState,
+) -> Result<String, String> {
+    let (secrets, storage_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !storage_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    Ok(redact_saved_credentials(&value, &secrets))
+}
+
 async fn diagnostic_credentials(state: &AppState) -> Result<Vec<String>, String> {
     let store = state.settings_store.lock().await;
     if !store.credential_storage_available() || store.credential_migration_pending() {
@@ -617,6 +634,179 @@ pub async fn start_delivery(
 pub async fn get_delivery_state(state: tauri::State<'_, AppState>) -> Result<String, String> {
     serde_json::to_string(&read_delivery_state(state.inner()).await?)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn create_product_research_work_order(
+    project_id: String,
+    question: String,
+    source_url: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let question = product_os_safe_text(question, state.inner()).await?;
+    let source_url = product_os_safe_text(source_url, state.inner()).await?;
+    let order = crate::product_os_runtime::create_research_work_order(
+        state.transcript_store.clone(),
+        project_id,
+        question,
+        source_url,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_product_research_work_order(
+    work_order_id: String,
+    source_url: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let source_url = product_os_safe_text(source_url, state.inner()).await?;
+    let order = crate::product_os_runtime::run_research_work_order(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        work_order_id,
+        source_url,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn create_product_fact_verifier_work_order(
+    project_id: String,
+    evidence_id: String,
+    source_url: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let evidence_id = product_os_safe_text(evidence_id, state.inner()).await?;
+    let source_url = product_os_safe_text(source_url, state.inner()).await?;
+    let order = crate::product_os_runtime::create_fact_verifier_work_order(
+        state.transcript_store.clone(),
+        project_id,
+        evidence_id,
+        source_url,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_product_fact_verifier_work_order(
+    work_order_id: String,
+    source_url: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let source_url = product_os_safe_text(source_url, state.inner()).await?;
+    let order = crate::product_os_runtime::run_fact_verifier_work_order(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        work_order_id,
+        source_url,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn cancel_product_work_order(
+    work_order_id: String,
+    reason: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let reason = product_os_safe_text(reason, state.inner()).await?;
+    let order = crate::product_os_runtime::cancel_product_work_order(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        work_order_id,
+        reason,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_product_os_snapshot(
+    project_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let snapshot = crate::product_os_runtime::snapshot(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        project_id,
+    )
+    .await?;
+    serde_json::to_string(&snapshot).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_latest_product_os_snapshot(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let snapshot = crate::product_os_runtime::latest_snapshot(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+    )
+    .await?;
+    serde_json::to_string(&snapshot).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn admit_product_ambiguity(
+    project_id: String,
+    work_order_id: String,
+    ambiguity_id: String,
+    question_id: String,
+    question: String,
+    affected_commitment: String,
+    severity: crate::evidence_gates::AmbiguitySeverity,
+    evidence_ids: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let ambiguity_id = product_os_safe_text(ambiguity_id, state.inner()).await?;
+    let question_id = product_os_safe_text(question_id, state.inner()).await?;
+    let question = product_os_safe_text(question, state.inner()).await?;
+    let affected_commitment = product_os_safe_text(affected_commitment, state.inner()).await?;
+    let ambiguity = crate::product_os_runtime::admit_ambiguity(
+        state.transcript_store.clone(),
+        project_id,
+        work_order_id,
+        ambiguity_id,
+        question_id,
+        question,
+        affected_commitment,
+        severity,
+        evidence_ids,
+    )
+    .await?;
+    serde_json::to_string(&ambiguity).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn provide_product_owner_decision(
+    project_id: String,
+    ambiguity_id: String,
+    question_id: String,
+    selected_option: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let ambiguity_id = product_os_safe_text(ambiguity_id, state.inner()).await?;
+    let question_id = product_os_safe_text(question_id, state.inner()).await?;
+    let selected_option = product_os_safe_text(selected_option, state.inner()).await?;
+    let records = crate::product_os_runtime::adopt_owner_decision(
+        state.transcript_store.clone(),
+        project_id,
+        ambiguity_id,
+        question_id,
+        selected_option,
+    )
+    .await?;
+    serde_json::to_string(&records).map_err(|error| error.to_string())
 }
 
 #[tauri::command]

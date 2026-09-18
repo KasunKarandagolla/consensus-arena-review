@@ -36,6 +36,15 @@ consultation output is evidence only after Arena correlates it with the
 current project/work-order authority; it cannot expand disclosure, acceptance,
 verification, or release authority.
 
+The current durable research seam now follows that rule in runtime: an
+Arena-admitted researcher produces an unverified proposal, and a distinct
+Arena fact-verifier work order must independently check the primary source
+before the claim can become verified. Owner-required ambiguities are admitted
+by Arena and resolved only by a current adopted owner decision bound to the
+question and authority revision. This Linux proof uses direct official
+GitHub HTTPS retrieval; it does not claim GitHub MCP or broad provider
+portability.
+
 ## Two product lanes
 
 ### Consult

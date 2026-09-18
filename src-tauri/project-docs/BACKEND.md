@@ -86,6 +86,21 @@ Consult-only transport. Key historical constraints remain:
 
 The project has disk-backed stores for settings, transcripts, blueprint/session data, and memory. DB work that can block must remain off the async runtime using the project's established blocking helper pattern.
 
+Milestone 05B reuses `TranscriptStore` for the durable Product OS boundary.
+Its `product_authority` and `product_work_orders` tables persist the current
+authority snapshot and the small research/verifier work-order record. This is
+not a second database or event log. The live task lease, cancellation, and
+run-generation checks remain in `SessionRuntime`; reopen marks an unexplained
+persisted `Running` order as `ReconciliationRequired` rather than completing
+it.
+
+The runtime module admits a bounded official GitHub metadata query, persists a
+sanitized `Unverified` proposal, and requires a distinct current Fact Verifier
+work order before finalization. Product OS commands expose admission,
+execution, cancellation, snapshot, ambiguity, and owner-decision operations;
+they do not expose direct mutation of ProductAuthority records. Full
+research-to-BuildPackage/Delivery admission is not yet runtime-qualified.
+
 ### Memory
 
 Phase 1 memory is implemented, not merely a future specification. The

@@ -104,6 +104,42 @@ The owner-facing Delivery view adds only a calm four-step summary — Intent,
 Build, Verify, Apply. Technical evidence remains progressively disclosed by
 the existing Delivery details rather than becoming the primary experience.
 
+### Durable Product OS research — Milestone 05B
+
+Research now enters the product boundary through one Arena-owned work-order
+seam, not through direct worker writes:
+
+```text
+Arena admits Researcher work order
+              ↓
+bounded primary-source retrieval
+              ↓
+current ProductAuthority record: ResearchClaim / Unverified
+              ↓
+Arena admits distinct FactVerifier work order
+              ↓
+independent source check + source scope
+              ↓
+IndependentlyVerified / Contradicted / Unresolved
+              ↓
+restart-safe Product OS snapshot and gate input
+```
+
+`TranscriptStore` is the durable home for Product OS records and work-order
+metadata. `SessionRuntime` remains the live ownership and cancellation
+authority. Unknown, wrong-role, cancelled, stale, superseded, and mismatched
+results fail closed. Ambiguity admission forces an Arena-owned owner-required
+question; only an adopted owner decision for the current question and
+authority revision can resolve it.
+
+The current runtime dogfood uses direct read-only official GitHub HTTPS
+retrieval and does not claim GitHub MCP. It proves durable research authority
+on Linux, but the research-only project intentionally does not fabricate an
+accepted architecture or Build Package. The complete research-to-assembled-
+gate handoff remains the M06 admission blocker. A candidate directory and
+Git worktree remain non-authoritative working locations, not OS/security
+sandboxes.
+
 ## Durable state ownership
 
 ### Arena owns

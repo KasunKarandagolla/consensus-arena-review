@@ -43,6 +43,20 @@ identity and verification disposition. GitHub MCP, browser/search MCP, and
 upstream skill procedures remain optional integrations until their actual
 runtime and permission boundaries are qualified.
 
+Milestone 05B makes that proposal path durable without adding a workflow
+engine. Admit research and fact-verification through the existing
+`SessionRuntime` identity and persist the current Product OS snapshot and
+work-order metadata in `TranscriptStore`. Verify that a proposal is still
+current before adopting it; after reopen, reconcile pending work rather than
+assuming completion. Treat ambiguity classification as Arena authority and
+require the current owner decision for the exact question/revision.
+
+The Linux dogfood uses the official GitHub API directly and records the source
+scope without claiming GitHub MCP. It proves proposal → independent verifier
+→ persisted truth, but the complete research-to-accepted-BuildPackage gate
+handoff remains blocked until it is exercised with real current Product OS
+records.
+
 ## Verification baseline
 
 Typical checks:

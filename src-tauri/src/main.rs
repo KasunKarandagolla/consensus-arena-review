@@ -26,6 +26,7 @@ mod memory_store;
 mod orchestrator;
 mod opencode_adapter;
 pub mod product_os;
+mod product_os_runtime;
 mod persona_manager;
 mod pipeline_ids;
 mod proxy_manager;
@@ -128,6 +129,15 @@ fn main() {
             commands::get_dsh_prerequisite,
             commands::get_delivery_state,
             commands::get_delivery_recovery_state,
+            commands::create_product_research_work_order,
+            commands::run_product_research_work_order,
+            commands::create_product_fact_verifier_work_order,
+            commands::run_product_fact_verifier_work_order,
+            commands::cancel_product_work_order,
+            commands::get_product_os_snapshot,
+            commands::get_latest_product_os_snapshot,
+            commands::admit_product_ambiguity,
+            commands::provide_product_owner_decision,
             commands::resume_delivery,
             commands::abort_delivery,
             commands::apply_delivery,
