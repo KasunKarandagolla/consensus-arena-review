@@ -59,6 +59,14 @@ gate evaluation stale. This is not market validation or final founder dogfood.
 See
 `/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/05C-research-buildpackage-gate-handoff.md`.
 
+M05D then blocked M06's broader web-discovery prerequisite. The installed
+OpenCode 1.17.18 Zen free-tier path now returns HTTP 426 before model/tool
+execution because that provider requires OpenCode 1.18.0 or newer. Arena must
+not manually relay web results into Product OS evidence. No upgrade, provider
+substitution, credential request, or search-service addition was authorized;
+see
+`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/05D-durable-web-research.md`.
+
 ## Reality hierarchy
 
 When sources disagree, use this order:

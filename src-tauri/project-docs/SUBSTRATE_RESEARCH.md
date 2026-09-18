@@ -115,6 +115,17 @@ out without a session/tool result. These observations do not widen the
 qualification and do not justify requesting NVIDIA credentials. Historical
 NVIDIA/DSH evidence is separate legacy-worker evidence.
 
+### M05D current web-discovery blocker
+
+On 2026-09-19, a bounded model-backed websearch probe using the same installed
+OpenCode 1.17.18 and Muse Zen model was rejected by the configured free tier
+with HTTP 426: OpenCode 1.18.0 or newer is now required. The SDK exposes
+websearch/webfetch permission types, but no real web tool call occurred and
+therefore no web-search capability is qualified. Do not upgrade the runtime,
+substitute a provider, request a key, or manually relay web research without a
+separate owner-authorized and requalified experiment. M06 remains blocked on
+autonomous durable web discovery.
+
 ### Milestone 05A research/release preflight
 
 The first narrow real research route is direct read-only retrieval from the

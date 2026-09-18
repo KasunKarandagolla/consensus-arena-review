@@ -58,6 +58,11 @@ owner-adopted direction → current Build Package → applicable
 pre-implementation gates. A material scope change must invalidate the old
 package rather than carry its gate result forward.
 
+M05D blocks M06 until a permitted, requalified autonomous web-search runtime
+can actually execute. A provider rejection before a web tool call is not
+evidence for search, verification, permissions, or prompt-injection handling.
+Do not manually relay browser/chat research into Product OS records.
+
 ## Verification baseline
 
 Typical checks:
