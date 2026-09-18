@@ -106,6 +106,13 @@ GitHub-MCP, frontier-consultation, Windows, or packaged GUI qualification.
   The direct GitHub/web retrieval observed in this preflight therefore does
   not yet constitute an Arena-produced durable research package. This is the
   primary M06 blocker.
+- The finalization helper records a verifier work-order ID and disposition but
+  does not yet resolve that ID against live `SessionRuntime` role,
+  cancellation, supersession, or primary-source inspection. The existing
+  ambiguity record also needs an Arena-owned admission seam so an owner-
+  required question cannot be downgraded by changing caller-supplied resolver
+  fields. These are authority-integration blockers, not reasons to weaken the
+  pure evaluator.
 - Official GitHub MCP runtime use, repository search through MCP, and MCP
   permission enforcement are unproven because no MCP server is configured.
   Direct public GitHub retrieval proves a narrow research capability, not MCP
