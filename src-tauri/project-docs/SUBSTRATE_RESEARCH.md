@@ -77,8 +77,9 @@ Gate testing found Arena-critical defects for the required path:
 The 2026-09-17 qualification closure proved that the installed Linux
 OpenCode control plane can execute real OpenCode Zen work. The subsequent
 Milestone 02 authority-adapter exercise proved the required composition for
-bounded candidate work. The pinned local binary is `1.17.18` (SHA256 recorded
-in `audits/product-os-transition/01-runtime-provider-foundation.md`). The
+bounded candidate work. An owner-authorized same-install-method upgrade now
+pins the local binary at `1.18.31` (the earlier SHA256 is recorded in
+`audits/product-os-transition/01-runtime-provider-foundation.md`). The
 tested primary model was `opencode/muse-spark-1.2-contributor-free`; Big
 Pickle was not needed.
 
@@ -106,7 +107,7 @@ already-available Zen path executed the real model work and the blocker was
 authority composition, which is now bounded by Arena.
 
 Provider portability remains a separate, unproven claim. The current runtime
-qualification covers only Linux OpenCode 1.17.18 with OpenCode Zen and
+qualification covers only Linux OpenCode 1.18.31 with OpenCode Zen and
 `opencode/muse-spark-1.2-contributor-free` behind the Arena adapter. A bounded
 Gemini attempt (`google/gemini-2.5-flash`, unavailable to new users) and a
 current Gemini attempt (`google/gemini-3.6-flash`, timed out) did not execute a
@@ -115,16 +116,28 @@ out without a session/tool result. These observations do not widen the
 qualification and do not justify requesting NVIDIA credentials. Historical
 NVIDIA/DSH evidence is separate legacy-worker evidence.
 
-### M05D current web-discovery blocker
+### M05D current web-discovery qualification
 
-On 2026-09-19, a bounded model-backed websearch probe using the same installed
-OpenCode 1.17.18 and Muse Zen model was rejected by the configured free tier
-with HTTP 426: OpenCode 1.18.0 or newer is now required. The SDK exposes
-websearch/webfetch permission types, but no real web tool call occurred and
-therefore no web-search capability is qualified. Do not upgrade the runtime,
-substitute a provider, request a key, or manually relay web research without a
-separate owner-authorized and requalified experiment. M06 remains blocked on
-autonomous durable web discovery.
+An owner-authorized pinned upgrade moved the existing curl-installed OpenCode
+binary from `1.17.18` to `1.18.31` without changing its executable path,
+configuration, provider, or session data. Muse Spark then executed real
+`websearch` through the hosted `exa` path and returned a public source URL; a
+separate probe also exercised `webfetch`. No search-provider credential was
+requested or added.
+
+Arena's integrated path uses the built-in OpenCode `plan` role for bounded
+read-only research, parses a strict structured result, and admits every
+researcher claim as `Unverified`. A distinct current Arena FactVerifier work
+order independently searches and finalizes only through the existing authority
+path. Two real user/problem and competitor/status-quo flows passed and
+survived store reopen. The exact evidence is in
+`audits/product-os-transition/05D-durable-web-research.md`.
+
+**Current decision:** **READY FOR M06 capability admission**, narrowly for
+bounded Linux OpenCode WebDiscovery behind Arena authority. This is not
+Windows, packaging, broad provider, unrestricted webfetch, market-validation,
+or final founder-dogfood qualification. OpenCode permission policy remains
+distinct from OS/same-user filesystem isolation.
 
 ### Milestone 05A research/release preflight
 

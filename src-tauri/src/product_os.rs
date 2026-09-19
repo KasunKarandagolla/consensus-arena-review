@@ -75,6 +75,25 @@ pub enum ProductWorkOrderRole {
     ProductDirector,
 }
 
+/// The two intentionally narrow research entry points. KnownSource preserves
+/// the existing official GitHub path; WebDiscovery delegates discovery to the
+/// qualified read-only OpenCode web tools and still enters Arena as a proposal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductResearchMode {
+    KnownSource,
+    WebDiscovery,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductResearchCategory {
+    UserProblem,
+    CompetitorStatusQuo,
+    PriorArtReuse,
+    TechnicalCurrentFact,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProductWorkOrderStatus {
@@ -95,14 +114,22 @@ pub struct ProductWorkOrder {
     pub work_order_id: String,
     pub project_id: String,
     pub session_id: String,
+    #[serde(default)]
+    pub runtime_session_id: Option<String>,
     pub run_generation: u64,
     pub role: ProductWorkOrderRole,
     pub status: ProductWorkOrderStatus,
     pub project_revision: u64,
     pub question: Option<String>,
     pub source_ref: Option<String>,
+    #[serde(default)]
+    pub research_mode: Option<ProductResearchMode>,
+    #[serde(default)]
+    pub research_category: Option<ProductResearchCategory>,
     pub parent_work_order_id: Option<String>,
     pub evidence_id: Option<String>,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
     pub result_ref: Option<String>,
     pub cancellation_reason: Option<String>,
     pub superseded_by: Option<String>,

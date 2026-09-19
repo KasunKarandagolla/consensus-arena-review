@@ -61,6 +61,10 @@ research seam:
 - `run_product_research_work_order`
 - `create_product_fact_verifier_work_order`
 - `run_product_fact_verifier_work_order`
+- `create_product_web_research_work_order`
+- `run_product_web_research_work_order`
+- `create_product_web_fact_verifier_work_order`
+- `run_product_web_fact_verifier_work_order`
 - `cancel_product_work_order`
 - `get_product_os_snapshot`
 - `get_latest_product_os_snapshot`
@@ -69,14 +73,18 @@ research seam:
 
 All multiword arguments use the snake-case command rename convention. These
 operations validate Arena-owned work-order/project identity and persist
-sanitized records through the existing backend store. A researcher can submit
-only an unverified proposal; the renderer cannot set verification, resolver,
-authority, or gate fields. The verifier and owner-decision commands are
-semantic Arena operations, not direct ProductAuthority record mutation.
+sanitized records through the existing backend store. WebDiscovery uses the
+built-in OpenCode `plan` role with bounded `websearch`; proposals are admitted
+as unverified evidence and a distinct FactVerifier work order performs final
+disposition. A researcher can submit only an unverified proposal; the renderer
+cannot set verification, resolver, authority, or gate fields. The verifier and
+owner-decision commands are semantic Arena operations, not direct
+ProductAuthority record mutation.
 
-The current runtime proof uses direct official GitHub HTTPS retrieval, not
-GitHub MCP. The complete research-only-to-accepted-BuildPackage gate flow is
-still pending, so these commands do not claim M06 readiness.
+The current known-source proof uses direct official GitHub HTTPS retrieval, not
+GitHub MCP. The current WebDiscovery proof uses OpenCode 1.18.31/Muse Spark's
+hosted Exa websearch path without manual relay. Search output is not a verified
+fact until the independent verifier path succeeds.
 
 ### Shared frontier consultation
 

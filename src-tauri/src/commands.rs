@@ -674,6 +674,39 @@ pub async fn run_product_research_work_order(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn create_product_web_research_work_order(
+    project_id: String,
+    question: String,
+    category: crate::product_os::ProductResearchCategory,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let question = product_os_safe_text(question, state.inner()).await?;
+    let order = crate::product_os_runtime::create_web_discovery_work_order(
+        state.transcript_store.clone(),
+        project_id,
+        question,
+        category,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_product_web_research_work_order(
+    work_order_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let order = crate::product_os_runtime::run_web_discovery_work_order(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        work_order_id,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn create_product_fact_verifier_work_order(
     project_id: String,
     evidence_id: String,
@@ -705,6 +738,37 @@ pub async fn run_product_fact_verifier_work_order(
         state.session_runtime.clone(),
         work_order_id,
         source_url,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn create_product_web_fact_verifier_work_order(
+    project_id: String,
+    evidence_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let evidence_id = product_os_safe_text(evidence_id, state.inner()).await?;
+    let order = crate::product_os_runtime::create_web_fact_verifier_work_order(
+        state.transcript_store.clone(),
+        project_id,
+        evidence_id,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_product_web_fact_verifier_work_order(
+    work_order_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let order = crate::product_os_runtime::run_web_fact_verifier_work_order(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        work_order_id,
     )
     .await?;
     serde_json::to_string(&order).map_err(|error| error.to_string())

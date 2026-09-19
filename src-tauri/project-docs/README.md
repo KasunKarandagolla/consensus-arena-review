@@ -59,12 +59,14 @@ gate evaluation stale. This is not market validation or final founder dogfood.
 See
 `/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/05C-research-buildpackage-gate-handoff.md`.
 
-M05D then blocked M06's broader web-discovery prerequisite. The installed
-OpenCode 1.17.18 Zen free-tier path now returns HTTP 426 before model/tool
-execution because that provider requires OpenCode 1.18.0 or newer. Arena must
-not manually relay web results into Product OS evidence. No upgrade, provider
-substitution, credential request, or search-service addition was authorized;
-see
+M05D now qualifies the bounded Linux web-discovery prerequisite. The existing
+OpenCode installation was upgraded by owner authorization from 1.17.18 to
+1.18.31 using the same curl method. Muse Spark executed real websearch through
+the hosted Exa path, and Arena admitted the result as Unverified before a
+distinct FactVerifier work order independently finalized claims. Arena must
+not manually relay web results into Product OS evidence. This does not claim
+Windows, packaging, broad provider portability, or final founder-dogfood
+readiness; see
 `/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/05D-durable-web-research.md`.
 
 ## Reality hierarchy
@@ -149,7 +151,7 @@ and the current qualification record in
 
 The current OpenCode authority-adapter and walking-skeleton evidence is in
 `audits/product-os-transition/02-product-os-authority-walking-skeleton.md`.
-It qualifies only the installed Linux OpenCode 1.17.18 + Muse Spark path for
+It qualifies only the installed Linux OpenCode 1.18.31 + Muse Spark path for
 bounded candidate execution. Windows, packaging, unrestricted authority, and
 production-scale performance remain unproven.
 

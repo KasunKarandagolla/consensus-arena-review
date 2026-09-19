@@ -58,10 +58,13 @@ owner-adopted direction → current Build Package → applicable
 pre-implementation gates. A material scope change must invalidate the old
 package rather than carry its gate result forward.
 
-M05D blocks M06 until a permitted, requalified autonomous web-search runtime
-can actually execute. A provider rejection before a web tool call is not
-evidence for search, verification, permissions, or prompt-injection handling.
-Do not manually relay browser/chat research into Product OS records.
+M05D now qualifies a permitted, requalified autonomous web-search runtime for
+bounded Linux WebDiscovery. OpenCode 1.18.31 with Muse Spark executed real
+websearch through the hosted Exa path; Arena admitted structured results as
+Unverified and required a distinct FactVerifier work order for final
+disposition. Do not manually relay browser/chat research into Product OS
+records. Windows, packaging, broad provider portability, and final founder
+dogfood remain separate evidence requirements.
 
 ## Verification baseline
 
