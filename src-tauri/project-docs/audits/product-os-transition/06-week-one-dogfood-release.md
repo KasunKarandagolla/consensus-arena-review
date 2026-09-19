@@ -107,6 +107,14 @@ runtime parity or a Windows model-backed run. The Linux `.deb` build is proven
 above; package install/GUI launch is not claimed because the current host is
 graphics/WebKit blocked.
 
+## ENVIRONMENT-BLOCKED
+
+- Native GUI launch on this Linux host: `/dev/dri` is absent and the measured
+  renderer is llvmpipe; no Tauri/Vite process was running during the probe.
+- Windows Rust/package runtime qualification for the implementation
+  checkpoint: the runner's existing formatting gate stopped the build before
+  Windows tests, `cargo check`, and NSIS packaging.
+
 ## OPTIONAL / UNPROVEN
 
 - GitHub MCP runtime use;
