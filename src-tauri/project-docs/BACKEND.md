@@ -5,9 +5,9 @@
 The DSH source integration is blocked by its current external-worker probe:
 two matching clean npm installs timed out on Arena's exact headless profile
 check, and neither Muse task ran. The worker assumption is materially
-challenged; Astra Trigger A is pending. No full production-path Delivery run
-is claimed. The opt-in dogfood boundary remains available for a future
-qualified worker and omits only Tauri event emission.
+challenged; Astra Trigger A is pending. The M07 production coordinator instead
+runtime-proves the qualified OpenCode Delivery path on Linux; the DSH path and
+Tauri GUI path remain unqualified.
 
 Agent Brain primary/fallback/secondary credentials and Hackathon model keys
 now pass through an injectable `CredentialStore` boundary backed in production
@@ -147,6 +147,23 @@ it does not mock Git, DSH, verification, state, or Apply. The model-backed
 end-to-end backend test is opt-in and has no successful current run, so this is
 not a GUI E2E claim. Receipts correlate session, attempt, unique verification
 run, acceptance SHA, candidate SHA, and frozen profile hash.
+
+### Production Product OS coordinator — Milestone 07
+
+`product_os_coordinator.rs` is the production sequencing boundary for the
+founder-to-Delivery path. Its five Tauri commands start/status/answer/cancel/
+resume one durable run; it does not introduce a second live task authority.
+`TranscriptStore` persists only the run phase and work-order/package/session
+references. Semantic role calls use the existing contained OpenCode adapter;
+typed Product OS operations admit their proposals, while `DeliveryState`
+continues to own candidate execution and independent verification.
+
+The real Linux dogfood proved the production path with three research work
+orders, independent verification, Product Director review, two architecture
+proposals, challenge/reuse evidence, feasibility, current gates, Build Package
+admission, and a Verified candidate. The final run took 963.57 seconds after
+the test binary was ready. It is not a claim of GUI E2E, Windows, packaging,
+Safe Apply, full restart/reconciliation, or concurrent role execution.
 
 ## DB/async rules
 

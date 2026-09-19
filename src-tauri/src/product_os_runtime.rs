@@ -73,6 +73,12 @@ pub struct ArchitectureAdmission {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProductRoleExecution {
+    pub work_order: ProductWorkOrder,
+    pub output: String,
+}
+
+#[derive(Debug, Clone)]
 struct GithubObservation {
     url: String,
     title: String,
@@ -696,6 +702,73 @@ pub async fn create_product_director_work_order(
     .map_err(db_error)
 }
 
+/// Admit one bounded semantic Product OS role. Role identity remains an
+/// Arena work-order fact; the external model only supplies a proposal.
+pub async fn create_product_role_work_order(
+    db: Arc<Mutex<TranscriptStore>>,
+    project_id: String,
+    subject: String,
+    role: ProductWorkOrderRole,
+) -> Result<ProductWorkOrder, String> {
+    if project_id.trim().is_empty() || subject.trim().is_empty() {
+        return Err("Product role work order requires project identity and subject".to_string());
+    }
+    if matches!(role, ProductWorkOrderRole::Researcher | ProductWorkOrderRole::FactVerifier) {
+        return Err("research roles use their dedicated work-order operations".to_string());
+    }
+    db_helpers::run_blocking(move || {
+        let mut store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        let records = load_records(&store, &project_id).map_err(AgentError::DatabaseError)?;
+        let order = new_work_order(
+            &project_id,
+            Some(subject.clone()),
+            role.clone(),
+            records.project_revision,
+            None,
+            None,
+            None,
+            None,
+        );
+        persist_records_and_order(&mut store, &records, &order)
+            .map_err(AgentError::DatabaseError)?;
+        Ok(order)
+    })
+    .await
+    .map_err(db_error)
+}
+
+pub async fn create_product_project(
+    db: Arc<Mutex<TranscriptStore>>,
+    project_id: String,
+    founder_idea: String,
+) -> Result<ProductAuthorityRecords, String> {
+    if project_id.trim().is_empty() || founder_idea.trim().is_empty() {
+        return Err("founder project requires identity and idea".to_string());
+    }
+    db_helpers::run_blocking(move || {
+        let mut store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        if store
+            .get_product_authority(&project_id)
+            .map_err(|error| error)?
+            .is_some()
+        {
+            return Err(AgentError::DatabaseError(
+                "Product OS project identity already exists".to_string(),
+            ));
+        }
+        let records = initial_records(&project_id, founder_idea.trim());
+        let raw = serialize_records(&records).map_err(AgentError::DatabaseError)?;
+        store.save_product_authority(&project_id, &raw, now())?;
+        Ok(records)
+    })
+    .await
+    .map_err(db_error)
+}
+
 #[allow(dead_code)]
 fn current_admitted_director(
     store: &TranscriptStore,
@@ -709,8 +782,11 @@ fn current_admitted_director(
             AgentError::DatabaseError("Product Director work order is unknown".to_string())
         })?;
     if order.project_id != project_id
-        || order.role != ProductWorkOrderRole::ProductDirector
-        || order.status != ProductWorkOrderStatus::Admitted
+        || !is_semantic_review_role(&order.role)
+        || !matches!(
+            order.status,
+            ProductWorkOrderStatus::Admitted | ProductWorkOrderStatus::Completed
+        )
         || order.project_revision != revision
     {
         return Err(AgentError::DatabaseError(
@@ -718,6 +794,144 @@ fn current_admitted_director(
         ));
     }
     Ok(order)
+}
+
+fn is_semantic_review_role(role: &ProductWorkOrderRole) -> bool {
+    matches!(
+        role,
+        ProductWorkOrderRole::ProductDirector
+            | ProductWorkOrderRole::ArchitectA
+            | ProductWorkOrderRole::ArchitectB
+            | ProductWorkOrderRole::ReuseReviewer
+            | ProductWorkOrderRole::ConstraintsReviewer
+            | ProductWorkOrderRole::RedTeamReviewer
+            | ProductWorkOrderRole::DissentReviewer
+            | ProductWorkOrderRole::FeasibilityReviewer
+    )
+}
+
+/// Execute a semantic role through SessionRuntime and persist only bounded
+/// correlation metadata. The model text is returned to the caller for strict
+/// parsing and typed Arena admission; it is not durable authority by itself.
+pub async fn run_product_role_work_order(
+    db: Arc<Mutex<TranscriptStore>>,
+    runtime: Arc<SessionRuntime>,
+    work_order_id: String,
+    prompt: String,
+) -> Result<ProductRoleExecution, String> {
+    let preflight = {
+        let db = db.clone();
+        let id = work_order_id.clone();
+        db_helpers::run_blocking(move || {
+            let mut store = db.lock().map_err(|_| {
+                AgentError::DatabaseError("transcript store lock poisoned".to_string())
+            })?;
+            let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
+                AgentError::DatabaseError("semantic role work order is unknown".to_string())
+            })?;
+            if !is_semantic_review_role(&order.role)
+                || !matches!(
+                    order.status,
+                    ProductWorkOrderStatus::Admitted | ProductWorkOrderStatus::ReconciliationRequired
+                )
+            {
+                return Err(AgentError::DatabaseError(
+                    "semantic role work order is not current and admissible".to_string(),
+                ));
+            }
+            let records = load_records(&store, &order.project_id)
+                .map_err(AgentError::DatabaseError)?;
+            if records.project_revision != order.project_revision {
+                return Err(AgentError::DatabaseError(
+                    "semantic role work order is stale for current authority".to_string(),
+                ));
+            }
+            order.status = ProductWorkOrderStatus::Running;
+            order.updated_at = now();
+            store.save_product_work_order(&order)?;
+            Ok(order)
+        })
+        .await
+        .map_err(db_error)?
+    };
+    let db_for_task = db.clone();
+    let id_for_task = work_order_id.clone();
+    let execution = execute_owned(runtime, work_order_id, move |generation| {
+        let db = db_for_task.clone();
+        let id = id_for_task.clone();
+        let prompt = prompt.clone();
+        async move {
+            db_helpers::run_blocking({
+                let db = db.clone();
+                let id = id.clone();
+                move || {
+                    let mut store = db.lock().map_err(|_| {
+                        AgentError::DatabaseError("transcript store lock poisoned".to_string())
+                    })?;
+                    let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
+                        AgentError::DatabaseError("semantic role work order disappeared".to_string())
+                    })?;
+                    if order.status != ProductWorkOrderStatus::Running {
+                        return Err(AgentError::DatabaseError(
+                            "semantic role work order is no longer running".to_string(),
+                        ));
+                    }
+                    order.run_generation = generation;
+                    order.updated_at = now();
+                    store.save_product_work_order(&order)
+                }
+            })
+            .await
+            .map_err(db_error)?;
+            let result = crate::opencode_adapter::run_semantic_prompt(prompt).await;
+            match result {
+                Ok(output) => {
+                    let root_session_id = output.root_session_id.clone();
+                    let root_session_id_for_db = root_session_id.clone();
+                    let db_for_finalize = db.clone();
+                    let finalized = db_helpers::run_blocking(move || {
+                        let mut store = db_for_finalize.lock().map_err(|_| {
+                            AgentError::DatabaseError("transcript store lock poisoned".to_string())
+                        })?;
+                        let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
+                            AgentError::DatabaseError("semantic role work order disappeared".to_string())
+                        })?;
+                        if order.status != ProductWorkOrderStatus::Running
+                            || order.run_generation != generation
+                        {
+                            return Err(AgentError::DatabaseError(
+                                "semantic role result is stale or cancelled".to_string(),
+                            ));
+                        }
+                        order.status = ProductWorkOrderStatus::Completed;
+                        order.runtime_session_id = Some(root_session_id_for_db.clone());
+                        order.result_ref = Some("bounded semantic result retained in memory for Arena admission".to_string());
+                        order.updated_at = now();
+                        store.save_product_work_order(&order)?;
+                        Ok(order)
+                    })
+                    .await
+                    .map_err(db_error)?;
+                    Ok(ProductRoleExecution {
+                        work_order: finalized,
+                        output: output.text,
+                    })
+                }
+                Err(error) => {
+                    mark_failed(db, &id, generation, &error).await;
+                    Err(error)
+                }
+            }
+        }
+    })
+    .await;
+    match execution {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let _ = preflight;
+            Err(error)
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -981,6 +1195,161 @@ pub async fn run_product_github_risk_spike(
     .await
 }
 
+/// Execute a bounded local feasibility check selected by the coordinator. It
+/// deliberately uses an existing deterministic Git command rather than
+/// treating model prose as experiment evidence.
+pub async fn run_product_feasibility_spike(
+    db: Arc<Mutex<TranscriptStore>>,
+    runtime: Arc<SessionRuntime>,
+    work_order_id: String,
+    repository: std::path::PathBuf,
+) -> Result<ProductWorkOrder, String> {
+    if !repository.is_dir() {
+        return Err("feasibility repository does not exist".to_string());
+    }
+    let preflight = {
+        let db = db.clone();
+        let id = work_order_id.clone();
+        db_helpers::run_blocking(move || {
+            let mut store = db.lock().map_err(|_| {
+                AgentError::DatabaseError("transcript store lock poisoned".to_string())
+            })?;
+            let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
+                AgentError::DatabaseError("feasibility work order is unknown".to_string())
+            })?;
+            let records = load_records(&store, &order.project_id)
+                .map_err(AgentError::DatabaseError)?;
+            if order.role != ProductWorkOrderRole::FeasibilityReviewer
+                || order.status != ProductWorkOrderStatus::Admitted
+                || order.project_revision != records.project_revision
+            {
+                return Err(AgentError::DatabaseError(
+                    "feasibility work order is stale or not admissible".to_string(),
+                ));
+            }
+            order.status = ProductWorkOrderStatus::Running;
+            order.updated_at = now();
+            store.save_product_work_order(&order)?;
+            Ok(order)
+        })
+        .await
+        .map_err(db_error)?
+    };
+    let db_for_task = db.clone();
+    let id_for_task = work_order_id.clone();
+    let result = execute_owned(runtime, work_order_id, move |generation| {
+        let db = db_for_task.clone();
+        let id = id_for_task.clone();
+        let repository = repository.clone();
+        async move {
+            db_helpers::run_blocking({
+                let db = db.clone();
+                let id = id.clone();
+                move || {
+                    let mut store = db.lock().map_err(|_| {
+                        AgentError::DatabaseError("transcript store lock poisoned".to_string())
+                    })?;
+                    let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
+                        AgentError::DatabaseError("feasibility work order disappeared".to_string())
+                    })?;
+                    if order.status != ProductWorkOrderStatus::Running {
+                        return Err(AgentError::DatabaseError(
+                            "feasibility work order is no longer running".to_string(),
+                        ));
+                    }
+                    order.run_generation = generation;
+                    order.updated_at = now();
+                    store.save_product_work_order(&order)
+                }
+            })
+            .await
+            .map_err(db_error)?;
+            let execution = crate::dsh_worker::run_contained_command(
+                std::path::Path::new("git"),
+                &[
+                    std::ffi::OsString::from("diff"),
+                    std::ffi::OsString::from("--check"),
+                ],
+                &repository,
+                Duration::from_secs(60),
+            )
+            .await;
+            let execution = match execution {
+                Ok(value) if !value.timed_out && value.exit_code == Some(0) => value,
+                Ok(_) => {
+                    let error = "bounded feasibility check failed".to_string();
+                    mark_failed(db, &id, generation, &error).await;
+                    return Err(error);
+                }
+                Err(error) => {
+                    mark_failed(db, &id, generation, &error).await;
+                    return Err(error);
+                }
+            };
+            let _ = execution;
+            db_helpers::run_blocking(move || {
+                let mut store = db.lock().map_err(|_| {
+                    AgentError::DatabaseError("transcript store lock poisoned".to_string())
+                })?;
+                let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
+                    AgentError::DatabaseError("feasibility work order disappeared".to_string())
+                })?;
+                if order.status != ProductWorkOrderStatus::Running
+                    || order.run_generation != generation
+                {
+                    return Err(AgentError::DatabaseError(
+                        "feasibility result is stale or cancelled".to_string(),
+                    ));
+                }
+                let mut records = load_records(&store, &order.project_id)
+                    .map_err(AgentError::DatabaseError)?;
+                let evidence_id = format!("{}:feasibility", order.work_order_id);
+                records.evidence.push(EvidenceItem {
+                    evidence_id: evidence_id.clone(),
+                    claim: "The accepted repository supports a bounded deterministic Git check without source mutation.".to_string(),
+                    source_reference: "git diff --check".to_string(),
+                    captured_at: Utc::now().to_rfc3339(),
+                    summary: "A real bounded feasibility command completed successfully.".to_string(),
+                    provenance: EvidenceProvenance::RuntimeProven,
+                    current: true,
+                    origin: Some(EvidenceOrigin::Verifier),
+                    verification: Some(EvidenceVerification::IndependentlyVerified),
+                    kind: Some(EvidenceKind::RiskExperiment),
+                    source: Some(EvidenceSource {
+                        reference: "git diff --check".to_string(),
+                        url: None,
+                        title: Some("Bounded local feasibility check".to_string()),
+                        checked_at: Utc::now().to_rfc3339(),
+                        version_or_scope: "current repository worktree".to_string(),
+                    }),
+                    verifier_work_order_id: Some(order.work_order_id.clone()),
+                    contradiction_ids: Vec::new(),
+                    decision_impact: true,
+                    revisit_trigger: Some("re-run when repository tooling or candidate boundary changes".to_string()),
+                });
+                records.project_revision = records.project_revision.saturating_add(1);
+                order.status = ProductWorkOrderStatus::Completed;
+                order.evidence_id = Some(evidence_id.clone());
+                order.result_ref = Some("git diff --check".to_string());
+                order.updated_at = now();
+                persist_records_and_order(&mut store, &records, &order)
+                    .map_err(AgentError::DatabaseError)?;
+                Ok(order)
+            })
+            .await
+            .map_err(db_error)
+        }
+    })
+    .await;
+    match result {
+        Ok(order) => Ok(order),
+        Err(error) => {
+            let _ = preflight;
+            Err(error)
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn completed_director_evidence(
     store: &TranscriptStore,
@@ -1005,7 +1374,7 @@ fn completed_director_evidence(
         .list_product_work_orders(project_id)?
         .into_iter()
         .find(|order| {
-            order.role == ProductWorkOrderRole::ProductDirector
+            is_semantic_review_role(&order.role)
                 && order.status == ProductWorkOrderStatus::Completed
                 && order.evidence_id.as_deref() == Some(evidence_id)
         })
@@ -1040,7 +1409,10 @@ pub async fn adopt_product_reuse_decision(
                 AgentError::DatabaseError("reuse reviewer work order is unknown".to_string())
             })?;
         if order.project_id != project_id
-            || order.role != ProductWorkOrderRole::ProductDirector
+            || !matches!(
+                order.role,
+                ProductWorkOrderRole::ProductDirector | ProductWorkOrderRole::ReuseReviewer
+            )
             || order.status != ProductWorkOrderStatus::Completed
         {
             return Err(AgentError::DatabaseError(
@@ -1122,6 +1494,20 @@ pub async fn adopt_product_architecture(
         if proposal_a.work_order_id == proposal_b.work_order_id {
             return Err(AgentError::DatabaseError(
                 "architecture proposals must originate from separate Product Director work orders"
+                    .to_string(),
+            ));
+        }
+        let proposal_a_order = store
+            .get_product_work_order(&proposal_a.work_order_id)?
+            .ok_or_else(|| AgentError::DatabaseError("architecture A work order disappeared".to_string()))?;
+        let proposal_b_order = store
+            .get_product_work_order(&proposal_b.work_order_id)?
+            .ok_or_else(|| AgentError::DatabaseError("architecture B work order disappeared".to_string()))?;
+        if proposal_a_order.role != ProductWorkOrderRole::ArchitectA
+            || proposal_b_order.role != ProductWorkOrderRole::ArchitectB
+        {
+            return Err(AgentError::DatabaseError(
+                "architecture proposals must use independent Architect A and Architect B roles"
                     .to_string(),
             ));
         }

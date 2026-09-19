@@ -70,6 +70,13 @@ impl TranscriptStore {
                 role TEXT NOT NULL,
                 work_order_json TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS product_coordinator_runs (
+                run_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                run_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
             );",
             )
             .map_err(AgentError::from)
@@ -272,6 +279,57 @@ impl TranscriptStore {
             result.push(value);
         }
         Ok(result)
+    }
+
+    pub fn save_product_coordinator_run(
+        &mut self,
+        run: &crate::product_os_coordinator::ProductCoordinatorRun,
+    ) -> Result<(), AgentError> {
+        let run_json = serde_json::to_string(run).map_err(|error| {
+            AgentError::DatabaseError(format!("serialize Product OS coordinator run: {error}"))
+        })?;
+        let status = serde_json::to_string(&run.status)
+            .map_err(|error| AgentError::DatabaseError(format!("serialize coordinator status: {error}")))?
+            .trim_matches('"')
+            .to_string();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO product_coordinator_runs (run_id, project_id, status, run_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![run.run_id, run.project_id, status, run_json, run.updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_product_coordinator_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::product_os_coordinator::ProductCoordinatorRun>, AgentError> {
+        match self.conn.query_row(
+            "SELECT run_json FROM product_coordinator_runs WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(raw) => serde_json::from_str(&raw).map(Some).map_err(|error| {
+                AgentError::DatabaseError(format!("parse Product OS coordinator run: {error}"))
+            }),
+            Err(SqliteError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(AgentError::from(error)),
+        }
+    }
+
+    pub fn get_latest_product_coordinator_run(
+        &self,
+    ) -> Result<Option<crate::product_os_coordinator::ProductCoordinatorRun>, AgentError> {
+        match self.conn.query_row(
+            "SELECT run_json FROM product_coordinator_runs ORDER BY updated_at DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(raw) => serde_json::from_str(&raw).map(Some).map_err(|error| {
+                AgentError::DatabaseError(format!("parse Product OS coordinator run: {error}"))
+            }),
+            Err(SqliteError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(AgentError::from(error)),
+        }
     }
 
     pub fn create_session(&mut self, config: &SessionConfig) -> Result<(), AgentError> {

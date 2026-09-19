@@ -156,6 +156,24 @@ replaceable execution substrate; Arena retains product truth, acceptance,
 verification, and Apply authority. This does not claim native GUI, Windows
 runtime, package installation, or hostile same-user filesystem isolation.
 
+### Production coordinator — Milestone 07
+
+M07 moves the sequencing out of the ignored integration harness and into the
+Arena-owned `product_os_coordinator` module. The coordinator is a small
+deterministic progression controller, not a workflow engine: it calls typed
+Product OS operations, admits semantic role work orders to the existing
+SessionRuntime/OpenCode adapter, persists minimal phase/reference state, and
+hands only a current passing Build Package to the existing Delivery boundary.
+AI supplies bounded semantic proposals; Arena adopts scope, owner decisions,
+reuse, architecture, gates, verification, and terminal status.
+
+The production API starts, observes, answers a genuinely owner-only question,
+cancels, or resumes a project. It does not expose stage controls or raw
+authority mutation to the renderer. M07 runtime-proves the fresh Linux
+research-to-verified-candidate sequence. It does not yet prove concurrent
+role execution, complete in-flight coordinator restart reconciliation, Windows
+parity, packaging, native GUI launch, or Safe Apply.
+
 ## Durable state ownership
 
 ### Arena owns

@@ -81,6 +81,24 @@ cannot set verification, resolver, authority, or gate fields. The verifier and
 owner-decision commands are semantic Arena operations, not direct
 ProductAuthority record mutation.
 
+### Production Product OS coordinator — Milestone 07
+
+The founder-facing production sequencing boundary exposes these
+JSON-serialized commands:
+
+- `start_product_project(founder_idea, repo_path)`
+- `get_product_coordinator_status(run_id?)`
+- `answer_product_question(run_id, selected_option)`
+- `cancel_product_project(run_id, reason)`
+- `resume_product_project(run_id)`
+
+These commands admit or reconcile one Arena-owned run. They do not expose raw
+stage transitions, `GateInput`, `ProductAuthorityRecords`, DeliveryState, or a
+worker self-verification operation. Multiword arguments use
+`rename_all = "snake_case"`; serialized results must be parsed by the
+renderer. M07 runtime-proves the production Linux backend path; in-flight
+restart/reconciliation and native GUI IPC behavior remain separate evidence.
+
 The current known-source proof uses direct official GitHub HTTPS retrieval, not
 GitHub MCP. The current WebDiscovery proof uses OpenCode 1.18.31/Muse Spark's
 hosted Exa websearch path without manual relay. Search output is not a verified

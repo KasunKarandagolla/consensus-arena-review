@@ -73,6 +73,17 @@ second workflow state machine. Failure and cancellation remain visibly
 terminal, while evidence and technical identifiers stay in the existing
 details/status areas.
 
+The production Product OS entry now starts through `start_product_project`.
+`DeliveryView` polls the coordinator status and shows the broader
+Discover → Decide → Deliver → Release progression, including evidence,
+ambiguity/owner-question state, current package readiness, and Delivery
+verification. It uses the existing calm visual language and keeps OpenCode
+sessions, worktree paths, and raw tool events out of the primary owner view.
+The owner question is answered through the semantic backend command; the
+renderer cannot mutate ProductAuthorityRecords or gate input. M07 proves the
+backend production run and frontend build, not native GUI runtime behavior on
+the current graphics-limited host.
+
 Do not turn Build into an IDE. Technical evidence may be inspectable behind a details surface.
 
 ## Existing frontend foundations to preserve

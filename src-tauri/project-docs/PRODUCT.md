@@ -115,6 +115,14 @@ the current package was assembled from reopened authority, and bounded
 OpenCode engineering roles fed the existing Delivery verifier. The final
 owner-facing result is truthful about verified, unresolved, and blocked state.
 
+M07 promotes the sequencing into the product boundary: one founder start
+operation now creates a durable project run that coordinates research,
+independent verification, Product Director challenge, architecture competition,
+reuse/constraints/red-team/dissent review, feasibility, gates, Build Package,
+and existing Delivery. The owner answered only the bounded direction question
+in the fresh Linux dogfood. This proves production backend autonomy for that
+bounded path, not Windows/package/native-GUI release completion.
+
 ## What Arena should not rebuild
 
 Prefer mature existing infrastructure for:

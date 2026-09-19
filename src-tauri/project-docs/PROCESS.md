@@ -74,6 +74,16 @@ does not imply `webfetch`. Two bounded engineering roles may work in parallel
 on disposable candidates; only the Arena integrator candidate can reach the
 existing independent verifier and Verified state.
 
+M07 makes that sequence a production coordinator operation rather than a
+test-only ordering. The owner starts one project and Arena advances bounded
+research, verification, product challenge, architecture/reuse/security
+review, feasibility, gates, Build Package, and Delivery. The owner is called
+only for the adopted product-direction question. The current implementation
+uses the existing SessionRuntime/resource boundary, so role executions are
+separate but serialized on the qualified Linux machine. Do not describe this
+as a generic workflow engine or claim complete restart/release/platform
+qualification; see the M07 audit.
+
 ## Verification baseline
 
 Typical checks:

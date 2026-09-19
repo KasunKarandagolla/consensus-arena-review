@@ -135,6 +135,15 @@ pub struct OpenCodeExecution {
     pub evidence_ref: String,
 }
 
+/// Sanitized result of a read-only semantic role. The prompt/result text is
+/// parsed by the Arena caller and is never treated as Product Authority by
+/// this adapter.
+#[derive(Debug, Clone)]
+pub struct SemanticExecution {
+    pub root_session_id: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedOpenCodeEvidence {
     pub evidence_id: String,
@@ -208,6 +217,90 @@ fn parse_run_output(output: &str) -> (Option<String>, u32) {
         }
     }
     (session_id, tool_count)
+}
+
+fn parse_semantic_output(output: &str) -> Result<SemanticExecution, String> {
+    let mut session_id = None;
+    let mut text_parts = Vec::new();
+    for line in output.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if session_id.is_none() {
+            session_id = value
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
+        let Some(part) = value.get("part") else {
+            continue;
+        };
+        match part.get("type").and_then(Value::as_str) {
+            Some("tool") => {}
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    text_parts.push(text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let root_session_id = session_id
+        .ok_or_else(|| "OpenCode role returned no correlated session identity".to_string())?;
+    let text = text_parts
+        .into_iter()
+        .rev()
+        .find(|text| !text.trim().is_empty())
+        .ok_or_else(|| "OpenCode role returned no bounded result".to_string())?;
+    Ok(SemanticExecution {
+        root_session_id,
+        text,
+    })
+}
+
+/// Run one bounded, read-only OpenCode semantic role in a disposable
+/// directory. The caller owns admission, parsing, and authority ingestion.
+pub async fn run_semantic_prompt(prompt: String) -> Result<SemanticExecution, String> {
+    const MAX_PROMPT_BYTES: usize = 48 * 1024;
+    const MAX_RESULT_BYTES: usize = 64 * 1024;
+    if prompt.len() > MAX_PROMPT_BYTES {
+        return Err("OpenCode semantic prompt exceeded the bounded size".to_string());
+    }
+    let workdir = std::env::temp_dir().join(format!(
+        "consensus-arena-semantic-role-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workdir)
+        .map_err(|error| format!("could not create semantic role workspace: {error}"))?;
+    let args = vec![
+        OsString::from("run"),
+        OsString::from("--agent"),
+        OsString::from("plan"),
+        OsString::from("--model"),
+        OsString::from(model_identifier()),
+        OsString::from("--format"),
+        OsString::from("json"),
+        OsString::from(prompt),
+    ];
+    let execution = dsh_worker::run_contained_command(
+        &executable(),
+        &args,
+        &workdir,
+        Duration::from_secs(300),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    let execution = execution?;
+    if execution.timed_out {
+        return Err("OpenCode semantic role timed out".to_string());
+    }
+    if execution.exit_code != Some(0) {
+        return Err("OpenCode semantic role failed before returning a result".to_string());
+    }
+    if execution.stdout.len() > MAX_RESULT_BYTES {
+        return Err("OpenCode semantic role exceeded the bounded result size".to_string());
+    }
+    parse_semantic_output(&execution.stdout)
 }
 
 fn safe_evidence_id(work_order_id: &str) -> String {

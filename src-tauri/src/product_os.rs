@@ -73,6 +73,13 @@ pub enum ProductWorkOrderRole {
     Researcher,
     FactVerifier,
     ProductDirector,
+    ArchitectA,
+    ArchitectB,
+    ReuseReviewer,
+    ConstraintsReviewer,
+    RedTeamReviewer,
+    DissentReviewer,
+    FeasibilityReviewer,
 }
 
 /// The two intentionally narrow research entry points. KnownSource preserves

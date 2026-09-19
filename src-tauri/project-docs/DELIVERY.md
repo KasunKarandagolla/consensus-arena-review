@@ -7,7 +7,7 @@
 `audits/delivery-loop-v1-linux-runtime-qualification.md` and
 `audits/delivery-loop-v1-post.md` retained as preceding audits.
 
-## Current worker and release gate — 2026-09-17
+## Current worker and release gate — 2026-09-19
 
 Two fresh npm installs from the same preserved manifest/lock produced matching
 dependency graphs and DSH version/root-help output, but both timed out on
@@ -19,8 +19,9 @@ qualified worker runtime. See
 `audits/dsh-runtime-reproducibility/dsh-runtime-reproducibility.md`.
 
 The DSH path remains blocked before admission. The opt-in OpenCode path now
-provides the first model-backed bounded candidate exercise behind an
-Arena-owned authority adapter; it does not replace the DSH path by default.
+provides a production-coordinator model-backed bounded candidate exercise
+behind an Arena-owned authority adapter; it does not replace the DSH path by
+default.
 The acceptance freeze, correlation, verifier, and Apply boundaries below
 remain source/test-backed for the legacy path and are exercised end-to-end
 for the OpenCode candidate adapter in the Milestone 02 audit. Dagu remains
@@ -137,6 +138,17 @@ Research evidence follows the same authority boundary. Worker and web/GitHub
 outputs are proposals with source references and verification state. Only a
 current Arena-owned independently verified claim can satisfy a Product OS
 research gate.
+
+### Production coordinator handoff — Milestone 07
+
+The production Product OS coordinator now calls the typed
+`admit_build_package` boundary after current pre-implementation gates pass. It
+does not construct `DeliveryState` in the renderer or in a test-only helper.
+Delivery then owns the same clean-base admission, candidate worktree,
+acceptance/protection, OpenCode worker, independent verifier, candidate
+identity, and terminal Verified rules described below. The fresh Linux M07
+dogfood reached this handoff and produced a current Verified candidate; Safe
+Apply and full restart/reconciliation remain unproven.
 
 The historical lock SHA256
 `1297ec9257567a85c5a653734979256e6958a2c1235079c62fdc5bb9f2505887` remains

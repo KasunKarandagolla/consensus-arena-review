@@ -27,6 +27,7 @@ mod orchestrator;
 mod opencode_adapter;
 pub mod product_os;
 mod product_os_runtime;
+mod product_os_coordinator;
 mod persona_manager;
 mod pipeline_ids;
 mod proxy_manager;
@@ -142,6 +143,11 @@ fn main() {
             commands::get_latest_product_os_snapshot,
             commands::admit_product_ambiguity,
             commands::provide_product_owner_decision,
+            commands::start_product_project,
+            commands::get_product_coordinator_status,
+            commands::answer_product_question,
+            commands::cancel_product_project,
+            commands::resume_product_project,
             commands::resume_delivery,
             commands::abort_delivery,
             commands::apply_delivery,

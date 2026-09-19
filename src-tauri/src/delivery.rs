@@ -437,6 +437,125 @@ pub async fn create_candidate_worktree(
     }
 }
 
+/// Admit an already accepted Product OS package into the existing Delivery
+/// supervisor. This is the production handoff used by the coordinator; UI and
+/// workers cannot construct a passing DeliveryState or gate input.
+pub async fn admit_build_package(
+    repo: &std::path::Path,
+    data_dir: &std::path::Path,
+    session_id: String,
+    objective: String,
+    records: ProductAuthorityRecords,
+    package: BuildPackage,
+    runtime: DeliveryRuntime,
+) -> Result<DeliveryState, String> {
+    if session_id.trim().is_empty() || objective.trim().is_empty() {
+        return Err("Delivery admission requires session identity and objective".to_string());
+    }
+    if runtime != DeliveryRuntime::OpenCode {
+        return Err("Product coordinator requires the qualified OpenCode Delivery path".to_string());
+    }
+    if !package.is_current_for(&records)? {
+        return Err("accepted Build Package is stale before Delivery admission".to_string());
+    }
+    let base = validate_clean_base(repo).await?;
+    let short = session_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(12)
+        .collect::<String>();
+    if short.is_empty() {
+        return Err("Delivery session identity cannot create a candidate branch".to_string());
+    }
+    let branch = format!("arena-coordinator/{short}");
+    let worktree = data_dir.join("delivery-worktrees").join(&short);
+    if worktree.exists() {
+        return Err("coordinator Delivery worktree already exists".to_string());
+    }
+    std::fs::create_dir_all(
+        worktree
+            .parent()
+            .ok_or_else(|| "Delivery worktree parent is unavailable".to_string())?,
+    )
+    .map_err(|error| format!("create Delivery worktree directory: {error}"))?;
+    if let Err(error) = create_candidate_worktree(repo, &worktree, &branch, &base).await {
+        let _ = std::fs::remove_dir_all(&worktree);
+        return Err(error);
+    }
+    let profile = match verification::load_profile(&worktree) {
+        Ok(profile) => profile,
+        Err(error) => {
+            let _ = crate::git_runtime::output_owned(
+                repo,
+                &[
+                    "worktree".into(),
+                    "remove".into(),
+                    "--force".into(),
+                    worktree.as_os_str().to_os_string(),
+                ],
+            )
+            .await;
+            let _ = git_output(repo, &["branch", "-D", &branch]).await;
+            return Err(format!("accepted Delivery candidate has no frozen verification profile: {error}"));
+        }
+    };
+    verification::validate_profile(&profile, &worktree)?;
+    let timestamp = chrono::Utc::now().timestamp();
+    let mut state = DeliveryState {
+        schema_version: DELIVERY_SCHEMA_VERSION,
+        session_id,
+        objective,
+        source_workspace: repo.to_string_lossy().into_owned(),
+        worktree_path: worktree.to_string_lossy().into_owned(),
+        branch_name: branch,
+        base_commit: base.clone(),
+        phase: DeliveryPhase::Preparing,
+        contract: Some(DeliveryContract {
+            revision: package.package_revision as u32,
+            objective: package.objective.clone(),
+            acceptance_criteria: package
+                .acceptance_scenarios
+                .iter()
+                .enumerate()
+                .map(|(index, description)| AcceptanceCriterion {
+                    id: format!("package-scenario-{}", index + 1),
+                    description: description.clone(),
+                })
+                .collect(),
+            constraints: package.constraints.clone(),
+            worker_brief: "Change only the non-authoritative candidate and preserve the frozen acceptance profile.".to_string(),
+        }),
+        user_answers: Vec::new(),
+        protected_files: profile.protected_paths.clone(),
+        protected_hashes: verification::protected_hashes(&worktree, &profile.protected_paths)?
+            .into_iter()
+            .map(|(path, sha256)| ProtectedFileHash { path, sha256 })
+            .collect(),
+        verification_commands: profile.commands.clone(),
+        acceptance_commit: Some(base),
+        attempt: 1,
+        pending_question: None,
+        waiting_phase: None,
+        candidate_commit: None,
+        last_worker_summary: None,
+        last_verification: None,
+        runtime,
+        work_order: None,
+        evidence: Vec::new(),
+        authority_records: Some(records),
+        build_package: Some(package),
+        created_at: timestamp,
+        updated_at: timestamp,
+        message: "Admitted from the current Arena Build Package".to_string(),
+    };
+    let bound_records = state
+        .authority_records
+        .clone()
+        .ok_or_else(|| "Delivery authority records were lost during admission".to_string())?;
+    bind_build_package(&mut state, bound_records)?;
+    Ok(state)
+}
+
 async fn git_names(repo: &std::path::Path, base: &str) -> Result<Vec<String>, String> {
     let tracked = git_output(repo, &["diff", "--name-only", base]).await?;
     if !tracked.status.success() {
@@ -1584,16 +1703,28 @@ pub async fn run_backend_qualification(
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let result = if activate_rx.await.is_ok() {
-            run_inner(
-                None,
-                state,
-                state_path,
-                delivery_slot,
-                transcript,
-                ask_tx,
-                settings,
-            )
-            .await
+            if state.runtime == DeliveryRuntime::OpenCode {
+                crate::opencode_adapter::run_delivery(
+                    None,
+                    state,
+                    state_path,
+                    delivery_slot,
+                    transcript,
+                    settings,
+                )
+                .await
+            } else {
+                run_inner(
+                    None,
+                    state,
+                    state_path,
+                    delivery_slot,
+                    transcript,
+                    ask_tx,
+                    settings,
+                )
+                .await
+            }
         } else {
             Err("backend qualification task was not activated".to_string())
         };

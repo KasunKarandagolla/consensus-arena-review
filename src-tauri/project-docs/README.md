@@ -8,7 +8,7 @@
 Consensus Arena is a native Tauri 2 desktop application evolving from an AI expert-panel blueprint tool into a **product-authority and delivery system for a nontechnical product owner**. It now has two deliberately separate lanes:
 
 1. **Consult** — the existing leader-driven frontier-model consultation system using authenticated consumer web chats and an OpenAI-compatible orchestration brain.
-2. **Build / Delivery** — a new parallel lane whose current source can take bounded product work into an isolated Git worktree, author and freeze executable acceptance material, verify independently, repair with bounded attempts, persist owner questions, and apply only a verified candidate under strict Git preconditions. Its DSH worker prerequisite is currently materially challenged and blocks Build before admission.
+2. **Build / Delivery** — a new parallel lane whose current source can take bounded product work into an isolated Git worktree, author and freeze executable acceptance material, verify independently, repair with bounded attempts, persist owner questions, and apply only a verified candidate under strict Git preconditions. The legacy DSH worker prerequisite remains materially challenged; the production Product OS coordinator uses the separately qualified Arena-owned OpenCode path for bounded Linux work.
 
 The long-term direction is not to turn Arena into another coding-agent platform. Arena should own **product intent, owner decisions, progression policy, and acceptance authority**, while reusing external workers, workflow engines, Git, test runners, browser/native automation, deployment tools, and other commodity infrastructure.
 
@@ -64,7 +64,7 @@ Windows, packaging, broad provider portability, or final founder-dogfood
 readiness; see
 `/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/05D-durable-web-research.md`.
 
-## Milestone 06 current closure
+## Milestone 06 historical harness closure
 
 The fresh M06 dogfood uses a new internal founder idea, not the earlier
 validation fixtures. The production path admitted real UserProblem and
@@ -90,6 +90,36 @@ qualification, hostile same-user filesystem isolation, full SSRF isolation,
 Git-object isolation, broad provider portability, or an external OpenCode
 installer. The detailed evidence is in
 `audits/product-os-transition/06-week-one-dogfood-release.md`.
+
+## Milestone 07 current production-coordinator closure
+
+The production entry point is now the narrow coordinator API:
+`start_product_project`, `get_product_coordinator_status`,
+`answer_product_question`, `cancel_product_project`, and
+`resume_product_project`. It persists only coordinator progress references in
+the existing `TranscriptStore`; ProductAuthorityRecords, SessionRuntime, and
+DeliveryState remain the respective authorities for product truth, live work,
+and implementation.
+
+The fresh M07 Linux dogfood used only the production start/status/owner-answer
+boundary. Arena autonomously ran three bounded WebDiscovery work orders,
+distinct FactVerifier work, Product Director review, two independent
+architecture sessions, reuse/constraints/red-team/dissent review, a real local
+feasibility check, current pre-implementation gates, Build Package admission,
+OpenCode candidate execution, and the independent Delivery verifier. The run
+returned a current Verified candidate while the canonical checkout remained
+unchanged. The only owner intervention was the genuine bounded direction
+answer; no research relay, role sequencing, library selection, terminal
+coordination, or manual package/Delivery construction was used.
+
+This is runtime-proven on Linux with OpenCode 1.18.31, Muse Spark
+(`opencode/muse-spark-1.2-contributor-free`), and hosted Exa WebDiscovery. The
+roles are separate real sessions but are currently serialized by the existing
+SessionRuntime/resource boundary rather than proven overlapping. Production
+coordinator restart/reconciliation through every in-flight phase, Windows,
+packaging/install, native GUI launch, explicit Apply, hostile same-user
+filesystem isolation, and broad provider portability remain unproven. See
+`audits/product-os-transition/07-production-autonomous-coordinator.md`.
 
 ## Reality hierarchy
 

@@ -165,6 +165,23 @@ pre-implementation gates from reopened durable authority and proves a material
 scope change returns the old package evaluation as `Stale`. It does not
 qualify Delivery execution, GUI, Windows, packaging, or same-user sandboxing.
 
+## Production coordinator invariants — Milestone 07
+
+The coordinator is deterministic code around existing authorities, not a
+second workflow engine. A run is durable before execution; semantic role
+outputs remain proposals until typed Arena admission; an owner question is
+persisted before the frontend is expected to answer; only a current passing
+Build Package can enter Delivery; and Delivery alone can produce Verified.
+Unknown, stale, cancelled, superseded, protected, or mismatched evidence
+continues to fail closed through the existing Product OS and Delivery checks.
+
+The fresh Linux M07 dogfood runtime-proves the complete production
+research-to-Verified-candidate path. The coordinator's complete in-flight
+restart/reconciliation matrix, end-to-end coordinator cancellation exercise,
+explicit Apply, Windows process behavior, packaging, and GUI runtime remain
+unproven. SessionRuntime currently serializes the semantic role wave; no
+parallel-overlap claim is made.
+
 ## Verification semantics
 
 Use three outcomes conceptually:

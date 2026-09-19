@@ -181,6 +181,7 @@ pub struct AppState {
     pub checkpoint: Arc<Mutex<Option<crate::checkpoint::SessionCheckpoint>>>,
     pub delivery_state: Arc<Mutex<Option<crate::delivery::DeliveryState>>>,
     pub delivery_state_path: PathBuf,
+    pub product_coordinator_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -252,6 +253,7 @@ impl AppState {
             checkpoint: Arc::new(Mutex::new(None)),
             delivery_state: Arc::new(Mutex::new(None)),
             delivery_state_path: PathBuf::from(data_dir).join("delivery-state.json"),
+            product_coordinator_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }

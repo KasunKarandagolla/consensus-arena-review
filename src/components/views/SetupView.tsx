@@ -86,9 +86,10 @@ export default function SetupView(){
         }
       }
       if(mode==='delivery'){
-        commandName='start_delivery'
-        const deliveryId=await invoke<string>('start_delivery',{objective:setupBrief.trim(),repo_path:projectPath.trim()})
-        useAppStore.getState().setDeliveryState({session_id:deliveryId,phase:'preparing',attempt:0,objective:setupBrief.trim()})
+        commandName='start_product_project'
+        const rawRun=await invoke<string>('start_product_project',{founder_idea:setupBrief.trim(),repo_path:projectPath.trim()})
+        const run=JSON.parse(rawRun) as {run_id:string}
+        useAppStore.getState().setDeliveryState({session_id:run.run_id,phase:'preparing',attempt:0,objective:setupBrief.trim()})
         setActiveMode('delivery');setSessionStatus('running')
       }else{
         const ids=participants.map(p=>p.agent_id).filter(id=>selected.has(id))

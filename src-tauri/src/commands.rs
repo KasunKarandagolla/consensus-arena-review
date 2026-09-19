@@ -883,6 +883,91 @@ pub async fn get_dsh_prerequisite() -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+fn product_coordinator_context(state: &AppState) -> crate::product_os_coordinator::CoordinatorContext {
+    crate::product_os_coordinator::CoordinatorContext {
+        db: state.transcript_store.clone(),
+        runtime: state.session_runtime.clone(),
+        coordinator_lock: state.product_coordinator_lock.clone(),
+        delivery_state_path: state.delivery_state_path.clone(),
+        delivery_slot: state.delivery_state.clone(),
+        settings: state.settings_store.clone(),
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn start_product_project(
+    founder_idea: String,
+    repo_path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let founder_idea = product_os_safe_text(founder_idea, state.inner()).await?;
+    let repo_path = product_os_safe_text(repo_path, state.inner()).await?;
+    let run = crate::product_os_coordinator::start(
+        product_coordinator_context(state.inner()),
+        founder_idea,
+        repo_path,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_product_coordinator_status(
+    run_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let run_id = match run_id {
+        Some(value) => Some(product_os_safe_text(value, state.inner()).await?),
+        None => None,
+    };
+    let status = crate::product_os_coordinator::status(&product_coordinator_context(state.inner()), run_id).await?;
+    serde_json::to_string(&status).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn answer_product_question(
+    run_id: String,
+    selected_option: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let selected_option = product_os_safe_text(selected_option, state.inner()).await?;
+    let run = crate::product_os_coordinator::answer_owner_question(
+        product_coordinator_context(state.inner()),
+        run_id,
+        selected_option,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn cancel_product_project(
+    run_id: String,
+    reason: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let reason = product_os_safe_text(reason, state.inner()).await?;
+    let run = crate::product_os_coordinator::cancel(
+        product_coordinator_context(state.inner()),
+        run_id,
+        reason,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn resume_product_project(
+    run_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let run = crate::product_os_coordinator::resume(product_coordinator_context(state.inner()), run_id).await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub async fn get_delivery_recovery_state(
     state: tauri::State<'_, AppState>,
@@ -1297,6 +1382,7 @@ pub async fn start_session(
     let checkpoint_clone = state.checkpoint.clone();
     let delivery_clone = state.delivery_state.clone();
     let delivery_path_clone = state.delivery_state_path.clone();
+    let product_coordinator_lock_clone = state.product_coordinator_lock.clone();
 
     start_permit.ensure_admitted().map_err(|e| e.to_string())?;
     let (activate_tx, activate_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1335,6 +1421,7 @@ pub async fn start_session(
             checkpoint: checkpoint_clone,
             delivery_state: delivery_clone,
             delivery_state_path: delivery_path_clone,
+            product_coordinator_lock: product_coordinator_lock_clone,
         };
 
         let mut nav_rx = tokio_rx;
@@ -1772,6 +1859,7 @@ pub async fn resume_session(
     let checkpoint_clone = state.checkpoint.clone();
     let delivery_clone = state.delivery_state.clone();
     let delivery_path_clone = state.delivery_state_path.clone();
+    let product_coordinator_lock_clone = state.product_coordinator_lock.clone();
     // Spawn resumed loop — skip setup, go directly to debate loop (gated)
     let handle = tokio::spawn(async move {
         if activate_rx.await.is_err() {
@@ -1803,6 +1891,7 @@ pub async fn resume_session(
             checkpoint: checkpoint_clone,
             delivery_state: delivery_clone,
             delivery_state_path: delivery_path_clone,
+            product_coordinator_lock: product_coordinator_lock_clone,
         };
         let runtime_for_terminal = state_ref.session_runtime.clone();
         let owner_for_terminal = resume_owner.clone();
