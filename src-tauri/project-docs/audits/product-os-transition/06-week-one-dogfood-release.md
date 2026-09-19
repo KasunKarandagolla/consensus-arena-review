@@ -91,8 +91,9 @@ Residual boundaries remain: OpenCode permissions are not an OS sandbox; hostile 
 
 ## WINDOWS / PACKAGING STATUS
 
-The existing Windows workflow is the qualification path. For this exact
-checkpoint SHA, run `35440202391`, the Windows frontend build completed but
+The existing Windows workflow is the qualification path. For the M06
+implementation checkpoint `1d7351b`, run `35440202391`, the Windows frontend
+build completed but
 `windows-build-test` stopped at the existing `cargo fmt --check` step; Windows
 Rust tests, Windows `cargo check`, Job Object execution, and unsigned NSIS
 packaging therefore did not run. This Linux session cannot claim Windows
