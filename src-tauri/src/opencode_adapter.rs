@@ -15,6 +15,7 @@ use std::time::Duration;
 use tauri::AppHandle;
 
 pub const DEFAULT_MODEL: &str = "opencode/muse-spark-1.2-contributor-free";
+pub const QUALIFIED_VERSION: &str = "1.18.31";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 1_800;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,12 +76,20 @@ pub async fn runtime_status() -> OpenCodeRuntimeStatus {
     match result {
         Ok(output) if !output.timed_out && output.exit_code == Some(0) => {
             let combined = format!("{}\n{}", output.stdout, output.stderr);
+            let version = reported_version(&combined);
+            let compatible = version.as_deref() == Some(QUALIFIED_VERSION);
             OpenCodeRuntimeStatus {
                 runtime: "opencode".to_string(),
-                compatible: true,
+                compatible,
                 executable: executable.to_string_lossy().into_owned(),
-                version: reported_version(&combined),
-                message: "OpenCode is ready for bounded Arena candidate work.".to_string(),
+                version,
+                message: if compatible {
+                    "OpenCode is ready for bounded Arena candidate work.".to_string()
+                } else {
+                    format!(
+                        "OpenCode version is not qualified for Arena; expected {QUALIFIED_VERSION}."
+                    )
+                },
             }
         }
         Ok(output) => OpenCodeRuntimeStatus {
@@ -857,6 +866,14 @@ mod tests {
         assert_eq!(parsed["work_order"]["work_order_id"], "wo-1");
         assert_eq!(parsed["work_order"]["candidate_revision"], 1);
         assert_eq!(parsed["verification_id"], "verification-1");
+    }
+
+    #[test]
+    fn runtime_qualification_requires_the_proven_version() {
+        assert_eq!(QUALIFIED_VERSION, "1.18.31");
+        assert_eq!(reported_version("1.18.31\n"), Some("1.18.31".to_string()));
+        assert_ne!(reported_version("1.17.18\n").as_deref(), Some(QUALIFIED_VERSION));
+        assert_ne!(reported_version("2.0.0\n").as_deref(), Some(QUALIFIED_VERSION));
     }
 
     #[tokio::test]

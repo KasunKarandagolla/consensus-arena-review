@@ -109,6 +109,12 @@ current Build Package only through Arena-owned review, owner-decision, and
 gate operations. This is not a market-validation claim or the final
 founder-to-release experience.
 
+M06 extends that evidence on a fresh internal founder idea. Real web discovery
+and independent verification remained evidence rather than product truth;
+the current package was assembled from reopened authority, and bounded
+OpenCode engineering roles fed the existing Delivery verifier. The final
+owner-facing result is truthful about verified, unresolved, and blocked state.
+
 ## What Arena should not rebuild
 
 Prefer mature existing infrastructure for:

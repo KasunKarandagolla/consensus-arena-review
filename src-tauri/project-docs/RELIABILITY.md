@@ -150,9 +150,10 @@ Product OS records and work-order metadata are persisted in the existing
 lease becomes `ReconciliationRequired`; no completion or evidence adoption is
 fabricated. A late result cannot attach to a cancelled or stale record.
 
-This milestone proves the Product OS research boundary on Linux. It does not
-claim a same-user filesystem sandbox, Windows parity, package qualification,
-or a complete research-only-to-BuildPackage/Delivery gate run.
+This milestone proves the Product OS research boundary on Linux. The later M06
+dogfood proves the fresh research-to-BuildPackage-to-Delivery path, but neither
+milestone claims a same-user filesystem sandbox, Windows runtime parity,
+package installation, or complete SSRF isolation.
 
 ## Product OS package currentness — Milestone 05C
 

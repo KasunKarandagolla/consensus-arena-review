@@ -66,6 +66,14 @@ disposition. Do not manually relay browser/chat research into Product OS
 records. Windows, packaging, broad provider portability, and final founder
 dogfood remain separate evidence requirements.
 
+M06 proves the fresh founder path without manual research relay: WebDiscovery
+claims are admitted as Unverified, independently checked through separate
+FactVerifier work orders, and consumed only through the reopened authoritative
+Build Package. The production verifier records search-level provenance and
+does not imply `webfetch`. Two bounded engineering roles may work in parallel
+on disposable candidates; only the Arena integrator candidate can reach the
+existing independent verifier and Verified state.
+
 ## Verification baseline
 
 Typical checks:

@@ -359,6 +359,14 @@ fn research_category_label(category: &ProductResearchCategory) -> &'static str {
     }
 }
 
+fn web_search_evidence_scope(source_type: &str, version_or_scope: &str) -> String {
+    format!(
+        "{}; {}; observation=search_result; OpenCode tools=websearch; webfetch=not_used_in_production_path",
+        source_type.trim(),
+        version_or_scope.trim()
+    )
+}
+
 fn validate_web_proposals(
     result: WebResearchResult,
 ) -> Result<Vec<(WebResearchProposal, String)>, String> {
@@ -1563,10 +1571,9 @@ pub async fn run_web_discovery_work_order(
                         } else {
                             proposal.source_type.trim()
                         };
-                        let scope = format!(
-                            "{}; {}; observation=search_result; OpenCode tools=websearch/webfetch",
+                        let scope = web_search_evidence_scope(
                             source_type,
-                            proposal.version_or_scope.trim()
+                            &proposal.version_or_scope,
                         );
                         let summary = if proposal.contradiction_notes.trim().is_empty() {
                             proposal.supporting_summary.trim().to_string()
@@ -2096,10 +2103,9 @@ pub async fn run_web_fact_verifier_work_order(
                         url: Some(source_url.clone()),
                         title: Some(verification.title.trim().to_string()),
                         checked_at: Utc::now().to_rfc3339(),
-                        version_or_scope: format!(
-                            "{}; {}; observation=source_observed; OpenCode tools=websearch/webfetch",
+                        version_or_scope: web_search_evidence_scope(
                             source_type,
-                            verification.version_or_scope.trim()
+                            &verification.version_or_scope,
                         ),
                     };
                     product_os::finalize_research_claim(
@@ -2354,6 +2360,17 @@ pub async fn adopt_owner_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verification;
+
+    #[test]
+    fn web_evidence_provenance_distinguishes_search_from_fetch() {
+        let scope = web_search_evidence_scope("primary", "current public documentation");
+        assert!(scope.contains("observation=search_result"));
+        assert!(scope.contains("OpenCode tools=websearch"));
+        assert!(scope.contains("webfetch=not_used_in_production_path"));
+        assert!(!scope.contains("observation=source_observed"));
+        assert!(!scope.contains("websearch/webfetch"));
+    }
 
     #[tokio::test]
     async fn official_github_metadata_is_retrieved_with_bounded_source_path() {
@@ -3332,6 +3349,650 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the installed OpenCode 1.18.31 Zen web-search and candidate paths"]
+    async fn real_m06_fresh_founder_dogfood_research_to_delivery() {
+        let root = std::env::temp_dir().join(format!(
+            "consensus arena m06 fresh founder {}",
+            uuid::Uuid::new_v4()
+        ));
+        let db_path = root.join("product-os.sqlite");
+        let canonical = root.join("candidate source");
+        std::fs::create_dir_all(&canonical).expect("create fresh founder source");
+        let project_id = "m06-fresh-accounting-interactive-study".to_string();
+        let founder_idea = "I want an application that helps university accounting students master difficult topics interactively.";
+        let source = "https://api.github.com/repos/github/github-mcp-server";
+        let runtime = Arc::new(SessionRuntime::new());
+        let db = Arc::new(Mutex::new(
+            TranscriptStore::open(db_path.to_string_lossy().as_ref()).expect("open M06 store"),
+        ));
+
+        // Research wave: real autonomous web discovery plus a bounded known-source
+        // prior-art/reuse check. Each result is admitted and independently checked
+        // through the production authority seam; no result is copied by the operator.
+        let user_order = create_web_discovery_work_order(
+            db.clone(),
+            project_id.clone(),
+            "What public evidence describes difficult learning or feedback problems that university accounting students face, and what scope/date limits apply? Do not claim market validation.".to_string(),
+            ProductResearchCategory::UserProblem,
+        )
+        .await
+        .expect("admit fresh user/problem research");
+        let user_order = run_web_discovery_work_order(
+            db.clone(),
+            runtime.clone(),
+            user_order.work_order_id,
+        )
+        .await
+        .expect("run fresh user/problem research");
+        let mut user_verified = false;
+        for evidence_id in user_order.evidence_ids.clone() {
+            let verifier = create_web_fact_verifier_work_order(
+                db.clone(),
+                project_id.clone(),
+                evidence_id.clone(),
+            )
+            .await
+            .expect("admit user/problem verifier");
+            run_web_fact_verifier_work_order(db.clone(), runtime.clone(), verifier.work_order_id)
+                .await
+                .expect("run user/problem verifier");
+            let current = snapshot(
+                db.clone(),
+                Arc::new(SessionRuntime::new()),
+                project_id.clone(),
+            )
+            .await
+            .expect("inspect user/problem evidence")
+            .expect("fresh project exists");
+            if current
+                .records
+                .evidence
+                .iter()
+                .any(|item| item.evidence_id == evidence_id
+                    && item.verification == Some(EvidenceVerification::IndependentlyVerified))
+            {
+                user_verified = true;
+                break;
+            }
+        }
+        assert!(
+            user_verified,
+            "the fresh user/problem evidence must contain one independently checked claim"
+        );
+
+        let competitor_order = create_web_discovery_work_order(
+            db.clone(),
+            project_id.clone(),
+            "What current official tools and status-quo workflows compete with a small interactive accounting study companion? Identify bounded capabilities, source dates/scopes, and do not claim market share.".to_string(),
+            ProductResearchCategory::CompetitorStatusQuo,
+        )
+        .await
+        .expect("admit fresh competitor research");
+        let competitor_order = run_web_discovery_work_order(
+            db.clone(),
+            runtime.clone(),
+            competitor_order.work_order_id,
+        )
+        .await
+        .expect("run fresh competitor research");
+        let mut competitor_verified = false;
+        for evidence_id in competitor_order.evidence_ids.clone() {
+            let verifier = create_web_fact_verifier_work_order(
+                db.clone(),
+                project_id.clone(),
+                evidence_id.clone(),
+            )
+            .await
+            .expect("admit competitor verifier");
+            run_web_fact_verifier_work_order(db.clone(), runtime.clone(), verifier.work_order_id)
+                .await
+                .expect("run competitor verifier");
+            let current = snapshot(
+                db.clone(),
+                Arc::new(SessionRuntime::new()),
+                project_id.clone(),
+            )
+            .await
+            .expect("inspect competitor evidence")
+            .expect("fresh project remains present");
+            if current
+                .records
+                .evidence
+                .iter()
+                .any(|item| item.evidence_id == evidence_id
+                    && item.verification == Some(EvidenceVerification::IndependentlyVerified))
+            {
+                competitor_verified = true;
+                break;
+            }
+        }
+        assert!(
+            competitor_verified,
+            "the fresh competitor evidence must contain one independently checked claim"
+        );
+
+        let prior_art = create_research_work_order(
+            db.clone(),
+            project_id.clone(),
+            "Which bounded official GitHub metadata and reuse boundary is relevant to a read-only study companion?".to_string(),
+            source.to_string(),
+        )
+        .await
+        .expect("admit fresh prior-art research");
+        let prior_art = run_research_work_order(
+            db.clone(),
+            runtime.clone(),
+            prior_art.work_order_id,
+            source.to_string(),
+        )
+        .await
+        .expect("run fresh prior-art source retrieval");
+        let prior_art_verifier = create_fact_verifier_work_order(
+            db.clone(),
+            project_id.clone(),
+            prior_art.evidence_id.clone().expect("prior-art evidence"),
+            source.to_string(),
+        )
+        .await
+        .expect("admit prior-art verifier");
+        run_fact_verifier_work_order(
+            db.clone(),
+            runtime.clone(),
+            prior_art_verifier.work_order_id,
+            source.to_string(),
+        )
+        .await
+        .expect("verify fresh prior-art source");
+
+        // Reopen before decision work. This is the authority handoff point for
+        // the fresh founder idea, not a fixture reload.
+        drop(db);
+        let db = Arc::new(Mutex::new(
+            TranscriptStore::open(db_path.to_string_lossy().as_ref()).expect("reopen M06 store"),
+        ));
+        let reopened = snapshot(
+            db.clone(),
+            Arc::new(SessionRuntime::new()),
+            project_id.clone(),
+        )
+        .await
+        .expect("reconcile reopened M06 store")
+        .expect("reopened M06 project");
+        assert!(reopened.records.evidence.iter().any(|item| {
+            item.kind == Some(EvidenceKind::ResearchClaim)
+                && item.verification == Some(EvidenceVerification::IndependentlyVerified)
+        }));
+
+        let scope_order = create_product_director_work_order(
+            db.clone(),
+            project_id.clone(),
+            "Product Director: restate the fresh founder idea and bound the validation slice".to_string(),
+        )
+        .await
+        .expect("admit fresh product direction review");
+        admit_product_scope_from_review(
+            db.clone(),
+            project_id.clone(),
+            scope_order.work_order_id,
+            ProductScopeAdmission {
+                objective: "Validate a tiny interactive accounting study companion slice with one bounded topic flow and feedback state.".to_string(),
+                target_user: "University accounting student practicing one difficult topic".to_string(),
+                requirements: vec![
+                    "Present one bounded difficult-topic study flow.".to_string(),
+                    "Offer an interactive answer/check step with truthful feedback.".to_string(),
+                    "Keep the slice local/read-only with no credential or deployment requirement.".to_string(),
+                ],
+                constraints: vec![
+                    "Do not claim market validation from search results.".to_string(),
+                    "Use existing Arena candidate, verifier, and Apply boundaries.".to_string(),
+                    "Keep the first implementation small enough for a disposable spike.".to_string(),
+                ],
+                non_goals: vec![
+                    "No full accounting curriculum.".to_string(),
+                    "No learner account system, analytics, or production deployment.".to_string(),
+                    "No replacement research or workflow framework.".to_string(),
+                ],
+                interfaces: vec![
+                    "One bounded study-mode source boundary and deterministic local check.".to_string(),
+                ],
+                risks: vec![
+                    "Search evidence may be weak, stale, or contradictory.".to_string(),
+                    "Interactive feedback may be confusing without a real learner study.".to_string(),
+                    "The implementation must not smuggle authority through worker output.".to_string(),
+                ],
+                acceptance_scenarios: vec![
+                    "The candidate reports interactive study mode for the bounded topic.".to_string(),
+                    "The independent verifier passes the exact candidate and frozen acceptance.".to_string(),
+                    "A protected acceptance mutation is rejected and cannot become Verified.".to_string(),
+                ],
+                reviewer_restatement: crate::evidence_gates::ReviewerRestatement {
+                    intended_outcome: founder_idea.to_string(),
+                    success_condition: "A bounded validation slice can be independently verified without overstating research certainty.".to_string(),
+                    invented_behaviors: Vec::new(),
+                },
+            },
+        )
+        .await
+        .expect("admit fresh product scope");
+
+        let architecture_a = admit_review_for_test(
+            db.clone(),
+            &project_id,
+            "Independent Architect A: local lesson-state design",
+            "m06-architecture-local-state",
+            EvidenceKind::ArchitectureProposal,
+            "Use a small local state machine and deterministic topic/feedback records; no network is needed for the validation slice.",
+        )
+        .await;
+        let architecture_b = admit_review_for_test(
+            db.clone(),
+            &project_id,
+            "Independent Architect B: reusable existing delivery boundary",
+            "m06-architecture-existing-boundary",
+            EvidenceKind::ArchitectureProposal,
+            "Wrap the existing Arena delivery/verifier boundary around a tiny study-mode source change and defer richer learner state.",
+        )
+        .await;
+        let reuse = admit_review_for_test(
+            db.clone(),
+            &project_id,
+            "Reuse reviewer: classify existing capabilities",
+            "m06-reuse-review",
+            EvidenceKind::ReuseReview,
+            "REUSE OpenCode, SessionRuntime, candidate worktrees, acceptance freeze, independent verifier, and Safe Apply; ADAPT the existing owner-facing evidence summary; DEFER a new learning platform.",
+        )
+        .await;
+        let constraints = admit_review_for_test(
+            db.clone(),
+            &project_id,
+            "Security/platform reviewer: hard constraints",
+            "m06-constraints-review",
+            EvidenceKind::ConstraintsReview,
+            "Keep research unverified until independent checking, keep workers off canonical authority, bound local checks, and avoid credentials/deployment.",
+        )
+        .await;
+        let red_team = admit_review_for_test(
+            db.clone(),
+            &project_id,
+            "Red team: no-build and trust-boundary challenge",
+            "m06-red-team-review",
+            EvidenceKind::RedTeamReview,
+            "The strongest no-build argument is that search evidence cannot establish learner demand; reject market claims, stale sources, protected writes, and unverifiable feedback assumptions.",
+        )
+        .await;
+        let dissent = admit_review_for_test(
+            db.clone(),
+            &project_id,
+            "Skeptic: preserve the rejected alternative",
+            "m06-dissent-review",
+            EvidenceKind::Dissent,
+            "Do not build a full adaptive accounting platform now; retain the narrow validation slice and revisit only after direct learner evidence.",
+        )
+        .await;
+
+        admit_ambiguity(
+            db.clone(),
+            project_id.clone(),
+            dissent.work_order_id.clone(),
+            "m06-scope-ambiguity".to_string(),
+            "m06-scope-ambiguity-question".to_string(),
+            "Should the first build remain a single bounded topic flow rather than a curriculum platform?".to_string(),
+            "scope and release commitment".to_string(),
+            AmbiguitySeverity::High,
+            vec![dissent.evidence_id.clone().expect("dissent evidence")],
+        )
+        .await
+        .expect("admit owner-required M06 ambiguity");
+        adopt_owner_decision(
+            db.clone(),
+            project_id.clone(),
+            "m06-scope-ambiguity".to_string(),
+            "m06-scope-ambiguity-question".to_string(),
+            "keep one bounded topic flow".to_string(),
+        )
+        .await
+        .expect("adopt current owner scope decision");
+
+        let spike_order = create_product_director_work_order(
+            db.clone(),
+            project_id.clone(),
+            "Risk spike: official source retrieval remains bounded and read-only".to_string(),
+        )
+        .await
+        .expect("admit M06 feasibility spike");
+        let spike = run_product_github_risk_spike(
+            db.clone(),
+            runtime.clone(),
+            spike_order.work_order_id,
+            source.to_string(),
+        )
+        .await
+        .expect("run M06 feasibility spike");
+
+        adopt_product_reuse_decision(
+            db.clone(),
+            project_id.clone(),
+            reuse.work_order_id,
+            "bounded study slice runtime and verification".to_string(),
+            ReuseClassification::Reuse,
+            vec![reuse.evidence_id.clone().expect("reuse evidence")],
+        )
+        .await
+        .expect("adopt M06 reuse decision");
+        adopt_product_architecture(
+            db.clone(),
+            project_id.clone(),
+            ArchitectureAdmission {
+                proposal_a_evidence_id: architecture_a.evidence_id.expect("architecture A"),
+                proposal_b_evidence_id: architecture_b.evidence_id.expect("architecture B"),
+                reuse_review_evidence_id: reuse.evidence_id.clone().expect("reuse evidence"),
+                constraints_review_evidence_id: constraints
+                    .evidence_id
+                    .expect("constraints evidence"),
+                risk_experiment_evidence_ids: vec![spike.evidence_id.expect("spike evidence")],
+                red_team_evidence_id: red_team.evidence_id.expect("red-team evidence"),
+                dissent_evidence_id: dissent.evidence_id.expect("dissent evidence"),
+                unresolved_high_blocker_evidence_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("adopt M06 architecture decision");
+
+        // The direction is adopted only after the research, no-build argument,
+        // ambiguity decision, competing architecture, reuse, red-team, and
+        // executable spike are current.
+        adopt_narrow_build_direction(db.clone(), project_id.clone())
+            .await
+            .expect("adopt evidence-backed bounded build direction");
+
+        drop(db);
+        let db = Arc::new(Mutex::new(
+            TranscriptStore::open(db_path.to_string_lossy().as_ref()).expect("reopen before package"),
+        ));
+        let package = assemble_current_build_package(db.clone(), project_id.clone())
+            .await
+            .expect("assemble current M06 Build Package");
+        let gate_evaluation = evaluate_current_preimplementation_gates(
+            db.clone(),
+            project_id.clone(),
+        )
+        .await
+        .expect("evaluate current M06 gates");
+        assert_eq!(package.package_id, gate_evaluation.package.package_id);
+        assert!(gate_evaluation.decisions.iter().all(|decision| {
+            decision.status == crate::evidence_gates::GateStatus::Pass
+        }));
+
+        // Build a disposable candidate fixture from the accepted package. The
+        // acceptance profile is committed before implementation and protects
+        // the acceptance file; Delivery owns the only integrator candidate.
+        let git = |repo: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git should start");
+            assert!(
+                output.status.success(),
+                "git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        std::fs::write(
+            canonical.join("study_tool.py"),
+            "def study_mode():\n    return 'static'\n",
+        )
+        .expect("write M06 source fixture");
+        std::fs::write(
+            canonical.join("acceptance.txt"),
+            "frozen: the bounded topic reports interactive mode\n",
+        )
+        .expect("write frozen M06 acceptance");
+        std::fs::create_dir_all(canonical.join(".arena")).expect("create M06 arena metadata");
+        let profile = serde_json::json!({
+            "version": 1,
+            "commands": [{
+                "id": "study-mode-test",
+                "program": "python3",
+                "args": ["-c", "from study_tool import study_mode; assert study_mode() == 'interactive'"],
+                "relative_cwd": ".",
+                "timeout_seconds": 60
+            }],
+            "protected_paths": ["acceptance.txt", ".arena/verification.json"]
+        });
+        std::fs::write(
+            canonical.join(".arena/verification.json"),
+            serde_json::to_vec_pretty(&profile).expect("serialize M06 verification profile"),
+        )
+        .expect("write M06 verification profile");
+        git(&canonical, &["init", "-b", "main"]);
+        git(&canonical, &["config", "user.email", "arena-m06@example.invalid"]);
+        git(&canonical, &["config", "user.name", "Consensus Arena M06"]);
+        git(&canonical, &["add", "."]);
+        git(&canonical, &["commit", "-m", "M06 frozen acceptance fixture"]);
+        let base = git(&canonical, &["rev-parse", "HEAD"]);
+        let role_a = root.join("engineering-role-a");
+        let role_b = root.join("engineering-role-b");
+        crate::delivery::create_candidate_worktree(
+            &canonical,
+            &role_a,
+            "arena-m06-role-a",
+            &base,
+        )
+        .await
+        .expect("create M06 role A worktree");
+        crate::delivery::create_candidate_worktree(
+            &canonical,
+            &role_b,
+            "arena-m06-role-b",
+            &base,
+        )
+        .await
+        .expect("create M06 role B worktree");
+        let role_profile = verification::load_profile(&role_a).expect("load M06 role profile");
+        let role_protected = verification::protected_hashes(
+            &role_a,
+            &role_profile.protected_paths,
+        )
+        .expect("hash M06 role protected paths");
+        let canonical_protected = verification::protected_hashes(
+            &canonical,
+            &role_profile.protected_paths,
+        )
+        .expect("hash M06 canonical protected paths");
+        let role_order = |id: &str, candidate: &std::path::Path| {
+            crate::delivery::OpenCodeWorkOrder {
+                work_order_id: format!("m06-{id}"),
+                project_id: project_id.clone(),
+                root_session_id: None,
+                candidate_id: candidate.to_string_lossy().into_owned(),
+                candidate_revision: 1,
+                authority_version: format!("{base}:{}", verification::profile_hash(&role_profile).expect("role profile hash")),
+                acceptance_commit: base.clone(),
+                task_state: crate::delivery::OpenCodeTaskState::Admitted,
+                evidence_ref: None,
+                result_ref: None,
+                cancellation_state: None,
+                verification_id: None,
+                verification_status: None,
+                error: None,
+                build_package_id: Some(package.package_id.clone()),
+                build_package_revision: Some(package.package_revision),
+                build_package_fingerprint: Some(package.authority_fingerprint.clone()),
+            }
+        };
+        let mut role_a_order = role_order("research-implementation", &role_a);
+        let mut role_b_order = role_order("security-review", &role_b);
+        let evidence_dir = root.join("engineering-evidence");
+        let (role_a_result, role_b_result) = tokio::join!(
+            crate::opencode_adapter::execute_candidate(
+                &canonical,
+                &role_a,
+                "Act as the bounded implementation lead. Write only role-a-plan.md with a short plan for changing study_tool.py from static to interactive. Do not touch acceptance or verification files and do not commit.",
+                &mut role_a_order,
+                &role_protected,
+                &canonical_protected,
+                &evidence_dir,
+            ),
+            crate::opencode_adapter::execute_candidate(
+                &canonical,
+                &role_b,
+                "Act as the independent security/QA reviewer. Write only role-b-review.md with one protected-state risk and one deterministic test for changing study_tool.py from static to interactive. Do not touch acceptance or verification files and do not commit.",
+                &mut role_b_order,
+                &role_protected,
+                &canonical_protected,
+                &evidence_dir,
+            )
+        );
+        role_a_result.expect("M06 implementation role should return evidence");
+        role_b_result.expect("M06 independent review role should return evidence");
+        assert_eq!(role_a_order.task_state, crate::delivery::OpenCodeTaskState::EvidenceReady);
+        assert_eq!(role_b_order.task_state, crate::delivery::OpenCodeTaskState::EvidenceReady);
+        assert_ne!(role_a_order.root_session_id, role_b_order.root_session_id);
+        git(&canonical, &["worktree", "remove", "--force", role_a.to_str().expect("role A path")]);
+        git(&canonical, &["worktree", "remove", "--force", role_b.to_str().expect("role B path")]);
+
+        let candidate = root.join("integrator candidate");
+        crate::delivery::create_candidate_worktree(
+            &canonical,
+            &candidate,
+            "arena-m06-integrator",
+            &base,
+        )
+        .await
+        .expect("create M06 integrator candidate");
+        let session_id = "m06-fresh-founder-delivery".to_string();
+        let delivery_state = crate::delivery::DeliveryState {
+            schema_version: crate::delivery::DELIVERY_SCHEMA_VERSION,
+            session_id: session_id.clone(),
+            objective: "Change study_tool.py so the bounded accounting study mode reports interactive.".to_string(),
+            source_workspace: canonical.to_string_lossy().into_owned(),
+            worktree_path: candidate.to_string_lossy().into_owned(),
+            branch_name: "arena-m06-integrator".to_string(),
+            base_commit: base.clone(),
+            phase: crate::delivery::DeliveryPhase::Preparing,
+            contract: Some(crate::delivery::DeliveryContract {
+                revision: 1,
+                objective: "Bounded interactive accounting study mode".to_string(),
+                acceptance_criteria: vec![crate::delivery::AcceptanceCriterion {
+                    id: "study-mode".to_string(),
+                    description: "The study mode reports interactive and the deterministic check passes.".to_string(),
+                }],
+                constraints: vec!["Do not alter frozen acceptance or verification authority.".to_string()],
+                worker_brief: "Make only the bounded source change in the candidate worktree.".to_string(),
+            }),
+            user_answers: Vec::new(),
+            protected_files: Vec::new(),
+            protected_hashes: Vec::new(),
+            verification_commands: Vec::new(),
+            acceptance_commit: None,
+            attempt: 1,
+            pending_question: None,
+            waiting_phase: None,
+            candidate_commit: None,
+            last_worker_summary: None,
+            last_verification: None,
+            runtime: crate::delivery::DeliveryRuntime::OpenCode,
+            work_order: None,
+            evidence: Vec::new(),
+            authority_records: Some(
+                snapshot(
+                    db.clone(),
+                    Arc::new(SessionRuntime::new()),
+                    project_id.clone(),
+                )
+                .await
+                .expect("load M06 authority before Delivery")
+                .expect("M06 authority before Delivery")
+                .records,
+            ),
+            build_package: Some(package.clone()),
+            created_at: chrono::Utc::now().timestamp(),
+            updated_at: chrono::Utc::now().timestamp(),
+            message: "M06 Delivery admitted from current Build Package".to_string(),
+        };
+        let state_path = root.join("delivery-state.json");
+        let delivery_slot = Arc::new(tokio::sync::Mutex::new(None));
+        let transcript = Arc::new(Mutex::new(TranscriptStore::new()));
+        let settings = Arc::new(tokio::sync::Mutex::new(
+            crate::settings_store::SettingsStore::new(":memory:")
+                .expect("create M06 settings store"),
+        ));
+        let completed = crate::opencode_adapter::run_delivery(
+            None,
+            delivery_state,
+            state_path,
+            delivery_slot,
+            transcript,
+            settings,
+        )
+        .await
+        .expect("run current Build Package through Delivery");
+        assert_eq!(completed.phase, crate::delivery::DeliveryPhase::Verified);
+        assert_eq!(
+            completed
+                .work_order
+                .as_ref()
+                .map(|order| order.task_state.clone()),
+            Some(crate::delivery::OpenCodeTaskState::Verified)
+        );
+        assert_eq!(
+            completed
+                .work_order
+                .as_ref()
+                .and_then(|order| order.build_package_id.as_deref()),
+            Some(package.package_id.as_str())
+        );
+        assert!(completed.last_verification.is_some());
+        assert_eq!(
+            std::fs::read(canonical.join("acceptance.txt")).expect("read final M06 acceptance"),
+            b"frozen: the bounded topic reports interactive mode\n"
+        );
+        assert_eq!(
+            git(&canonical, &["status", "--porcelain", "--untracked-files=all"]),
+            ""
+        );
+
+        let final_snapshot = snapshot(
+            db.clone(),
+            Arc::new(SessionRuntime::new()),
+            project_id.clone(),
+        )
+        .await
+        .expect("load final M06 snapshot")
+        .expect("final M06 project");
+        println!(
+            "M06 runtime IDs: project={} revision={} package={} fingerprint={} research_orders={} delivery_work_order={} candidate_commit={} verified_claims={} founder_interventions=1",
+            project_id,
+            final_snapshot.records.project_revision,
+            package.package_id,
+            package.authority_fingerprint,
+            final_snapshot
+                .work_orders
+                .iter()
+                .filter(|order| order.research_mode.is_some())
+                .count(),
+            completed
+                .work_order
+                .as_ref()
+                .map(|order| order.work_order_id.as_str())
+                .unwrap_or("missing"),
+            completed.candidate_commit.as_deref().unwrap_or("missing"),
+            final_snapshot
+                .records
+                .evidence
+                .iter()
+                .filter(|item| {
+                    item.kind == Some(EvidenceKind::ResearchClaim)
+                        && item.verification == Some(EvidenceVerification::IndependentlyVerified)
+                })
+                .count()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

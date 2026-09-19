@@ -94,12 +94,14 @@ run-generation checks remain in `SessionRuntime`; reopen marks an unexplained
 persisted `Running` order as `ReconciliationRequired` rather than completing
 it.
 
-The runtime module admits a bounded official GitHub metadata query, persists a
-sanitized `Unverified` proposal, and requires a distinct current Fact Verifier
-work order before finalization. Product OS commands expose admission,
-execution, cancellation, snapshot, ambiguity, and owner-decision operations;
-they do not expose direct mutation of ProductAuthority records. Full
-research-to-BuildPackage/Delivery admission is not yet runtime-qualified.
+The runtime module admits a bounded official GitHub metadata query and a
+bounded OpenCode WebDiscovery query, persists sanitized `Unverified` proposals,
+and requires a distinct current Fact Verifier work order before finalization.
+Product OS commands expose admission, execution, cancellation, snapshot,
+ambiguity, and owner-decision operations; they do not expose direct mutation
+of ProductAuthority records. M06 runtime-proves the fresh Linux
+research-to-BuildPackage/Delivery path, while Windows, packaging installation,
+and native GUI remain separate release evidence.
 
 ### Memory
 

@@ -1,6 +1,6 @@
 # Consensus Arena — Project Documentation Index
 
-**Last refreshed:** 2026-09-18
+**Last refreshed:** 2026-09-19
 **Purpose:** Small, modular source-of-truth documents for humans, ChatGPT, and Codex working on Consensus Arena.
 
 ## Current product in one paragraph
@@ -21,15 +21,10 @@ until Arena records an independent verifier work-order and source metadata;
 contradicted or stale claims cannot satisfy research gates. A candidate
 working directory remains non-authoritative and is not an OS/security sandbox.
 
-The narrow real research capability proven so far is direct read-only official
-GitHub/web-source retrieval outside the Product OS runtime; the typed
-proposal/finalization seam is not yet exposed through a durable Arena command
-or founder-facing research store. The official GitHub MCP server, integrated
-web search, ECC/gstack runtime procedures, shared consultation, and non-Zen
-provider portability remain unqualified. Linux package production is proven
-through the existing Tauri path, but installation/GUI launch are not claimed;
-Windows current-SHA qualification and
-native GUI launch remain unproven. See
+The narrow real research capability at that checkpoint was direct read-only
+official GitHub/web-source retrieval outside the Product OS runtime. Later
+milestones closed the durable Product OS and OpenCode WebDiscovery seams; this
+paragraph remains the historical 05A boundary. See
 `audits/product-os-transition/05A-research-runtime-release-preflight.md`.
 
 ## Milestone 05B current status
@@ -68,6 +63,33 @@ not manually relay web results into Product OS evidence. This does not claim
 Windows, packaging, broad provider portability, or final founder-dogfood
 readiness; see
 `/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/05D-durable-web-research.md`.
+
+## Milestone 06 current closure
+
+The fresh M06 dogfood uses a new internal founder idea, not the earlier
+validation fixtures. The production path admitted real UserProblem and
+CompetitorStatusQuo WebDiscovery work orders, persisted source-backed claims as
+Unverified, independently checked claims through distinct FactVerifier work
+orders, reopened the store, assembled the current Build Package, passed the
+applicable pre-implementation gates, and ran two bounded OpenCode engineering
+roles in parallel before Arena's independent Delivery verifier produced a
+current Verified candidate. The run recorded one owner decision intervention;
+routine research transport, role execution, candidate integration, and
+verification required no manual relay.
+
+The integrated provenance is deliberately search-level:
+`observation=search_result; OpenCode tools=websearch;
+webfetch=not_used_in_production_path`. The separate M05D webfetch probe proves
+that capability exists in the installed runtime, not that M06 claims fetched
+source content. Search evidence is not market validation and unresolved or
+contradicted claims remain gate-blocking.
+
+This is runtime-proven on Linux with OpenCode 1.18.31, Muse Spark free tier,
+and hosted Exa WebDiscovery. It is not Windows runtime parity, native GUI
+qualification, hostile same-user filesystem isolation, full SSRF isolation,
+Git-object isolation, broad provider portability, or an external OpenCode
+installer. The detailed evidence is in
+`audits/product-os-transition/06-week-one-dogfood-release.md`.
 
 ## Reality hierarchy
 

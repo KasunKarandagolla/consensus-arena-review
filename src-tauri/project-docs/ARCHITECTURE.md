@@ -100,9 +100,11 @@ authorize a worker, or replace `SessionRuntime`, Delivery, the verifier, or
 Safe Apply. Those boundaries remain the responsibility of the existing Arena
 authority kernel and are future integration work.
 
-The owner-facing Delivery view adds only a calm four-step summary — Intent,
-Build, Verify, Apply. Technical evidence remains progressively disclosed by
-the existing Delivery details rather than becoming the primary experience.
+The owner-facing Delivery view keeps the calm Delivery details and now places
+them under the broader project journey label `Discover → Decide → Deliver →
+Release`; the four-step Intent/Build/Verify/Apply sequence remains the
+Delivery subsection. Technical evidence remains progressively disclosed rather
+than becoming the primary experience.
 
 ### Durable Product OS research — Milestone 05B
 
@@ -142,6 +144,17 @@ update invalidates the old package. This is not market validation or final
 founder dogfood. A candidate directory and
 Git worktree remain non-authoritative working locations, not OS/security
 sandboxes.
+
+### Fresh founder dogfood — Milestone 06
+
+The fresh Linux dogfood proves the first integrated Product OS path from a
+newly admitted founder idea through WebDiscovery, independent fact
+verification, an authority-derived Build Package and pre-implementation gates,
+parallel bounded engineering roles, the existing frozen-acceptance Delivery
+path, and an independent Verified candidate. The external worker remains a
+replaceable execution substrate; Arena retains product truth, acceptance,
+verification, and Apply authority. This does not claim native GUI, Windows
+runtime, package installation, or hostile same-user filesystem isolation.
 
 ## Durable state ownership
 

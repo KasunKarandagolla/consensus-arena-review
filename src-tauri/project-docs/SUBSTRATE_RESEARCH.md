@@ -139,6 +139,18 @@ Windows, packaging, broad provider, unrestricted webfetch, market-validation,
 or final founder-dogfood qualification. OpenCode permission policy remains
 distinct from OS/same-user filesystem isolation.
 
+### M06 fresh founder closure
+
+The fresh Linux M06 run advances the practical verdict narrowly to a
+runtime-proven founder-to-Delivery path behind the Arena-owned adapter:
+OpenCode 1.18.31/Muse Spark performed WebDiscovery and bounded engineering
+work, while Arena admitted evidence, independently verified claims, assembled
+the current package, enforced frozen acceptance, and ran the independent
+verifier. The production evidence scope is search-level only
+(`observation=search_result`, `websearch`, no production `webfetch`). This is
+not broad provider portability, Windows parity, package/install qualification,
+GUI qualification, or a security sandbox.
+
 ### Milestone 05A research/release preflight
 
 The first narrow real research route is direct read-only retrieval from the
