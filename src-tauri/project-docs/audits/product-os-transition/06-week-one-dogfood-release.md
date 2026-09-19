@@ -91,7 +91,14 @@ Residual boundaries remain: OpenCode permissions are not an OS sandbox; hostile 
 
 ## WINDOWS / PACKAGING STATUS
 
-The existing Windows workflow is the qualification path. This Linux session cannot claim Windows runtime parity or a Windows model-backed run. Windows compile, Product OS serialization, Job Object behavior, frontend build, and unsigned NSIS packaging require the workflow runner result for this checkpoint. The Linux `.deb` build is proven above; package install/GUI launch is not claimed because the current host is graphics/WebKit blocked.
+The existing Windows workflow is the qualification path. For this exact
+checkpoint SHA, run `35440202391`, the Windows frontend build completed but
+`windows-build-test` stopped at the existing `cargo fmt --check` step; Windows
+Rust tests, Windows `cargo check`, Job Object execution, and unsigned NSIS
+packaging therefore did not run. This Linux session cannot claim Windows
+runtime parity or a Windows model-backed run. The Linux `.deb` build is proven
+above; package install/GUI launch is not claimed because the current host is
+graphics/WebKit blocked.
 
 ## OPTIONAL / UNPROVEN
 
