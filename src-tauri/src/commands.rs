@@ -576,6 +576,7 @@ pub async fn start_delivery(
         },
         work_order: None,
         evidence: Vec::new(),
+        semantic_reviews: Vec::new(),
         authority_records: None,
         build_package: None,
         created_at: now,

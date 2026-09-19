@@ -2,6 +2,9 @@ use crate::delivery::{
     DeliveryPhase, DeliveryState, OpenCodeEvidence, OpenCodeTaskState, OpenCodeWorkOrder,
     ProtectedFileHash,
 };
+use crate::candidate_review::{
+    self, CandidateReviewContext, CandidateReviewSummary, ReviewLens, SemanticReviewReceipt,
+};
 use crate::dsh_worker;
 use crate::execution_profiles::ExecutionProfile;
 use crate::settings_store::SettingsStore;
@@ -333,6 +336,22 @@ pub async fn run_profile_prompt(
     prompt: String,
     profile: ExecutionProfile,
 ) -> Result<SemanticExecution, String> {
+    let workdir = std::env::temp_dir().join(format!(
+        "consensus-arena-semantic-role-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workdir)
+        .map_err(|error| format!("could not create semantic role workspace: {error}"))?;
+    let result = run_profile_prompt_in_workspace(prompt, profile, &workdir).await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    result
+}
+
+pub(crate) async fn run_profile_prompt_in_workspace(
+    prompt: String,
+    profile: ExecutionProfile,
+    workdir: &Path,
+) -> Result<SemanticExecution, String> {
     let spec = profile.spec();
     if prompt.len() > spec.max_prompt_bytes {
         return Err(format!(
@@ -340,12 +359,9 @@ pub async fn run_profile_prompt(
             profile
         ));
     }
-    let workdir = std::env::temp_dir().join(format!(
-        "consensus-arena-semantic-role-{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&workdir)
-        .map_err(|error| format!("could not create semantic role workspace: {error}"))?;
+    if !workdir.is_dir() {
+        return Err("OpenCode profile workspace does not exist".to_string());
+    }
     let profile_workspace = profile_workspace(profile)?;
     let _resource_permit = if spec.lsp {
         Some(
@@ -374,7 +390,7 @@ pub async fn run_profile_prompt(
     let execution = dsh_worker::run_contained_command_with_options(
         &executable(),
         &args,
-        &workdir,
+        workdir,
         Duration::from_secs(spec.timeout_seconds),
         &dsh_worker::ContainedCommandOptions {
             environment: profile_workspace.overrides.clone(),
@@ -382,7 +398,6 @@ pub async fn run_profile_prompt(
         },
     )
     .await;
-    let _ = std::fs::remove_dir_all(&workdir);
     let execution = execution?;
     if execution.timed_out {
         return Err("OpenCode semantic role timed out".to_string());
@@ -394,6 +409,104 @@ pub async fn run_profile_prompt(
         return Err("OpenCode semantic role exceeded the bounded result size".to_string());
     }
     parse_semantic_output(&execution.stdout)
+}
+
+async fn candidate_review_context(
+    candidate: &Path,
+    acceptance_commit: &str,
+    candidate_sha: &str,
+    acceptance_summary: &str,
+    cache_root: &Path,
+) -> Result<CandidateReviewContext, String> {
+    let diff = git_output(
+        candidate,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--unified=20",
+            acceptance_commit,
+            candidate_sha,
+        ],
+    )
+    .await?;
+    if !diff.status.success() {
+        return Err("could not collect the bounded candidate diff".to_string());
+    }
+    let diff = String::from_utf8_lossy(&diff.stdout)
+        .chars()
+        .take(candidate_review::MAX_CONTEXT_BYTES)
+        .collect::<String>();
+    let repo_intel = crate::repo_intelligence::bounded_slice(
+        candidate,
+        cache_root,
+        "symbols for the changed implementation boundary",
+    )
+    .await
+    .ok()
+    .map(|slice| slice.content);
+    Ok(CandidateReviewContext {
+        candidate_sha: candidate_sha.to_string(),
+        acceptance_commit: acceptance_commit.to_string(),
+        diff,
+        acceptance_summary: acceptance_summary
+            .chars()
+            .take(candidate_review::MAX_CONTEXT_BYTES / 4)
+            .collect(),
+        repo_intel,
+    })
+}
+
+async fn run_candidate_reviews(
+    candidate: &Path,
+    acceptance_commit: &str,
+    candidate_sha: &str,
+    acceptance_summary: &str,
+    cache_root: &Path,
+) -> Result<CandidateReviewSummary, String> {
+    let context = candidate_review_context(
+        candidate,
+        acceptance_commit,
+        candidate_sha,
+        acceptance_summary,
+        cache_root,
+    )
+    .await?;
+    let mut receipts: Vec<SemanticReviewReceipt> = Vec::new();
+    let mut review_error = None;
+    for lens in [
+        ReviewLens::TestQuality,
+        ReviewLens::ErrorHandling,
+        ReviewLens::TypeApiDesign,
+        ReviewLens::Maintainability,
+    ] {
+        let prompt = context.bounded_prompt(lens);
+        match run_profile_prompt_in_workspace(prompt, ExecutionProfile::CandidateReview, candidate)
+            .await
+        {
+            Ok(execution) => match candidate_review::parse_receipt(
+                candidate_sha,
+                acceptance_commit,
+                lens,
+                &execution.root_session_id,
+                &execution.text,
+            ) {
+                Ok(receipt) => receipts.push(receipt),
+                Err(error) => review_error = Some(error),
+            },
+            Err(error) => {
+                review_error = Some(error);
+                break;
+            }
+        }
+    }
+    let deduplicated_findings = candidate_review::deduplicate(&receipts);
+    Ok(CandidateReviewSummary {
+        candidate_sha: candidate_sha.to_string(),
+        acceptance_commit: acceptance_commit.to_string(),
+        receipts,
+        deduplicated_findings,
+        review_error,
+    })
 }
 
 fn safe_evidence_id(work_order_id: &str) -> String {
@@ -899,6 +1012,79 @@ pub async fn run_delivery(
         summary: "Bounded worker result retained as candidate evidence; Arena performed admission and verification.".to_string(),
         result_ref: execution.evidence_ref.clone(),
     });
+
+    // Semantic review is advisory and exact-candidate bound. It runs before
+    // the deterministic verifier, but neither review output nor a skill can
+    // produce a PASS/Verified transition.
+    let review_summary = run_candidate_reviews(
+        &candidate,
+        &state.base_commit,
+        &execution.candidate_sha,
+        &state
+            .contract
+            .as_ref()
+            .map(|contract| {
+                contract
+                    .acceptance_criteria
+                    .iter()
+                    .map(|criterion| format!("{}: {}", criterion.id, criterion.description))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| "Frozen acceptance summary unavailable".to_string()),
+        state_path.parent().unwrap_or(Path::new(".")),
+    )
+    .await;
+    match review_summary {
+        Ok(summary) => {
+            let blocking_count = summary
+                .deduplicated_findings
+                .iter()
+                .filter(|finding| {
+                    matches!(
+                        finding.recommended_disposition,
+                        candidate_review::FindingDisposition::BlockingRepair
+                    )
+                })
+                .count();
+            state.semantic_reviews = summary.receipts;
+            if let Some(error) = summary.review_error {
+                state.last_worker_summary = Some(format!(
+                    "Semantic review was advisory and incomplete: {error}"
+                ));
+            } else if blocking_count > 0 {
+                state.last_worker_summary = Some(format!(
+                    "Semantic review recorded {blocking_count} blocking-repair recommendation(s); deterministic verification remains authoritative"
+                ));
+            }
+        }
+        Err(error) => {
+            state.last_worker_summary = Some(format!(
+                "Semantic review was unavailable; deterministic verification remains authoritative: {error}"
+            ));
+        }
+    };
+    let candidate_after_review = verification::candidate_sha(&candidate).await?;
+    let review_tree = git_output(
+        &candidate,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )
+    .await?;
+    if candidate_after_review != execution.candidate_sha || !review_tree.stdout.is_empty() {
+        if candidate_after_review == execution.candidate_sha {
+            let _ = discard_candidate_changes(&candidate, &execution.candidate_sha).await;
+        }
+        state.phase = DeliveryPhase::Failed;
+        if let Some(work_order) = state.work_order.as_mut() {
+            work_order.task_state = OpenCodeTaskState::Invalid;
+            work_order.error = Some(
+                "semantic review changed the candidate; review output was rejected".to_string(),
+            );
+        }
+        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+            .await?;
+        return Ok(state);
+    }
     state.phase = DeliveryPhase::Verifying;
     crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
         .await?;

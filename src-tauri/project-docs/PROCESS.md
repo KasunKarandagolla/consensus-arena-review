@@ -215,6 +215,12 @@ and requesting/receiving review for CandidateReview. These procedures guide
 worker method only. Arena still owns work-order progression, Product OS
 admission, verification, and Apply.
 
+The Q2 candidate-review phase uses only the relevant specialist lenses
+(test-quality, error-handling, type/API design, and maintainability). Findings
+are deduplicated and can be stale when the candidate SHA changes. A review
+worker cannot select a stronger profile, install a skill, or redefine
+acceptance.
+
 Use repository intelligence on demand as a bounded derived slice. Use Context7
 only for a bounded current/version-specific technical question. Do not put
 full repository maps, raw documentation sessions, credentials, or provider

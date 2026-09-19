@@ -277,3 +277,9 @@ Repository intelligence is a derived `agent-analyzer` cache keyed by
 repository identity, base HEAD, and analyzer version. Arena retains bounded
 metadata/index references and injects only a bounded query slice; the full map
 is never ProductAuthorityRecords.
+
+CandidateReview is an Arena-owned advisory stage bound to the candidate SHA
+and frozen acceptance commit. It may produce deduplicated semantic findings
+before deterministic verification, but it cannot produce PASS/Verified or
+change acceptance, ProductAuthorityRecords, or Apply authority. Exploratory
+browser and performance procedures follow the same evidence boundary.

@@ -186,3 +186,112 @@ Resolved predecessor/current base: `ee003a96dfb66ab9b59c59880eb27a503b3d32fa`
 External qualification references: [agent-analyzer](https://github.com/agent-sh/agent-analyzer),
 [Superpowers](https://github.com/obra/superpowers), and
 [Context7](https://github.com/upstash/context7).
+
+## Follow-up closure and Q2 integration — 2026-09-20
+
+This section preserves the original checkpoint claims above. It records the
+environment work performed after that checkpoint and the small Q2 policy seam
+added without changing Arena's authority model.
+
+### SOURCE-CONFIRMED / INTEGRATED
+
+- The active rustup toolchain is `stable-x86_64-unknown-linux-gnu`, Rust
+  `1.95.0 (59807616 2026-04-14)`. The matching rustup component now provides
+  `/home/kasun/.cargo/bin/rust-analyzer`, version `1.95.0 (5980761
+  2026-04-14)`. OpenCode's Arena profile configuration points at native LSP;
+  no Arena LSP client or server was added.
+- TypeScript tooling is reproducibly installed outside the repository at
+  `/home/kasun/.local/share/consensus-arena-tools/typescript-language-server-4.3.3`:
+  `typescript-language-server 4.3.3` with bundled/pinned TypeScript `5.4.5`.
+  The repository's existing frontend build remains the fallback and no
+  package.json dependency was added.
+- Q2 now has an Arena-owned bounded `SemanticReviewReceipt` policy. Receipts
+  carry exact candidate SHA and acceptance commit, deduplicate findings, and
+  are explicitly advisory. CandidateReview runs before deterministic
+  verification when the qualified execution runtime is available; a stale or
+  mutating review is rejected and no review can mark PASS/Verified.
+- Browser evidence policy distinguishes frozen Playwright/native Webdriver
+  commands from exploratory Playwright MCP and Chromium DevTools output.
+  Performance workflow data requires measured evidence before it is complete.
+  These are policy types, not a second coordinator.
+
+### RUNTIME-PROVEN
+
+- Rust LSP protocol proof on disposable target
+  `/tmp/arena-q1-rust-proof-20260919` produced four syntax diagnostics, one
+  definition result and one references result through the installed
+  rust-analyzer stdio server. Maximum RSS was `174628 KB` (about `170.5 MiB`)
+  over `19.55 s`; the server was terminated and no rust-analyzer process
+  remained.
+- TypeScript LSP protocol proof on disposable target
+  `/tmp/arena-q1-ts-proof-20260919` produced two type diagnostics, one
+  definition result and two references results through the pinned
+  `typescript-language-server 4.3.3` path. The bounded target used `noLib` to
+  avoid irrelevant standard-library acquisition on this constrained host.
+  Maximum RSS was `65540 KB` (about `64.0 MiB`) over `23.41 s`; the spawned
+  tsserver children were terminated and orphan inspection was clean.
+- These raw LSP proofs are advisory source-intelligence evidence only. They do
+  not enter ProductAuthorityRecords or verification receipts.
+
+### ENVIRONMENT-BLOCKED
+
+- An actual model-backed OpenCode profile run was attempted with the exact
+  Arena-style LSP configuration. The qualified executable reached provider
+  startup but returned the exact provider error `403 FreeTierError: OpenCode's
+  free tier can only be used from within OpenCode`. The configured local
+  OmniRoute endpoint at `http://localhost:20128/v1` was also unreachable.
+  Therefore OpenCode tool-call proof and real Superpowers Implementation and
+  DebugRepair influence remain blocked by provider access, not inferred from
+  copied skill files. No credential was placed in temporary configuration.
+- The TypeScript proof on the full frontend project was resource-heavy on this
+  host; the disposable bounded `noLib` target is the successful qualification
+  case. Project-native `npm run build` remains the default frontend fallback.
+
+### Q1 test-resource closure status
+
+- The focused binary test was rerun with one Cargo job, test debuginfo removed,
+  GCC as linker, and `--reduce-memory-overheads`. The dependency build was
+  completed successfully. The previous `2.06 GiB` failed linker attempt
+  remains historical evidence and is not described as product runtime
+  performance.
+- The supported low-resource command is:
+  `CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 RUSTFLAGS='-C debuginfo=0 -C linker=gcc -C link-arg=-Wl,--reduce-memory-overheads' cargo test --bin consensus-arena -- --nocapture`.
+  It is intentionally serial and should be used for Q1 policy/cache tests on
+  the target host.
+- The first low-memory link completed the execution-profile tests (3 passed).
+  The timed cached-profile run completed the new candidate-review tests (4
+  passed) with peak RSS `1,434,664 KB` (about `1.37 GiB`) over `228.01 s`.
+  Direct execution of the cached binary also passed the drift (1), workflow
+  policy (2), repo-intelligence (2), environment allowlist (2), and existing
+  OpenCode authority (3) tests. This closes the Q1 test-linking proof gap;
+  it does not claim that the full suite is cheap on this host.
+
+### Q2 evidence status
+
+- Semantic-review policy is **INTEGRATED**, with pure parser, exact-SHA,
+  deduplication and advisory-authority tests. Real model-backed candidate
+  review and bounded repair are **ENVIRONMENT-BLOCKED** by the provider error
+  above.
+- Playwright Test, Playwright MCP, Chrome DevTools MCP, and native Tauri
+  WebdriverIO runtime qualification are recorded separately in the Q2 audit;
+  no browser result is accepted as a deterministic verdict unless it is a
+  frozen VerificationCommand for the target it actually exercises.
+- Sentry MCP is **REJECTED / NOT REQUIRED AS CORE V1**; AgentSys skillers are
+  **REJECTED FOR V1**; Flow-Next is **REJECTED AS RUNTIME DEPENDENCY**.
+
+### Closure verification — 2026-09-20
+
+- `cargo check`: passed after the closure changes.
+- Focused low-memory tests: passed as recorded above. The source-only
+  `cargo fmt --all -- --check` baseline remains noisy; touched new Rust files
+  were checked with edition-2024 rustfmt.
+- Frontend `npm run build`: passed (`tsc` and Vite, 1,712 modules).
+- The qualified analyzer cache reported valid at the current base HEAD before
+  the closure commit; its status was keyed to `d9ee05d1e49f9e8dd27795c2c2686d64949bb6d6`.
+  After the closure commit it reported `stale`; an incremental update processed
+  one commit and emitted a valid new map at the new HEAD in `5.66 s` with peak
+  RSS `26,640 KB`. The post-commit stale-HEAD check is recorded in the Q2 audit.
+- Context7 anonymous MCP health/query proof, Playwright repeat proof, scoped
+  secret scan, and orphan-process inspection passed. Model-backed
+  Superpowers and OpenCode LSP tool-call proof remain provider-blocked as
+  stated above.

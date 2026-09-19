@@ -206,3 +206,7 @@ verification state, or Apply authority; project-native verification remains
 the sole source of the Verified verdict. Full AgentSys orchestration, global
 Superpowers bootstrap, an Arena LSP server/client, and arbitrary worker-chosen
 profiles are not required.
+
+Q2 retains the same decision: semantic review, browser exploration, and
+performance procedures are derived evidence only. Sentry MCP, AgentSys
+skillers, and Flow-Next are not V1 runtime dependencies.

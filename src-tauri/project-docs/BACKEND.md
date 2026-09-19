@@ -230,3 +230,7 @@ profile configuration and selected skill files are cleaned after execution.
 The repository-intelligence integration uses standalone `agent-analyzer`
 metadata and bounded CLI queries. It is fail-soft for semantic roles and is
 not a source of product intent or acceptance truth.
+
+Candidate review receipts are bounded derived records keyed to the exact
+candidate SHA and acceptance commit. They are advisory inputs to Delivery;
+the deterministic verifier remains the only source of a Verified verdict.

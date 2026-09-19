@@ -392,3 +392,10 @@ another profile. Candidate isolation, canonical-checkout protection, process
 containment, frozen acceptance, project-native verification, and explicit
 Apply remain unchanged. LSP, repo intelligence, Context7, and skills can
 inform execution but cannot produce a Verified state.
+
+Before deterministic verification, OpenCode candidate Delivery may run the
+Arena CandidateReview profile over a bounded diff, frozen acceptance summary,
+bounded repo-intelligence slice, and exact candidate identity. The resulting
+semantic receipts are advisory and stale when the candidate changes. Review
+mutation or stale identity fails closed; provider/resource unavailability is
+reported and the deterministic verifier remains authoritative.

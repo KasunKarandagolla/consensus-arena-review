@@ -4292,6 +4292,7 @@ mod tests {
             runtime: crate::delivery::DeliveryRuntime::OpenCode,
             work_order: None,
             evidence: Vec::new(),
+            semantic_reviews: Vec::new(),
             authority_records: Some(
                 snapshot(
                     db.clone(),

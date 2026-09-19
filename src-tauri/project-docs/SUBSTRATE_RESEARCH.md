@@ -279,6 +279,8 @@ with bounded library/version/question inputs and no credential in profile
 configuration.
 
 OpenCode's native LSP configuration is source-confirmed for Rust and
-TypeScript, but this host lacks both a runnable `rust-analyzer` component and
-the TypeScript language-server executable. Those qualifications remain
-environment-blocked and fall back to project-native diagnostics.
+TypeScript. The matching rustup `rust-analyzer` and pinned
+`typescript-language-server 4.3.3` have protocol-level disposable-target
+proof, including diagnostics and navigation. Heavy LSP is single-slot on the
+target host; project-native diagnostics and the frontend build remain the
+fallback when resource or provider conditions prevent the profile run.

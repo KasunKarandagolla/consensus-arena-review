@@ -287,8 +287,11 @@ semantic and web roles do not start LSP.
 
 On the current Linux host, `agent-analyzer` used approximately 25.7 MiB RSS
 for an incremental update. A bounded OpenCode version probe measured about
-101.6 MiB RSS. `rust-analyzer` is unavailable because the installed Rust
-toolchain lacks that component, and the TypeScript language-server executable
-is not installed; project-native `cargo check` and the frontend build remain
-the truthful fallbacks. These are recorded as environment blocks, not silent
-qualification claims.
+101.6 MiB RSS. The matching rustup `rust-analyzer` now qualifies at about
+170.5 MiB RSS for a disposable diagnostic/navigation session. The pinned
+TypeScript language server qualifies at about 64.0 MiB RSS when its disposable
+target uses bounded `noLib` configuration; full frontend build/typecheck
+remains the fallback on constrained hardware. Heavy LSP profiles remain
+single-slot only, and no second LSP-equipped worker is launched silently.
+Model-backed OpenCode/Superpowers runtime evidence remains provider-blocked as
+recorded in the permanent Q1 follow-up.

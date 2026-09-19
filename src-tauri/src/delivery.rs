@@ -162,6 +162,8 @@ pub struct DeliveryState {
     #[serde(default)]
     pub evidence: Vec<OpenCodeEvidence>,
     #[serde(default)]
+    pub semantic_reviews: Vec<crate::candidate_review::SemanticReviewReceipt>,
+    #[serde(default)]
     pub authority_records: Option<ProductAuthorityRecords>,
     #[serde(default)]
     pub build_package: Option<BuildPackage>,
@@ -259,6 +261,7 @@ pub struct DeliveryPresentation {
     pub runtime: DeliveryRuntime,
     pub work_order: Option<OpenCodeWorkOrder>,
     pub evidence: Vec<OpenCodeEvidence>,
+    pub semantic_review_count: usize,
     pub build_package_id: Option<String>,
     pub build_package_ready: bool,
 }
@@ -299,6 +302,7 @@ pub fn presentation(state: &DeliveryState) -> DeliveryPresentation {
         runtime: state.runtime.clone(),
         work_order: state.work_order.clone(),
         evidence: state.evidence.clone(),
+        semantic_review_count: state.semantic_reviews.len(),
         build_package_id: state
             .build_package
             .as_ref()
@@ -542,6 +546,7 @@ pub async fn admit_build_package(
         runtime,
         work_order: None,
         evidence: Vec::new(),
+        semantic_reviews: Vec::new(),
         authority_records: Some(records),
         build_package: Some(package),
         created_at: timestamp,
@@ -2030,6 +2035,7 @@ mod tests {
             runtime: DeliveryRuntime::Dsh,
             work_order: None,
             evidence: Vec::new(),
+            semantic_reviews: Vec::new(),
             authority_records: None,
             build_package: None,
             created_at: 1,
@@ -2232,6 +2238,7 @@ mod tests {
             runtime: DeliveryRuntime::Dsh,
             work_order: None,
             evidence: Vec::new(),
+            semantic_reviews: Vec::new(),
             authority_records: None,
             build_package: None,
             created_at: chrono::Utc::now().timestamp(),

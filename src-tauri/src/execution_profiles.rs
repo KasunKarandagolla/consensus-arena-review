@@ -27,7 +27,7 @@ pub enum ResourcePolicy {
     Light,
     Standard,
     HeavyLsp,
-    MpcBounded,
+    McpBounded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +133,7 @@ impl ExecutionProfile {
                 timeout_seconds: 600,
                 max_prompt_bytes: 16 * 1024,
                 max_result_bytes: 32 * 1024,
-                resource_policy: ResourcePolicy::MpcBounded,
+                resource_policy: ResourcePolicy::McpBounded,
             },
             Self::PerformanceInvestigation => ProfileSpec {
                 agent: "plan",
@@ -144,7 +144,7 @@ impl ExecutionProfile {
                 timeout_seconds: 900,
                 max_prompt_bytes: 16 * 1024,
                 max_result_bytes: 32 * 1024,
-                resource_policy: ResourcePolicy::MpcBounded,
+                resource_policy: ResourcePolicy::McpBounded,
             },
         }
     }
