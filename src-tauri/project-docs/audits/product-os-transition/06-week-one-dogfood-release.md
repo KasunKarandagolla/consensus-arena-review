@@ -59,6 +59,12 @@ The run closed and reopened the Product OS store before package assembly. It the
 - production verifier: `websearch` only; production `webfetch` was not invoked;
 - no new provider key or search credential was requested.
 
+The runtime behavior is explicit: a missing executable returns
+`compatible=false` with an unavailable diagnostic; a present but non-1.18.31
+version returns `compatible=false` with the required-version diagnostic; and a
+provider/rate-limit/runtime failure is returned as a bounded research error,
+not silently switched to another provider or model.
+
 ### Checks and package
 
 - `cargo check`: passed with the historical 81-warning baseline;
