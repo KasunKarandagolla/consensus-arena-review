@@ -217,3 +217,16 @@ cd src-tauri && cargo check
 ```
 
 Delivery/reliability changes require targeted tests plus source-level audit of invariants; frontend-coupled changes also require frontend build.
+
+## Q1 execution profiles
+
+`src-tauri/src/execution_profiles.rs` is the small Arena-owned policy layer for
+OpenCode. It fixes the agent/mode, allowed tools, selected pinned skills,
+optional native LSP, optional Context7 MCP, bounded timeout/result sizes, and a
+resource policy. `dsh_worker` clears the child environment and injects only
+explicit non-secret OpenCode configuration paths and feature flags. Temporary
+profile configuration and selected skill files are cleaned after execution.
+
+The repository-intelligence integration uses standalone `agent-analyzer`
+metadata and bounded CLI queries. It is fail-soft for semantic roles and is
+not a source of product intent or acceptance truth.

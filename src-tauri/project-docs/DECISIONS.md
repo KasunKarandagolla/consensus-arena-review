@@ -195,3 +195,14 @@ The following are **not current architecture requirements**:
 - The entire future product must stay below a hard global 2 GB limit or exactly two WebViews. These remain important optimization/current-lane facts, not universal architecture laws.
 
 See `SUBSTRATE_RESEARCH.md` for concise gate conclusions.
+
+## D-2026-22 — Execution-side quality capabilities remain derived and bounded
+
+**Accepted for Q1.** Arena owns a small role-selected OpenCode execution
+profile policy. Standalone repository intelligence, native OpenCode LSP,
+selected pinned procedures, and on-demand Context7 documentation are bounded
+execution inputs only. They cannot mutate ProductAuthorityRecords, acceptance,
+verification state, or Apply authority; project-native verification remains
+the sole source of the Verified verdict. Full AgentSys orchestration, global
+Superpowers bootstrap, an Arena LSP server/client, and arbitrary worker-chosen
+profiles are not required.

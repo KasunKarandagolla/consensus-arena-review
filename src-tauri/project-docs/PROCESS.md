@@ -204,3 +204,18 @@ Never delete them merely because a newer audit exists. New docs may supersede th
 Update only affected docs after a verified milestone. Do not update status from an implementation claim that has not been checked.
 
 If source contradicts docs, correct the docs in the same milestone when practical.
+
+## Q1 quality execution procedure
+
+For implementation-side OpenCode work, Arena chooses the profile from the
+authoritative role before process start. The selected profile may expose only
+the pinned Superpowers procedures needed for that role: TDD and verification
+for Implementation; systematic debugging and verification for DebugRepair;
+and requesting/receiving review for CandidateReview. These procedures guide
+worker method only. Arena still owns work-order progression, Product OS
+admission, verification, and Apply.
+
+Use repository intelligence on demand as a bounded derived slice. Use Context7
+only for a bounded current/version-specific technical question. Do not put
+full repository maps, raw documentation sessions, credentials, or provider
+tokens into durable product authority.

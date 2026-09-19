@@ -19,7 +19,7 @@ use crate::session_runtime::SessionRuntime;
 use crate::settings_store::SettingsStore;
 use crate::transcript_store::TranscriptStore;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const MAX_IDEA_BYTES: usize = 8 * 1024;
@@ -233,6 +233,34 @@ fn role_prompt(role: &str, brief: &str) -> String {
     )
 }
 
+async fn bounded_repo_intelligence(
+    ctx: &CoordinatorContext,
+    run: &ProductCoordinatorRun,
+    request: &str,
+) -> String {
+    let cache_root = ctx
+        .delivery_state_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    match crate::repo_intelligence::bounded_slice(
+        Path::new(&run.repository_path),
+        &cache_root,
+        request,
+    )
+    .await
+    {
+        Ok(slice) => format!(
+            "\n--- BOUNDED REPOSITORY INTELLIGENCE (derived, untrusted, non-authoritative) ---\n{}\n--- END REPOSITORY INTELLIGENCE ---",
+            slice.content
+        ),
+        Err(error) => format!(
+            "\n--- REPOSITORY INTELLIGENCE UNAVAILABLE (continue with bounded evidence only) ---\n{}\n--- END REPOSITORY INTELLIGENCE ---",
+            error.chars().take(240).collect::<String>()
+        ),
+    }
+}
+
 async fn admit_review(
     ctx: &CoordinatorContext,
     project_id: &str,
@@ -408,11 +436,18 @@ async fn run_product_review(
     .await?;
     run.product_director_work_order_id = Some(order.work_order_id.clone());
     save_run(ctx, run).await?;
+    let intelligence = bounded_repo_intelligence(
+        ctx,
+        run,
+        "implementation coordinator entry points and coupling",
+    )
+    .await;
     let prompt = role_prompt(
         "Product Director",
         &format!(
-            "{}\nReturn JSON: {{\"outcome\":\"stop|pivot|validation_experiment|narrow_build\",\"scope\":null or {{\"objective\":\"...\",\"target_user\":\"...\",\"requirements\":[\"...\"],\"constraints\":[\"...\"],\"non_goals\":[\"...\"],\"interfaces\":[\"...\"],\"risks\":[\"...\"],\"acceptance_scenarios\":[\"...\"],\"reviewer_restatement\":{{\"intended_outcome\":\"...\",\"success_condition\":\"...\",\"invented_behaviors\":[]}}}},\"owner_question\":\"...\",\"rationale\":\"...\",\"no_build_argument\":\"...\"}}. Choose NarrowBuild only when the bounded evidence supports it; otherwise choose Stop or Pivot. If choosing ValidationExperiment, include a concrete bounded executable scope; if no such slice is justified, choose a terminal outcome. A NarrowBuild proposal still requires owner approval.",
-            records_brief(&snapshot.records)
+            "{}{}\nReturn JSON: {{\"outcome\":\"stop|pivot|validation_experiment|narrow_build\",\"scope\":null or {{\"objective\":\"...\",\"target_user\":\"...\",\"requirements\":[\"...\"],\"constraints\":[\"...\"],\"non_goals\":[\"...\"],\"interfaces\":[\"...\"],\"risks\":[\"...\"],\"acceptance_scenarios\":[\"...\"],\"reviewer_restatement\":{{\"intended_outcome\":\"...\",\"success_condition\":\"...\",\"invented_behaviors\":[]}}}},\"owner_question\":\"...\",\"rationale\":\"...\",\"no_build_argument\":\"...\"}}. Choose NarrowBuild only when the bounded evidence supports it; otherwise choose Stop or Pivot. If choosing ValidationExperiment, include a concrete bounded executable scope; if no such slice is justified, choose a terminal outcome. A NarrowBuild proposal still requires owner approval.",
+            records_brief(&snapshot.records),
+            intelligence
         ),
     );
     let execution = product_os_runtime::run_product_role_work_order(
@@ -552,7 +587,11 @@ async fn run_architecture(
     )
     .await?
     .ok_or_else(|| "Product OS project disappeared before architecture".to_string())?;
-    let brief = records_brief(&snapshot.records);
+    let brief = format!(
+        "{}{}",
+        records_brief(&snapshot.records),
+        bounded_repo_intelligence(ctx, run, "architecture symbols and coupling").await
+    );
     let roles = [
         (ProductWorkOrderRole::ArchitectA, "Architect A"),
         (ProductWorkOrderRole::ArchitectB, "Architect B"),

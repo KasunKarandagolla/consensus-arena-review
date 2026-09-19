@@ -275,3 +275,20 @@ worker are available. On the logged-in Linux desktop:
 
 The current host does not satisfy these prerequisites. This procedure is
 prepared for the final dogfood block and is not qualification evidence.
+
+## Q1 process and resource safeguards
+
+OpenCode profile configuration is temporary and injected through an explicit
+allowlist after environment sanitization. The existing process-group and Job
+Object containment remains the cancellation boundary. Repository analysis is
+one cached run per repository HEAD and query output is bounded. Heavy LSP
+profiles are intended to run one at a time on the target low-resource machine;
+semantic and web roles do not start LSP.
+
+On the current Linux host, `agent-analyzer` used approximately 25.7 MiB RSS
+for an incremental update. A bounded OpenCode version probe measured about
+101.6 MiB RSS. `rust-analyzer` is unavailable because the installed Rust
+toolchain lacks that component, and the TypeScript language-server executable
+is not installed; project-native `cargo check` and the frontend build remain
+the truthful fallbacks. These are recorded as environment blocks, not silent
+qualification claims.

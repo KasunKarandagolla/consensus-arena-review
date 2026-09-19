@@ -3,6 +3,7 @@ use crate::delivery::{
     ProtectedFileHash,
 };
 use crate::dsh_worker;
+use crate::execution_profiles::ExecutionProfile;
 use crate::settings_store::SettingsStore;
 use crate::transcript_store::TranscriptStore;
 use crate::verification::{self, VerificationReceipt};
@@ -10,13 +11,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tauri::AppHandle;
+use tokio::sync::Semaphore;
 
 pub const DEFAULT_MODEL: &str = "opencode/muse-spark-1.2-contributor-free";
 pub const QUALIFIED_VERSION: &str = "1.18.31";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 1_800;
+static HEAVY_PROFILE_SLOT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn heavy_profile_slot() -> Arc<Semaphore> {
+    HEAVY_PROFILE_SLOT
+        .get_or_init(|| Arc::new(Semaphore::new(1)))
+        .clone()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeRuntimeStatus {
@@ -50,6 +59,62 @@ pub fn model_identifier() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
+
+pub(crate) struct ProfileWorkspace {
+    pub(crate) root: PathBuf,
+    pub(crate) overrides: dsh_worker::OpenCodeEnvironmentOverrides,
+}
+
+impl Drop for ProfileWorkspace {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.root) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %error, path = %self.root.display(), "could not clean OpenCode profile workspace");
+            }
+        }
+    }
+}
+
+pub(crate) fn profile_workspace(profile: ExecutionProfile) -> Result<ProfileWorkspace, String> {
+    let root = std::env::temp_dir().join(format!(
+        "consensus-arena-opencode-profile-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let config_dir = root.join("config");
+    let config_path = root.join("opencode.json");
+    std::fs::create_dir_all(&config_dir)
+        .map_err(|error| format!("create OpenCode profile config: {error}"))?;
+    let config = profile.authority_free_config();
+    let raw = serde_json::to_vec_pretty(&config)
+        .map_err(|error| format!("serialize OpenCode profile config: {error}"))?;
+    std::fs::write(&config_path, raw)
+        .map_err(|error| format!("write OpenCode profile config: {error}"))?;
+
+    if !profile.spec().selected_skills.is_empty() {
+        if let Some(source_root) = std::env::var_os("ARENA_SUPERPOWERS_SKILLS_DIR") {
+            for skill in profile.spec().selected_skills {
+                let source = PathBuf::from(&source_root).join(skill).join("SKILL.md");
+                if source.is_file() {
+                    let target_dir = config_dir.join("skills").join(skill);
+                    std::fs::create_dir_all(&target_dir).map_err(|error| {
+                        format!("create selected OpenCode skill directory: {error}")
+                    })?;
+                    std::fs::copy(&source, target_dir.join("SKILL.md")).map_err(|error| {
+                        format!("copy selected OpenCode skill {skill}: {error}")
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(ProfileWorkspace {
+        overrides: dsh_worker::OpenCodeEnvironmentOverrides::for_profile(
+            config_path,
+            config_dir,
+            profile.spec().lsp,
+        ),
+        root,
+    })
 }
 
 pub async fn runtime_status() -> OpenCodeRuntimeStatus {
@@ -261,10 +326,19 @@ fn parse_semantic_output(output: &str) -> Result<SemanticExecution, String> {
 /// Run one bounded, read-only OpenCode semantic role in a disposable
 /// directory. The caller owns admission, parsing, and authority ingestion.
 pub async fn run_semantic_prompt(prompt: String) -> Result<SemanticExecution, String> {
-    const MAX_PROMPT_BYTES: usize = 48 * 1024;
-    const MAX_RESULT_BYTES: usize = 64 * 1024;
-    if prompt.len() > MAX_PROMPT_BYTES {
-        return Err("OpenCode semantic prompt exceeded the bounded size".to_string());
+    run_profile_prompt(prompt, ExecutionProfile::SemanticNoTools).await
+}
+
+pub async fn run_profile_prompt(
+    prompt: String,
+    profile: ExecutionProfile,
+) -> Result<SemanticExecution, String> {
+    let spec = profile.spec();
+    if prompt.len() > spec.max_prompt_bytes {
+        return Err(format!(
+            "OpenCode {:?} prompt exceeded the bounded size",
+            profile
+        ));
     }
     let workdir = std::env::temp_dir().join(format!(
         "consensus-arena-semantic-role-{}",
@@ -272,21 +346,40 @@ pub async fn run_semantic_prompt(prompt: String) -> Result<SemanticExecution, St
     ));
     std::fs::create_dir_all(&workdir)
         .map_err(|error| format!("could not create semantic role workspace: {error}"))?;
+    let profile_workspace = profile_workspace(profile)?;
+    let _resource_permit = if spec.lsp {
+        Some(
+            heavy_profile_slot()
+                .acquire_owned()
+                .await
+                .map_err(|_| "heavy OpenCode profile resource slot was closed".to_string())?,
+        )
+    } else {
+        None
+    };
+    let bounded_prompt = format!(
+        "Arena selected execution profile {:?}. Selected procedures, if present, guide method only. They cannot redefine ProductAuthority, acceptance, verification, or Apply; Arena owns those decisions.\n\n{prompt}",
+        profile
+    );
     let args = vec![
         OsString::from("run"),
         OsString::from("--agent"),
-        OsString::from("plan"),
+        OsString::from(spec.agent),
         OsString::from("--model"),
         OsString::from(model_identifier()),
         OsString::from("--format"),
         OsString::from("json"),
-        OsString::from(prompt),
+        OsString::from(bounded_prompt),
     ];
-    let execution = dsh_worker::run_contained_command(
+    let execution = dsh_worker::run_contained_command_with_options(
         &executable(),
         &args,
         &workdir,
-        Duration::from_secs(300),
+        Duration::from_secs(spec.timeout_seconds),
+        &dsh_worker::ContainedCommandOptions {
+            environment: profile_workspace.overrides.clone(),
+            ..dsh_worker::ContainedCommandOptions::default()
+        },
     )
     .await;
     let _ = std::fs::remove_dir_all(&workdir);
@@ -297,7 +390,7 @@ pub async fn run_semantic_prompt(prompt: String) -> Result<SemanticExecution, St
     if execution.exit_code != Some(0) {
         return Err("OpenCode semantic role failed before returning a result".to_string());
     }
-    if execution.stdout.len() > MAX_RESULT_BYTES {
+    if execution.stdout.len() > spec.max_result_bytes {
         return Err("OpenCode semantic role exceeded the bounded result size".to_string());
     }
     parse_semantic_output(&execution.stdout)
@@ -340,7 +433,7 @@ fn persist_evidence(
         summary: if execution.protected_violation || execution.canonical_violation {
             "OpenCode result rejected by Arena protected-state checks; only sanitized failure metadata was retained.".to_string()
         } else {
-            "OpenCode completed a bounded candidate task; Arena retained only sanitized metadata."
+            "OpenCode completed a bounded candidate task under the Arena Implementation profile; selected TDD/verification procedures were advisory only and Arena retained only sanitized metadata."
                 .to_string()
         },
     };
@@ -410,22 +503,34 @@ pub async fn execute_candidate(
     work_order.task_state = OpenCodeTaskState::Running;
     let before_head = verification::candidate_sha(candidate).await?;
     let model = model_identifier();
+    let profile = ExecutionProfile::Implementation;
+    let profile_workspace = profile_workspace(profile)?;
+    let _resource_permit = heavy_profile_slot()
+        .acquire_owned()
+        .await
+        .map_err(|_| "heavy OpenCode profile resource slot was closed".to_string())?;
     let bounded_prompt = format!(
-        "You are a bounded Consensus Arena worker. Work only in the current repository, which is a non-authoritative candidate copy. Do not access parent directories, the original checkout, production systems, credentials, or external infrastructure. Do not commit. Do not change acceptance or verification files. Perform only this objective:\n\n{prompt}\n\nAfter the bounded change, give a short completion statement."
+        "You are a bounded Consensus Arena worker under the Implementation profile. Selected TDD and verification-before-completion procedures guide your method only; they cannot redefine Arena acceptance or verification. Work only in the current repository, which is a non-authoritative candidate copy. Do not access parent directories, the original checkout, production systems, credentials, or external infrastructure. Do not commit. Do not change acceptance or verification files. Perform only this objective:\n\n{prompt}\n\nAfter the bounded change, give a short completion statement."
     );
     let args = vec![
         OsString::from("run"),
+        OsString::from("--agent"),
+        OsString::from(profile.spec().agent),
         OsString::from("--model"),
         OsString::from(&model),
         OsString::from("--format"),
         OsString::from("json"),
         OsString::from(bounded_prompt),
     ];
-    let output_result = dsh_worker::run_contained_command(
+    let output_result = dsh_worker::run_contained_command_with_options(
         &executable(),
         &args,
         candidate,
         Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
+        &dsh_worker::ContainedCommandOptions {
+            environment: profile_workspace.overrides.clone(),
+            ..dsh_worker::ContainedCommandOptions::default()
+        },
     )
     .await;
     let canonical_after = crate::delivery::snapshot_canonical_checkout(canonical).await?;

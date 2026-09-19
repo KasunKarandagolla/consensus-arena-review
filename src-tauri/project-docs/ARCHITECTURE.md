@@ -262,3 +262,18 @@ Owner ↔ Arena product authority
 Dagu would own durable execution mechanics, not product meaning. Arena would adopt completed owner decisions into product truth.
 
 **This diagram is a pending target, not the current implemented source.**
+
+## Q1 execution-side quality foundation
+
+The current implemented path adds Arena-owned execution profiles around the
+existing OpenCode adapter. Profiles are selected from the authoritative work
+order role; workers cannot request a stronger profile. Implementation,
+DebugRepair, and CandidateReview may request native OpenCode LSP. Product and
+research roles remain semantic/web profiles without LSP. Selected Superpowers
+procedures and anonymous Context7 documentation are bounded inputs, not
+workflow, Product OS, acceptance, verification, or Apply authority.
+
+Repository intelligence is a derived `agent-analyzer` cache keyed by
+repository identity, base HEAD, and analyzer version. Arena retains bounded
+metadata/index references and injects only a bounded query slice; the full map
+is never ProductAuthorityRecords.

@@ -4,6 +4,7 @@
 //! SessionRuntime. It is not a second scheduler, database, or role framework.
 
 use crate::db_helpers;
+use crate::execution_profiles::ExecutionProfile;
 use crate::errors::AgentError;
 use crate::evidence_gates::{
     AmbiguitySeverity, EvidenceItem, EvidenceKind, EvidenceOrigin, EvidenceProvenance,
@@ -433,6 +434,7 @@ async fn run_opencode_web_prompt(prompt: String) -> Result<OpenCodeWebOutput, St
     ));
     std::fs::create_dir_all(&workdir)
         .map_err(|_| "could not create disposable web research workspace".to_string())?;
+    let profile_workspace = crate::opencode_adapter::profile_workspace(ExecutionProfile::WebResearch)?;
     let args = vec![
         OsString::from("run"),
         OsString::from("--agent"),
@@ -443,11 +445,15 @@ async fn run_opencode_web_prompt(prompt: String) -> Result<OpenCodeWebOutput, St
         OsString::from("json"),
         OsString::from(prompt),
     ];
-    let execution = crate::dsh_worker::run_contained_command(
+    let execution = crate::dsh_worker::run_contained_command_with_options(
         &crate::opencode_adapter::executable(),
         &args,
         &workdir,
         Duration::from_secs(WEB_RESEARCH_TIMEOUT_SECONDS),
+        &crate::dsh_worker::ContainedCommandOptions {
+            environment: profile_workspace.overrides.clone(),
+            ..crate::dsh_worker::ContainedCommandOptions::default()
+        },
     )
     .await;
     let _ = std::fs::remove_dir_all(&workdir);
@@ -854,6 +860,7 @@ pub async fn run_product_role_work_order(
         .await
         .map_err(db_error)?
     };
+    let execution_profile = ExecutionProfile::for_product_role(&preflight.role);
     let db_for_task = db.clone();
     let id_for_task = work_order_id.clone();
     let execution = execute_owned(runtime, work_order_id, move |generation| {
@@ -883,7 +890,7 @@ pub async fn run_product_role_work_order(
             })
             .await
             .map_err(db_error)?;
-            let result = crate::opencode_adapter::run_semantic_prompt(prompt).await;
+            let result = crate::opencode_adapter::run_profile_prompt(prompt, execution_profile).await;
             match result {
                 Ok(output) => {
                     let root_session_id = output.root_session_id.clone();

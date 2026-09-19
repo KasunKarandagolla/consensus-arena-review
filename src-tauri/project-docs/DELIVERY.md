@@ -382,3 +382,13 @@ Any Delivery change must preserve:
     discarded and other local evidence is treated as potentially sensitive;
 11. explicit Apply with unchanged clean base;
 12. native Linux/Windows-compatible path/process design.
+
+## Q1 execution profile boundary
+
+OpenCode Delivery uses Arena's `Implementation` profile for candidate work.
+The profile's temporary configuration, selected skills, LSP flags, and
+resource limits are derived by Arena; no Delivery payload lets a worker choose
+another profile. Candidate isolation, canonical-checkout protection, process
+containment, frozen acceptance, project-native verification, and explicit
+Apply remain unchanged. LSP, repo intelligence, Context7, and skills can
+inform execution but cannot produce a Verified state.

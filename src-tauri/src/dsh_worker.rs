@@ -24,6 +24,33 @@ const DSH_PROBE_TIMEOUT_SECONDS: u64 = 5;
 const CHILD_CLEANUP_TIMEOUT_SECONDS: u64 = 5;
 const OUTPUT_READER_CLEANUP_TIMEOUT_SECONDS: u64 = 1;
 
+/// Explicit, non-secret configuration values Arena may inject into an
+/// OpenCode child. Ambient variables with these names are never inherited.
+#[derive(Debug, Clone, Default)]
+pub struct OpenCodeEnvironmentOverrides {
+    pub config: Option<PathBuf>,
+    pub config_dir: Option<PathBuf>,
+    pub disable_lsp_download: bool,
+    pub experimental_lsp_tool: bool,
+}
+
+impl OpenCodeEnvironmentOverrides {
+    pub fn for_profile(config: PathBuf, config_dir: PathBuf, lsp: bool) -> Self {
+        Self {
+            config: Some(config),
+            config_dir: Some(config_dir),
+            disable_lsp_download: true,
+            experimental_lsp_tool: lsp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContainedCommandOptions {
+    pub environment: OpenCodeEnvironmentOverrides,
+    pub stdout_path: Option<PathBuf>,
+}
+
 type OutputReaderTask = tokio::task::JoinHandle<Result<String, String>>;
 type ContainedChild = Box<dyn ChildWrapper>;
 
@@ -376,9 +403,32 @@ where
 }
 
 fn apply_sanitized_environment(command: &mut Command, api_key: Option<&str>) {
+    apply_sanitized_environment_with_overrides(command, api_key, None);
+}
+
+fn apply_sanitized_environment_with_overrides(
+    command: &mut Command,
+    api_key: Option<&str>,
+    overrides: Option<&OpenCodeEnvironmentOverrides>,
+) {
     command.env_clear();
     for (key, value) in sanitized_environment(std::env::vars_os(), api_key) {
         command.env(key, value);
+    }
+    let Some(overrides) = overrides else {
+        return;
+    };
+    if let Some(path) = &overrides.config {
+        command.env("OPENCODE_CONFIG", path);
+    }
+    if let Some(path) = &overrides.config_dir {
+        command.env("OPENCODE_CONFIG_DIR", path);
+    }
+    if overrides.disable_lsp_download {
+        command.env("OPENCODE_DISABLE_LSP_DOWNLOAD", "true");
+    }
+    if overrides.experimental_lsp_tool {
+        command.env("OPENCODE_EXPERIMENTAL_LSP_TOOL", "true");
     }
 }
 
@@ -610,18 +660,16 @@ where
 fn spawn_output_readers(
     child: &mut dyn ChildWrapper,
 ) -> Result<(OutputReaderTask, OutputReaderTask), String> {
-    let stdout = child
-        .stdout()
-        .take()
-        .ok_or_else(|| "DSH stdout pipe was unavailable".to_string())?;
+    let stdout = child.stdout().take();
     let stderr = child
         .stderr()
         .take()
         .ok_or_else(|| "DSH stderr pipe was unavailable".to_string())?;
-    Ok((
-        tokio::spawn(read_bounded(stdout)),
-        tokio::spawn(read_bounded(stderr)),
-    ))
+    let stdout_task = match stdout {
+        Some(stdout) => tokio::spawn(read_bounded(stdout)),
+        None => tokio::spawn(async { Ok(String::new()) }),
+    };
+    Ok((stdout_task, tokio::spawn(read_bounded(stderr))))
 }
 
 async fn spawn_output_readers_or_terminate(
@@ -709,18 +757,41 @@ pub async fn run_contained_command(
     current_dir: &Path,
     timeout: Duration,
 ) -> Result<ContainedExecution, String> {
+    run_contained_command_with_options(
+        program,
+        args,
+        current_dir,
+        timeout,
+        &ContainedCommandOptions::default(),
+    )
+    .await
+}
+
+pub async fn run_contained_command_with_options(
+    program: &Path,
+    args: &[OsString],
+    current_dir: &Path,
+    timeout: Duration,
+    options: &ContainedCommandOptions,
+) -> Result<ContainedExecution, String> {
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(current_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    apply_sanitized_environment(&mut command, None);
+    command.args(args).current_dir(current_dir);
+    match &options.stdout_path {
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .map_err(|error| format!("create contained stdout file: {error}"))?;
+            command.stdout(std::process::Stdio::from(file));
+        }
+        None => {
+            command.stdout(std::process::Stdio::piped());
+        }
+    }
+    command.stderr(std::process::Stdio::piped());
+    apply_sanitized_environment_with_overrides(&mut command, None, Some(&options.environment));
     command.env("OPENCODE_DISABLE_AUTOUPDATE", "1");
     let mut child = spawn_contained(command)
         .map_err(|error| format!("could not start contained worker: {error}"))?;
-    let (mut stdout_task, mut stderr_task) =
-        spawn_output_readers_or_terminate(&mut *child).await?;
+    let (mut stdout_task, mut stderr_task) = spawn_output_readers_or_terminate(&mut *child).await?;
     let execution = match tokio::time::timeout(
         timeout,
         collect_process(&mut *child, &mut stdout_task, &mut stderr_task),
@@ -1212,6 +1283,39 @@ mod tests {
         );
         assert!(!values.contains_key("OPENAI_API_KEY"));
         assert!(!values.contains_key("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[test]
+    fn opencode_overrides_are_explicit_and_non_secret() {
+        let vars = vec![
+            (OsString::from("OPENCODE_CONFIG"), OsString::from("ambient")),
+            (
+                OsString::from("OPENCODE_CONFIG_DIR"),
+                OsString::from("ambient-dir"),
+            ),
+            (
+                OsString::from("ARENA_ARBITRARY_SECRET"),
+                OsString::from("secret"),
+            ),
+        ];
+        let inherited = sanitized_environment(vars, None);
+        assert!(
+            inherited.is_empty(),
+            "OpenCode config must not leak ambiently"
+        );
+
+        let root = std::env::temp_dir().join("arena-profile-config-test");
+        let overrides = OpenCodeEnvironmentOverrides::for_profile(
+            root.join("profile.json"),
+            root.join("config"),
+            true,
+        );
+        let mut command = Command::new("/bin/true");
+        apply_sanitized_environment_with_overrides(&mut command, None, Some(&overrides));
+        let debug = format!("{command:?}");
+        assert!(debug.contains("OPENCODE_CONFIG"));
+        assert!(debug.contains("OPENCODE_CONFIG_DIR"));
+        assert!(!debug.contains("ARENA_ARBITRARY_SECRET"));
     }
 
     #[cfg(windows)]

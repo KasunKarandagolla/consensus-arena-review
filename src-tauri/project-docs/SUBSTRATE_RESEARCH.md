@@ -265,3 +265,20 @@ Serious higher-level alternative because it provides mission planning/workers/va
 Do not restart broad “best agent framework” research unless the current bounded-worker/workflow/verifier contracts themselves are disproven.
 
 Next research/qualification should be narrow and falsifiable.
+
+## Q1 qualified execution substrates
+
+Q1 uses the existing OpenCode adapter as the replaceable execution boundary,
+not a second orchestrator. Standalone `agent-analyzer` v0.8.1 (MIT,
+`719badc74731cd127a03b2d52bc51812b0c50c30`) is used only for deterministic
+repository intelligence. Superpowers v6.4.1 (MIT,
+`5bf4e78011075bcfc0dc295f0724994cd123ee71`) contributes only the five
+selected procedures documented in the Q1 audit; the full methodology is not
+installed or delegated authority. Context7 is an on-demand remote MCP path
+with bounded library/version/question inputs and no credential in profile
+configuration.
+
+OpenCode's native LSP configuration is source-confirmed for Rust and
+TypeScript, but this host lacks both a runnable `rust-analyzer` component and
+the TypeScript language-server executable. Those qualifications remain
+environment-blocked and fall back to project-native diagnostics.
