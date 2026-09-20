@@ -297,7 +297,6 @@ fn coordinator_status_is_terminal(status: &CoordinatorStatus) -> bool {
         CoordinatorStatus::Completed
             | CoordinatorStatus::Stopped
             | CoordinatorStatus::Pivoted
-            | CoordinatorStatus::Failed
             | CoordinatorStatus::Cancelled
     )
 }
@@ -426,7 +425,6 @@ async fn mark_failed(ctx: &CoordinatorContext, run: &mut ProductCoordinatorRun, 
         return;
     }
     current.status = CoordinatorStatus::Failed;
-    current.phase = CoordinatorPhase::Terminal;
     current.error = Some(error.chars().take(240).collect());
     current.updated_at = now();
     let _ = save_run(ctx, &current).await;
@@ -759,16 +757,58 @@ async fn run_product_review(
         return Err("Product Director returned an unsupported outcome".to_string());
     }
     if matches!(outcome.as_str(), "stop" | "pivot") {
-        run.status = if outcome == "stop" {
-            CoordinatorStatus::Stopped
+        let recommendation = if outcome == "stop" {
+            "stop"
         } else {
-            CoordinatorStatus::Pivoted
+            "pivot"
         };
-        run.phase = CoordinatorPhase::Terminal;
-        run.terminal_outcome = Some(outcome);
+        let admitted = admit_review(
+            ctx,
+            &run.project_id,
+            execution.work_order,
+            EvidenceKind::Dissent,
+            format!("Product Director recommends {recommendation}"),
+            format!(
+                "rationale={}; strongest_no_build_argument={}",
+                output.rationale, output.no_build_argument
+            ),
+        )
+        .await?;
+        let ambiguity_id = format!("{}:product-direction-recommendation", run.project_id);
+        let question_id =
+            format!("{}:product-direction-recommendation-question", run.project_id);
+        product_os_runtime::admit_ambiguity(
+            ctx.db.clone(),
+            run.project_id.clone(),
+            admitted.work_order_id,
+            ambiguity_id.clone(),
+            question_id.clone(),
+            format!(
+                "Arena's Product Director recommends {recommendation}. Do you accept that recommendation, choose the alternative direction, or continue bounded evaluation?"
+            ),
+            "whether Arena continues product evaluation".to_string(),
+            AmbiguitySeverity::High,
+            vec![
+                admitted
+                    .evidence_id
+                    .ok_or_else(|| "product-direction recommendation evidence was not admitted".to_string())?,
+            ],
+        )
+        .await?;
+        run.product_review_outcome = Some(format!("{recommendation}_recommendation"));
+        run.owner_ambiguity_id = Some(ambiguity_id);
+        run.owner_question_id = Some(question_id);
+        run.pending_owner_decision = Some(if outcome == "stop" {
+            OwnerDecisionKind::StopRun
+        } else {
+            OwnerDecisionKind::PivotRun
+        });
+        run.status = CoordinatorStatus::WaitingForOwner;
+        run.phase = CoordinatorPhase::ProductReview;
+        run.terminal_outcome = Some(format!("recommend_{recommendation}"));
         run.updated_at = now();
         save_run(ctx, run).await?;
-        return Ok(false);
+        return Ok(true);
     }
     let Some(scope) = output.scope else {
         return Err(format!(
@@ -2347,6 +2387,7 @@ pub async fn answer_owner_question(
         OwnerDecisionKind::AuthorizeValidationExperiment
             | OwnerDecisionKind::AuthorizeNarrowBuild
             | OwnerDecisionKind::AuthorizeBuild
+            | OwnerDecisionKind::ContinueEvaluation
             | OwnerDecisionKind::StopRun
             | OwnerDecisionKind::PivotRun
     ) {
@@ -2391,6 +2432,23 @@ pub async fn answer_owner_question(
         save_run(&ctx, &terminal).await?;
         return Ok(terminal);
     }
+    if decision == OwnerDecisionKind::ContinueEvaluation {
+        let mut resumed = run;
+        resumed.status = CoordinatorStatus::Running;
+        resumed.phase = CoordinatorPhase::ProductReview;
+        resumed.stage = PipelineStage::Decide;
+        resumed.product_review_outcome = Some("continue_evaluation".to_string());
+        resumed.pending_owner_decision = None;
+        resumed.owner_ambiguity_id = None;
+        resumed.owner_question_id = None;
+        resumed.execution_epoch = resumed.execution_epoch.saturating_add(1);
+        resumed.error = None;
+        resumed.updated_at = now();
+        save_run(&ctx, &resumed).await?;
+        spawn(ctx, resumed.run_id.clone());
+        return Ok(resumed);
+    }
+
     if decision == OwnerDecisionKind::AuthorizeBuild {
         let mut resumed = run;
         resumed.status = CoordinatorStatus::Running;
