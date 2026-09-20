@@ -73,7 +73,7 @@ async fn contained(
     executable: &Path,
     args: Vec<OsString>,
     cwd: &Path,
-) -> Result<crate::dsh_worker::ContainedCommandResult, String> {
+) -> Result<crate::dsh_worker::ContainedExecution, String> {
     let result = dsh_worker::run_contained_command(
         executable,
         &args,
