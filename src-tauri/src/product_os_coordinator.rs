@@ -754,16 +754,59 @@ async fn run_product_review(
         return Err("Product Director returned an unsupported outcome".to_string());
     }
     if matches!(outcome.as_str(), "stop" | "pivot") {
-        run.status = if outcome == "stop" {
-            CoordinatorStatus::Stopped
+        let recommendation = if outcome == "stop" { "Stop" } else { "Pivot" };
+        let evidence = admit_review(
+            ctx,
+            &run.project_id,
+            execution.work_order,
+            EvidenceKind::ProductChallenge,
+            format!("Product Director recommendation: {recommendation}"),
+            format!(
+                "rationale: {}; strongest no-build argument: {}",
+                output.rationale, output.no_build_argument
+            ),
+        )
+        .await?;
+        let ambiguity_id = format!("{}:product-direction-recommendation", run.project_id);
+        let question_id = format!("{}:product-direction-recommendation-question", run.project_id);
+        let question = output
+            .owner_question
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "Arena's Product Director recommends {recommendation}. Should Arena stop this run or pivot the product direction?"
+                )
+            });
+        product_os_runtime::admit_ambiguity(
+            ctx.db.clone(),
+            run.project_id.clone(),
+            evidence.work_order_id,
+            ambiguity_id.clone(),
+            question_id.clone(),
+            question,
+            "owner disposition of the Product Director stop/pivot recommendation".to_string(),
+            AmbiguitySeverity::High,
+            vec![
+                evidence
+                    .evidence_id
+                    .ok_or_else(|| "product challenge evidence was not admitted".to_string())?,
+            ],
+        )
+        .await?;
+        run.product_review_outcome = Some(outcome.clone());
+        run.owner_ambiguity_id = Some(ambiguity_id);
+        run.owner_question_id = Some(question_id);
+        run.pending_owner_decision = Some(if outcome == "stop" {
+            OwnerDecisionKind::StopRun
         } else {
-            CoordinatorStatus::Pivoted
-        };
-        run.phase = CoordinatorPhase::Terminal;
-        run.terminal_outcome = Some(outcome);
+            OwnerDecisionKind::PivotRun
+        });
+        run.status = CoordinatorStatus::WaitingForOwner;
+        run.phase = CoordinatorPhase::ProductReview;
+        run.terminal_outcome = Some(format!("recommend_{outcome}"));
         run.updated_at = now();
         save_run(ctx, run).await?;
-        return Ok(false);
+        return Ok(true);
     }
     let Some(scope) = output.scope else {
         return Err(format!(
@@ -833,7 +876,12 @@ async fn run_product_review(
         role_prompt(
             "Product Director",
             &format!(
-                "The bounded scope was admitted from the founder idea. Return JSON: {{\"summary\":\"...\",\"findings\":[\"...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}. Preserve the owner-only choice: proceed with the proposed NarrowBuild or stop/pivot. Proposed owner question: {question}. Product Director rationale: {}. Strongest no-build argument: {}",
+                "The bounded scope was admitted from the founder idea. Return JSON: {{\"summary\":\"...\",\"findings\":[\"...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}. Preserve the owner-only choice: {} or stop/pivot. Proposed owner question: {question}. Product Director rationale: {}. Strongest no-build argument: {}",
+                if outcome == "validation_experiment" {
+                    "authorize the explicitly bounded ValidationExperiment"
+                } else {
+                    "proceed with the proposed NarrowBuild"
+                },
                 output.rationale,
                 output.no_build_argument
             ),
@@ -2422,6 +2470,25 @@ pub async fn answer_owner_question(
     }
     if decision == OwnerDecisionKind::AuthorizeValidationExperiment {
         let mut returned = run.clone();
+        let budget_key = "ProductReviewValidationExperiment".to_string();
+        let completed_attempts = returned
+            .remediation_counts
+            .get(&budget_key)
+            .copied()
+            .unwrap_or(0);
+        if completed_attempts >= 2 {
+            returned.status = CoordinatorStatus::Blocked;
+            returned.error = Some(
+                "Product review validation-experiment budget is exhausted; founder must stop or pivot instead of repeating experiments indefinitely"
+                    .to_string(),
+            );
+            returned.updated_at = now();
+            save_run(&ctx, &returned).await?;
+            return Ok(returned);
+        }
+        returned
+            .remediation_counts
+            .insert(budget_key, completed_attempts.saturating_add(1));
         let contract = returned
             .pending_experiment
             .clone()
