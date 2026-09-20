@@ -12,6 +12,8 @@ mod capability_registry;
 mod checkpoint;
 mod commands;
 pub mod consultation;
+pub mod consultation_broker;
+mod external_browser;
 mod context_manager;
 mod credentials;
 mod critical_transport;
