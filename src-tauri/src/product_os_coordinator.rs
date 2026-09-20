@@ -2871,6 +2871,147 @@ pub async fn status(
     .map_err(|error| error.to_string())
 }
 
+pub async fn inject_owner_guidance(
+    ctx: CoordinatorContext,
+    run_id: String,
+    guidance: String,
+) -> Result<ProductCoordinatorRun, String> {
+    let mut run = load_run(&ctx, &run_id).await?;
+    if coordinator_status_is_terminal(&run.status) {
+        return Err("terminal Product OS runs cannot accept new in-run guidance".to_string());
+    }
+    if let Some(delivery_id) = run.delivery_session_id.clone()
+        && let Some(delivery) = load_delivery_state(&ctx, &delivery_id).await?
+        && delivery.phase == crate::delivery::DeliveryPhase::Applied
+    {
+        return Err(
+            "the prior candidate is already Applied; start a new product/change run for new guidance"
+                .to_string(),
+        );
+    }
+
+    let snapshot = product_os_runtime::snapshot(
+        ctx.db.clone(),
+        ctx.runtime.clone(),
+        run.project_id.clone(),
+    )
+    .await?
+    .ok_or_else(|| "Product OS authority snapshot is missing".to_string())?;
+    let directive = crate::work_graph::owner_directive_from_text(
+        &guidance,
+        snapshot.records.project_revision,
+        now(),
+    )?;
+    let mandate = crate::work_graph::research_mandate_for(&directive);
+
+    // Publish newer owner authority before touching the live task. Every stale
+    // coordinator write from the old epoch is rejected by save_run().
+    run.owner_directives.push(directive.clone());
+    if let Some(mandate) = mandate.clone() {
+        run.research_mandates.push(mandate);
+    }
+    run.execution_epoch = run.execution_epoch.saturating_add(1);
+    run.revision = run.revision.saturating_add(1);
+    run.status = CoordinatorStatus::Reconciling;
+    run.error = Some("New owner guidance admitted; Arena is safely re-planning.".to_string());
+    run.updated_at = now();
+    save_run(&ctx, &run).await?;
+
+    if let Some(owner) = ctx.runtime.current_owner()
+        && run_owns_runtime_session(&run, &owner.session_id)
+        && let Some(guard) = ctx.runtime.stop_owner(&owner).await?
+    {
+        *ctx.ask_user_tx.lock().await = None;
+        guard.finish();
+    }
+
+    // Wait for the old coordinator epoch to unwind before cleanup/re-plan.
+    let _guard = ctx.coordinator_lock.lock().await;
+    let mut current = load_run(&ctx, &run_id).await?;
+    if current.execution_epoch != run.execution_epoch {
+        return Err("owner guidance lost its execution epoch during reconciliation".to_string());
+    }
+
+    if let Some(delivery_id) = current.delivery_session_id.clone()
+        && let Some(mut delivery) = load_delivery_state(&ctx, &delivery_id).await?
+        && !matches!(
+            delivery.phase,
+            crate::delivery::DeliveryPhase::Applied
+                | crate::delivery::DeliveryPhase::Cancelled
+        )
+    {
+        delivery.phase = crate::delivery::DeliveryPhase::Cancelled;
+        delivery.message =
+            "Candidate superseded by newer owner guidance; a new Build Package is required."
+                .to_string();
+        if let Some(work_order) = delivery.work_order.as_mut() {
+            crate::opencode_adapter::cancel(work_order);
+        }
+        crate::delivery::persist_state(
+            &ctx.delivery_state_path,
+            &ctx.delivery_slot,
+            &ctx.db,
+            &mut delivery,
+        )
+        .await?;
+    }
+
+    let _ = crate::consultation_broker::cancel_project_open_requests(
+        ctx.db.clone(),
+        current.project_id.clone(),
+        "Superseded by newer owner guidance; no automatic resend".to_string(),
+    )
+    .await?;
+
+    product_os_runtime::invalidate_for_owner_guidance(
+        ctx.db.clone(),
+        current.project_id.clone(),
+        format!("superseded by owner directive {}", directive.directive_id),
+    )
+    .await?;
+
+    current.product_director_work_order_id = None;
+    current.product_review_outcome = None;
+    current.pending_owner_decision = None;
+    current.owner_ambiguity_id = None;
+    current.owner_question_id = None;
+    current.architecture_work_order_ids.clear();
+    current.architecture_evidence_ids.clear();
+    current.reuse_work_order_id = None;
+    current.constraints_work_order_id = None;
+    current.red_team_work_order_id = None;
+    current.dissent_work_order_id = None;
+    current.feasibility_work_order_id = None;
+    current.pending_experiment = None;
+    current.build_package_id = None;
+    current.delivery_session_id = None;
+    current.terminal_outcome = None;
+    current.remediation_counts.clear();
+    current.last_remediation = None;
+    current.remediation_question = None;
+    current.error = None;
+    current.status = CoordinatorStatus::Running;
+    current.phase = if current.route == ProductRoute::Incident
+        && run.phase == CoordinatorPhase::ReproduceDiagnose
+    {
+        CoordinatorPhase::ReproduceDiagnose
+    } else if mandate.is_some() {
+        CoordinatorPhase::Research
+    } else {
+        CoordinatorPhase::ProductReview
+    };
+    current.stage = match current.phase {
+        CoordinatorPhase::Research => PipelineStage::Discover,
+        CoordinatorPhase::ReproduceDiagnose => PipelineStage::ReproduceDiagnose,
+        _ => PipelineStage::Decide,
+    };
+    current.updated_at = now();
+    save_run(&ctx, &current).await?;
+    drop(_guard);
+    spawn(ctx, current.run_id.clone());
+    Ok(current)
+}
+
 pub async fn request_consultation(
     ctx: CoordinatorContext,
     run_id: String,
