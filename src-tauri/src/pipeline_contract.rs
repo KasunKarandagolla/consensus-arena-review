@@ -95,7 +95,7 @@ pub fn select_route(intent: &str) -> ProductRoute {
     ]
     .iter()
     .any(|marker| lower.contains(marker));
-    if [
+    let incident_language = [
         "incident",
         "outage",
         "regression",
@@ -107,7 +107,18 @@ pub fn select_route(intent: &str) -> ProductRoute {
     ]
     .iter()
     .any(|marker| lower.contains(marker))
-    {
+        || (existing_context
+            && [
+                "fix bug",
+                "bug in",
+                "error in",
+                "fails when",
+                "not working",
+                "broken ",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker)));
+    if incident_language {
         ProductRoute::Incident
     } else if existing_context
         && [
@@ -123,6 +134,8 @@ pub fn select_route(intent: &str) -> ProductRoute {
             "support ",
             "remove ",
             "replace ",
+            "fix ",
+            "refactor",
             "want ",
             "need ",
         ]
@@ -779,6 +792,18 @@ mod tests {
         assert_eq!(
             select_route("Add CSV export to this existing repo"),
             ProductRoute::ExistingFeature
+        );
+        assert_eq!(
+            select_route("Fix the typo in this existing repo"),
+            ProductRoute::ExistingFeature
+        );
+        assert_eq!(
+            select_route("Fix bug in this existing repo when export is empty"),
+            ProductRoute::Incident
+        );
+        assert_eq!(
+            select_route("Build a new product that helps teams fix invoice errors"),
+            ProductRoute::NewProduct
         );
         assert_eq!(
             select_route("I want dark mode in my current app"),
