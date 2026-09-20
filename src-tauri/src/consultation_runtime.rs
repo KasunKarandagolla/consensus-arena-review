@@ -7,7 +7,7 @@ use crate::consultation_broker::{
     self, ConsultationProvider, ConsultationReason, ConsultationResult,
     ConsultationTransactionState, ConsultationTransportKind, ConsultationWorkOrder,
     ConversationAnchor, ConversationAnchorUpdate, ConversationAvailability,
-    ConversationEstablishment, TransportSubmissionOutcome,
+    ConversationEstablishment,
 };
 use crate::db_helpers;
 use crate::errors::AgentError;
@@ -233,14 +233,10 @@ pub async fn execute_external_browser_consultation(
         staged_order.request_id.clone(),
     )
     .await?;
-    let submission = external_browser::submit_once(&repository, &permit, &staged).await;
-    let mut current = consultation_broker::record_submission_outcome(
-        db.clone(),
-        permit,
-        submission.clone(),
-    )
-    .await?;
-    if matches!(submission, TransportSubmissionOutcome::Submitted { .. }) {
+    let effect = external_browser::submit_once(&repository, permit, &staged).await;
+    let mut current =
+        consultation_broker::record_submission_outcome(db.clone(), effect).await?;
+    if current.state == ConsultationTransactionState::Submitted {
         current = consultation_broker::mark_observing(
             db.clone(),
             armed_order.request_id.clone(),
