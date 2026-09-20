@@ -1233,6 +1233,13 @@ async fn run_architecture(
         .evidence_id
         .clone()
         .ok_or_else(|| "dissent evidence was not recorded".to_string())?;
+    review_findings.push(format!(
+        "Dissent reviewer [{dissent_evidence_id}] summary={} findings={} rejected_alternative={} rationale={}",
+        dissent_output.summary,
+        dissent_output.findings.join(" | "),
+        dissent_output.rejected_alternative,
+        dissent_output.rationale
+    ));
 
     let chief_order = product_os_runtime::create_product_role_work_order(
         ctx.db.clone(),
