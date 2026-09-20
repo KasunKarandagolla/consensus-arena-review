@@ -886,8 +886,23 @@ fn input_for_records(
         ambiguities,
         next_irreversible_commitment: records
             .ambiguities
-            .first()
-            .map(|ambiguity| ambiguity.affected_commitment.clone()),
+            .iter()
+            .find(|ambiguity| {
+                matches!(
+                    ambiguity.status,
+                    AmbiguityStatus::Open | AmbiguityStatus::Deferred
+                )
+            })
+            .map(|ambiguity| ambiguity.affected_commitment.clone())
+            .or_else(|| match records.decision_outcome {
+                Some(DecisionOutcome::NarrowBuild) => {
+                    Some("implementation of the accepted bounded scope".to_string())
+                }
+                Some(DecisionOutcome::ValidationExperiment) => {
+                    Some("execution of the accepted bounded validation experiment".to_string())
+                }
+                Some(DecisionOutcome::Stop | DecisionOutcome::Pivot) | None => None,
+            }),
         reviewer_restatement: records.reviewer_restatement.clone(),
         decision_outcome: records.decision_outcome,
         research_required: records.route == ProductRoute::NewProduct,
@@ -1250,6 +1265,16 @@ mod tests {
         adopt_owner_decision(&mut records, "a2", "q2", "proceed".to_string())
             .expect("current owner decision");
         assert!(assemble_build_package(&records).is_ok());
+    }
+
+    #[test]
+    fn narrow_build_without_open_ambiguity_still_identifies_next_commitment() {
+        let records = records();
+        let package = assemble_build_package(&records).expect("package");
+        let decision = package
+            .evaluate_current(&records, GateId::Ambiguity)
+            .expect("ambiguity gate");
+        assert_eq!(decision.status, GateStatus::Pass);
     }
 
     #[test]
