@@ -791,9 +791,22 @@ pub fn assemble_build_package(records: &ProductAuthorityRecords) -> Result<Build
         })?;
     let direction = adopted_owner_decision(records, direction_id)
         .ok_or_else(|| "NarrowBuild outcome lacks a current owner decision".to_string())?;
-    if direction.question_id != format!("product-direction:{}", records.project_id)
-        || direction.selected_option != "narrow_build"
-    {
+    let direction_is_bound = if records.route == ProductRoute::NewProduct {
+        matches!(
+            direction.selected_option.as_str(),
+            "narrow_build" | "authorize_narrow_build"
+        ) && records.ambiguities.iter().any(|ambiguity| {
+            ambiguity.arena_admitted
+                && ambiguity.resolver == AmbiguityResolver::Owner
+                && ambiguity.status == AmbiguityStatus::Resolved
+                && ambiguity.question_id == direction.question_id
+                && ambiguity.owner_decision_id.as_deref() == Some(direction_id)
+        })
+    } else {
+        direction.question_id == format!("founder-mandate:{}", records.project_id)
+            && direction.selected_option == "narrow_build"
+    };
+    if !direction_is_bound {
         return Err(
             "NarrowBuild outcome is not bound to the current product direction".to_string(),
         );
