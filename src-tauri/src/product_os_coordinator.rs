@@ -1166,8 +1166,7 @@ async fn run_architecture(
                 kind,
                 claim: text(&output.summary, "review summary")?,
                 summary,
-                source_reference: "Arena-owned packet-bound semantic review work order"
-                    .to_string(),
+                source_reference: "Arena-owned packet-bound semantic review work order".to_string(),
                 decision_impact: true,
                 packet_hash: Some(packet.packet_hash.clone()),
             },
@@ -3067,7 +3066,7 @@ mod tests {
             pipeline_contract::owner_decision_matches_pending(
                 OwnerDecisionKind::AuthorizeValidationExperiment,
                 OwnerDecisionKind::AuthorizeBuild,
-) == false
+            ) == false
         );
         assert!(pipeline_contract::owner_decision_matches_pending(
             OwnerDecisionKind::AuthorizeValidationExperiment,
@@ -3103,7 +3102,10 @@ mod tests {
         ));
         // The coordinator deliberately rejects this pair before ambiguity
         // adoption; the only executable owner Apply path is apply_delivery.
-        assert_eq!(OwnerDecisionKind::ApproveApply, OwnerDecisionKind::ApproveApply);
+        assert_eq!(
+            OwnerDecisionKind::ApproveApply,
+            OwnerDecisionKind::ApproveApply
+        );
     }
 
     #[test]
