@@ -812,6 +812,342 @@ pub async fn create_product_role_work_order(
     .map_err(db_error)
 }
 
+pub async fn create_delegated_product_role_work_order(
+    db: Arc<Mutex<TranscriptStore>>,
+    project_id: String,
+    parent_work_order_id: String,
+    subject: String,
+    role: ProductWorkOrderRole,
+    model_id: Option<String>,
+) -> Result<ProductWorkOrder, String> {
+    if project_id.trim().is_empty()
+        || parent_work_order_id.trim().is_empty()
+        || subject.trim().is_empty()
+    {
+        return Err("delegated work requires project, parent, and subject".to_string());
+    }
+    if matches!(role, ProductWorkOrderRole::Researcher | ProductWorkOrderRole::FactVerifier) {
+        return Err("delegated research uses the channel-research admission path".to_string());
+    }
+    let model_id = model_id
+        .as_deref()
+        .map(crate::opencode_adapter::validate_model_identifier)
+        .transpose()?;
+    db_helpers::run_blocking(move || {
+        let mut store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        let records = load_records(&store, &project_id).map_err(AgentError::DatabaseError)?;
+        let parent = store
+            .get_product_work_order(&parent_work_order_id)?
+            .ok_or_else(|| AgentError::DatabaseError("delegation parent is unknown".to_string()))?;
+        if parent.project_id != project_id
+            || parent.status != ProductWorkOrderStatus::Completed
+            || parent.delegation_depth >= crate::work_graph::MAX_DELEGATION_DEPTH
+        {
+            return Err(AgentError::DatabaseError(
+                "delegation parent is stale, incomplete, or at the depth limit".to_string(),
+            ));
+        }
+        let mut order = new_work_order(
+            &project_id,
+            Some(subject),
+            role,
+            records.project_revision,
+            Some(parent_work_order_id),
+            None,
+            None,
+            None,
+        );
+        order.model_id = model_id;
+        order.delegation_depth = parent.delegation_depth.saturating_add(1);
+        persist_records_and_order(&mut store, &records, &order)
+            .map_err(AgentError::DatabaseError)?;
+        Ok(order)
+    })
+    .await
+    .map_err(db_error)
+}
+
+pub async fn create_delegated_channel_research_work_order(
+    db: Arc<Mutex<TranscriptStore>>,
+    project_id: String,
+    parent_work_order_id: String,
+    question: String,
+    channel: crate::work_graph::ResearchChannel,
+    category: ProductResearchCategory,
+    model_id: Option<String>,
+) -> Result<ProductWorkOrder, String> {
+    if question.trim().is_empty()
+        || question.len() > MAX_WEB_QUESTION_BYTES.saturating_mul(2)
+        || question.chars().any(char::is_control)
+    {
+        return Err("delegated channel research question is invalid or oversized".to_string());
+    }
+    let model_id = model_id
+        .as_deref()
+        .map(crate::opencode_adapter::validate_model_identifier)
+        .transpose()?;
+    db_helpers::run_blocking(move || {
+        let mut store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        let records = load_records(&store, &project_id).map_err(AgentError::DatabaseError)?;
+        let parent = store
+            .get_product_work_order(&parent_work_order_id)?
+            .ok_or_else(|| AgentError::DatabaseError("research delegation parent is unknown".to_string()))?;
+        if parent.project_id != project_id
+            || parent.status != ProductWorkOrderStatus::Completed
+            || parent.delegation_depth >= crate::work_graph::MAX_DELEGATION_DEPTH
+        {
+            return Err(AgentError::DatabaseError(
+                "research delegation parent is stale, incomplete, or at the depth limit"
+                    .to_string(),
+            ));
+        }
+        let mode = if matches!(
+            channel,
+            crate::work_graph::ResearchChannel::Web
+                | crate::work_graph::ResearchChannel::ResearchPapers
+        ) {
+            ProductResearchMode::WebDiscovery
+        } else {
+            ProductResearchMode::ChannelResearch
+        };
+        let mut order = new_work_order(
+            &project_id,
+            Some(question),
+            ProductWorkOrderRole::Researcher,
+            records.project_revision,
+            Some(parent_work_order_id),
+            None,
+            Some(mode),
+            Some(category),
+        );
+        order.research_channel = Some(channel);
+        order.model_id = model_id;
+        order.delegation_depth = parent.delegation_depth.saturating_add(1);
+        persist_records_and_order(&mut store, &records, &order)
+            .map_err(AgentError::DatabaseError)?;
+        Ok(order)
+    })
+    .await
+    .map_err(db_error)
+}
+
+pub async fn run_channel_research_work_order(
+    db: Arc<Mutex<TranscriptStore>>,
+    runtime: Arc<SessionRuntime>,
+    work_order_id: String,
+    repository: std::path::PathBuf,
+) -> Result<ProductWorkOrder, String> {
+    if !repository.is_dir() {
+        return Err("channel research repository does not exist".to_string());
+    }
+    let db_for_preflight = db.clone();
+    let id_for_preflight = work_order_id.clone();
+    let preflight = db_helpers::run_blocking(move || {
+        let mut store = db_for_preflight
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        let mut order = store
+            .get_product_work_order(&id_for_preflight)?
+            .ok_or_else(|| AgentError::DatabaseError("channel research work order is unknown".to_string()))?;
+        let records = load_records(&store, &order.project_id).map_err(AgentError::DatabaseError)?;
+        if order.role != ProductWorkOrderRole::Researcher
+            || order.research_mode != Some(ProductResearchMode::ChannelResearch)
+            || !matches!(
+                order.status,
+                ProductWorkOrderStatus::Admitted | ProductWorkOrderStatus::ReconciliationRequired
+            )
+            || order.project_revision != records.project_revision
+            || order.question.as_deref().is_none_or(str::is_empty)
+            || order.research_channel.is_none()
+        {
+            return Err(AgentError::DatabaseError(
+                "channel research work order is stale or not current and admissible".to_string(),
+            ));
+        }
+        order.status = ProductWorkOrderStatus::Running;
+        order.updated_at = now();
+        store.save_product_work_order(&order)?;
+        Ok(order)
+    })
+    .await
+    .map_err(db_error)?;
+    let channel = preflight
+        .research_channel
+        .ok_or_else(|| "channel research binding disappeared".to_string())?;
+    let question = preflight
+        .question
+        .clone()
+        .ok_or_else(|| "channel research question disappeared".to_string())?;
+    let id_for_task = work_order_id.clone();
+    let db_for_task = db.clone();
+    execute_owned(runtime, work_order_id, move |generation| {
+        let db = db_for_task.clone();
+        let id = id_for_task.clone();
+        let repository = repository.clone();
+        let question = question.clone();
+        async move {
+            db_helpers::run_blocking({
+                let db = db.clone();
+                let id = id.clone();
+                move || {
+                    let mut store = db.lock().map_err(|_| {
+                        AgentError::DatabaseError("transcript store lock poisoned".to_string())
+                    })?;
+                    let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
+                        AgentError::DatabaseError("channel research work order disappeared".to_string())
+                    })?;
+                    if order.status != ProductWorkOrderStatus::Running {
+                        return Err(AgentError::DatabaseError(
+                            "channel research work order is no longer running".to_string(),
+                        ));
+                    }
+                    order.run_generation = generation;
+                    order.updated_at = now();
+                    store.save_product_work_order(&order)
+                }
+            })
+            .await
+            .map_err(db_error)?;
+
+            let observed = crate::agent_reach::research_channel(&repository, channel, &question).await;
+            match observed {
+                Ok(Err(unavailable)) => {
+                    db_helpers::run_blocking(move || {
+                        let mut store = db.lock().map_err(|_| {
+                            AgentError::DatabaseError("transcript store lock poisoned".to_string())
+                        })?;
+                        let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
+                            AgentError::DatabaseError("channel research work order disappeared".to_string())
+                        })?;
+                        if order.status != ProductWorkOrderStatus::Running
+                            || order.run_generation != generation
+                        {
+                            return Err(AgentError::DatabaseError(
+                                "channel research unavailability is stale".to_string(),
+                            ));
+                        }
+                        order.status = ProductWorkOrderStatus::Unavailable;
+                        order.result_ref = Some(format!(
+                            "channel-unavailable:{}:{}",
+                            unavailable.channel.as_str(),
+                            unavailable.reason.chars().take(320).collect::<String>()
+                        ));
+                        order.updated_at = now();
+                        store.save_product_work_order(&order)?;
+                        Ok(order)
+                    })
+                    .await
+                    .map_err(db_error)
+                }
+                Ok(Ok(result)) => {
+                    db_helpers::run_blocking(move || {
+                        let mut store = db.lock().map_err(|_| {
+                            AgentError::DatabaseError("transcript store lock poisoned".to_string())
+                        })?;
+                        let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
+                            AgentError::DatabaseError("channel research work order disappeared".to_string())
+                        })?;
+                        if order.status != ProductWorkOrderStatus::Running
+                            || order.run_generation != generation
+                        {
+                            return Err(AgentError::DatabaseError(
+                                "channel research result is stale or cancelled".to_string(),
+                            ));
+                        }
+                        let mut records =
+                            load_records(&store, &order.project_id).map_err(AgentError::DatabaseError)?;
+                        if order.project_revision != records.project_revision {
+                            return Err(AgentError::DatabaseError(
+                                "channel research authority changed during execution".to_string(),
+                            ));
+                        }
+                        let mut evidence_ids = Vec::new();
+                        for (index, source) in result.sources.into_iter().enumerate() {
+                            let evidence_id =
+                                format!("{}:channel-claim:{}", order.work_order_id, index + 1);
+                            let origin = if channel == crate::work_graph::ResearchChannel::Github {
+                                EvidenceOrigin::GitHub
+                            } else {
+                                EvidenceOrigin::Web
+                            };
+                            let claim = format!(
+                                "{} research source relevant to the bounded question: {}",
+                                channel.as_str(),
+                                source.title
+                            );
+                            product_os::submit_research_proposal(
+                                &mut records,
+                                EvidenceItem {
+                                    evidence_id: evidence_id.clone(),
+                                    claim,
+                                    source_reference: source.url.clone(),
+                                    captured_at: Utc::now().to_rfc3339(),
+                                    summary: source.summary.chars().take(MAX_WEB_FIELD_BYTES).collect(),
+                                    provenance: EvidenceProvenance::RuntimeProven,
+                                    current: true,
+                                    origin: Some(origin),
+                                    verification: Some(EvidenceVerification::Unverified),
+                                    kind: Some(EvidenceKind::ResearchClaim),
+                                    source: Some(EvidenceSource {
+                                        reference: source.url.clone(),
+                                        url: Some(source.url),
+                                        title: Some(source.title),
+                                        checked_at: Utc::now().to_rfc3339(),
+                                        version_or_scope: format!(
+                                            "channel={}; backend={}; source_type={}",
+                                            channel.as_str(),
+                                            result.backend,
+                                            source.source_type
+                                        ),
+                                    }),
+                                    verifier_work_order_id: None,
+                                    contradiction_ids: Vec::new(),
+                                    decision_impact: true,
+                                    revisit_trigger: Some(
+                                        "recheck if the owner mandate, source, or channel backend changes"
+                                            .to_string(),
+                                    ),
+                                    decision_question: order.question.clone(),
+                                },
+                            )
+                            .map_err(AgentError::DatabaseError)?;
+                            evidence_ids.push(evidence_id);
+                        }
+                        if evidence_ids.is_empty() {
+                            return Err(AgentError::DatabaseError(
+                                "channel research returned no admissible source evidence".to_string(),
+                            ));
+                        }
+                        order.evidence_id = evidence_ids.first().cloned();
+                        order.evidence_ids = evidence_ids;
+                        order.status = ProductWorkOrderStatus::Completed;
+                        order.result_ref = Some(format!(
+                            "channel-research:{}:{}",
+                            channel.as_str(),
+                            result.backend
+                        ));
+                        order.updated_at = now();
+                        persist_records_and_order(&mut store, &records, &order)
+                            .map_err(AgentError::DatabaseError)?;
+                        Ok(order)
+                    })
+                    .await
+                    .map_err(db_error)
+                }
+                Err(error) => {
+                    mark_failed(db.clone(), &id, generation, &error).await;
+                    Err(error)
+                }
+            }
+        }
+    })
+    .await
+}
+
 pub async fn bind_input_manifest(
     db: Arc<Mutex<TranscriptStore>>,
     work_order_id: String,
