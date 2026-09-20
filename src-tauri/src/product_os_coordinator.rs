@@ -105,6 +105,10 @@ pub struct ProductCoordinatorRun {
     pub consultation_request_ids: Vec<String>,
     #[serde(default)]
     pub consultation_evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub consultation_return_status: Option<CoordinatorStatus>,
+    #[serde(default)]
+    pub consultation_return_error: Option<String>,
     pub build_package_id: Option<String>,
     pub delivery_session_id: Option<String>,
     pub terminal_outcome: Option<String>,
@@ -288,6 +292,68 @@ fn retryable_research_shape_error(error: &str) -> bool {
         || lower.contains("produced no evidence")
 }
 
+fn coordinator_status_is_terminal(status: &CoordinatorStatus) -> bool {
+    matches!(
+        status,
+        CoordinatorStatus::Completed
+            | CoordinatorStatus::Stopped
+            | CoordinatorStatus::Pivoted
+            | CoordinatorStatus::Failed
+            | CoordinatorStatus::Cancelled
+    )
+}
+
+fn run_owns_runtime_session(run: &ProductCoordinatorRun, session_id: &str) -> bool {
+    run.research_work_order_ids.iter().any(|id| id == session_id)
+        || run.verifier_work_order_ids.iter().any(|id| id == session_id)
+        || run
+            .product_director_work_order_id
+            .as_deref()
+            .is_some_and(|id| id == session_id)
+        || run.architecture_work_order_ids.iter().any(|id| id == session_id)
+        || run
+            .reuse_work_order_id
+            .as_deref()
+            .is_some_and(|id| id == session_id)
+        || run
+            .constraints_work_order_id
+            .as_deref()
+            .is_some_and(|id| id == session_id)
+        || run
+            .red_team_work_order_id
+            .as_deref()
+            .is_some_and(|id| id == session_id)
+        || run
+            .dissent_work_order_id
+            .as_deref()
+            .is_some_and(|id| id == session_id)
+        || run
+            .feasibility_work_order_id
+            .as_deref()
+            .is_some_and(|id| id == session_id)
+        || run
+            .delivery_session_id
+            .as_deref()
+            .is_some_and(|id| id == session_id)
+        || session_id.starts_with(&format!("consultation:{}:", run.project_id))
+}
+
+async fn project_consultations(
+    ctx: &CoordinatorContext,
+    project_id: &str,
+) -> Result<Vec<crate::consultation_broker::ConsultationWorkOrder>, String> {
+    let db = ctx.db.clone();
+    let project_id = project_id.to_string();
+    db_helpers::run_blocking(move || {
+        let store = db.lock().map_err(|_| {
+            AgentError::DatabaseError("transcript store lock poisoned".to_string())
+        })?;
+        store.list_project_consultation_work_orders(&project_id)
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 async fn load_run(ctx: &CoordinatorContext, run_id: &str) -> Result<ProductCoordinatorRun, String> {
     let db = ctx.db.clone();
     let id = run_id.to_string();
@@ -310,6 +376,31 @@ async fn save_run(ctx: &CoordinatorContext, run: &ProductCoordinatorRun) -> Resu
         let mut store = db
             .lock()
             .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        if let Some(current) = store.get_product_coordinator_run(&run.run_id)? {
+            if current.execution_epoch > run.execution_epoch {
+                return Err(AgentError::DatabaseError(
+                    "stale coordinator epoch cannot overwrite current run state".to_string(),
+                ));
+            }
+            if matches!(
+                current.status,
+                CoordinatorStatus::Cancelling | CoordinatorStatus::Cancelled
+            ) && !matches!(
+                run.status,
+                CoordinatorStatus::Cancelling | CoordinatorStatus::Cancelled
+            ) {
+                return Err(AgentError::DatabaseError(
+                    "cancellation authority prevents stale coordinator writes".to_string(),
+                ));
+            }
+            if coordinator_status_is_terminal(&current.status)
+                && current.status != run.status
+            {
+                return Err(AgentError::DatabaseError(
+                    "terminal coordinator state cannot be overwritten".to_string(),
+                ));
+            }
+        }
         store.save_product_coordinator_run(&run)
     })
     .await
@@ -317,11 +408,24 @@ async fn save_run(ctx: &CoordinatorContext, run: &ProductCoordinatorRun) -> Resu
 }
 
 async fn mark_failed(ctx: &CoordinatorContext, run: &mut ProductCoordinatorRun, error: String) {
-    run.status = CoordinatorStatus::Failed;
-    run.phase = CoordinatorPhase::Terminal;
-    run.error = Some(error.chars().take(240).collect());
-    run.updated_at = now();
-    let _ = save_run(ctx, run).await;
+    let Ok(mut current) = load_run(ctx, &run.run_id).await else {
+        return;
+    };
+    if current.execution_epoch != run.execution_epoch
+        || matches!(
+            current.status,
+            CoordinatorStatus::Cancelling | CoordinatorStatus::Cancelled
+        )
+        || coordinator_status_is_terminal(&current.status)
+    {
+        return;
+    }
+    current.status = CoordinatorStatus::Failed;
+    current.phase = CoordinatorPhase::Terminal;
+    current.error = Some(error.chars().take(240).collect());
+    current.updated_at = now();
+    let _ = save_run(ctx, &current).await;
+    *run = current;
 }
 
 fn role_prompt(role: &str, brief: &str) -> String {
@@ -1758,6 +1862,8 @@ pub async fn start(
         pending_experiment: None,
         consultation_request_ids: Vec::new(),
         consultation_evidence_ids: Vec::new(),
+        consultation_return_status: None,
+        consultation_return_error: None,
         build_package_id: None,
         delivery_session_id: None,
         terminal_outcome: None,
@@ -1826,6 +1932,10 @@ pub async fn request_consultation(
                 .to_string(),
         );
     }
+    run.consultation_return_status = Some(run.status.clone());
+    run.consultation_return_error = run.error.clone();
+    run.updated_at = now();
+    save_run(&ctx, &run).await?;
     let snapshot = product_os_runtime::snapshot(
         ctx.db.clone(),
         ctx.runtime.clone(),
@@ -1873,7 +1983,10 @@ pub async fn request_consultation(
             .await?;
             run.consultation_request_ids.push(request_id);
             run.consultation_evidence_ids.push(evidence.evidence_id);
-            run.error = None;
+            run.error = run.consultation_return_error.take();
+            if let Some(previous) = run.consultation_return_status.take() {
+                run.status = previous;
+            }
         }
         crate::consultation_runtime::ConsultationExecutionOutcome::UnknownOutcome(order) => {
             run.consultation_request_ids.push(order.request_id);
@@ -2038,36 +2151,178 @@ pub async fn cancel(
     reason: String,
 ) -> Result<ProductCoordinatorRun, String> {
     let mut run = load_run(&ctx, &run_id).await?;
-    let owned_work_orders = run
-        .research_work_order_ids
-        .iter()
-        .chain(run.verifier_work_order_ids.iter())
-        .chain(run.product_director_work_order_id.iter())
-        .chain(run.architecture_work_order_ids.iter())
-        .chain(run.reuse_work_order_id.iter())
-        .chain(run.constraints_work_order_id.iter())
-        .chain(run.red_team_work_order_id.iter())
-        .chain(run.dissent_work_order_id.iter())
-        .chain(run.feasibility_work_order_id.iter())
-        .chain(run.delivery_session_id.iter())
-        .collect::<Vec<_>>();
-    if let Some(owner) = ctx.runtime.current_owner() {
-        if owned_work_orders
-            .iter()
-            .any(|work_order_id| *work_order_id == &owner.session_id)
-        {
-            if let Some(guard) = ctx.runtime.stop_owner(&owner).await? {
-                guard.finish();
-            }
-        }
+    if coordinator_status_is_terminal(&run.status) {
+        return Ok(run);
     }
+
+    // Publish cancellation authority first. The epoch bump plus save_run guard
+    // prevents stale in-flight coordinator work from writing success/failure
+    // after the owner has requested cancellation.
     run.status = CoordinatorStatus::Cancelling;
-    save_run(&ctx, &run).await?;
-    run.status = CoordinatorStatus::Cancelled;
-    run.phase = CoordinatorPhase::Terminal;
-    run.error = Some(reason.chars().take(240).collect());
+    run.execution_epoch = run.execution_epoch.saturating_add(1);
     run.updated_at = now();
     save_run(&ctx, &run).await?;
+
+    if let Some(owner) = ctx.runtime.current_owner()
+        && run_owns_runtime_session(&run, &owner.session_id)
+        && let Some(guard) = ctx.runtime.stop_owner(&owner).await?
+    {
+        *ctx.ask_user_tx.lock().await = None;
+        guard.finish();
+    }
+
+    let _ = crate::consultation_broker::cancel_project_open_requests(
+        ctx.db.clone(),
+        run.project_id.clone(),
+        format!("Product OS run cancelled by owner: {}", reason.chars().take(240).collect::<String>()),
+    )
+    .await?;
+
+    // Wait until any coordinator step that held the serialization lock has
+    // unwound after observing the new epoch/cancel authority.
+    let _guard = ctx.coordinator_lock.lock().await;
+    let mut current = load_run(&ctx, &run_id).await?;
+    if current.status == CoordinatorStatus::Cancelled {
+        return Ok(current);
+    }
+
+    if let Some(delivery_id) = current.delivery_session_id.clone() {
+        let db = ctx.db.clone();
+        let raw = db_helpers::run_blocking(move || {
+            let store = db.lock().map_err(|_| {
+                AgentError::DatabaseError("transcript store lock poisoned".to_string())
+            })?;
+            store.get_delivery_state(&delivery_id)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        if let Some(raw) = raw
+            && let Ok(mut delivery) = serde_json::from_str::<crate::delivery::DeliveryState>(&raw)
+            && !matches!(
+                delivery.phase,
+                crate::delivery::DeliveryPhase::Applied
+                    | crate::delivery::DeliveryPhase::Cancelled
+            )
+        {
+            delivery.phase = crate::delivery::DeliveryPhase::Cancelled;
+            if let Some(work_order) = delivery.work_order.as_mut() {
+                crate::opencode_adapter::cancel(work_order);
+            }
+            crate::delivery::persist_state(
+                &ctx.delivery_state_path,
+                &ctx.delivery_slot,
+                &ctx.db,
+                &mut delivery,
+            )
+            .await?;
+        }
+    }
+
+    current.status = CoordinatorStatus::Cancelled;
+    current.phase = CoordinatorPhase::Terminal;
+    current.stage = PipelineStage::Terminal;
+    current.pending_owner_decision = None;
+    current.error = Some(reason.chars().take(240).collect());
+    current.updated_at = now();
+    save_run(&ctx, &current).await?;
+    Ok(current)
+}
+
+pub async fn recover_consultation(
+    ctx: CoordinatorContext,
+    run_id: String,
+    request_id: String,
+    action: String,
+) -> Result<ProductCoordinatorRun, String> {
+    let _guard = ctx.coordinator_lock.lock().await;
+    let mut run = load_run(&ctx, &run_id).await?;
+    if coordinator_status_is_terminal(&run.status) {
+        return Err("terminal Product OS run cannot recover consultation".to_string());
+    }
+    let order = project_consultations(&ctx, &run.project_id)
+        .await?
+        .into_iter()
+        .find(|order| order.request_id == request_id)
+        .ok_or_else(|| "consultation request is not owned by this Product OS run".to_string())?;
+    if order.originating_run_id != run.run_id {
+        return Err("consultation request belongs to a different coordinator run".to_string());
+    }
+
+    let action = action.trim().to_ascii_lowercase();
+    if action == "abandon" {
+        crate::consultation_broker::abandon_request(
+            ctx.db.clone(),
+            order.request_id.clone(),
+            "Owner explicitly abandoned advisory consultation recovery".to_string(),
+        )
+        .await?;
+    } else if action == "observe" {
+        let data_root = ctx
+            .delivery_state_path
+            .parent()
+            .ok_or_else(|| "Arena data directory is unavailable".to_string())?;
+        let outcome = crate::consultation_runtime::recover_owned_external_browser_consultation(
+            ctx.runtime.clone(),
+            ctx.db.clone(),
+            PathBuf::from(&run.repository_path),
+            data_root.join("consultation-browser-profiles"),
+            run.project_id.clone(),
+            order.request_id.clone(),
+        )
+        .await?;
+        match outcome {
+            crate::consultation_runtime::ConsultationExecutionOutcome::Complete(result) => {
+                let evidence = product_os_runtime::admit_consultation_result(
+                    ctx.db.clone(),
+                    run.project_id.clone(),
+                    result.clone(),
+                )
+                .await?;
+                if !run.consultation_request_ids.iter().any(|id| id == &result.request_id) {
+                    run.consultation_request_ids.push(result.request_id);
+                }
+                if !run
+                    .consultation_evidence_ids
+                    .iter()
+                    .any(|id| id == &evidence.evidence_id)
+                {
+                    run.consultation_evidence_ids.push(evidence.evidence_id);
+                }
+            }
+            crate::consultation_runtime::ConsultationExecutionOutcome::UnknownOutcome(_) => {
+                run.status = CoordinatorStatus::Blocked;
+                run.error = Some(
+                    "Consultation response is still uncorrelated; Arena will not resend it."
+                        .to_string(),
+                );
+                run.updated_at = now();
+                save_run(&ctx, &run).await?;
+                return Ok(run);
+            }
+            crate::consultation_runtime::ConsultationExecutionOutcome::PreSendBlocked(_) => {
+                return Err("post-send recovery cannot become a pre-send transaction".to_string());
+            }
+        }
+    } else {
+        return Err("consultation recovery action must be observe or abandon".to_string());
+    }
+
+    run.error = run.consultation_return_error.take();
+    run.status = run
+        .consultation_return_status
+        .take()
+        .unwrap_or_else(|| {
+            if run.pending_owner_decision.is_some() {
+                CoordinatorStatus::WaitingForOwner
+            } else {
+                CoordinatorStatus::Running
+            }
+        });
+    run.updated_at = now();
+    save_run(&ctx, &run).await?;
+    if run.status == CoordinatorStatus::Running {
+        spawn(ctx.clone(), run.run_id.clone());
+    }
     Ok(run)
 }
 
@@ -2076,18 +2331,30 @@ pub async fn resume(
     run_id: String,
 ) -> Result<ProductCoordinatorRun, String> {
     let mut run = load_run(&ctx, &run_id).await?;
-    if matches!(
-        run.status,
-        CoordinatorStatus::Completed
-            | CoordinatorStatus::Stopped
-            | CoordinatorStatus::Pivoted
-            | CoordinatorStatus::Cancelled
-    ) {
+    if coordinator_status_is_terminal(&run.status) {
         return Ok(run);
     }
     if run.status == CoordinatorStatus::WaitingForOwner {
         return Ok(run);
     }
+
+    crate::consultation_runtime::reconcile_after_restart(ctx.db.clone()).await?;
+    let open_consultations = project_consultations(&ctx, &run.project_id)
+        .await?
+        .into_iter()
+        .filter(|order| !order.state.is_terminal())
+        .collect::<Vec<_>>();
+    if !open_consultations.is_empty() {
+        run.status = CoordinatorStatus::Blocked;
+        run.error = Some(format!(
+            "{} consultation transaction(s) require explicit observe/abandon recovery before Product OS can resume",
+            open_consultations.len()
+        ));
+        run.updated_at = now();
+        save_run(&ctx, &run).await?;
+        return Ok(run);
+    }
+
     run.status = CoordinatorStatus::Reconciling;
     save_run(&ctx, &run).await?;
     product_os_runtime::reconcile_after_restart(ctx.db.clone(), ctx.runtime.clone()).await?;
@@ -2172,6 +2439,8 @@ mod tests {
             pending_experiment: None,
             consultation_request_ids: vec!["consultation-1".to_string()],
             consultation_evidence_ids: vec!["consultation-evidence-1".to_string()],
+            consultation_return_status: None,
+            consultation_return_error: None,
             build_package_id: Some("package-1".to_string()),
             delivery_session_id: Some("delivery-1".to_string()),
             terminal_outcome: None,
