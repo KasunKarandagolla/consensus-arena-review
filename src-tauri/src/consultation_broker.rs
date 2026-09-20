@@ -394,7 +394,7 @@ pub fn validate_application_url(
     established_identity: bool,
 ) -> Result<String, String> {
     let mut url =
-        url::Url::parse(raw_url).map_err(|_| "consultation application URL is invalid".to_string())?;
+        reqwest::Url::parse(raw_url).map_err(|_| "consultation application URL is invalid".to_string())?;
     if url.scheme() != "https" || url.host_str() != Some(provider.expected_host()) {
         return Err("consultation application URL has the wrong origin".to_string());
     }
