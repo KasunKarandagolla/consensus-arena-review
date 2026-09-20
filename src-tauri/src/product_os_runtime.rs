@@ -1272,9 +1272,11 @@ pub async fn admit_packet_review_batch(
             }
             packet_hash.get_or_insert(admission_packet.clone());
 
-            let mut order = store.get_product_work_order(&work_order_id)?.ok_or_else(|| {
-                AgentError::DatabaseError("packet review work order is unknown".to_string())
-            })?;
+            let mut order = store
+                .get_product_work_order(&work_order_id)?
+                .ok_or_else(|| {
+                    AgentError::DatabaseError("packet review work order is unknown".to_string())
+                })?;
             if order.project_id != project_id
                 || !is_semantic_review_role(&order.role)
                 || order.status != ProductWorkOrderStatus::Completed
