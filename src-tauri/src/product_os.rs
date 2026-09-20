@@ -96,6 +96,7 @@ pub enum ProductWorkOrderRole {
 pub enum ProductResearchMode {
     KnownSource,
     WebDiscovery,
+    ChannelResearch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -139,6 +140,9 @@ pub struct ProductWorkOrder {
     pub research_mode: Option<ProductResearchMode>,
     #[serde(default)]
     pub research_category: Option<ProductResearchCategory>,
+    /// Optional explicit research platform for a channel-specialist child.
+    #[serde(default)]
+    pub research_channel: Option<crate::work_graph::ResearchChannel>,
     pub parent_work_order_id: Option<String>,
     /// Arena-owned per-work-order model binding. None inherits the configured
     /// default; workers cannot choose or mutate this value themselves.
