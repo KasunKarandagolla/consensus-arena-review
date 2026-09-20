@@ -2657,6 +2657,39 @@ pub async fn recover_consultation(
     Ok(run)
 }
 
+pub async fn reconcile_latest_after_restart(
+    db: Arc<Mutex<TranscriptStore>>,
+    runtime: Arc<SessionRuntime>,
+) -> Result<Option<ProductCoordinatorRun>, String> {
+    product_os_runtime::reconcile_after_restart(db.clone(), runtime).await?;
+    db_helpers::run_blocking(move || {
+        let mut store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        let Some(mut run) = store.get_latest_product_coordinator_run()? else {
+            return Ok(None);
+        };
+        if matches!(
+            run.status,
+            CoordinatorStatus::Admitted
+                | CoordinatorStatus::Running
+                | CoordinatorStatus::Reconciling
+                | CoordinatorStatus::Cancelling
+        ) {
+            run.status = CoordinatorStatus::Reconciling;
+            run.error = Some(
+                "Arena reopened while Product OS work was in flight; persisted authority is intact and explicit Resume will reconcile/restart only the required stage."
+                    .to_string(),
+            );
+            run.updated_at = now();
+            store.save_product_coordinator_run(&run)?;
+        }
+        Ok(Some(run))
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 pub async fn resume(
     ctx: CoordinatorContext,
     run_id: String,
