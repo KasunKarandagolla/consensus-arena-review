@@ -451,17 +451,61 @@ pub enum ExperimentDisposition {
     Inconclusive,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentExecutorKind {
+    DeterministicCommand,
+    ToolProbe,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExperimentOperation {
+    CargoCheckLocked,
+    FrontendBuild,
+    GitHubRepositoryMetadata { url: String },
+    FileContains { relative_path: String, needle: String },
+}
+
+impl ExperimentOperation {
+    pub const fn executor_kind(&self) -> ExperimentExecutorKind {
+        match self {
+            Self::CargoCheckLocked | Self::FrontendBuild => {
+                ExperimentExecutorKind::DeterministicCommand
+            }
+            Self::GitHubRepositoryMetadata { .. } | Self::FileContains { .. } => {
+                ExperimentExecutorKind::ToolProbe
+            }
+        }
+    }
+
+    pub fn description(&self) -> String {
+        match self {
+            Self::CargoCheckLocked => "cargo check --locked".to_string(),
+            Self::FrontendBuild => "npm run build".to_string(),
+            Self::GitHubRepositoryMetadata { url } => {
+                format!("GitHub repository metadata probe: {url}")
+            }
+            Self::FileContains {
+                relative_path,
+                needle,
+            } => format!("bounded file probe: {relative_path} contains {needle:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExperimentContract {
     pub experiment_id: String,
     pub synthesis_identity: String,
     pub assumption: String,
-    pub protocol: String,
-    pub executor: String,
+    pub executor_kind: ExperimentExecutorKind,
+    pub operation: ExperimentOperation,
     pub expected_observation: String,
     pub pass_condition: String,
     pub fail_condition: String,
     pub inconclusive_condition: String,
+    pub environment: String,
     pub timeout_seconds: u64,
     pub allowed_effects: Vec<String>,
     pub protected_paths: Vec<String>,
@@ -473,18 +517,21 @@ impl ExperimentContract {
             (&self.experiment_id, "experiment id"),
             (&self.synthesis_identity, "synthesis identity"),
             (&self.assumption, "assumption"),
-            (&self.protocol, "protocol"),
-            (&self.executor, "executor"),
             (&self.expected_observation, "expected observation"),
             (&self.pass_condition, "PASS condition"),
             (&self.fail_condition, "FAIL condition"),
             (&self.inconclusive_condition, "INCONCLUSIVE condition"),
+            (&self.environment, "environment"),
         ] {
             if value.trim().is_empty() {
                 return Err(format!("experiment contract requires {field}"));
             }
         }
+        if self.executor_kind != self.operation.executor_kind() {
+            return Err("experiment executor does not match its typed operation".to_string());
+        }
         if self.timeout_seconds == 0
+            || self.timeout_seconds > 900
             || self.allowed_effects.is_empty()
             || self.protected_paths.is_empty()
         {
@@ -492,6 +539,37 @@ impl ExperimentContract {
                 "experiment contract requires bounded timeout, effects, and protected paths"
                     .to_string(),
             );
+        }
+        match &self.operation {
+            ExperimentOperation::GitHubRepositoryMetadata { url } => {
+                let parsed = url::Url::parse(url)
+                    .map_err(|_| "GitHub metadata experiment URL is invalid".to_string())?;
+                if parsed.scheme() != "https"
+                    || parsed.host_str() != Some("api.github.com")
+                    || !parsed.path().starts_with("/repos/")
+                    || parsed.query().is_some()
+                    || parsed.fragment().is_some()
+                {
+                    return Err(
+                        "GitHub metadata experiment must use a canonical api.github.com /repos/ URL"
+                            .to_string(),
+                    );
+                }
+            }
+            ExperimentOperation::FileContains {
+                relative_path,
+                needle,
+            } => {
+                if relative_path.trim().is_empty()
+                    || relative_path.starts_with('/')
+                    || relative_path.split('/').any(|part| part == "..")
+                    || needle.is_empty()
+                    || needle.len() > 4 * 1024
+                {
+                    return Err("bounded file experiment is invalid".to_string());
+                }
+            }
+            ExperimentOperation::CargoCheckLocked | ExperimentOperation::FrontendBuild => {}
         }
         Ok(())
     }
@@ -831,18 +909,22 @@ mod tests {
             experiment_id: "experiment-1".to_string(),
             synthesis_identity: "synthesis-1".to_string(),
             assumption: "the adapter compiles".to_string(),
-            protocol: "cargo check".to_string(),
-            executor: "Arena".to_string(),
+            executor_kind: ExperimentExecutorKind::DeterministicCommand,
+            operation: ExperimentOperation::CargoCheckLocked,
             expected_observation: "exit zero".to_string(),
             pass_condition: "exit zero".to_string(),
             fail_condition: "exit non-zero".to_string(),
             inconclusive_condition: "timeout".to_string(),
+            environment: "isolated repository worktree".to_string(),
             timeout_seconds: 60,
             allowed_effects: vec!["read-only".to_string()],
             protected_paths: vec![".arena".to_string()],
         };
         assert!(contract.validate().is_ok());
         contract.timeout_seconds = 0;
+        assert!(contract.validate().is_err());
+        contract.timeout_seconds = 60;
+        contract.executor_kind = ExperimentExecutorKind::ToolProbe;
         assert!(contract.validate().is_err());
     }
 
