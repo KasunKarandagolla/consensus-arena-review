@@ -15,6 +15,7 @@ pub mod consultation;
 pub mod consultation_broker;
 mod consultation_runtime;
 mod external_browser;
+mod functional_contract;
 mod context_manager;
 mod credentials;
 mod critical_transport;
