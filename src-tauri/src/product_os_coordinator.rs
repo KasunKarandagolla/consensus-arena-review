@@ -1112,6 +1112,37 @@ fn records_brief(records: &ProductAuthorityRecords, route: ProductRoute) -> Stri
     )
 }
 
+fn owner_directives_brief(run: &ProductCoordinatorRun) -> String {
+    let values = run
+        .owner_directives
+        .iter()
+        .rev()
+        .take(12)
+        .map(|directive| {
+            format!(
+                "- kind={:?}; must_complete_before_decision={}; channels={}; text={}",
+                directive.kind,
+                directive.must_complete_before_decision,
+                directive
+                    .requested_channels
+                    .iter()
+                    .map(|channel| channel.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                directive.text.chars().take(720).collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "Durable owner directives (newest first; these outrank inferred/model preferences):\n{}",
+        if values.is_empty() {
+            "- none".to_string()
+        } else {
+            values.join("\n")
+        }
+    )
+}
+
 fn product_review_route_instruction(route: ProductRoute) -> &'static str {
     match route {
         ProductRoute::NewProduct => {
@@ -1157,7 +1188,11 @@ async fn run_product_review(
         &format!(
             "{}\n{}{}\nReturn JSON: {{\"outcome\":\"stop|pivot|validation_experiment|narrow_build\",\"scope\":null or {{\"objective\":\"...\",\"target_user\":\"...\",\"requirements\":[\"...\"],\"constraints\":[\"...\"],\"non_goals\":[\"...\"],\"interfaces\":[\"...\"],\"risks\":[\"...\"],\"acceptance_scenarios\":[\"...\"],\"reviewer_restatement\":{{\"intended_outcome\":\"...\",\"success_condition\":\"...\",\"invented_behaviors\":[]}}}},\"experiment_contract\":null or {{\"experiment_id\":\"...\",\"synthesis_identity\":\"...\",\"assumption\":\"...\",\"executor_kind\":\"deterministic_command|tool_probe\",\"operation\":{{\"kind\":\"cargo_check_locked|frontend_build|github_repository_metadata|file_contains\"}},\"expected_observation\":\"...\",\"pass_condition\":\"...\",\"fail_condition\":\"...\",\"inconclusive_condition\":\"...\",\"environment\":\"...\",\"timeout_seconds\":120,\"allowed_effects\":[\"...\"],\"protected_paths\":[\"...\"]}},\"owner_question\":\"...\",\"rationale\":\"...\",\"no_build_argument\":\"...\"}}. Scope may be null only for Stop or Pivot. NarrowBuild and ValidationExperiment both require a bounded typed scope because Arena must know what commitment/experiment is being authorized. Choose NarrowBuild only when the bounded route-specific evidence supports it. If choosing ValidationExperiment, provide the exact typed ExperimentContract from Arena's closed operation set; never describe one experiment and expect Arena to substitute another. If the needed experiment cannot be represented safely, do not choose ValidationExperiment.",
             product_review_route_instruction(run.route),
-            records_brief(&snapshot.records, run.route),
+            format!(
+                "{}\n{}",
+                owner_directives_brief(run),
+                records_brief(&snapshot.records, run.route)
+            ),
             intelligence
         ),
     );
