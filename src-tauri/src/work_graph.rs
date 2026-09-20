@@ -292,6 +292,32 @@ pub fn owner_directive_from_text(
     })
 }
 
+fn env_model(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name).ok().filter(|value| !value.trim().is_empty()) {
+        Some(value) => crate::opencode_adapter::validate_model_identifier(&value).map(Some),
+        None => Ok(None),
+    }
+}
+
+pub fn configured_research_lead_model() -> Result<Option<String>, String> {
+    env_model("ARENA_MODEL_RESEARCH_LEAD")
+}
+
+pub fn configured_channel_model(channel: ResearchChannel) -> Result<Option<String>, String> {
+    let key = match channel {
+        ResearchChannel::Web => "ARENA_MODEL_RESEARCH_WEB",
+        ResearchChannel::Github => "ARENA_MODEL_RESEARCH_GITHUB",
+        ResearchChannel::Youtube => "ARENA_MODEL_RESEARCH_YOUTUBE",
+        ResearchChannel::Reddit => "ARENA_MODEL_RESEARCH_REDDIT",
+        ResearchChannel::X => "ARENA_MODEL_RESEARCH_X",
+        ResearchChannel::Rss => "ARENA_MODEL_RESEARCH_RSS",
+        ResearchChannel::ResearchPapers => "ARENA_MODEL_RESEARCH_PAPERS",
+        ResearchChannel::Douyin => "ARENA_MODEL_RESEARCH_DOUYIN",
+        ResearchChannel::Tiktok => "ARENA_MODEL_RESEARCH_TIKTOK",
+    };
+    env_model(key)
+}
+
 pub fn research_mandate_for(directive: &OwnerDirective) -> Option<ResearchMandate> {
     if directive.kind != OwnerDirectiveKind::Research {
         return None;
