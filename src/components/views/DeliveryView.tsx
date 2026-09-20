@@ -63,7 +63,7 @@ export default function DeliveryView() {
     ['verified', 'applied', 'cancelled', 'failed'].includes(state?.phase ?? '') ||
     ['completed', 'stopped', 'pivoted', 'blocked', 'cancelled'].includes(coordinator?.status ?? '')
   const canResume =
-    coordinator?.status === 'failed' ||
+    ['failed', 'blocked', 'reconciling'].includes(coordinator?.status ?? '') ||
     ['cancelled', 'failed'].includes(state?.phase ?? '')
 
   async function apply() {
