@@ -93,8 +93,12 @@ pub struct ResearchMandate {
     pub minimum_distinct_sources: u16,
     pub max_cycles: u16,
     pub status: ResearchMandateStatus,
+    #[serde(default)]
+    pub cycles_completed: u16,
     pub child_work_order_ids: Vec<String>,
     pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub completed_channels: Vec<ResearchChannel>,
     pub unavailable_channels: Vec<ResearchChannel>,
 }
 
@@ -344,8 +348,10 @@ pub fn research_mandate_for(directive: &OwnerDirective) -> Option<ResearchMandat
         minimum_distinct_sources,
         max_cycles,
         status: ResearchMandateStatus::Pending,
+        cycles_completed: 0,
         child_work_order_ids: Vec::new(),
         evidence_ids: Vec::new(),
+        completed_channels: Vec::new(),
         unavailable_channels: Vec::new(),
     };
     mandate.validate().ok().map(|_| mandate)
@@ -368,8 +374,10 @@ pub fn default_new_product_research_mandate(
         minimum_distinct_sources: 4,
         max_cycles: 4,
         status: ResearchMandateStatus::Pending,
+        cycles_completed: 0,
         child_work_order_ids: Vec::new(),
         evidence_ids: Vec::new(),
+        completed_channels: Vec::new(),
         unavailable_channels: Vec::new(),
     }
 }
