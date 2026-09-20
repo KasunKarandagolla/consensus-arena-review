@@ -2922,6 +2922,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_runs_are_recoverable_but_true_terminal_states_are_not() {
+        assert!(!coordinator_status_is_terminal(&CoordinatorStatus::Failed));
+        assert!(!coordinator_status_is_terminal(&CoordinatorStatus::Blocked));
+        assert!(coordinator_status_is_terminal(&CoordinatorStatus::Completed));
+        assert!(coordinator_status_is_terminal(&CoordinatorStatus::Stopped));
+        assert!(coordinator_status_is_terminal(&CoordinatorStatus::Pivoted));
+        assert!(coordinator_status_is_terminal(&CoordinatorStatus::Cancelled));
+    }
+
+    #[test]
+    fn stop_and_pivot_recommendations_are_owner_decisions_not_model_authority() {
+        assert_eq!(
+            pipeline_contract::owner_decision_for_option(None, "continue_evaluation"),
+            Ok(OwnerDecisionKind::ContinueEvaluation)
+        );
+        assert_eq!(
+            pipeline_contract::owner_decision_for_option(None, "stop"),
+            Ok(OwnerDecisionKind::StopRun)
+        );
+        assert_eq!(
+            pipeline_contract::owner_decision_for_option(None, "pivot"),
+            Ok(OwnerDecisionKind::PivotRun)
+        );
+    }
+
+    #[test]
     fn semantic_result_parser_rejects_missing_outcome() {
         assert!(parse_json::<DirectorOutput>(r#"{"scope":null}"#).is_err());
     }
