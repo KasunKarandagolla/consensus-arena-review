@@ -363,6 +363,33 @@ pub fn admit_product_scope(
     Ok(())
 }
 
+/// Invalidate downstream technical commitments after new owner guidance or
+/// newly-required evidence changes the decision basis. Current research
+/// evidence remains inspectable; architecture, build direction and frozen
+/// acceptance must be re-established against the new revision.
+pub fn invalidate_downstream_for_owner_guidance(
+    records: &mut ProductAuthorityRecords,
+) {
+    records.decision_outcome = None;
+    records.product_direction_decision_id = None;
+    records.reuse_decisions.clear();
+    records.architecture = ArchitectureEvidenceRecords {
+        architecture_version: records.architecture.architecture_version.saturating_add(1),
+        proposal_a_evidence_id: String::new(),
+        proposal_b_evidence_id: String::new(),
+        reuse_review_evidence_id: String::new(),
+        constraints_review_evidence_id: String::new(),
+        risk_experiment_evidence_ids: Vec::new(),
+        red_team_evidence_id: String::new(),
+        dissent_evidence_id: String::new(),
+        unresolved_high_blocker_evidence_ids: Vec::new(),
+        competition_mode: ArchitectureCompetitionMode::CompetingProposals,
+        synthesis: None,
+    };
+    records.acceptance_profile_version = None;
+    records.project_revision = records.project_revision.saturating_add(1);
+}
+
 /// Adopt an owner-approved bounded product direction. This is the only
 /// Product OS operation that can set a current NarrowBuild direction.
 pub fn adopt_product_direction(
