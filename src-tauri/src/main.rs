@@ -34,6 +34,7 @@ mod opencode_adapter;
 mod orchestrator;
 mod persona_manager;
 pub mod pipeline_contract;
+mod pipeline_integrity;
 mod pipeline_ids;
 pub mod product_os;
 mod product_os_coordinator;
