@@ -331,7 +331,7 @@ pub struct ConversationAnchorUpdate {
     pub adapter_version: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ArmedSendPermit {
     request_id: String,
     execution_epoch: u64,
@@ -347,6 +347,25 @@ impl ArmedSendPermit {
     pub fn transport(&self) -> ConsultationTransportKind {
         self.transport
     }
+
+    pub fn complete(self, outcome: TransportSubmissionOutcome) -> TransportEffectReceipt {
+        TransportEffectReceipt {
+            request_id: self.request_id,
+            execution_epoch: self.execution_epoch,
+            transport: self.transport,
+            issued_at: self.issued_at,
+            outcome,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TransportEffectReceipt {
+    request_id: String,
+    execution_epoch: u64,
+    transport: ConsultationTransportKind,
+    issued_at: i64,
+    outcome: TransportSubmissionOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,20 +558,19 @@ where
 
 pub async fn record_submission_outcome(
     db: Arc<Mutex<TranscriptStore>>,
-    permit: ArmedSendPermit,
-    outcome: TransportSubmissionOutcome,
+    receipt: TransportEffectReceipt,
 ) -> Result<ConsultationWorkOrder, String> {
-    if now().saturating_sub(permit.issued_at) > 120 {
-        return Err("consultation send permit expired before submission outcome".to_string());
+    if now().saturating_sub(receipt.issued_at) > 120 {
+        return Err("consultation send effect receipt expired before durable admission".to_string());
     }
-    mutate_request(db, permit.request_id.clone(), move |order| {
+    mutate_request(db, receipt.request_id.clone(), move |order| {
         if order.state != ConsultationTransactionState::Armed
-            || order.execution_epoch != permit.execution_epoch
-            || order.transport != permit.transport
+            || order.execution_epoch != receipt.execution_epoch
+            || order.transport != receipt.transport
         {
-            return Err("consultation send permit is stale or mismatched".to_string());
+            return Err("consultation send effect receipt is stale or mismatched".to_string());
         }
-        match outcome {
+        match receipt.outcome {
             TransportSubmissionOutcome::Submitted { .. } => {
                 order.submitted_at = Some(now());
                 order.transition(ConsultationTransactionState::Submitted)
