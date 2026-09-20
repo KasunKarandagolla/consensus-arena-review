@@ -155,7 +155,8 @@ export default function DeliveryView() {
                   {coordinator.error}
                 </div>
               )}
-              {coordinator.status === 'waiting_for_owner' && (
+              {coordinator.status === 'waiting_for_owner' &&
+                coordinator.pending_owner_decision !== 'approve_apply' && (
                 <div className="form-error" role="status">
                   {product?.records.ambiguities.find(
                     item => item.ambiguity_id === coordinator.owner_ambiguity_id,
@@ -196,6 +197,13 @@ export default function DeliveryView() {
                   </div>
                 </div>
               )}
+              {coordinator.status === 'waiting_for_owner' &&
+                coordinator.pending_owner_decision === 'approve_apply' && (
+                  <div className="form-success" role="status">
+                    The exact candidate is Verified. Review the result, then use Apply below to
+                    perform the explicit Safe Apply.
+                  </div>
+                )}
             </div>
           )}
 
