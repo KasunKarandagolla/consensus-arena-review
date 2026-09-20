@@ -2925,10 +2925,14 @@ mod tests {
     fn failed_runs_are_recoverable_but_true_terminal_states_are_not() {
         assert!(!coordinator_status_is_terminal(&CoordinatorStatus::Failed));
         assert!(!coordinator_status_is_terminal(&CoordinatorStatus::Blocked));
-        assert!(coordinator_status_is_terminal(&CoordinatorStatus::Completed));
+        assert!(coordinator_status_is_terminal(
+            &CoordinatorStatus::Completed
+        ));
         assert!(coordinator_status_is_terminal(&CoordinatorStatus::Stopped));
         assert!(coordinator_status_is_terminal(&CoordinatorStatus::Pivoted));
-        assert!(coordinator_status_is_terminal(&CoordinatorStatus::Cancelled));
+        assert!(coordinator_status_is_terminal(
+            &CoordinatorStatus::Cancelled
+        ));
     }
 
     #[test]
