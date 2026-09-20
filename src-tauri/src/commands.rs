@@ -877,6 +877,7 @@ fn product_coordinator_context(
         delivery_state_path: state.delivery_state_path.clone(),
         delivery_slot: state.delivery_state.clone(),
         settings: state.settings_store.clone(),
+        memory: state.memory_store.clone(),
         ask_user_tx: state.ask_user_tx.clone(),
         app,
         role_scheduler: Arc::new(crate::pipeline_contract::ResourceScheduler::default()),
