@@ -422,15 +422,30 @@ pub fn validate_application_url(
     url.set_fragment(None);
     let path = url.path().trim_end_matches('/');
     let lower = path.to_ascii_lowercase();
-    let blocked = lower.is_empty()
-        || matches!(
-            lower.as_str(),
-            "/login" | "/auth" | "/authorize" | "/new" | "/chat" | "/"
+    let segments = lower
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let blocked_segment = segments.iter().any(|segment| {
+        matches!(
+            *segment,
+            "login"
+                | "auth"
+                | "authorize"
+                | "oauth"
+                | "challenge"
+                | "captcha"
+                | "new"
+                | "new-chat"
+                | "new_chat"
+                | "signin"
+                | "sign-in"
         )
-        || lower.contains("/oauth")
-        || lower.contains("/challenge")
-        || lower.contains("/captcha")
-        || lower.contains("/login/");
+    });
+    let blocked = lower.is_empty()
+        || lower == "/"
+        || lower == "/chat"
+        || blocked_segment;
     if established_identity && blocked {
         return Err("setup/auth/new-chat URL cannot establish a conversation anchor".to_string());
     }
