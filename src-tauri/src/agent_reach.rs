@@ -291,6 +291,12 @@ pub async fn research_channel(
             "Agent Reach is not installed; Arena did not substitute an unqualified platform path",
         )));
     }
+    if !reach.version_matches_qualification {
+        return Ok(Err(unsupported(
+            channel,
+            "Agent Reach is installed but its exact version is not qualified by Arena; set ARENA_AGENT_REACH_QUALIFIED_VERSION only after runtime qualification",
+        )));
+    }
     match channel {
         ResearchChannel::Github => research_github(cwd, &query).await.map(Ok),
         ResearchChannel::Youtube => research_youtube(cwd, &query).await.map(Ok),
