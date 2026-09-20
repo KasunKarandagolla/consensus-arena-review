@@ -563,25 +563,61 @@ pub async fn record_submission_outcome(
     if now().saturating_sub(receipt.issued_at) > 120 {
         return Err("consultation send effect receipt expired before durable admission".to_string());
     }
-    mutate_request(db, receipt.request_id.clone(), move |order| {
+    db_helpers::run_blocking(move || {
+        let mut store = db.lock().map_err(|_| {
+            AgentError::DatabaseError("consultation store lock poisoned".to_string())
+        })?;
+        let mut order = store
+            .get_consultation_work_order(&receipt.request_id)?
+            .ok_or_else(|| AgentError::DatabaseError("consultation request is unknown".to_string()))?;
         if order.state != ConsultationTransactionState::Armed
             || order.execution_epoch != receipt.execution_epoch
             || order.transport != receipt.transport
         {
-            return Err("consultation send effect receipt is stale or mismatched".to_string());
+            return Err(AgentError::DatabaseError(
+                "consultation send effect receipt is stale or mismatched".to_string(),
+            ));
         }
         match receipt.outcome {
-            TransportSubmissionOutcome::Submitted { .. } => {
+            TransportSubmissionOutcome::Submitted { canonical_url } => {
                 order.submitted_at = Some(now());
-                order.transition(ConsultationTransactionState::Submitted)
+                order
+                    .transition(ConsultationTransactionState::Submitted)
+                    .map_err(AgentError::DatabaseError)?;
+                // Persist a provider-created conversation locator immediately
+                // after Send when it is already observable. A setup/new-chat
+                // URL is ignored rather than weakening an established anchor.
+                if let Some(raw_url) = canonical_url
+                    && let Ok(canonical) =
+                        validate_application_url(order.provider, &raw_url, true)
+                    && let Some(mut anchor) = store.get_conversation_anchor(&order.anchor_id)?
+                {
+                    if anchor.provider == order.provider
+                        && anchor.profile_id == order.profile_id
+                    {
+                        anchor.establishment = ConversationEstablishment::Established;
+                        anchor.availability = ConversationAvailability::Available;
+                        anchor.canonical_url = Some(canonical);
+                        anchor.pending_request_id = Some(order.request_id.clone());
+                        anchor.revision = anchor.revision.saturating_add(1);
+                        anchor.updated_at = now();
+                        store.save_conversation_anchor(&anchor)?;
+                        order.anchor_revision = anchor.revision;
+                    }
+                }
             }
             TransportSubmissionOutcome::UnknownOutcome { diagnostic } => {
                 order.failure = Some(diagnostic.chars().take(512).collect());
-                order.transition(ConsultationTransactionState::UnknownOutcome)
+                order
+                    .transition(ConsultationTransactionState::UnknownOutcome)
+                    .map_err(AgentError::DatabaseError)?;
             }
         }
+        store.save_consultation_work_order(&order)?;
+        Ok(order)
     })
     .await
+    .map_err(|error| error.to_string())
 }
 
 pub async fn mark_observing(
@@ -604,6 +640,73 @@ pub async fn mark_unknown_outcome(
         order.transition(ConsultationTransactionState::UnknownOutcome)
     })
     .await
+}
+
+pub async fn begin_owner_recovery(
+    db: Arc<Mutex<TranscriptStore>>,
+    request_id: String,
+) -> Result<ConsultationWorkOrder, String> {
+    mutate_request(db, request_id, |order| {
+        if order.state == ConsultationTransactionState::UnknownOutcome {
+            order.transition(ConsultationTransactionState::OwnerRecovery)
+        } else if order.state == ConsultationTransactionState::OwnerRecovery {
+            Ok(())
+        } else {
+            Err("consultation recovery is allowed only from UnknownOutcome".to_string())
+        }
+    })
+    .await
+}
+
+pub async fn abandon_request(
+    db: Arc<Mutex<TranscriptStore>>,
+    request_id: String,
+    reason: String,
+) -> Result<ConsultationWorkOrder, String> {
+    mutate_request(db, request_id, move |order| {
+        if !matches!(
+            order.state,
+            ConsultationTransactionState::Preparing
+                | ConsultationTransactionState::Staged
+                | ConsultationTransactionState::UnknownOutcome
+                | ConsultationTransactionState::OwnerRecovery
+        ) {
+            return Err(
+                "consultation can be abandoned only before Send or during explicit recovery"
+                    .to_string(),
+            );
+        }
+        order.failure = Some(reason.chars().take(512).collect());
+        order.transition(ConsultationTransactionState::Cancelled)
+    })
+    .await
+}
+
+pub async fn cancel_project_open_requests(
+    db: Arc<Mutex<TranscriptStore>>,
+    project_id: String,
+    reason: String,
+) -> Result<Vec<ConsultationWorkOrder>, String> {
+    db_helpers::run_blocking(move || {
+        let mut store = db.lock().map_err(|_| {
+            AgentError::DatabaseError("consultation store lock poisoned".to_string())
+        })?;
+        let mut cancelled = Vec::new();
+        for mut order in store.list_project_consultation_work_orders(&project_id)? {
+            if order.state.is_terminal() {
+                continue;
+            }
+            order.failure = Some(reason.chars().take(512).collect());
+            order
+                .transition(ConsultationTransactionState::Cancelled)
+                .map_err(AgentError::DatabaseError)?;
+            store.save_consultation_work_order(&order)?;
+            cancelled.push(order);
+        }
+        Ok(cancelled)
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 pub async fn reconcile_after_restart(
@@ -682,6 +785,7 @@ pub async fn admit_observation(
                 ConsultationTransactionState::Submitted
                     | ConsultationTransactionState::Observing
                     | ConsultationTransactionState::UnknownOutcome
+                    | ConsultationTransactionState::OwnerRecovery
             )
         {
             return Err(AgentError::DatabaseError(
@@ -740,7 +844,11 @@ pub async fn admit_observation(
         };
         store.save_consultation_result(&result)?;
         order.result_id = Some(result_id);
-        if order.state == ConsultationTransactionState::UnknownOutcome {
+        if matches!(
+            order.state,
+            ConsultationTransactionState::UnknownOutcome
+                | ConsultationTransactionState::OwnerRecovery
+        ) {
             order.state = ConsultationTransactionState::Observing;
         }
         order.transition(ConsultationTransactionState::ReadyToCommit)
@@ -795,6 +903,29 @@ mod tests {
         value.transition(ConsultationTransactionState::Staged).unwrap();
         value.transition(ConsultationTransactionState::Armed).unwrap();
         assert!(value.transition(ConsultationTransactionState::Staged).is_err());
+    }
+
+    #[test]
+    fn unknown_outcome_requires_observation_or_owner_recovery_not_resend() {
+        let mut value = order();
+        value.transition(ConsultationTransactionState::Staged).unwrap();
+        value.transition(ConsultationTransactionState::Armed).unwrap();
+        value
+            .transition(ConsultationTransactionState::UnknownOutcome)
+            .unwrap();
+        assert!(
+            value
+                .transition(ConsultationTransactionState::Staged)
+                .is_err()
+        );
+        value
+            .transition(ConsultationTransactionState::OwnerRecovery)
+            .unwrap();
+        assert!(
+            value
+                .transition(ConsultationTransactionState::Armed)
+                .is_err()
+        );
     }
 
     #[test]
