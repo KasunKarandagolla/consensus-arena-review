@@ -1744,18 +1744,14 @@ pub async fn run_delivery(
         }
     }
 
-    // Recovery after an infrastructure-only verifier INCONCLUSIVE reuses the
-    // exact candidate and same frozen profile. No implementation model reruns.
-    if state.phase == DeliveryPhase::Verifying
-        && state
-            .last_verification
-            .as_ref()
-            .is_some_and(|receipt| receipt.verdict == "inconclusive")
-    {
+    // Recovery while verification was interrupted or INCONCLUSIVE reuses the
+    // exact persisted candidate and same frozen profile. No implementation
+    // model reruns merely because the verifier process/session disappeared.
+    if state.phase == DeliveryPhase::Verifying && state.candidate_commit.is_some() {
         let candidate_sha = state
             .candidate_commit
             .clone()
-            .ok_or_else(|| "inconclusive verifier recovery lost candidate identity".to_string())?;
+            .ok_or_else(|| "verifier recovery lost candidate identity".to_string())?;
         let disposition = verify_exact_candidate(
             app,
             &state_path,
@@ -1775,7 +1771,7 @@ pub async fn run_delivery(
             Ok(CandidateVerificationDisposition::Pass) => {
                 state.phase = DeliveryPhase::Verified;
                 state.last_worker_summary =
-                    Some("Frozen verification passed on exact recovered candidate".to_string());
+                    Some("Frozen verification passed on the exact recovered candidate".to_string());
                 crate::delivery::persist_emit(
                     app,
                     &state_path,
