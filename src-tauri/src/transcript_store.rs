@@ -85,7 +85,30 @@ impl TranscriptStore {
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_tool_use_receipts_work_order
-                ON tool_use_receipts(work_order_id, updated_at);",
+                ON tool_use_receipts(work_order_id, updated_at);
+            CREATE TABLE IF NOT EXISTS consultation_work_orders (
+                request_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                order_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_consultation_work_orders_project
+                ON consultation_work_orders(project_id, updated_at);
+            CREATE TABLE IF NOT EXISTS conversation_anchors (
+                anchor_id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                anchor_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS consultation_results (
+                result_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                completed_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_consultation_results_request
+                ON consultation_results(request_id, completed_at);",
             )
             .map_err(AgentError::from)
     }
@@ -345,6 +368,153 @@ impl TranscriptStore {
             Err(SqliteError::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(AgentError::from(error)),
         }
+    }
+
+    pub fn save_consultation_work_order(
+        &mut self,
+        order: &crate::consultation_broker::ConsultationWorkOrder,
+    ) -> Result<(), AgentError> {
+        let order_json = serde_json::to_string(order).map_err(|error| {
+            AgentError::DatabaseError(format!("serialize consultation work order: {error}"))
+        })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO consultation_work_orders
+             (request_id, project_id, state, order_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &order.request_id,
+                &order.project_id,
+                format!("{:?}", order.state),
+                order_json,
+                order.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_consultation_work_order(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::consultation_broker::ConsultationWorkOrder>, AgentError> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT order_json FROM consultation_work_orders WHERE request_id = ?1",
+                params![request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        raw.map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                AgentError::DatabaseError(format!("parse consultation work order: {error}"))
+            })
+        })
+        .transpose()
+    }
+
+    pub fn list_open_consultation_work_orders(
+        &self,
+    ) -> Result<Vec<crate::consultation_broker::ConsultationWorkOrder>, AgentError> {
+        let mut statement = self.conn.prepare(
+            "SELECT order_json FROM consultation_work_orders
+             WHERE state NOT IN ('Complete', 'Cancelled')
+             ORDER BY updated_at, request_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut values = Vec::new();
+        for row in rows {
+            let raw = row?;
+            let value: crate::consultation_broker::ConsultationWorkOrder =
+                serde_json::from_str(&raw).map_err(|error| {
+                    AgentError::DatabaseError(format!("parse consultation work order: {error}"))
+                })?;
+            if !value.state.is_terminal() {
+                values.push(value);
+            }
+        }
+        Ok(values)
+    }
+
+    pub fn save_conversation_anchor(
+        &mut self,
+        anchor: &crate::consultation_broker::ConversationAnchor,
+    ) -> Result<(), AgentError> {
+        let anchor_json = serde_json::to_string(anchor).map_err(|error| {
+            AgentError::DatabaseError(format!("serialize ConversationAnchor: {error}"))
+        })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO conversation_anchors
+             (anchor_id, provider, anchor_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &anchor.anchor_id,
+                format!("{:?}", anchor.provider),
+                anchor_json,
+                anchor.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_conversation_anchor(
+        &self,
+        anchor_id: &str,
+    ) -> Result<Option<crate::consultation_broker::ConversationAnchor>, AgentError> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT anchor_json FROM conversation_anchors WHERE anchor_id = ?1",
+                params![anchor_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        raw.map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                AgentError::DatabaseError(format!("parse ConversationAnchor: {error}"))
+            })
+        })
+        .transpose()
+    }
+
+    pub fn save_consultation_result(
+        &mut self,
+        result: &crate::consultation_broker::ConsultationResult,
+    ) -> Result<(), AgentError> {
+        let result_json = serde_json::to_string(result).map_err(|error| {
+            AgentError::DatabaseError(format!("serialize consultation result: {error}"))
+        })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO consultation_results
+             (result_id, request_id, result_json, completed_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &result.result_id,
+                &result.request_id,
+                result_json,
+                result.completed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_consultation_result(
+        &self,
+        result_id: &str,
+    ) -> Result<Option<crate::consultation_broker::ConsultationResult>, AgentError> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT result_json FROM consultation_results WHERE result_id = ?1",
+                params![result_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        raw.map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                AgentError::DatabaseError(format!("parse consultation result: {error}"))
+            })
+        })
+        .transpose()
     }
 
     pub fn save_tool_use_receipt(
