@@ -302,3 +302,20 @@ Superpowers runtime influence, and exploratory Playwright MCP qualification.
 CandidateReview's current free-tier background-path 403 and native Tauri
 WebdriverIO's host graphics/driver limitation are explicitly classified in the
 08A audit; neither changes Arena's verifier or Apply authority.
+
+## Current 08B platform and capability closure
+
+The 08B audit at
+`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/08B-platform-capability-closure-v2.md`
+records the platform and packaging boundary at the current checkpoint.
+Current-HEAD Linux packaging, formatting, frontend, and backend evidence are
+separated from Windows-only evidence; the current Linux host has no Windows
+runner, WebView2, NSIS toolchain, or native `/dev/dri` graphics device.
+
+OpenCode remains an explicit external prerequisite with bounded version health
+and remediation reporting. Repository intelligence, selected skills, LSP,
+Context7, and browser helpers remain optional-degradable or target-specific;
+they are not silently bundled or allowed to become product authority. The
+official GitHub MCP server is read-only interoperable but rejected as a
+default V1 dependency because direct GitHub/OpenCode retrieval already covers
+the required path. ECC, gstack, DSH, and Dagu remain rejected for active V1.

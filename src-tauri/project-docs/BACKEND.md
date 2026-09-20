@@ -244,3 +244,19 @@ requirements.
 Candidate review receipts are bounded derived records keyed to the exact
 candidate SHA and acceptance commit. They are advisory inputs to Delivery;
 the deterministic verifier remains the only source of a Verified verdict.
+
+## 08B platform capability distribution
+
+The production backend reports OpenCode prerequisite failure through its
+bounded health path and uses the existing `ARENA_OPENCODE_EXECUTABLE` override
+for an explicit external installation. It does not install or bundle provider
+runtimes. `agent-analyzer` and selected Superpowers assets are optional and
+fail-soft; Rust and TypeScript LSP are target-specific quality helpers with
+project-native diagnostics/build fallback; Context7 and browser MCP are
+bounded optional inputs. Native Tauri WebdriverIO is target-specific and
+cannot be replaced by Playwright evidence.
+
+The current Linux `.deb`, Windows workflow, official read-only GitHub MCP,
+non-Zen provider attempts, and native GUI result are recorded separately in
+the 08B permanent audit. None of these helpers can write ProductAuthority,
+acceptance, Verified, or Apply state.

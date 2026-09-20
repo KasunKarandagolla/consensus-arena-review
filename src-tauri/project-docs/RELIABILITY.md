@@ -302,3 +302,18 @@ The successful Rust test-link strategy uses one Cargo job, test debuginfo
 disabled, GCC, and `--reduce-memory-overheads`; it measured `1374656 KB`
 (about `1.31 GiB`) peak. This is a test-link measurement, not normal Arena
 runtime. No concurrent heavy model/LSP/browser tasks are launched silently.
+
+## 08B platform and build-resource closure
+
+The current low-resource policy remains runtime-focused: heavy LSP/model/
+browser work is single-slot, optional helpers degrade to project-native checks,
+and the native GUI path is blocked on this host's missing `/dev/dri` graphics
+device despite GTK/WebKitGTK being installed. The release `.deb` build is a
+developer/package-link measurement and is recorded separately from normal
+runtime RSS; it must not be used as a Product OS runtime performance claim.
+
+Windows process cleanup and NSIS remain current-HEAD Windows-runner evidence.
+Linux package extraction/launch does not prove Windows WebView2 or native
+Tauri functional parity. Every external quality capability has an explicit
+required, optional-degradable, target-specific, or environment-blocked status
+in the 08B audit.

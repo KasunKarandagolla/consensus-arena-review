@@ -457,7 +457,9 @@ pub async fn admit_build_package(
         return Err("Delivery admission requires session identity and objective".to_string());
     }
     if runtime != DeliveryRuntime::OpenCode {
-        return Err("Product coordinator requires the qualified OpenCode Delivery path".to_string());
+        return Err(
+            "Product coordinator requires the qualified OpenCode Delivery path".to_string(),
+        );
     }
     if !package.is_current_for(&records)? {
         return Err("accepted Build Package is stale before Delivery admission".to_string());
@@ -500,7 +502,9 @@ pub async fn admit_build_package(
             )
             .await;
             let _ = git_output(repo, &["branch", "-D", &branch]).await;
-            return Err(format!("accepted Delivery candidate has no frozen verification profile: {error}"));
+            return Err(format!(
+                "accepted Delivery candidate has no frozen verification profile: {error}"
+            ));
         }
     };
     verification::validate_profile(&profile, &worktree)?;

@@ -1,9 +1,9 @@
+use crate::candidate_review::{
+    self, CandidateReviewContext, CandidateReviewSummary, ReviewLens, SemanticReviewReceipt,
+};
 use crate::delivery::{
     DeliveryPhase, DeliveryState, OpenCodeEvidence, OpenCodeTaskState, OpenCodeWorkOrder,
     ProtectedFileHash,
-};
-use crate::candidate_review::{
-    self, CandidateReviewContext, CandidateReviewSummary, ReviewLens, SemanticReviewReceipt,
 };
 use crate::dsh_worker;
 use crate::execution_profiles::ExecutionProfile;
@@ -1256,8 +1256,14 @@ mod tests {
     fn runtime_qualification_requires_the_proven_version() {
         assert_eq!(QUALIFIED_VERSION, "1.18.31");
         assert_eq!(reported_version("1.18.31\n"), Some("1.18.31".to_string()));
-        assert_ne!(reported_version("1.17.18\n").as_deref(), Some(QUALIFIED_VERSION));
-        assert_ne!(reported_version("2.0.0\n").as_deref(), Some(QUALIFIED_VERSION));
+        assert_ne!(
+            reported_version("1.17.18\n").as_deref(),
+            Some(QUALIFIED_VERSION)
+        );
+        assert_ne!(
+            reported_version("2.0.0\n").as_deref(),
+            Some(QUALIFIED_VERSION)
+        );
     }
 
     #[tokio::test]

@@ -76,10 +76,7 @@ pub(crate) fn configured_credentials(
     Ok(secrets)
 }
 
-async fn product_os_safe_text(
-    value: String,
-    state: &AppState,
-) -> Result<String, String> {
+async fn product_os_safe_text(value: String, state: &AppState) -> Result<String, String> {
     let (secrets, storage_ready) = {
         let store = state.settings_store.lock().await;
         (
@@ -881,10 +878,12 @@ pub async fn get_dsh_prerequisite() -> Result<String, String> {
     } else {
         serde_json::to_string(&crate::dsh_worker::check_prerequisite().await)
     }
-        .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())
 }
 
-fn product_coordinator_context(state: &AppState) -> crate::product_os_coordinator::CoordinatorContext {
+fn product_coordinator_context(
+    state: &AppState,
+) -> crate::product_os_coordinator::CoordinatorContext {
     crate::product_os_coordinator::CoordinatorContext {
         db: state.transcript_store.clone(),
         runtime: state.session_runtime.clone(),
@@ -921,7 +920,9 @@ pub async fn get_product_coordinator_status(
         Some(value) => Some(product_os_safe_text(value, state.inner()).await?),
         None => None,
     };
-    let status = crate::product_os_coordinator::status(&product_coordinator_context(state.inner()), run_id).await?;
+    let status =
+        crate::product_os_coordinator::status(&product_coordinator_context(state.inner()), run_id)
+            .await?;
     serde_json::to_string(&status).map_err(|error| error.to_string())
 }
 
@@ -965,7 +966,9 @@ pub async fn resume_product_project(
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let run_id = product_os_safe_text(run_id, state.inner()).await?;
-    let run = crate::product_os_coordinator::resume(product_coordinator_context(state.inner()), run_id).await?;
+    let run =
+        crate::product_os_coordinator::resume(product_coordinator_context(state.inner()), run_id)
+            .await?;
     serde_json::to_string(&run).map_err(|error| error.to_string())
 }
 

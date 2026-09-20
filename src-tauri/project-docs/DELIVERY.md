@@ -407,3 +407,18 @@ CandidateReview background-shaped provider 403 is surfaced as a bounded
 quality limitation; it cannot block or fabricate deterministic verification.
 Native Tauri WebdriverIO remains target-specific and is not substituted by
 Playwright evidence when the host cannot provide the WebKitGTK driver/plugin.
+
+## 08B platform/package closure
+
+OpenCode distribution remains an explicit external prerequisite: the Arena
+health check requires the qualified executable/version and reports a concrete
+remediation path through `ARENA_OPENCODE_EXECUTABLE`; no hidden shell state or
+silent installer is assumed. The Linux `.deb` package is qualified separately
+from Windows NSIS and native GUI evidence. Windows Job Object, path-with-spaces,
+OpenCode/analyzer/LSP discovery, current-HEAD tests, and NSIS remain Windows
+runner evidence; historical workflow success is not promoted to current-HEAD
+proof.
+
+GitHub MCP is read-only interoperable but not a default Delivery dependency.
+Non-Zen provider attempts remain optional fallback evidence, and DSH/Dagu are
+not reintroduced into the production coordinator.

@@ -1,6 +1,4 @@
-use crate::hackathon::{
-    HackathonConfig, HackathonMessage, call_hackathon_model_with_max_tokens,
-};
+use crate::hackathon::{HackathonConfig, HackathonMessage, call_hackathon_model_with_max_tokens};
 use crate::orchestrator::AppState;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -108,10 +106,13 @@ pub fn validate_request(request: &ConsultationRequest) -> Result<(), String> {
             return Err("consultation evidence content is empty or too large".to_string());
         }
         if evidence.minimum_scope > request.disclosure_scope {
-            return Err("consultation disclosure scope is insufficient for its evidence".to_string());
+            return Err(
+                "consultation disclosure scope is insufficient for its evidence".to_string(),
+            );
         }
     }
-    if request.allowed_provider.trim().is_empty() || request.allowed_provider.len() > MAX_REQUEST_ID_BYTES
+    if request.allowed_provider.trim().is_empty()
+        || request.allowed_provider.len() > MAX_REQUEST_ID_BYTES
     {
         return Err("consultation provider selection is invalid".to_string());
     }
@@ -151,11 +152,20 @@ fn classify_failure(error: &str) -> (ConsultationStatus, &'static str) {
     if lower.contains("timed out") {
         (ConsultationStatus::UnknownOutcome, "consultation timed out")
     } else if lower.contains("rate limited") {
-        (ConsultationStatus::RateLimited, "consultation was rate limited")
+        (
+            ConsultationStatus::RateLimited,
+            "consultation was rate limited",
+        )
     } else if lower.contains("authentication failed") {
-        (ConsultationStatus::NeedsAuth, "consultation authentication is unavailable")
+        (
+            ConsultationStatus::NeedsAuth,
+            "consultation authentication is unavailable",
+        )
     } else {
-        (ConsultationStatus::Unavailable, "consultation provider unavailable")
+        (
+            ConsultationStatus::Unavailable,
+            "consultation provider unavailable",
+        )
     }
 }
 
@@ -231,7 +241,8 @@ pub async fn execute(
         .find(|model| model.id == request.allowed_provider)
     else {
         let mut result = base_result(&request, &request.allowed_provider);
-        result.error = Some("consultation provider is not configured for this work order".to_string());
+        result.error =
+            Some("consultation provider is not configured for this work order".to_string());
         return Ok(result);
     };
     let mut result = base_result(&request, &model.model_name);

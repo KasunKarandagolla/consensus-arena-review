@@ -295,3 +295,20 @@ Implementation/DebugRepair paths, rust-analyzer and TypeScript LSP through
 OpenCode configuration, selected Superpowers procedure influence, and
 exploratory Playwright MCP. Native Tauri WebdriverIO remains target-specific
 and host-blocked by the current WebKitGTK/driver/graphics environment.
+
+## 08B platform and distribution boundary
+
+The current source keeps platform capability discovery explicit and bounded.
+OpenCode is an external prerequisite checked at the qualified version through
+the Arena health path; Arena does not silently install a model runtime or
+inherit an unbounded developer shell. `agent-analyzer`, selected Superpowers
+assets, native LSP, Context7, Playwright MCP, and native WebdriverIO are
+optional-degradable or target-specific capabilities with project-native
+fallbacks where applicable.
+
+The official GitHub MCP server was read-only runtime-qualified, but remains
+rejected as a default V1 dependency because existing direct GitHub/OpenCode
+retrieval is sufficient. ECC, gstack, DSH, and Dagu do not enter the accepted
+architecture. Windows packaging/runtime and native GUI functional proof stay
+separate release evidence; Linux package evidence does not imply Windows or
+WebView2 parity.

@@ -294,3 +294,28 @@ but native execution is environment-blocked on the host's missing driver/plugin
 and `/dev/dri`/WebKitGTK limitation. CandidateReview's current OpenCode
 background-shaped free-tier 403 is recorded as an upstream regression; it does
 not change the accepted authority model.
+
+## 08B platform capability dispositions
+
+The current distribution boundary is intentionally small:
+
+- OpenCode: required external prerequisite for the qualified OpenCode Delivery
+  path, with bounded version discovery and explicit remediation.
+- `agent-analyzer`: optional-degradable derived repository intelligence.
+- Selected Superpowers assets: optional-degradable and pinned; full Superpowers
+  orchestration is not installed.
+- Rust and TypeScript LSP: target-specific optional helpers with native
+  diagnostics/build fallback.
+- Context7: optional-degradable bounded technical documentation input.
+- Playwright Test/MCP: target-specific or optional-degradable web evidence;
+  MCP output remains exploratory.
+- Native Tauri WebdriverIO: target-specific; current host execution is
+  environment-blocked by the driver/plugin/graphics boundary.
+- Official GitHub MCP v1.12.2: read-only interoperability proven, rejected as
+  a default V1 dependency because direct GitHub/OpenCode retrieval suffices.
+
+ECC and gstack add broad mutation-capable orchestration, browser daemons,
+planning, shipping, or installer surface without a current Arena requirement;
+both are rejected for V1. DSH remains rejected after reproducible worker
+qualification failures, and Dagu remains rejected because the Arena coordinator
+already owns the required lifecycle and authority boundary.

@@ -140,10 +140,7 @@ impl TranscriptStore {
         Ok(())
     }
 
-    pub fn get_product_authority(
-        &self,
-        project_id: &str,
-    ) -> Result<Option<String>, AgentError> {
+    pub fn get_product_authority(&self, project_id: &str) -> Result<Option<String>, AgentError> {
         match self.conn.query_row(
             "SELECT records_json FROM product_authority WHERE project_id = ?1",
             params![project_id],
@@ -163,11 +160,15 @@ impl TranscriptStore {
             AgentError::DatabaseError(format!("serialize Product OS work order: {error}"))
         })?;
         let status = serde_json::to_string(&work_order.status)
-            .map_err(|error| AgentError::DatabaseError(format!("serialize work-order status: {error}")))?
+            .map_err(|error| {
+                AgentError::DatabaseError(format!("serialize work-order status: {error}"))
+            })?
             .trim_matches('"')
             .to_string();
         let role = serde_json::to_string(&work_order.role)
-            .map_err(|error| AgentError::DatabaseError(format!("serialize work-order role: {error}")))?
+            .map_err(|error| {
+                AgentError::DatabaseError(format!("serialize work-order role: {error}"))
+            })?
             .trim_matches('"')
             .to_string();
         self.conn.execute(
@@ -194,11 +195,15 @@ impl TranscriptStore {
             AgentError::DatabaseError(format!("serialize Product OS work order: {error}"))
         })?;
         let status = serde_json::to_string(&work_order.status)
-            .map_err(|error| AgentError::DatabaseError(format!("serialize work-order status: {error}")))?
+            .map_err(|error| {
+                AgentError::DatabaseError(format!("serialize work-order status: {error}"))
+            })?
             .trim_matches('"')
             .to_string();
         let role = serde_json::to_string(&work_order.role)
-            .map_err(|error| AgentError::DatabaseError(format!("serialize work-order role: {error}")))?
+            .map_err(|error| {
+                AgentError::DatabaseError(format!("serialize work-order role: {error}"))
+            })?
             .trim_matches('"')
             .to_string();
         let transaction = self.conn.transaction()?;
@@ -289,7 +294,9 @@ impl TranscriptStore {
             AgentError::DatabaseError(format!("serialize Product OS coordinator run: {error}"))
         })?;
         let status = serde_json::to_string(&run.status)
-            .map_err(|error| AgentError::DatabaseError(format!("serialize coordinator status: {error}")))?
+            .map_err(|error| {
+                AgentError::DatabaseError(format!("serialize coordinator status: {error}"))
+            })?
             .trim_matches('"')
             .to_string();
         self.conn.execute(

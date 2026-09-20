@@ -4,15 +4,15 @@
 //! SessionRuntime. It is not a second scheduler, database, or role framework.
 
 use crate::db_helpers;
-use crate::execution_profiles::ExecutionProfile;
 use crate::errors::AgentError;
 use crate::evidence_gates::{
     AmbiguitySeverity, EvidenceItem, EvidenceKind, EvidenceOrigin, EvidenceProvenance,
     EvidenceSource, EvidenceVerification, GateDecision, GateId,
 };
+use crate::execution_profiles::ExecutionProfile;
 use crate::product_os::{
-    self, AuthorityAmbiguityRecord, ProductAuthorityRecords, ProductScopeAdmission,
-    ProductResearchCategory, ProductResearchMode, ProductWorkOrder, ProductWorkOrderRole,
+    self, AuthorityAmbiguityRecord, ProductAuthorityRecords, ProductResearchCategory,
+    ProductResearchMode, ProductScopeAdmission, ProductWorkOrder, ProductWorkOrderRole,
     ProductWorkOrderStatus, ReuseClassification, ReuseDecisionRecord,
 };
 use crate::session_runtime::SessionRuntime;
@@ -194,7 +194,7 @@ fn initial_records(project_id: &str, question: &str) -> ProductAuthorityRecords 
         interfaces: vec!["Arena Product OS evidence boundary".to_string()],
         risks: vec!["Source may change and must be independently rechecked".to_string()],
         acceptance_scenarios: vec![
-            "Verified source evidence remains current after reopen".to_string()
+            "Verified source evidence remains current after reopen".to_string(),
         ],
         decision_outcome: None,
         product_direction_decision_id: None,
@@ -254,7 +254,9 @@ fn normalize_public_web_url(source_url: &str) -> Result<String, String> {
         || parsed.username() != ""
         || parsed.password().is_some()
     {
-        return Err("web research sources must be public HTTPS URLs without credentials".to_string());
+        return Err(
+            "web research sources must be public HTTPS URLs without credentials".to_string(),
+        );
     }
     let host = parsed
         .host_str()
@@ -266,7 +268,10 @@ fn normalize_public_web_url(source_url: &str) -> Result<String, String> {
     if let Ok(address) = host.parse::<std::net::IpAddr>() {
         let private = match address {
             std::net::IpAddr::V4(value) => {
-                value.is_loopback() || value.is_private() || value.is_link_local() || value.is_unspecified()
+                value.is_loopback()
+                    || value.is_private()
+                    || value.is_link_local()
+                    || value.is_unspecified()
             }
             std::net::IpAddr::V6(value) => {
                 value.is_loopback() || value.is_unspecified() || value.is_unique_local()
@@ -278,7 +283,12 @@ fn normalize_public_web_url(source_url: &str) -> Result<String, String> {
     }
     let lower = parsed.as_str().to_ascii_lowercase();
     for marker in [
-        "token=", "api_key=", "apikey=", "secret=", "password=", "authorization=",
+        "token=",
+        "api_key=",
+        "apikey=",
+        "secret=",
+        "password=",
+        "authorization=",
     ] {
         if lower.contains(marker) {
             return Err("web research source URL contains a credential-like query".to_string());
@@ -434,7 +444,8 @@ async fn run_opencode_web_prompt(prompt: String) -> Result<OpenCodeWebOutput, St
     ));
     std::fs::create_dir_all(&workdir)
         .map_err(|_| "could not create disposable web research workspace".to_string())?;
-    let profile_workspace = crate::opencode_adapter::profile_workspace(ExecutionProfile::WebResearch)?;
+    let profile_workspace =
+        crate::opencode_adapter::profile_workspace(ExecutionProfile::WebResearch)?;
     let args = vec![
         OsString::from("run"),
         OsString::from("--agent"),
@@ -468,9 +479,7 @@ async fn run_opencode_web_prompt(prompt: String) -> Result<OpenCodeWebOutput, St
             || diagnostic.contains("rate limit")
         {
             "web-search provider was rate limited"
-        } else if diagnostic.contains("http 426")
-            || diagnostic.contains("1.18.0 or newer")
-        {
+        } else if diagnostic.contains("http 426") || diagnostic.contains("1.18.0 or newer") {
             "OpenCode free-tier runtime rejected the installed version"
         } else {
             "OpenCode exited before producing a result"
@@ -719,7 +728,10 @@ pub async fn create_product_role_work_order(
     if project_id.trim().is_empty() || subject.trim().is_empty() {
         return Err("Product role work order requires project identity and subject".to_string());
     }
-    if matches!(role, ProductWorkOrderRole::Researcher | ProductWorkOrderRole::FactVerifier) {
+    if matches!(
+        role,
+        ProductWorkOrderRole::Researcher | ProductWorkOrderRole::FactVerifier
+    ) {
         return Err("research roles use their dedicated work-order operations".to_string());
     }
     db_helpers::run_blocking(move || {
@@ -838,15 +850,16 @@ pub async fn run_product_role_work_order(
             if !is_semantic_review_role(&order.role)
                 || !matches!(
                     order.status,
-                    ProductWorkOrderStatus::Admitted | ProductWorkOrderStatus::ReconciliationRequired
+                    ProductWorkOrderStatus::Admitted
+                        | ProductWorkOrderStatus::ReconciliationRequired
                 )
             {
                 return Err(AgentError::DatabaseError(
                     "semantic role work order is not current and admissible".to_string(),
                 ));
             }
-            let records = load_records(&store, &order.project_id)
-                .map_err(AgentError::DatabaseError)?;
+            let records =
+                load_records(&store, &order.project_id).map_err(AgentError::DatabaseError)?;
             if records.project_revision != order.project_revision {
                 return Err(AgentError::DatabaseError(
                     "semantic role work order is stale for current authority".to_string(),
@@ -876,7 +889,9 @@ pub async fn run_product_role_work_order(
                         AgentError::DatabaseError("transcript store lock poisoned".to_string())
                     })?;
                     let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
-                        AgentError::DatabaseError("semantic role work order disappeared".to_string())
+                        AgentError::DatabaseError(
+                            "semantic role work order disappeared".to_string(),
+                        )
                     })?;
                     if order.status != ProductWorkOrderStatus::Running {
                         return Err(AgentError::DatabaseError(
@@ -890,7 +905,8 @@ pub async fn run_product_role_work_order(
             })
             .await
             .map_err(db_error)?;
-            let result = crate::opencode_adapter::run_profile_prompt(prompt, execution_profile).await;
+            let result =
+                crate::opencode_adapter::run_profile_prompt(prompt, execution_profile).await;
             match result {
                 Ok(output) => {
                     let root_session_id = output.root_session_id.clone();
@@ -901,7 +917,9 @@ pub async fn run_product_role_work_order(
                             AgentError::DatabaseError("transcript store lock poisoned".to_string())
                         })?;
                         let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
-                            AgentError::DatabaseError("semantic role work order disappeared".to_string())
+                            AgentError::DatabaseError(
+                                "semantic role work order disappeared".to_string(),
+                            )
                         })?;
                         if order.status != ProductWorkOrderStatus::Running
                             || order.run_generation != generation
@@ -912,7 +930,10 @@ pub async fn run_product_role_work_order(
                         }
                         order.status = ProductWorkOrderStatus::Completed;
                         order.runtime_session_id = Some(root_session_id_for_db.clone());
-                        order.result_ref = Some("bounded semantic result retained in memory for Arena admission".to_string());
+                        order.result_ref = Some(
+                            "bounded semantic result retained in memory for Arena admission"
+                                .to_string(),
+                        );
                         order.updated_at = now();
                         store.save_product_work_order(&order)?;
                         Ok(order)
@@ -1224,8 +1245,8 @@ pub async fn run_product_feasibility_spike(
             let mut order = store.get_product_work_order(&id)?.ok_or_else(|| {
                 AgentError::DatabaseError("feasibility work order is unknown".to_string())
             })?;
-            let records = load_records(&store, &order.project_id)
-                .map_err(AgentError::DatabaseError)?;
+            let records =
+                load_records(&store, &order.project_id).map_err(AgentError::DatabaseError)?;
             if order.role != ProductWorkOrderRole::FeasibilityReviewer
                 || order.status != ProductWorkOrderStatus::Admitted
                 || order.project_revision != records.project_revision
@@ -1506,10 +1527,14 @@ pub async fn adopt_product_architecture(
         }
         let proposal_a_order = store
             .get_product_work_order(&proposal_a.work_order_id)?
-            .ok_or_else(|| AgentError::DatabaseError("architecture A work order disappeared".to_string()))?;
+            .ok_or_else(|| {
+                AgentError::DatabaseError("architecture A work order disappeared".to_string())
+            })?;
         let proposal_b_order = store
             .get_product_work_order(&proposal_b.work_order_id)?
-            .ok_or_else(|| AgentError::DatabaseError("architecture B work order disappeared".to_string()))?;
+            .ok_or_else(|| {
+                AgentError::DatabaseError("architecture B work order disappeared".to_string())
+            })?;
         if proposal_a_order.role != ProductWorkOrderRole::ArchitectA
             || proposal_b_order.role != ProductWorkOrderRole::ArchitectB
         {
@@ -1851,14 +1876,18 @@ pub async fn run_web_discovery_work_order(
             .lock()
             .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
         let records = {
-            let order = store.get_product_work_order(&id_for_preflight)?.ok_or_else(|| {
-                AgentError::DatabaseError("web research work order is unknown".to_string())
-            })?;
+            let order = store
+                .get_product_work_order(&id_for_preflight)?
+                .ok_or_else(|| {
+                    AgentError::DatabaseError("web research work order is unknown".to_string())
+                })?;
             load_records(&store, &order.project_id).map_err(AgentError::DatabaseError)?
         };
-        let mut order = store.get_product_work_order(&id_for_preflight)?.ok_or_else(|| {
-            AgentError::DatabaseError("web research work order is unknown".to_string())
-        })?;
+        let mut order = store
+            .get_product_work_order(&id_for_preflight)?
+            .ok_or_else(|| {
+                AgentError::DatabaseError("web research work order is unknown".to_string())
+            })?;
         if order.role != ProductWorkOrderRole::Researcher
             || order.research_mode != Some(ProductResearchMode::WebDiscovery)
             || !matches!(
@@ -1964,10 +1993,8 @@ pub async fn run_web_discovery_work_order(
                         } else {
                             proposal.source_type.trim()
                         };
-                        let scope = web_search_evidence_scope(
-                            source_type,
-                            &proposal.version_or_scope,
-                        );
+                        let scope =
+                            web_search_evidence_scope(source_type, &proposal.version_or_scope);
                         let summary = if proposal.contradiction_notes.trim().is_empty() {
                             proposal.supporting_summary.trim().to_string()
                         } else {
@@ -2324,9 +2351,11 @@ pub async fn run_web_fact_verifier_work_order(
         let mut store = db_for_preflight
             .lock()
             .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
-        let mut order = store.get_product_work_order(&id_for_preflight)?.ok_or_else(|| {
-            AgentError::DatabaseError("web verifier work order is unknown".to_string())
-        })?;
+        let mut order = store
+            .get_product_work_order(&id_for_preflight)?
+            .ok_or_else(|| {
+                AgentError::DatabaseError("web verifier work order is unknown".to_string())
+            })?;
         if order.role != ProductWorkOrderRole::FactVerifier
             || order.research_mode != Some(ProductResearchMode::WebDiscovery)
             || !matches!(
@@ -2367,7 +2396,9 @@ pub async fn run_web_fact_verifier_work_order(
             .evidence
             .iter()
             .find(|item| item.evidence_id == evidence_id && item.current)
-            .ok_or_else(|| AgentError::DatabaseError("web verifier evidence is stale".to_string()))?;
+            .ok_or_else(|| {
+                AgentError::DatabaseError("web verifier evidence is stale".to_string())
+            })?;
         if evidence.origin != Some(EvidenceOrigin::Web)
             || evidence.kind != Some(EvidenceKind::ResearchClaim)
             || evidence.verification != Some(EvidenceVerification::Unverified)
@@ -2379,7 +2410,11 @@ pub async fn run_web_fact_verifier_work_order(
         order.status = ProductWorkOrderStatus::Running;
         order.updated_at = now();
         store.save_product_work_order(&order)?;
-        Ok((order, evidence.claim.clone(), evidence.source_reference.clone()))
+        Ok((
+            order,
+            evidence.claim.clone(),
+            evidence.source_reference.clone(),
+        ))
     })
     .await
     .map_err(db_error)?;
@@ -2474,13 +2509,17 @@ pub async fn run_web_fact_verifier_work_order(
                         ));
                     }
                     let evidence_id = order.evidence_id.clone().ok_or_else(|| {
-                        AgentError::DatabaseError("web verifier evidence identity disappeared".to_string())
+                        AgentError::DatabaseError(
+                            "web verifier evidence identity disappeared".to_string(),
+                        )
                     })?;
                     let evidence = records
                         .evidence
                         .iter()
                         .find(|item| item.evidence_id == evidence_id && item.current)
-                        .ok_or_else(|| AgentError::DatabaseError("web verifier evidence is stale".to_string()))?;
+                        .ok_or_else(|| {
+                            AgentError::DatabaseError("web verifier evidence is stale".to_string())
+                        })?;
                     if evidence.verification != Some(EvidenceVerification::Unverified) {
                         return Err(AgentError::DatabaseError(
                             "web verifier evidence was already finalized".to_string(),
@@ -2836,15 +2875,17 @@ mod tests {
             ambiguity.resolver,
             crate::product_os::AmbiguityResolver::Owner
         );
-        assert!(adopt_owner_decision(
-            db.clone(),
-            "m05b-real-dogfood".to_string(),
-            "a-real".to_string(),
-            "wrong-question".to_string(),
-            "proceed".to_string(),
-        )
-        .await
-        .is_err());
+        assert!(
+            adopt_owner_decision(
+                db.clone(),
+                "m05b-real-dogfood".to_string(),
+                "a-real".to_string(),
+                "wrong-question".to_string(),
+                "proceed".to_string(),
+            )
+            .await
+            .is_err()
+        );
         adopt_owner_decision(
             db.clone(),
             "m05b-real-dogfood".to_string(),
@@ -2895,11 +2936,13 @@ mod tests {
             Some(EvidenceVerification::IndependentlyVerified)
         );
         assert!(verified.verifier_work_order_id.is_some());
-        assert!(reopened_snapshot
-            .work_orders
-            .iter()
-            .any(|order| order.role == ProductWorkOrderRole::FactVerifier
-                && order.status == ProductWorkOrderStatus::Completed));
+        assert!(
+            reopened_snapshot
+                .work_orders
+                .iter()
+                .any(|order| order.role == ProductWorkOrderRole::FactVerifier
+                    && order.status == ProductWorkOrderStatus::Completed)
+        );
         assert_eq!(
             reopened_snapshot.records.ambiguities[0].status,
             crate::evidence_gates::AmbiguityStatus::Resolved
@@ -2936,14 +2979,16 @@ mod tests {
         .await
         .expect("cancel work order");
         assert_eq!(cancelled.status, ProductWorkOrderStatus::Cancelled);
-        assert!(run_research_work_order(
-            db,
-            runtime,
-            order.work_order_id,
-            "https://api.github.com/repos/github/github-mcp-server".to_string(),
-        )
-        .await
-        .is_err());
+        assert!(
+            run_research_work_order(
+                db,
+                runtime,
+                order.work_order_id,
+                "https://api.github.com/repos/github/github-mcp-server".to_string(),
+            )
+            .await
+            .is_err()
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -3490,7 +3535,7 @@ mod tests {
                 interfaces: vec!["The existing bounded request boundary.".to_string()],
                 risks: vec!["Changed scope requires a new owner direction.".to_string()],
                 acceptance_scenarios: vec![
-                    "Changed scope remains blocked pending direction.".to_string()
+                    "Changed scope remains blocked pending direction.".to_string(),
                 ],
                 reviewer_restatement: crate::evidence_gates::ReviewerRestatement {
                     intended_outcome: "Changed internal validation objective".to_string(),
@@ -3510,9 +3555,11 @@ mod tests {
         .expect("changed snapshot")
         .expect("changed project")
         .records;
-        assert!(!package
-            .is_current_for(&changed_records)
-            .expect("stale package"));
+        assert!(
+            !package
+                .is_current_for(&changed_records)
+                .expect("stale package")
+        );
         assert_eq!(
             package
                 .evaluate_current(&changed_records, GateId::BuildReadiness)
@@ -3597,19 +3644,19 @@ mod tests {
         .await
         .expect("cancel web discovery");
         assert_eq!(cancelled.status, ProductWorkOrderStatus::Cancelled);
-        assert!(run_web_discovery_work_order(db, runtime, order.work_order_id)
-            .await
-            .is_err());
+        assert!(
+            run_web_discovery_work_order(db, runtime, order.work_order_id)
+                .await
+                .is_err()
+        );
         let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     #[ignore = "requires the owner-authorized OpenCode 1.18.31 Zen web-search path"]
     async fn real_web_discovery_user_problem_and_competitor_flows_survive_reopen() {
-        let path = std::env::temp_dir().join(format!(
-            "arena-m05d-real-web-{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("arena-m05d-real-web-{}.db", uuid::Uuid::new_v4()));
         let project_id = "m05d-real-web-research".to_string();
         let db = Arc::new(Mutex::new(
             TranscriptStore::open(path.to_string_lossy().as_ref()).expect("temporary store"),
@@ -3625,13 +3672,10 @@ mod tests {
         )
         .await
         .expect("admit user/problem research");
-        let user_problem = run_web_discovery_work_order(
-            db.clone(),
-            runtime.clone(),
-            user_problem.work_order_id,
-        )
-        .await
-        .expect("run autonomous user/problem research");
+        let user_problem =
+            run_web_discovery_work_order(db.clone(), runtime.clone(), user_problem.work_order_id)
+                .await
+                .expect("run autonomous user/problem research");
         assert!(user_problem.evidence_ids.len() >= 2);
         let user_evidence_id = user_problem.evidence_ids[0].clone();
         let user_verifier = create_web_fact_verifier_work_order(
@@ -3641,13 +3685,9 @@ mod tests {
         )
         .await
         .expect("admit user/problem fact verifier");
-        run_web_fact_verifier_work_order(
-            db.clone(),
-            runtime.clone(),
-            user_verifier.work_order_id,
-        )
-        .await
-        .expect("verify user/problem evidence");
+        run_web_fact_verifier_work_order(db.clone(), runtime.clone(), user_verifier.work_order_id)
+            .await
+            .expect("verify user/problem evidence");
 
         let competitor = create_web_discovery_work_order(
             db.clone(),
@@ -3658,13 +3698,10 @@ mod tests {
         )
         .await
         .expect("admit competitor/status-quo research");
-        let competitor = run_web_discovery_work_order(
-            db.clone(),
-            runtime.clone(),
-            competitor.work_order_id,
-        )
-        .await
-        .expect("run autonomous competitor/status-quo research");
+        let competitor =
+            run_web_discovery_work_order(db.clone(), runtime.clone(), competitor.work_order_id)
+                .await
+                .expect("run autonomous competitor/status-quo research");
         assert!(competitor.evidence_ids.len() >= 2);
         let mut competitor_evidence_id = None;
         for candidate_id in &competitor.evidence_ids {
@@ -3690,13 +3727,10 @@ mod tests {
             .await
             .expect("inspect competitor verification")
             .expect("competitor project remains present");
-            if current
-                .records
-                .evidence
-                .iter()
-                .any(|item| item.evidence_id == *candidate_id
-                    && item.verification == Some(EvidenceVerification::IndependentlyVerified))
-            {
+            if current.records.evidence.iter().any(|item| {
+                item.evidence_id == *candidate_id
+                    && item.verification == Some(EvidenceVerification::IndependentlyVerified)
+            }) {
                 competitor_evidence_id = Some(candidate_id.clone());
                 break;
             }
@@ -3723,9 +3757,11 @@ mod tests {
                 .iter()
                 .find(|item| item.evidence_id == user_evidence_id)
                 .and_then(|item| item.verification),
-            Some(EvidenceVerification::IndependentlyVerified
-                | EvidenceVerification::Contradicted
-                | EvidenceVerification::Unresolved)
+            Some(
+                EvidenceVerification::IndependentlyVerified
+                    | EvidenceVerification::Contradicted
+                    | EvidenceVerification::Unresolved
+            )
         ));
         assert_eq!(
             reopened_snapshot
@@ -3736,11 +3772,13 @@ mod tests {
                 .and_then(|item| item.verification),
             Some(EvidenceVerification::IndependentlyVerified)
         );
-        assert!(reopened_snapshot
-            .work_orders
-            .iter()
-            .filter(|order| order.research_mode == Some(ProductResearchMode::WebDiscovery))
-            .all(|order| order.runtime_session_id.is_some()));
+        assert!(
+            reopened_snapshot
+                .work_orders
+                .iter()
+                .filter(|order| order.research_mode == Some(ProductResearchMode::WebDiscovery))
+                .all(|order| order.runtime_session_id.is_some())
+        );
         println!(
             "M05D runtime IDs: project={} revision={} work_orders={:?} evidence_ids={:?} statuses={:?}",
             project_id,
@@ -3795,13 +3833,10 @@ mod tests {
         )
         .await
         .expect("admit fresh user/problem research");
-        let user_order = run_web_discovery_work_order(
-            db.clone(),
-            runtime.clone(),
-            user_order.work_order_id,
-        )
-        .await
-        .expect("run fresh user/problem research");
+        let user_order =
+            run_web_discovery_work_order(db.clone(), runtime.clone(), user_order.work_order_id)
+                .await
+                .expect("run fresh user/problem research");
         let mut user_verified = false;
         for evidence_id in user_order.evidence_ids.clone() {
             let verifier = create_web_fact_verifier_work_order(
@@ -3822,13 +3857,10 @@ mod tests {
             .await
             .expect("inspect user/problem evidence")
             .expect("fresh project exists");
-            if current
-                .records
-                .evidence
-                .iter()
-                .any(|item| item.evidence_id == evidence_id
-                    && item.verification == Some(EvidenceVerification::IndependentlyVerified))
-            {
+            if current.records.evidence.iter().any(|item| {
+                item.evidence_id == evidence_id
+                    && item.verification == Some(EvidenceVerification::IndependentlyVerified)
+            }) {
                 user_verified = true;
                 break;
             }
@@ -3873,13 +3905,10 @@ mod tests {
             .await
             .expect("inspect competitor evidence")
             .expect("fresh project remains present");
-            if current
-                .records
-                .evidence
-                .iter()
-                .any(|item| item.evidence_id == evidence_id
-                    && item.verification == Some(EvidenceVerification::IndependentlyVerified))
-            {
+            if current.records.evidence.iter().any(|item| {
+                item.evidence_id == evidence_id
+                    && item.verification == Some(EvidenceVerification::IndependentlyVerified)
+            }) {
                 competitor_verified = true;
                 break;
             }
@@ -3944,7 +3973,8 @@ mod tests {
         let scope_order = create_product_director_work_order(
             db.clone(),
             project_id.clone(),
-            "Product Director: restate the fresh founder idea and bound the validation slice".to_string(),
+            "Product Director: restate the fresh founder idea and bound the validation slice"
+                .to_string(),
         )
         .await
         .expect("admit fresh product direction review");
@@ -4125,21 +4155,23 @@ mod tests {
 
         drop(db);
         let db = Arc::new(Mutex::new(
-            TranscriptStore::open(db_path.to_string_lossy().as_ref()).expect("reopen before package"),
+            TranscriptStore::open(db_path.to_string_lossy().as_ref())
+                .expect("reopen before package"),
         ));
         let package = assemble_current_build_package(db.clone(), project_id.clone())
             .await
             .expect("assemble current M06 Build Package");
-        let gate_evaluation = evaluate_current_preimplementation_gates(
-            db.clone(),
-            project_id.clone(),
-        )
-        .await
-        .expect("evaluate current M06 gates");
+        let gate_evaluation =
+            evaluate_current_preimplementation_gates(db.clone(), project_id.clone())
+                .await
+                .expect("evaluate current M06 gates");
         assert_eq!(package.package_id, gate_evaluation.package.package_id);
-        assert!(gate_evaluation.decisions.iter().all(|decision| {
-            decision.status == crate::evidence_gates::GateStatus::Pass
-        }));
+        assert!(
+            gate_evaluation
+                .decisions
+                .iter()
+                .all(|decision| { decision.status == crate::evidence_gates::GateStatus::Pass })
+        );
 
         // Build a disposable candidate fixture from the accepted package. The
         // acceptance profile is committed before implementation and protects
@@ -4185,48 +4217,42 @@ mod tests {
         )
         .expect("write M06 verification profile");
         git(&canonical, &["init", "-b", "main"]);
-        git(&canonical, &["config", "user.email", "arena-m06@example.invalid"]);
+        git(
+            &canonical,
+            &["config", "user.email", "arena-m06@example.invalid"],
+        );
         git(&canonical, &["config", "user.name", "Consensus Arena M06"]);
         git(&canonical, &["add", "."]);
-        git(&canonical, &["commit", "-m", "M06 frozen acceptance fixture"]);
+        git(
+            &canonical,
+            &["commit", "-m", "M06 frozen acceptance fixture"],
+        );
         let base = git(&canonical, &["rev-parse", "HEAD"]);
         let role_a = root.join("engineering-role-a");
         let role_b = root.join("engineering-role-b");
-        crate::delivery::create_candidate_worktree(
-            &canonical,
-            &role_a,
-            "arena-m06-role-a",
-            &base,
-        )
-        .await
-        .expect("create M06 role A worktree");
-        crate::delivery::create_candidate_worktree(
-            &canonical,
-            &role_b,
-            "arena-m06-role-b",
-            &base,
-        )
-        .await
-        .expect("create M06 role B worktree");
+        crate::delivery::create_candidate_worktree(&canonical, &role_a, "arena-m06-role-a", &base)
+            .await
+            .expect("create M06 role A worktree");
+        crate::delivery::create_candidate_worktree(&canonical, &role_b, "arena-m06-role-b", &base)
+            .await
+            .expect("create M06 role B worktree");
         let role_profile = verification::load_profile(&role_a).expect("load M06 role profile");
-        let role_protected = verification::protected_hashes(
-            &role_a,
-            &role_profile.protected_paths,
-        )
-        .expect("hash M06 role protected paths");
-        let canonical_protected = verification::protected_hashes(
-            &canonical,
-            &role_profile.protected_paths,
-        )
-        .expect("hash M06 canonical protected paths");
-        let role_order = |id: &str, candidate: &std::path::Path| {
-            crate::delivery::OpenCodeWorkOrder {
+        let role_protected = verification::protected_hashes(&role_a, &role_profile.protected_paths)
+            .expect("hash M06 role protected paths");
+        let canonical_protected =
+            verification::protected_hashes(&canonical, &role_profile.protected_paths)
+                .expect("hash M06 canonical protected paths");
+        let role_order =
+            |id: &str, candidate: &std::path::Path| crate::delivery::OpenCodeWorkOrder {
                 work_order_id: format!("m06-{id}"),
                 project_id: project_id.clone(),
                 root_session_id: None,
                 candidate_id: candidate.to_string_lossy().into_owned(),
                 candidate_revision: 1,
-                authority_version: format!("{base}:{}", verification::profile_hash(&role_profile).expect("role profile hash")),
+                authority_version: format!(
+                    "{base}:{}",
+                    verification::profile_hash(&role_profile).expect("role profile hash")
+                ),
                 acceptance_commit: base.clone(),
                 task_state: crate::delivery::OpenCodeTaskState::Admitted,
                 evidence_ref: None,
@@ -4238,8 +4264,7 @@ mod tests {
                 build_package_id: Some(package.package_id.clone()),
                 build_package_revision: Some(package.package_revision),
                 build_package_fingerprint: Some(package.authority_fingerprint.clone()),
-            }
-        };
+            };
         let mut role_a_order = role_order("research-implementation", &role_a);
         let mut role_b_order = role_order("security-review", &role_b);
         let evidence_dir = root.join("engineering-evidence");
@@ -4265,11 +4290,33 @@ mod tests {
         );
         role_a_result.expect("M06 implementation role should return evidence");
         role_b_result.expect("M06 independent review role should return evidence");
-        assert_eq!(role_a_order.task_state, crate::delivery::OpenCodeTaskState::EvidenceReady);
-        assert_eq!(role_b_order.task_state, crate::delivery::OpenCodeTaskState::EvidenceReady);
+        assert_eq!(
+            role_a_order.task_state,
+            crate::delivery::OpenCodeTaskState::EvidenceReady
+        );
+        assert_eq!(
+            role_b_order.task_state,
+            crate::delivery::OpenCodeTaskState::EvidenceReady
+        );
         assert_ne!(role_a_order.root_session_id, role_b_order.root_session_id);
-        git(&canonical, &["worktree", "remove", "--force", role_a.to_str().expect("role A path")]);
-        git(&canonical, &["worktree", "remove", "--force", role_b.to_str().expect("role B path")]);
+        git(
+            &canonical,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                role_a.to_str().expect("role A path"),
+            ],
+        );
+        git(
+            &canonical,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                role_b.to_str().expect("role B path"),
+            ],
+        );
 
         let candidate = root.join("integrator candidate");
         crate::delivery::create_candidate_worktree(
@@ -4284,7 +4331,9 @@ mod tests {
         let delivery_state = crate::delivery::DeliveryState {
             schema_version: crate::delivery::DELIVERY_SCHEMA_VERSION,
             session_id: session_id.clone(),
-            objective: "Change study_tool.py so the bounded accounting study mode reports interactive.".to_string(),
+            objective:
+                "Change study_tool.py so the bounded accounting study mode reports interactive."
+                    .to_string(),
             source_workspace: canonical.to_string_lossy().into_owned(),
             worktree_path: candidate.to_string_lossy().into_owned(),
             branch_name: "arena-m06-integrator".to_string(),
@@ -4295,10 +4344,15 @@ mod tests {
                 objective: "Bounded interactive accounting study mode".to_string(),
                 acceptance_criteria: vec![crate::delivery::AcceptanceCriterion {
                     id: "study-mode".to_string(),
-                    description: "The study mode reports interactive and the deterministic check passes.".to_string(),
+                    description:
+                        "The study mode reports interactive and the deterministic check passes."
+                            .to_string(),
                 }],
-                constraints: vec!["Do not alter frozen acceptance or verification authority.".to_string()],
-                worker_brief: "Make only the bounded source change in the candidate worktree.".to_string(),
+                constraints: vec![
+                    "Do not alter frozen acceptance or verification authority.".to_string(),
+                ],
+                worker_brief: "Make only the bounded source change in the candidate worktree."
+                    .to_string(),
             }),
             user_answers: Vec::new(),
             protected_files: Vec::new(),
@@ -4369,7 +4423,10 @@ mod tests {
             b"frozen: the bounded topic reports interactive mode\n"
         );
         assert_eq!(
-            git(&canonical, &["status", "--porcelain", "--untracked-files=all"]),
+            git(
+                &canonical,
+                &["status", "--porcelain", "--untracked-files=all"]
+            ),
             ""
         );
 
