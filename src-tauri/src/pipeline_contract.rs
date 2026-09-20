@@ -257,6 +257,52 @@ pub fn owner_decision_for_option(
     Ok(decision)
 }
 
+pub fn owner_decision_matches_pending(
+    pending: OwnerDecisionKind,
+    decision: OwnerDecisionKind,
+) -> bool {
+    match pending {
+        OwnerDecisionKind::AuthorizeValidationExperiment => matches!(
+            decision,
+            OwnerDecisionKind::AuthorizeValidationExperiment
+                | OwnerDecisionKind::StopRun
+                | OwnerDecisionKind::PivotRun
+        ),
+        OwnerDecisionKind::AuthorizeNarrowBuild => matches!(
+            decision,
+            OwnerDecisionKind::AuthorizeNarrowBuild
+                | OwnerDecisionKind::StopRun
+                | OwnerDecisionKind::PivotRun
+        ),
+        OwnerDecisionKind::AuthorizeBuild => matches!(
+            decision,
+            OwnerDecisionKind::AuthorizeBuild
+                | OwnerDecisionKind::StopRun
+                | OwnerDecisionKind::PivotRun
+        ),
+        OwnerDecisionKind::StopRun | OwnerDecisionKind::PivotRun => matches!(
+            decision,
+            OwnerDecisionKind::ContinueEvaluation
+                | OwnerDecisionKind::StopRun
+                | OwnerDecisionKind::PivotRun
+        ),
+        OwnerDecisionKind::ApproveApply => matches!(
+            decision,
+            OwnerDecisionKind::ApproveApply | OwnerDecisionKind::StopRun
+        ),
+        OwnerDecisionKind::ApproveRelease => matches!(
+            decision,
+            OwnerDecisionKind::ApproveRelease | OwnerDecisionKind::StopRun
+        ),
+        OwnerDecisionKind::ContinueEvaluation => matches!(
+            decision,
+            OwnerDecisionKind::ContinueEvaluation
+                | OwnerDecisionKind::StopRun
+                | OwnerDecisionKind::PivotRun
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GateRemediationOutcome {
