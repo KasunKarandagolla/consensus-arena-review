@@ -399,3 +399,11 @@ bounded repo-intelligence slice, and exact candidate identity. The resulting
 semantic receipts are advisory and stale when the candidate changes. Review
 mutation or stale identity fails closed; provider/resource unavailability is
 reported and the deterministic verifier remains authoritative.
+
+08A runtime closure additionally proves the low-memory deterministic test
+strategy and the Safe Apply rejection matrix. OpenCode 1.18.31 is still the
+qualified V1 runtime for the plain and implementation-side paths. The current
+CandidateReview background-shaped provider 403 is surfaced as a bounded
+quality limitation; it cannot block or fabricate deterministic verification.
+Native Tauri WebdriverIO remains target-specific and is not substituted by
+Playwright evidence when the host cannot provide the WebKitGTK driver/plugin.

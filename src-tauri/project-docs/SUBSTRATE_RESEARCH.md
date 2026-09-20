@@ -284,3 +284,13 @@ TypeScript. The matching rustup `rust-analyzer` and pinned
 proof, including diagnostics and navigation. Heavy LSP is single-slot on the
 target host; project-native diagnostics and the frontend build remain the
 fallback when resource or provider conditions prevent the profile run.
+
+The 08A closure also runtime-proved the selected Superpowers procedures on
+bounded disposable Implementation and DebugRepair tasks using the pinned
+revision `5bf4e78011075bcfc0dc295f0724994cd123ee71`, and qualified Playwright
+MCP `0.0.82` for exploratory inspection/action. The current native Tauri
+WebdriverIO toolchain is `@wdio/tauri-service 1.4.0` with WebdriverIO `9.31.9`,
+but native execution is environment-blocked on the host's missing driver/plugin
+and `/dev/dri`/WebKitGTK limitation. CandidateReview's current OpenCode
+background-shaped free-tier 403 is recorded as an upstream regression; it does
+not change the accepted authority model.

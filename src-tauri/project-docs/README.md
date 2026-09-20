@@ -291,3 +291,14 @@ After a meaningful milestone:
 3. add or retain a permanent audit under `src-tauri/project-docs/audits/`;
 4. update `DECISIONS.md` if a durable architecture/product decision changed;
 5. update this index only if the document map/current transition point changed.
+
+## Current 08A transition point
+
+The Q1 runtime closure and 08A reliability audit now record executed
+low-memory tests, Safe Apply guards, bounded cancellation/reconciliation,
+light semantic-role concurrency, OpenCode 1.18.31 plain/Implementation/
+DebugRepair proofs, native Rust/TypeScript LSP qualification, selected
+Superpowers runtime influence, and exploratory Playwright MCP qualification.
+CandidateReview's current free-tier background-path 403 and native Tauri
+WebdriverIO's host graphics/driver limitation are explicitly classified in the
+08A audit; neither changes Arena's verifier or Apply authority.

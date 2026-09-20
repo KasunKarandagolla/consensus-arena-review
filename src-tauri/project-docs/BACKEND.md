@@ -231,6 +231,16 @@ The repository-intelligence integration uses standalone `agent-analyzer`
 metadata and bounded CLI queries. It is fail-soft for semantic roles and is
 not a source of product intent or acceptance truth.
 
+08A runtime closure confirms the matching rustup `rust-analyzer 1.95.0` and
+pinned `typescript-language-server 4.3.3` disposable diagnostics/navigation
+paths, and real Implementation/DebugRepair procedure-guided tasks on
+OpenCode 1.18.31. CandidateReview's current background-shaped request returns
+the upstream free-tier 403; the deterministic verifier remains authoritative
+and the runtime health reports that limitation rather than converting it into a
+PASS. Native Tauri WebdriverIO is a qualified disposable toolchain but is
+environment-blocked here by the missing driver/plugin and WebKitGTK graphics
+requirements.
+
 Candidate review receipts are bounded derived records keyed to the exact
 candidate SHA and acceptance commit. They are advisory inputs to Delivery;
 the deterministic verifier remains the only source of a Verified verdict.

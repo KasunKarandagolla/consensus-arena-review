@@ -3153,13 +3153,35 @@ mod tests {
         kind: EvidenceKind,
         claim: &str,
     ) -> ProductWorkOrder {
-        let order = create_product_director_work_order(
-            db.clone(),
-            project_id.to_string(),
-            subject.to_string(),
-        )
-        .await
-        .expect("admit Product Director work order");
+        let order = match kind {
+            EvidenceKind::ArchitectureProposal if subject.ends_with(" A") => {
+                create_product_role_work_order(
+                    db.clone(),
+                    project_id.to_string(),
+                    subject.to_string(),
+                    ProductWorkOrderRole::ArchitectA,
+                )
+                .await
+            }
+            EvidenceKind::ArchitectureProposal if subject.ends_with(" B") => {
+                create_product_role_work_order(
+                    db.clone(),
+                    project_id.to_string(),
+                    subject.to_string(),
+                    ProductWorkOrderRole::ArchitectB,
+                )
+                .await
+            }
+            _ => {
+                create_product_director_work_order(
+                    db.clone(),
+                    project_id.to_string(),
+                    subject.to_string(),
+                )
+                .await
+            }
+        }
+        .expect("admit typed Product OS review work order");
         admit_product_review(
             db,
             project_id.to_string(),

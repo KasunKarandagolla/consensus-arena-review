@@ -293,5 +293,12 @@ TypeScript language server qualifies at about 64.0 MiB RSS when its disposable
 target uses bounded `noLib` configuration; full frontend build/typecheck
 remains the fallback on constrained hardware. Heavy LSP profiles remain
 single-slot only, and no second LSP-equipped worker is launched silently.
-Model-backed OpenCode/Superpowers runtime evidence remains provider-blocked as
-recorded in the permanent Q1 follow-up.
+Plain OpenCode 1.18.31 and the Implementation/DebugRepair Superpowers tasks
+are runtime-proven. The CandidateReview-shaped background path still returns
+the upstream free-tier 403 and remains explicitly advisory/unavailable for
+that run; no acceptance or Verified state depends on it.
+
+The successful Rust test-link strategy uses one Cargo job, test debuginfo
+disabled, GCC, and `--reduce-memory-overheads`; it measured `1374656 KB`
+(about `1.31 GiB`) peak. This is a test-link measurement, not normal Arena
+runtime. No concurrent heavy model/LSP/browser tasks are launched silently.

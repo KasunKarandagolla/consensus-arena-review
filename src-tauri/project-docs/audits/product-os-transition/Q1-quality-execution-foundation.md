@@ -295,3 +295,122 @@ added without changing Arena's authority model.
   secret scan, and orphan-process inspection passed. Model-backed
   Superpowers and OpenCode LSP tool-call proof remain provider-blocked as
   stated above.
+
+## Q1 runtime closure addendum — 2026-09-20
+
+This addendum preserves the historical checkpoint statements above and records
+the current runtime disposition after the 08A preflight. It does not change the
+Q1 execution-profile, authority, or derived-evidence architecture.
+
+### RUNTIME-PROVEN
+
+- OpenCode `/home/kasun/.opencode/bin/opencode` `1.18.31` passed a plain
+  official CLI request on `/tmp/arena-08a-official-target`: exact `READY`, exit
+  `0`, peak RSS `544448 KB`, elapsed `52.91 s`.
+- The same model passed an Arena-equivalent temporary configuration with the
+  `plan` agent and denied authority/tools: exact `READY`, exit `0`, peak RSS
+  `509948 KB`, elapsed `49.27 s`. This is the minimal profile/config path used
+  to compare the earlier provider failure; no credential was exposed.
+- A bounded Implementation proof ran in
+  `/tmp/arena-08a-implementation-repo` from baseline
+  `d1f705447a4ad6e1fcbc74aba39fa601f0ec1903` to candidate
+  `9cc57aa740b3e85e52b16279f0311d0281973ed0`. The worker loaded the pinned
+  Superpowers `test-driven-development` and
+  `verification-before-completion` procedures, demonstrated red then green
+  `npm run check` (5/5), and did not claim Arena authority. Peak RSS was
+  `536128 KB` over `141.68 s` for the completing continuation.
+- A bounded DebugRepair proof ran in `/tmp/arena-08a-debug-repo` from seeded
+  defect commit `c6d0f3b7a22966e4f649ceb57d9ba99d312714c4`. The worker loaded
+  `systematic-debugging` and `verification-before-completion`, reproduced the
+  failing check, identified the percentage arithmetic defect, repaired it, and
+  reran the same check successfully (1/1). Peak RSS was `713528 KB` over
+  `193.68 s`. The independent check also passed after the worker returned.
+- The pinned Superpowers revision is
+  `5bf4e78011075bcfc0dc295f0724994cd123ee71`, MIT licensed. Only the five
+  selected procedures remain exposed; workers cannot install or select others.
+- Rust LSP now uses the matching rustup component, `rust-analyzer 1.95.0
+  (5980761 2026-04-14)`, and the previous disposable OpenCode-native protocol
+  proof remains valid: diagnostics, definition, and references, peak RSS
+  `174628 KB` (about `170.5 MiB`). TypeScript remains pinned at
+  `typescript-language-server 4.3.3` with TypeScript `5.4.5`; its disposable
+  proof produced diagnostics, definition, and references at peak RSS
+  `65540 KB` (about `64.0 MiB`). Both are advisory and cleanup was verified.
+- Playwright MCP `@playwright/mcp 0.0.82` started in a disposable isolated
+  server and handled a real page: navigation, snapshot locator discovery,
+  form fill, click, observed `Hello Arena`, and close. Its reported bundled
+  Playwright was `1.64.0-alpha-1789764292000`; the server and page server were
+  stopped cleanly.
+- Chrome DevTools MCP `1.9.0` (Apache-2.0) started and completed a bounded
+  `navigate` plus `evaluate` probe. Its server was stopped cleanly; it adds no
+  required V1 capability beyond the proven Playwright MCP path.
+- `@wdio/tauri-service 1.4.0` with WebdriverIO `9.31.9` was installed in a
+  disposable tools location and `wdio --version` passed. Native launch was
+  attempted through both embedded and external providers; the exact outcomes
+  are recorded as environment-blocked below.
+- The successful low-memory Cargo strategy executed the new deterministic
+  tests. The rebuilt test binary passed execution-profile policy (3), repo
+  intelligence (2), Safe Apply rejection matrix (1), verifier mutation/
+  timeout (2), Product OS runtime/reopen/cancellation (12 with 2 explicitly
+  ignored provider-backed cases), OpenCode late-result/identity (2), process
+  containment (13), candidate-review policy (4), and workflow policy (2).
+  The successful link peak was `1374656 KB` (about `1.31 GiB`) over `298.85 s`.
+- The final rebuild including the positive OpenCode Safe Apply test peaked at
+  `1514764 KB` (about `1.45 GiB`) over `346.61 s`; both successful links used
+  the same supported one-job/debuginfo-disabled strategy.
+- The previous `2.06 GiB` failed test-link attempt remains historical test
+  resource evidence, not an Arena runtime-performance claim.
+
+### INTEGRATED
+
+- The coordinator now creates and persists Architect A/B and the light
+  independent review work orders before executing them with `tokio::try_join!`.
+  The execution-profile mapping, `env_clear()` boundary, single heavy-LSP
+  slot, and all Product OS/verifier/Apply authority boundaries are unchanged.
+- The existing real-Product-OS handoff fixture was corrected to create its two
+  architecture proposals as `ArchitectA` and `ArchitectB`; the production
+  admission rule was not weakened.
+- The supported test command on the low-spec host is:
+  `CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 RUSTFLAGS='-C debuginfo=0 -C linker=gcc -C link-arg=-Wl,--reduce-memory-overheads' cargo test --bin consensus-arena -- --nocapture`.
+- Resource policy is now explicit: one heavy model/LSP/browser task at a time;
+  light semantic roles may overlap only when measured headroom permits; repo
+  analysis is cached by repository identity/HEAD/analyzer version; optional
+  LSP, analyzer, MCP, and browser helpers fail soft to project-native checks.
+
+### UPSTREAM-REGRESSION
+
+- A CandidateReview-style run using the same `1.18.31` model, bounded plan
+  configuration, LSP-enabled profile shape, and selected review skills returned
+  the exact provider response: `403 FreeTierError: OpenCode's free tier can
+  only be used from within OpenCode`. This is path-specific: the plain CLI,
+  minimal plan request, Implementation proof, and DebugRepair proof succeeded.
+  Arena is not downgraded to `1.18.28`; the active supported runtime remains
+  `1.18.31` for the proven paths, while CandidateReview reports the provider
+  failure and remains advisory/non-authoritative.
+
+### ENVIRONMENT-BLOCKED
+
+- Native Tauri WebdriverIO could not execute a smoke scenario on this host.
+  The embedded provider spawned the current binary but its WebDriver server did
+  not become ready because `tauri-plugin-wdio-webdriver` is not registered;
+  the external provider reported missing `tauri-driver` and
+  `webkit2gtk-driver`. The host also has no `/dev/dri`, matching the existing
+  WebKitGTK/EGL graphics limitation. Embedded and external WDIO probes peaked
+  at `148440 KB` and `218952 KB`, respectively, and both cleaned up.
+- A concurrent pair of lightweight profile-equivalent model probes timed out
+  at the 90-second bound after the earlier successful single-run probes; they
+  left no process. The coordinator overlap is source-integrated, but no full
+  model-backed Product OS architecture run is claimed as runtime proof from
+  that failed pair.
+- Full frontend TypeScript LSP remains resource-sensitive; the bounded
+  disposable `noLib` qualification and `npm run build` fallback remain the
+  supported evidence on this machine.
+
+### REJECTED/NOT REQUIRED
+
+- Side-by-side OpenCode `1.18.28` fallback was not installed because
+  `1.18.31` passed the plain, minimal, Implementation, and DebugRepair probes.
+- Chrome DevTools MCP is not a default V1 dependency because Playwright MCP
+  already supplies the required exploratory inspect/locator/action surface.
+- Full AgentSys orchestration, global Superpowers bootstrap, arbitrary worker
+  skills, Context7 as Product OS memory, LSP as acceptance authority, and
+  browser/MCP output as PASS remain rejected or not required.

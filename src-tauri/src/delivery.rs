@@ -2152,6 +2152,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_apply_fast_forwards_current_verified_opencode_candidate() {
+        let (repo, base, candidate, _) = apply_guard_fixture("positive apply");
+        let candidate_worktree = repo
+            .parent()
+            .expect("fixture parent")
+            .join("verified candidate");
+        create_candidate_worktree(
+            &repo,
+            &candidate_worktree,
+            "arena-delivery/positive-apply",
+            &candidate,
+        )
+        .await
+        .expect("create verified candidate worktree");
+        let mut state = sample_state();
+        state.source_workspace = repo.to_string_lossy().into_owned();
+        state.worktree_path = candidate_worktree.to_string_lossy().into_owned();
+        state.base_commit = base.clone();
+        state.acceptance_commit = Some(base.clone());
+        state.candidate_commit = Some(candidate.clone());
+        state.phase = DeliveryPhase::Verified;
+        state.runtime = DeliveryRuntime::OpenCode;
+        state.last_verification = Some(VerificationReceipt {
+            session_id: state.session_id.clone(),
+            attempt_id: "session/attempt/1".to_string(),
+            verification_id: "verification-positive-apply".to_string(),
+            candidate_sha: candidate.clone(),
+            acceptance_commit: base,
+            contract_revision: 1,
+            profile_hash: "profile".to_string(),
+            candidate_tree_unchanged: true,
+            protected_paths_unchanged: true,
+            checks: Vec::new(),
+            verdict: "pass".to_string(),
+        });
+
+        apply_verified_candidate(&mut state)
+            .await
+            .expect("current verified candidate should fast-forward");
+        assert_eq!(state.phase, DeliveryPhase::Applied);
+        assert_eq!(
+            git_fixture_success(&repo, &["rev-parse", "HEAD"]),
+            candidate
+        );
+
+        let removed = std::process::Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&candidate_worktree)
+            .current_dir(&repo)
+            .status()
+            .expect("remove verified candidate worktree");
+        assert!(removed.success());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[tokio::test]
     #[ignore = "requires an approved external DSH credential and runtime"]
     async fn backend_qualification_runs_production_delivery_path() {
         let root = std::env::temp_dir().join(format!(

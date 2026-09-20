@@ -225,3 +225,11 @@ Use repository intelligence on demand as a bounded derived slice. Use Context7
 only for a bounded current/version-specific technical question. Do not put
 full repository maps, raw documentation sessions, credentials, or provider
 tokens into durable product authority.
+
+08A adds one bounded concurrency rule: create and persist independent light
+semantic work orders first, then run the independent Architect/reviewer calls
+concurrently through the existing runtime. The results are admitted in role
+order and a failed call cannot fabricate consensus. Heavy LSP/model/browser
+tasks remain single-slot on the low-spec host. Current runtime proof and
+environment boundaries are recorded in
+`src-tauri/project-docs/audits/product-os-transition/08A-reliability-security-safe-apply-v2.md`.

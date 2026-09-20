@@ -283,3 +283,15 @@ and frozen acceptance commit. It may produce deduplicated semantic findings
 before deterministic verification, but it cannot produce PASS/Verified or
 change acceptance, ProductAuthorityRecords, or Apply authority. Exploratory
 browser and performance procedures follow the same evidence boundary.
+
+### 08A runtime closure
+
+Architect A/B and the independent light review roles are created and persisted
+before their executions and run concurrently through the existing
+`SessionRuntime`; this is bounded role concurrency, not a new scheduler. Heavy
+LSP/model/browser work remains single-slot on the low-resource host. Current
+runtime evidence proves OpenCode 1.18.31 on the plain/minimal and
+Implementation/DebugRepair paths, rust-analyzer and TypeScript LSP through
+OpenCode configuration, selected Superpowers procedure influence, and
+exploratory Playwright MCP. Native Tauri WebdriverIO remains target-specific
+and host-blocked by the current WebKitGTK/driver/graphics environment.

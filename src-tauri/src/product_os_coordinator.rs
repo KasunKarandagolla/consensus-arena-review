@@ -596,7 +596,7 @@ async fn run_architecture(
         (ProductWorkOrderRole::ArchitectA, "Architect A"),
         (ProductWorkOrderRole::ArchitectB, "Architect B"),
     ];
-    let mut proposal_ids = Vec::new();
+    let mut architect_orders = Vec::new();
     for (role, label) in roles {
         let order = product_os_runtime::create_product_role_work_order(
             ctx.db.clone(),
@@ -607,20 +607,33 @@ async fn run_architecture(
         .await?;
         run.architecture_work_order_ids
             .push(order.work_order_id.clone());
-        save_run(ctx, run).await?;
-        let prompt = role_prompt(
+        architect_orders.push((order, label));
+    }
+    save_run(ctx, run).await?;
+    let architect_prompt = |label: &str| {
+        role_prompt(
             label,
             &format!(
                 "{brief}\nPropose one materially distinct architecture. Do not read another architect's response. Return JSON: {{\"proposal\":\"...\",\"assumptions\":[\"...\"],\"reuse_choices\":[\"...\"],\"interfaces\":[\"...\"],\"risks\":[\"...\"]}}"
             ),
-        );
-        let execution = product_os_runtime::run_product_role_work_order(
+        )
+    };
+    let (architect_a, architect_b) = tokio::try_join!(
+        product_os_runtime::run_product_role_work_order(
             ctx.db.clone(),
             ctx.runtime.clone(),
-            order.work_order_id,
-            prompt,
-        )
-        .await?;
+            architect_orders[0].0.work_order_id.clone(),
+            architect_prompt(architect_orders[0].1),
+        ),
+        product_os_runtime::run_product_role_work_order(
+            ctx.db.clone(),
+            ctx.runtime.clone(),
+            architect_orders[1].0.work_order_id.clone(),
+            architect_prompt(architect_orders[1].1),
+        ),
+    )?;
+    let mut proposal_ids = Vec::new();
+    for execution in [architect_a, architect_b] {
         let output: ArchitectureOutput = parse_json(&execution.output)?;
         let claim = text(&output.proposal, "architecture proposal")?;
         let summary = format!(
@@ -665,7 +678,7 @@ async fn run_architecture(
             "Red-team reviewer",
         ),
     ];
-    let mut review_evidence = Vec::new();
+    let mut review_orders = Vec::new();
     for (role, kind, label) in review_roles {
         let order = product_os_runtime::create_product_role_work_order(
             ctx.db.clone(),
@@ -674,19 +687,46 @@ async fn run_architecture(
             role,
         )
         .await?;
-        let prompt = role_prompt(
+        review_orders.push((order, kind, label));
+    }
+    run.reuse_work_order_id = Some(review_orders[0].0.work_order_id.clone());
+    run.constraints_work_order_id = Some(review_orders[1].0.work_order_id.clone());
+    run.red_team_work_order_id = Some(review_orders[2].0.work_order_id.clone());
+    save_run(ctx, run).await?;
+    let review_prompt = |label: &str| {
+        role_prompt(
             label,
             &format!(
                 "{brief}\nThe independent proposals are now available by reference only. Challenge reuse, constraints, security, platform, and trust boundaries as appropriate. Return JSON: {{\"summary\":\"...\",\"findings\":[\"...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}"
             ),
-        );
-        let execution = product_os_runtime::run_product_role_work_order(
+        )
+    };
+    let (reuse_execution, constraints_execution, red_team_execution) = tokio::try_join!(
+        product_os_runtime::run_product_role_work_order(
             ctx.db.clone(),
             ctx.runtime.clone(),
-            order.work_order_id,
-            prompt,
-        )
-        .await?;
+            review_orders[0].0.work_order_id.clone(),
+            review_prompt(review_orders[0].2),
+        ),
+        product_os_runtime::run_product_role_work_order(
+            ctx.db.clone(),
+            ctx.runtime.clone(),
+            review_orders[1].0.work_order_id.clone(),
+            review_prompt(review_orders[1].2),
+        ),
+        product_os_runtime::run_product_role_work_order(
+            ctx.db.clone(),
+            ctx.runtime.clone(),
+            review_orders[2].0.work_order_id.clone(),
+            review_prompt(review_orders[2].2),
+        ),
+    )?;
+    let mut review_evidence = Vec::new();
+    for (kind, execution) in [
+        (review_orders[0].1.clone(), reuse_execution),
+        (review_orders[1].1.clone(), constraints_execution),
+        (review_orders[2].1.clone(), red_team_execution),
+    ] {
         let output: ReviewOutput = parse_json(&execution.output)?;
         let summary = format!(
             "{}; findings: {}",
