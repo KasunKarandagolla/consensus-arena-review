@@ -949,6 +949,24 @@ pub async fn get_product_functional_state(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn inject_product_guidance(
+    run_id: String,
+    guidance: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let guidance = product_os_safe_text(guidance, state.inner()).await?;
+    let run = crate::product_os_coordinator::inject_owner_guidance(
+        product_coordinator_context(state.inner(), Some(app)),
+        run_id,
+        guidance,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn request_product_consultation(
     run_id: String,
     provider: String,
