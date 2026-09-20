@@ -2252,16 +2252,20 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
         };
         match result {
             Ok(state) if state.phase == crate::delivery::DeliveryPhase::Verified => {
-                run.status = CoordinatorStatus::Completed;
+                // Verified is candidate qualification, not lifecycle completion.
+                // The owner still has exclusive authority to execute Safe Apply.
+                run.status = CoordinatorStatus::WaitingForOwner;
                 run.phase = CoordinatorPhase::Terminal;
                 run.stage = PipelineStage::Release;
+                run.pending_owner_decision = Some(OwnerDecisionKind::ApproveApply);
                 run.terminal_outcome = Some(
                     if run.product_review_outcome.as_deref() == Some("validation_experiment") {
-                        "validation_experiment_verified".to_string()
+                        "validation_experiment_verified_waiting_for_apply".to_string()
                     } else {
-                        "narrow_build_verified".to_string()
+                        "narrow_build_verified_waiting_for_apply".to_string()
                     },
                 );
+                run.error = None;
                 run.updated_at = now();
                 save_run(&ctx, &run).await?;
             }
@@ -2670,6 +2674,49 @@ pub async fn answer_owner_question(
     Ok(resumed)
 }
 
+pub async fn mark_delivery_applied(
+    ctx: &CoordinatorContext,
+    delivery_session_id: String,
+) -> Result<Option<ProductCoordinatorRun>, String> {
+    let db = ctx.db.clone();
+    let delivery_session_id_for_lookup = delivery_session_id.clone();
+    let maybe_run = db_helpers::run_blocking(move || {
+        let store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        store.find_product_coordinator_by_delivery_session(&delivery_session_id_for_lookup)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some(mut run) = maybe_run else {
+        return Ok(None);
+    };
+    if run.delivery_session_id.as_deref() != Some(delivery_session_id.as_str()) {
+        return Err("applied Delivery does not belong to the resolved Product OS run".to_string());
+    }
+    let persisted = load_delivery_state(ctx, &delivery_session_id)
+        .await?
+        .ok_or_else(|| "applied Delivery state is missing".to_string())?;
+    if persisted.phase != crate::delivery::DeliveryPhase::Applied {
+        return Err("Product OS can complete only after Safe Apply is durably Applied".to_string());
+    }
+    if !matches!(
+        run.status,
+        CoordinatorStatus::WaitingForOwner | CoordinatorStatus::Completed
+    ) {
+        return Err("Product OS run was not waiting at the release boundary".to_string());
+    }
+    run.status = CoordinatorStatus::Completed;
+    run.phase = CoordinatorPhase::Terminal;
+    run.stage = PipelineStage::Terminal;
+    run.pending_owner_decision = None;
+    run.terminal_outcome = Some("safe_apply_completed".to_string());
+    run.error = None;
+    run.updated_at = now();
+    save_run(ctx, &run).await?;
+    Ok(Some(run))
+}
+
 pub async fn cancel(
     ctx: CoordinatorContext,
     run_id: String,
@@ -2975,6 +3022,18 @@ mod tests {
         assert_eq!(
             pipeline_contract::owner_decision_for_option(None, "pivot"),
             Ok(OwnerDecisionKind::PivotRun)
+        );
+    }
+
+    #[test]
+    fn verified_candidate_is_not_a_completed_product_run() {
+        assert_ne!(
+            CoordinatorStatus::WaitingForOwner,
+            CoordinatorStatus::Completed
+        );
+        assert_eq!(
+            Some(OwnerDecisionKind::ApproveApply),
+            Some(OwnerDecisionKind::ApproveApply)
         );
     }
 
