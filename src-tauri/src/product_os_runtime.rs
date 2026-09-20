@@ -11,7 +11,8 @@ use crate::evidence_gates::{
 };
 use crate::execution_profiles::ExecutionProfile;
 use crate::pipeline_contract::{
-    ArchitectureCompetitionMode, ExperimentContract, ResolvedInputManifest,
+    ArchitectureCompetitionMode, ExperimentContract, ExperimentDisposition, ExperimentOperation,
+    ResolvedInputManifest,
 };
 use crate::product_os::{
     self, AuthorityAmbiguityRecord, ProductAuthorityRecords, ProductResearchCategory,
@@ -1337,9 +1338,171 @@ pub async fn run_product_github_risk_spike(
     .await
 }
 
-/// Execute the bounded deterministic validation protocol selected by Arena.
-/// Repository hygiene (`git diff --check`) is deliberately not evidence here;
-/// this path executes the project check that the experiment contract names.
+#[derive(Debug, Clone)]
+struct ExperimentObservation {
+    disposition: ExperimentDisposition,
+    source_reference: String,
+    summary: String,
+}
+
+async fn execute_experiment_operation(
+    repository: &std::path::Path,
+    contract: &ExperimentContract,
+) -> ExperimentObservation {
+    let description = contract.operation.description();
+    match &contract.operation {
+        ExperimentOperation::CargoCheckLocked => {
+            let result = crate::dsh_worker::run_contained_command(
+                std::path::Path::new("cargo"),
+                &[
+                    std::ffi::OsString::from("check"),
+                    std::ffi::OsString::from("--locked"),
+                ],
+                repository,
+                Duration::from_secs(contract.timeout_seconds),
+            )
+            .await;
+            match result {
+                Ok(value) if value.timed_out => ExperimentObservation {
+                    disposition: ExperimentDisposition::Inconclusive,
+                    source_reference: description,
+                    summary: "cargo check --locked timed out before a valid observation".to_string(),
+                },
+                Ok(value) if value.exit_code == Some(0) => ExperimentObservation {
+                    disposition: ExperimentDisposition::Pass,
+                    source_reference: description,
+                    summary: "cargo check --locked exited successfully".to_string(),
+                },
+                Ok(value) => ExperimentObservation {
+                    disposition: ExperimentDisposition::Fail,
+                    source_reference: description,
+                    summary: format!(
+                        "cargo check --locked exited with {:?}",
+                        value.exit_code
+                    ),
+                },
+                Err(_) => ExperimentObservation {
+                    disposition: ExperimentDisposition::Inconclusive,
+                    source_reference: description,
+                    summary: "cargo check --locked could not produce a valid observation"
+                        .to_string(),
+                },
+            }
+        }
+        ExperimentOperation::FrontendBuild => {
+            let result = crate::dsh_worker::run_contained_command(
+                std::path::Path::new("npm"),
+                &[
+                    std::ffi::OsString::from("run"),
+                    std::ffi::OsString::from("build"),
+                ],
+                repository,
+                Duration::from_secs(contract.timeout_seconds),
+            )
+            .await;
+            match result {
+                Ok(value) if value.timed_out => ExperimentObservation {
+                    disposition: ExperimentDisposition::Inconclusive,
+                    source_reference: description,
+                    summary: "npm run build timed out before a valid observation".to_string(),
+                },
+                Ok(value) if value.exit_code == Some(0) => ExperimentObservation {
+                    disposition: ExperimentDisposition::Pass,
+                    source_reference: description,
+                    summary: "npm run build exited successfully".to_string(),
+                },
+                Ok(value) => ExperimentObservation {
+                    disposition: ExperimentDisposition::Fail,
+                    source_reference: description,
+                    summary: format!("npm run build exited with {:?}", value.exit_code),
+                },
+                Err(_) => ExperimentObservation {
+                    disposition: ExperimentDisposition::Inconclusive,
+                    source_reference: description,
+                    summary: "npm run build could not produce a valid observation".to_string(),
+                },
+            }
+        }
+        ExperimentOperation::GitHubRepositoryMetadata { url } => {
+            match tokio::time::timeout(
+                Duration::from_secs(contract.timeout_seconds),
+                retrieve_github_metadata(url),
+            )
+            .await
+            {
+                Ok(Ok(observation)) => ExperimentObservation {
+                    disposition: ExperimentDisposition::Pass,
+                    source_reference: observation.url,
+                    summary: format!(
+                        "official GitHub metadata observed repository {} with default branch {}",
+                        observation.repository, observation.default_branch
+                    ),
+                },
+                Ok(Err(error)) if error.contains("HTTP 404") => ExperimentObservation {
+                    disposition: ExperimentDisposition::Fail,
+                    source_reference: description,
+                    summary: "GitHub metadata probe returned HTTP 404".to_string(),
+                },
+                Ok(Err(_)) | Err(_) => ExperimentObservation {
+                    disposition: ExperimentDisposition::Inconclusive,
+                    source_reference: description,
+                    summary: "GitHub metadata probe could not produce a valid bounded observation"
+                        .to_string(),
+                },
+            }
+        }
+        ExperimentOperation::FileContains {
+            relative_path,
+            needle,
+        } => {
+            let path = repository.join(relative_path);
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_SOURCE_BYTES as u64 => {
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) if content.contains(needle) => ExperimentObservation {
+                            disposition: ExperimentDisposition::Pass,
+                            source_reference: relative_path.clone(),
+                            summary: format!(
+                                "bounded file probe found the expected marker in {relative_path}"
+                            ),
+                        },
+                        Ok(_) => ExperimentObservation {
+                            disposition: ExperimentDisposition::Fail,
+                            source_reference: relative_path.clone(),
+                            summary: format!(
+                                "bounded file probe did not find the expected marker in {relative_path}"
+                            ),
+                        },
+                        Err(_) => ExperimentObservation {
+                            disposition: ExperimentDisposition::Inconclusive,
+                            source_reference: relative_path.clone(),
+                            summary: "bounded file probe could not read the selected file".to_string(),
+                        },
+                    }
+                }
+                Ok(_) => ExperimentObservation {
+                    disposition: ExperimentDisposition::Inconclusive,
+                    source_reference: relative_path.clone(),
+                    summary: "bounded file probe rejected a non-file or oversized input".to_string(),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => ExperimentObservation {
+                    disposition: ExperimentDisposition::Fail,
+                    source_reference: relative_path.clone(),
+                    summary: "bounded file probe did not find the selected file".to_string(),
+                },
+                Err(_) => ExperimentObservation {
+                    disposition: ExperimentDisposition::Inconclusive,
+                    source_reference: relative_path.clone(),
+                    summary: "bounded file probe could not inspect the selected file".to_string(),
+                },
+            }
+        }
+    }
+}
+
+/// Execute exactly the typed, Arena-owned experiment operation frozen in the
+/// ExperimentContract. The model never supplies shell text and evidence always
+/// records the operation that actually ran.
 pub async fn run_product_feasibility_spike(
     db: Arc<Mutex<TranscriptStore>>,
     runtime: Arc<SessionRuntime>,
@@ -1381,10 +1544,13 @@ pub async fn run_product_feasibility_spike(
     };
     let db_for_task = db.clone();
     let id_for_task = work_order_id.clone();
+    let operation_description = contract.operation.description();
     let result = execute_owned(runtime, work_order_id, move |generation| {
         let db = db_for_task.clone();
         let id = id_for_task.clone();
         let repository = repository.clone();
+        let contract = contract.clone();
+        let operation_description = operation_description.clone();
         async move {
             db_helpers::run_blocking({
                 let db = db.clone();
@@ -1408,29 +1574,8 @@ pub async fn run_product_feasibility_spike(
             })
             .await
             .map_err(db_error)?;
-            let execution = crate::dsh_worker::run_contained_command(
-                std::path::Path::new("cargo"),
-                &[
-                    std::ffi::OsString::from("check"),
-                    std::ffi::OsString::from("--locked"),
-                ],
-                &repository,
-                Duration::from_secs(180),
-            )
-            .await;
-            let execution = match execution {
-                Ok(value) if !value.timed_out && value.exit_code == Some(0) => value,
-                Ok(_) => {
-                    let error = "bounded feasibility check failed".to_string();
-                    mark_failed(db, &id, generation, &error).await;
-                    return Err(error);
-                }
-                Err(error) => {
-                    mark_failed(db, &id, generation, &error).await;
-                    return Err(error);
-                }
-            };
-            let _ = execution;
+
+            let observation = execute_experiment_operation(&repository, &contract).await;
             db_helpers::run_blocking(move || {
                 let mut store = db.lock().map_err(|_| {
                     AgentError::DatabaseError("transcript store lock poisoned".to_string())
@@ -1448,34 +1593,61 @@ pub async fn run_product_feasibility_spike(
                 let mut records = load_records(&store, &order.project_id)
                     .map_err(AgentError::DatabaseError)?;
                 let evidence_id = format!("{}:feasibility", order.work_order_id);
+                let verification = match observation.disposition {
+                    ExperimentDisposition::Pass => EvidenceVerification::IndependentlyVerified,
+                    ExperimentDisposition::Fail => EvidenceVerification::Contradicted,
+                    ExperimentDisposition::Inconclusive => EvidenceVerification::Unresolved,
+                };
                 records.evidence.push(EvidenceItem {
                     evidence_id: evidence_id.clone(),
-                    claim: "The accepted repository passes its bounded deterministic validation check without source mutation.".to_string(),
-                    source_reference: "cargo check --locked".to_string(),
+                    claim: contract.assumption.clone(),
+                    source_reference: observation.source_reference.clone(),
                     captured_at: Utc::now().to_rfc3339(),
-                    summary: "A real bounded feasibility command completed successfully.".to_string(),
+                    summary: format!(
+                        "Experiment {:?}. Expected: {}. Observed: {}. PASS={} FAIL={} INCONCLUSIVE={}",
+                        observation.disposition,
+                        contract.expected_observation,
+                        observation.summary,
+                        contract.pass_condition,
+                        contract.fail_condition,
+                        contract.inconclusive_condition
+                    ),
                     provenance: EvidenceProvenance::RuntimeProven,
                     current: true,
                     origin: Some(EvidenceOrigin::Verifier),
-                    verification: Some(EvidenceVerification::IndependentlyVerified),
+                    verification: Some(verification),
                     kind: Some(EvidenceKind::RiskExperiment),
                     source: Some(EvidenceSource {
-                        reference: "cargo check --locked".to_string(),
-                        url: None,
-                        title: Some("Bounded local validation check".to_string()),
+                        reference: observation.source_reference.clone(),
+                        url: match &contract.operation {
+                            ExperimentOperation::GitHubRepositoryMetadata { url } => {
+                                Some(url.clone())
+                            }
+                            _ => None,
+                        },
+                        title: Some("Arena bounded ExperimentContract execution".to_string()),
                         checked_at: Utc::now().to_rfc3339(),
-                        version_or_scope: "current repository worktree".to_string(),
+                        version_or_scope: format!(
+                            "executor={:?}; operation={operation_description}; environment={}",
+                            contract.executor_kind, contract.environment
+                        ),
                     }),
                     verifier_work_order_id: Some(order.work_order_id.clone()),
                     contradiction_ids: Vec::new(),
                     decision_impact: true,
-                    revisit_trigger: Some("re-run when repository tooling or candidate boundary changes".to_string()),
+                    revisit_trigger: Some(
+                        "re-run when the assumption, environment, or selected operation changes"
+                            .to_string(),
+                    ),
                     decision_question: None,
                 });
                 records.project_revision = records.project_revision.saturating_add(1);
                 order.status = ProductWorkOrderStatus::Completed;
                 order.evidence_id = Some(evidence_id.clone());
-                order.result_ref = Some("cargo check --locked".to_string());
+                order.result_ref = Some(format!(
+                    "{:?}:{}",
+                    observation.disposition, observation.source_reference
+                ));
                 order.updated_at = now();
                 persist_records_and_order(&mut store, &records, &order)
                     .map_err(AgentError::DatabaseError)?;
