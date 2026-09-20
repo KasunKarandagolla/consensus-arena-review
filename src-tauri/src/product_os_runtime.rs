@@ -611,6 +611,7 @@ fn new_work_order(
         source_ref,
         research_mode,
         research_category,
+        research_channel: None,
         created_at: timestamp,
         updated_at: timestamp,
     }
