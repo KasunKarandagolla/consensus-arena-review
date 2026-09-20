@@ -358,6 +358,23 @@ pub fn adopt_product_direction(
     if selected_option.trim() != "narrow_build" {
         return Err("Build Package admission requires the owner option narrow_build".to_string());
     }
+    if records.route == ProductRoute::NewProduct {
+        let fresh_owner_authorization = records.owner_decisions.iter().rev().any(|decision| {
+            decision.authority == DecisionAuthority::Owner
+                && decision.status == DecisionStatus::Adopted
+                && matches!(
+                    decision.selected_option.as_str(),
+                    "narrow_build" | "authorize_narrow_build"
+                )
+                && decision.revision.saturating_add(1) == records.project_revision
+        });
+        if !fresh_owner_authorization {
+            return Err(
+                "NewProduct NarrowBuild requires a fresh explicit owner decision before product-direction adoption"
+                    .to_string(),
+            );
+        }
+    }
     let decision_id = format!(
         "product-direction:{}:{}",
         records.project_id, records.project_revision
@@ -1309,6 +1326,35 @@ mod tests {
 
         records.architecture.proposal_a_evidence_id.clear();
         assert!(assemble_build_package(&records).is_err());
+    }
+
+    #[test]
+    fn greenfield_direction_cannot_be_minted_without_fresh_owner_authority() {
+        let mut records = records();
+        records.decision_outcome = None;
+        records.product_direction_decision_id = None;
+        records.owner_decisions.clear();
+        assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_err());
+
+        records.owner_decisions.push(OwnerDecisionRecord {
+            decision_id: "explicit-owner".to_string(),
+            question_id: "question".to_string(),
+            selected_option: "narrow_build".to_string(),
+            revision: records.project_revision.saturating_sub(1),
+            status: DecisionStatus::Adopted,
+            authority: DecisionAuthority::Owner,
+        });
+        assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_ok());
+    }
+
+    #[test]
+    fn existing_change_can_use_initial_founder_mandate_without_redundant_question() {
+        let mut records = records();
+        records.route = ProductRoute::ExistingFeature;
+        records.decision_outcome = None;
+        records.product_direction_decision_id = None;
+        records.owner_decisions.clear();
+        assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_ok());
     }
 
     #[test]
