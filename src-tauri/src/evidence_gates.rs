@@ -210,6 +210,10 @@ pub struct GateInput {
     pub next_irreversible_commitment: Option<String>,
     pub reviewer_restatement: Option<ReviewerRestatement>,
     pub decision_outcome: Option<DecisionOutcome>,
+    /// Greenfield routes require independently verified problem/positioning
+    /// research. ExistingFeature/Incident deliberately omit that ceremony.
+    pub research_required: bool,
+    pub research_omission_reason: Option<String>,
     pub owner_decision_required: bool,
     pub owner_decision_recorded: bool,
     pub reuse_scan_complete: bool,
@@ -380,6 +384,29 @@ pub fn evaluate(input: &GateInput) -> GateDecision {
             ),
         },
         GateId::ProblemResearch | GateId::Positioning => {
+            if !input.research_required {
+                return if input.decision_outcome.is_some()
+                    && input
+                        .research_omission_reason
+                        .as_deref()
+                        .is_some_and(|reason| !reason.trim().is_empty())
+                {
+                    decision(
+                        input,
+                        GateStatus::Pass,
+                        format!(
+                            "research gate explicitly omitted for this route: {}",
+                            input.research_omission_reason.as_deref().unwrap_or_default()
+                        ),
+                    )
+                } else {
+                    decision(
+                        input,
+                        GateStatus::Blocked,
+                        "research omission is missing route justification or next decision",
+                    )
+                };
+            }
             let research = input
                 .evidence
                 .iter()
@@ -606,6 +633,8 @@ mod tests {
             next_irreversible_commitment: Some("commitment-1".to_string()),
             reviewer_restatement: None,
             decision_outcome: Some(DecisionOutcome::NarrowBuild),
+            research_required: true,
+            research_omission_reason: None,
             owner_decision_required: false,
             owner_decision_recorded: false,
             reuse_scan_complete: true,
@@ -699,6 +728,18 @@ mod tests {
             success_condition: "condition".to_string(),
             invented_behaviors: vec!["unsupported feature".to_string()],
         });
+        assert_eq!(evaluate(&input).status, GateStatus::Blocked);
+    }
+
+    #[test]
+    fn non_greenfield_research_gate_requires_explicit_omission_reason() {
+        let mut input = base(GateId::ProblemResearch);
+        input.evidence.clear();
+        input.research_required = false;
+        input.research_omission_reason =
+            Some("incident begins with reproduction and diagnosis".to_string());
+        assert_eq!(evaluate(&input).status, GateStatus::Pass);
+        input.research_omission_reason = None;
         assert_eq!(evaluate(&input).status, GateStatus::Blocked);
     }
 
