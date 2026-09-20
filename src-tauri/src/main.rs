@@ -131,6 +131,8 @@ fn main() {
                 );
             }
             let consultation_db = app_state.transcript_store.clone();
+            let product_db = app_state.transcript_store.clone();
+            let product_runtime = app_state.session_runtime.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) =
                     crate::consultation_runtime::reconcile_after_restart(consultation_db).await
@@ -138,6 +140,20 @@ fn main() {
                     tracing::warn!(
                         error = %error,
                         "consultation restart reconciliation did not complete"
+                    );
+                }
+            });
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) =
+                    crate::product_os_coordinator::reconcile_latest_after_restart(
+                        product_db,
+                        product_runtime,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "Product OS restart reconciliation did not complete"
                     );
                 }
             });
