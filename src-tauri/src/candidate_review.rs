@@ -35,6 +35,44 @@ impl ReviewLens {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewLensStatus {
+    Complete,
+    Unavailable,
+    Failed,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewLensState {
+    pub reviewer_type: ReviewLens,
+    pub status: ReviewLensStatus,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffCoverageStatus {
+    Included,
+    Excerpted,
+    Omitted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateDiffFile {
+    pub path: String,
+    pub status: DiffCoverageStatus,
+    pub excerpt_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateDiffManifest {
+    pub files: Vec<CandidateDiffFile>,
+    pub total_changed_files: usize,
+    pub omitted_files: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingDisposition {
@@ -91,6 +129,8 @@ pub struct CandidateReviewSummary {
     pub acceptance_commit: String,
     pub receipts: Vec<SemanticReviewReceipt>,
     pub deduplicated_findings: Vec<SemanticReviewFinding>,
+    pub lens_states: Vec<ReviewLensState>,
+    pub diff_manifest: CandidateDiffManifest,
     pub review_error: Option<String>,
 }
 
@@ -99,6 +139,7 @@ pub struct CandidateReviewContext {
     pub candidate_sha: String,
     pub acceptance_commit: String,
     pub diff: String,
+    pub diff_manifest: CandidateDiffManifest,
     pub acceptance_summary: String,
     pub repo_intel: Option<String>,
 }
@@ -109,6 +150,10 @@ impl CandidateReviewContext {
             .repo_intel
             .as_deref()
             .unwrap_or("No repo-intelligence slice was available; use only the bounded diff.");
+        let manifest = match serde_json::to_string(&self.diff_manifest) {
+            Ok(value) => value,
+            Err(_) => "{\"error\":\"diff manifest unavailable\"}".to_string(),
+        };
         format!(
             "Review exact candidate SHA {candidate} against acceptance commit {acceptance}.\n\n\
 You are the {lens} reviewer. This is advisory analysis only. You cannot mark the candidate\n\
@@ -116,12 +161,14 @@ Verified, PASS, accepted, or ready to Apply, and you cannot change files. Return
 JSON object with this shape: {{\"findings\":[{{\"finding_id\":\"stable-id\",\"severity\":\"low|medium|high|critical\",\"confidence\":\"low|medium|high\",\"file\":\"path or null\",\"line\":0,\"finding\":\"...\",\"evidence\":\"...\",\"recommended_disposition\":\"blocking_repair|nonblocking_warning|false_unsupported|already_covered\"}}]}}.\n\
 Use an empty array when no material issue is supported by the supplied evidence.\n\n\
 Frozen acceptance summary:\n{summary}\n\n\
+Changed-file coverage manifest (omissions are explicit and must not be inferred as reviewed):\n{manifest}\n\n\
 Bounded repository-intelligence slice:\n{repo_intel}\n\n\
-Bounded candidate diff:\n{diff}",
+Bounded per-file candidate excerpts:\n{diff}",
             candidate = self.candidate_sha,
             acceptance = self.acceptance_commit,
             lens = lens.as_str(),
             summary = self.acceptance_summary,
+            manifest = manifest,
             repo_intel = repo_intel,
             diff = self.diff,
         )
@@ -293,6 +340,15 @@ mod tests {
             candidate_sha: "candidate".to_string(),
             acceptance_commit: "acceptance".to_string(),
             diff: "bounded diff".to_string(),
+            diff_manifest: CandidateDiffManifest {
+                files: vec![CandidateDiffFile {
+                    path: "src/lib.rs".to_string(),
+                    status: DiffCoverageStatus::Included,
+                    excerpt_bytes: 12,
+                }],
+                total_changed_files: 1,
+                omitted_files: 0,
+            },
             acceptance_summary: "frozen check".to_string(),
             repo_intel: None,
         };
@@ -300,6 +356,30 @@ mod tests {
         assert!(prompt.contains("candidate"));
         assert!(prompt.contains("frozen check"));
         assert!(prompt.contains("advisory analysis only"));
+        assert!(prompt.contains("changed-file coverage manifest") || prompt.contains("Changed-file coverage manifest"));
+        assert!(prompt.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn manifest_makes_omitted_files_explicit() {
+        let manifest = CandidateDiffManifest {
+            files: vec![
+                CandidateDiffFile {
+                    path: "src/large.rs".to_string(),
+                    status: DiffCoverageStatus::Omitted,
+                    excerpt_bytes: 0,
+                },
+                CandidateDiffFile {
+                    path: "src/small.rs".to_string(),
+                    status: DiffCoverageStatus::Included,
+                    excerpt_bytes: 40,
+                },
+            ],
+            total_changed_files: 2,
+            omitted_files: 1,
+        };
+        assert_eq!(manifest.omitted_files, 1);
+        assert_eq!(manifest.files[0].status, DiffCoverageStatus::Omitted);
     }
 
     #[test]
