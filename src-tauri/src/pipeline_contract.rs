@@ -542,7 +542,7 @@ impl ExperimentContract {
         }
         match &self.operation {
             ExperimentOperation::GitHubRepositoryMetadata { url } => {
-                let parsed = url::Url::parse(url)
+                let parsed = reqwest::Url::parse(url)
                     .map_err(|_| "GitHub metadata experiment URL is invalid".to_string())?;
                 if parsed.scheme() != "https"
                     || parsed.host_str() != Some("api.github.com")
