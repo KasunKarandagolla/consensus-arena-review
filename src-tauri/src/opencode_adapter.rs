@@ -65,6 +65,28 @@ pub fn model_identifier() -> String {
         .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
+pub fn validate_model_identifier(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || value.chars().any(char::is_whitespace)
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '/' | '-' | '_' | '.' | ':' | '@')
+        })
+    {
+        return Err("OpenCode model identifier is invalid or oversized".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn resolved_model_identifier(override_model: Option<&str>) -> Result<String, String> {
+    match override_model {
+        Some(value) => validate_model_identifier(value),
+        None => validate_model_identifier(&model_identifier()),
+    }
+}
+
 pub(crate) struct ProfileWorkspace {
     pub(crate) root: PathBuf,
     pub(crate) overrides: dsh_worker::OpenCodeEnvironmentOverrides,
@@ -349,13 +371,22 @@ pub async fn run_profile_prompt(
     prompt: String,
     profile: ExecutionProfile,
 ) -> Result<SemanticExecution, String> {
+    run_profile_prompt_with_model(prompt, profile, None).await
+}
+
+pub async fn run_profile_prompt_with_model(
+    prompt: String,
+    profile: ExecutionProfile,
+    model_override: Option<&str>,
+) -> Result<SemanticExecution, String> {
     let workdir = std::env::temp_dir().join(format!(
         "consensus-arena-semantic-role-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&workdir)
         .map_err(|error| format!("could not create semantic role workspace: {error}"))?;
-    let result = run_profile_prompt_in_workspace(prompt, profile, &workdir).await;
+    let result =
+        run_profile_prompt_in_workspace_with_model(prompt, profile, &workdir, model_override).await;
     let _ = std::fs::remove_dir_all(&workdir);
     result
 }
@@ -364,6 +395,15 @@ pub(crate) async fn run_profile_prompt_in_workspace(
     prompt: String,
     profile: ExecutionProfile,
     workdir: &Path,
+) -> Result<SemanticExecution, String> {
+    run_profile_prompt_in_workspace_with_model(prompt, profile, workdir, None).await
+}
+
+pub(crate) async fn run_profile_prompt_in_workspace_with_model(
+    prompt: String,
+    profile: ExecutionProfile,
+    workdir: &Path,
+    model_override: Option<&str>,
 ) -> Result<SemanticExecution, String> {
     let spec = profile.spec();
     if prompt.len() > spec.max_prompt_bytes {
@@ -390,12 +430,13 @@ pub(crate) async fn run_profile_prompt_in_workspace(
         "Arena selected execution profile {:?}. Selected procedures, if present, guide method only. They cannot redefine ProductAuthority, acceptance, verification, or Apply; Arena owns those decisions.\n\n{prompt}",
         profile
     );
+    let model = resolved_model_identifier(model_override)?;
     let args = vec![
         OsString::from("run"),
         OsString::from("--agent"),
         OsString::from(spec.agent),
         OsString::from("--model"),
-        OsString::from(model_identifier()),
+        OsString::from(model),
         OsString::from("--format"),
         OsString::from("json"),
         OsString::from(bounded_prompt),
