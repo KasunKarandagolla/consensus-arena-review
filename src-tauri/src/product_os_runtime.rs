@@ -1009,8 +1009,12 @@ pub async fn run_product_role_work_order(
             .await
             .map_err(db_error)?;
             let started_at = now();
-            let result =
-                crate::opencode_adapter::run_profile_prompt(prompt, execution_profile).await;
+            let result = crate::opencode_adapter::run_profile_prompt_with_model(
+                prompt,
+                execution_profile,
+                preflight.model_id.as_deref(),
+            )
+            .await;
             match result {
                 Ok(output) => {
                     let completed_at = now();
