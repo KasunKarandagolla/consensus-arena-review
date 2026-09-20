@@ -935,6 +935,32 @@ pub async fn answer_product_question(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn request_product_consultation(
+    run_id: String,
+    provider: String,
+    question: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let provider = product_os_safe_text(provider, state.inner()).await?;
+    let question = product_os_safe_text(question, state.inner()).await?;
+    let provider = match provider.trim().to_ascii_lowercase().as_str() {
+        "chatgpt" | "chat_gpt" => crate::consultation_broker::ConsultationProvider::ChatGpt,
+        "qwen" => crate::consultation_broker::ConsultationProvider::Qwen,
+        _ => return Err("M09C consultation currently supports only ChatGPT and Qwen".to_string()),
+    };
+    let run = crate::product_os_coordinator::request_consultation(
+        product_coordinator_context(state.inner(), Some(app)),
+        run_id,
+        provider,
+        question,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn cancel_product_project(
     run_id: String,
     reason: String,
