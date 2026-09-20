@@ -110,9 +110,24 @@ pub fn select_route(intent: &str) -> ProductRoute {
     {
         ProductRoute::Incident
     } else if existing_context
-        && ["existing feature", "add ", "modify", "extend", "implement"]
-            .iter()
-            .any(|marker| lower.contains(marker))
+        && [
+            "existing feature",
+            "add ",
+            "modify",
+            "extend",
+            "implement",
+            "change ",
+            "update ",
+            "improve ",
+            "enable ",
+            "support ",
+            "remove ",
+            "replace ",
+            "want ",
+            "need ",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
     {
         ProductRoute::ExistingFeature
     } else {
@@ -757,6 +772,14 @@ mod tests {
         assert_eq!(
             select_route("Add CSV export to this existing repo"),
             ProductRoute::ExistingFeature
+        );
+        assert_eq!(
+            select_route("I want dark mode in my current app"),
+            ProductRoute::ExistingFeature
+        );
+        assert_eq!(
+            select_route("Build a new product that integrates with an existing app"),
+            ProductRoute::NewProduct
         );
     }
 
