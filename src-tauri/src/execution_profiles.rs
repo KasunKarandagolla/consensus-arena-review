@@ -169,7 +169,8 @@ impl ExecutionProfile {
             ProductWorkOrderRole::Researcher | ProductWorkOrderRole::FactVerifier => {
                 Self::WebResearch
             }
-            ProductWorkOrderRole::ProductDirector
+            ProductWorkOrderRole::ResearchLead
+            | ProductWorkOrderRole::ProductDirector
             | ProductWorkOrderRole::ArchitectA
             | ProductWorkOrderRole::ArchitectB
             | ProductWorkOrderRole::ChiefEngineer
