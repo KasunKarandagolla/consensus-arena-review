@@ -82,6 +82,14 @@ pub struct ProductCoordinatorRun {
     pub remediation_question: Option<String>,
     #[serde(default)]
     pub last_remediation: Option<GateRemediation>,
+    /// Durable owner guidance is separate from model reasoning. Every
+    /// interruption/guidance event is retained and can force re-planning.
+    #[serde(default)]
+    pub owner_directives: Vec<crate::work_graph::OwnerDirective>,
+    /// Research is a dynamic campaign that may dominate the project duration
+    /// and may be re-entered from later phases.
+    #[serde(default)]
+    pub research_mandates: Vec<crate::work_graph::ResearchMandate>,
     pub research_work_order_ids: Vec<String>,
     pub verifier_work_order_ids: Vec<String>,
     pub verified_evidence_ids: Vec<String>,
@@ -2386,6 +2394,24 @@ pub async fn start(
         remediation_counts: BTreeMap::new(),
         remediation_question: None,
         last_remediation: None,
+        owner_directives: {
+            let directive = crate::work_graph::owner_directive_from_text(
+                &founder_idea,
+                1,
+                timestamp,
+            )?;
+            vec![directive]
+        },
+        research_mandates: {
+            let directive = crate::work_graph::owner_directive_from_text(
+                &founder_idea,
+                1,
+                timestamp,
+            )?;
+            crate::work_graph::research_mandate_for(&directive)
+                .into_iter()
+                .collect()
+        },
         research_work_order_ids: Vec::new(),
         verifier_work_order_ids: Vec::new(),
         verified_evidence_ids: Vec::new(),
@@ -3165,6 +3191,8 @@ mod tests {
             remediation_counts: BTreeMap::new(),
             remediation_question: None,
             last_remediation: None,
+            owner_directives: Vec::new(),
+            research_mandates: Vec::new(),
             research_work_order_ids: vec!["research-1".to_string()],
             verifier_work_order_ids: vec!["verifier-1".to_string()],
             verified_evidence_ids: vec!["evidence-1".to_string()],
