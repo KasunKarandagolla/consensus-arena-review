@@ -169,7 +169,11 @@ export default function DeliveryView() {
                             ? 'authorize_validation_experiment'
                             : coordinator.pending_owner_decision === 'authorize_build'
                               ? 'authorize_build'
-                              : 'authorize_narrow_build',
+                              : ['stop_run', 'pivot_run', 'continue_evaluation'].includes(
+                                    coordinator.pending_owner_decision ?? '',
+                                  )
+                                ? 'continue_evaluation'
+                                : 'authorize_narrow_build',
                         )
                       }
                     >
@@ -177,7 +181,11 @@ export default function DeliveryView() {
                         ? 'Run bounded validation experiment'
                         : coordinator.pending_owner_decision === 'authorize_build'
                           ? 'Continue after owner decision'
-                          : 'Proceed with bounded build'}
+                          : ['stop_run', 'pivot_run', 'continue_evaluation'].includes(
+                                coordinator.pending_owner_decision ?? '',
+                              )
+                            ? 'Continue evaluation'
+                            : 'Proceed with bounded build'}
                     </button>
                     <button className="sv-btn" onClick={() => void answerOwner('stop')}>
                       Stop
