@@ -313,7 +313,7 @@ fn decision_options(kind: Option<OwnerDecisionKind>) -> Vec<String> {
         // Safe Apply is intentionally a separate protected action surface.
         // The functional contract exposes it through ApplyState, never as a
         // generic owner-question option.
-        Some(OwnerDecisionKind::ApproveApply) => Vec::new()
+        Some(OwnerDecisionKind::ApproveApply) => Vec::new(),
         Some(OwnerDecisionKind::ApproveRelease) => {
             vec!["approve_release".to_string(), "stop".to_string()]
         }
