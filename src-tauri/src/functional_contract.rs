@@ -625,12 +625,7 @@ pub async fn load_functional_state(
                 .transpose()?,
             None => None,
         };
-        let mut consultations = Vec::new();
-        for request_id in &run.consultation_request_ids {
-            if let Some(order) = store.get_consultation_work_order(request_id)? {
-                consultations.push(order);
-            }
-        }
+        let consultations = store.list_project_consultation_work_orders(&run.project_id)?;
         let mut tool_receipts = Vec::new();
         for order in &work_orders {
             tool_receipts.extend(store.list_tool_use_receipts(&order.work_order_id)?);
