@@ -155,10 +155,23 @@ export default function DeliveryView() {
                     item => item.ambiguity_id === coordinator.owner_ambiguity_id,
                   )?.question || 'Arena needs your product direction.'}
                   <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                    <button className="btn-p" onClick={() => void answerOwner(coordinator.product_review_outcome === 'validation_experiment' ? 'authorize_validation_experiment' : 'authorize_narrow_build')}>
-                      {coordinator.product_review_outcome === 'validation_experiment'
+                    <button
+                      className="btn-p"
+                      onClick={() =>
+                        void answerOwner(
+                          coordinator.pending_owner_decision === 'authorize_validation_experiment'
+                            ? 'authorize_validation_experiment'
+                            : coordinator.pending_owner_decision === 'authorize_build'
+                              ? 'authorize_build'
+                              : 'authorize_narrow_build',
+                        )
+                      }
+                    >
+                      {coordinator.pending_owner_decision === 'authorize_validation_experiment'
                         ? 'Run bounded validation experiment'
-                        : 'Proceed with bounded build'}
+                        : coordinator.pending_owner_decision === 'authorize_build'
+                          ? 'Continue after owner decision'
+                          : 'Proceed with bounded build'}
                     </button>
                     <button className="sv-btn" onClick={() => void answerOwner('stop')}>
                       Stop
