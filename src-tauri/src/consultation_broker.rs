@@ -576,6 +576,18 @@ pub async fn mark_observing(
     .await
 }
 
+pub async fn mark_unknown_outcome(
+    db: Arc<Mutex<TranscriptStore>>,
+    request_id: String,
+    diagnostic: String,
+) -> Result<ConsultationWorkOrder, String> {
+    mutate_request(db, request_id, move |order| {
+        order.failure = Some(diagnostic.chars().take(512).collect());
+        order.transition(ConsultationTransactionState::UnknownOutcome)
+    })
+    .await
+}
+
 pub async fn reconcile_after_restart(
     db: Arc<Mutex<TranscriptStore>>,
 ) -> Result<Vec<ConsultationWorkOrder>, String> {
