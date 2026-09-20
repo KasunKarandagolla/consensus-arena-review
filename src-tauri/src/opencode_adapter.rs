@@ -1,5 +1,6 @@
 use crate::candidate_review::{
-    self, CandidateReviewContext, CandidateReviewSummary, ReviewLens, SemanticReviewReceipt,
+    self, CandidateDiffFile, CandidateDiffManifest, CandidateReviewContext, CandidateReviewSummary,
+    DiffCoverageStatus, ReviewLens, ReviewLensState, ReviewLensStatus, SemanticReviewReceipt,
 };
 use crate::delivery::{
     DeliveryPhase, DeliveryState, OpenCodeEvidence, OpenCodeTaskState, OpenCodeWorkOrder,
@@ -209,6 +210,7 @@ pub struct OpenCodeExecution {
 #[derive(Debug, Clone)]
 pub struct SemanticExecution {
     pub root_session_id: String,
+    pub tool_names: Vec<String>,
     pub text: String,
 }
 
@@ -289,6 +291,7 @@ fn parse_run_output(output: &str) -> (Option<String>, u32) {
 
 fn parse_semantic_output(output: &str) -> Result<SemanticExecution, String> {
     let mut session_id = None;
+    let mut tool_names = Vec::new();
     let mut text_parts = Vec::new();
     for line in output.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -304,7 +307,14 @@ fn parse_semantic_output(output: &str) -> Result<SemanticExecution, String> {
             continue;
         };
         match part.get("type").and_then(Value::as_str) {
-            Some("tool") => {}
+            Some("tool") => {
+                if let Some(tool) = part.get("tool").and_then(Value::as_str) {
+                    let tool = tool.trim();
+                    if !tool.is_empty() && tool.len() <= 128 {
+                        tool_names.push(tool.to_string());
+                    }
+                }
+            }
             Some("text") => {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
                     text_parts.push(text.to_string());
@@ -320,8 +330,11 @@ fn parse_semantic_output(output: &str) -> Result<SemanticExecution, String> {
         .rev()
         .find(|text| !text.trim().is_empty())
         .ok_or_else(|| "OpenCode role returned no bounded result".to_string())?;
+    tool_names.sort();
+    tool_names.dedup();
     Ok(SemanticExecution {
         root_session_id,
+        tool_names,
         text,
     })
 }
@@ -418,24 +431,88 @@ async fn candidate_review_context(
     acceptance_summary: &str,
     cache_root: &Path,
 ) -> Result<CandidateReviewContext, String> {
-    let diff = git_output(
+    let names = git_output(
         candidate,
         &[
             "diff",
             "--no-ext-diff",
-            "--unified=20",
+            "--name-only",
             acceptance_commit,
             candidate_sha,
         ],
     )
     .await?;
-    if !diff.status.success() {
-        return Err("could not collect the bounded candidate diff".to_string());
+    if !names.status.success() {
+        return Err("could not collect the candidate changed-file manifest".to_string());
     }
-    let diff = String::from_utf8_lossy(&diff.stdout)
-        .chars()
-        .take(candidate_review::MAX_CONTEXT_BYTES)
-        .collect::<String>();
+    let paths = String::from_utf8_lossy(&names.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut remaining = candidate_review::MAX_CONTEXT_BYTES;
+    let mut excerpts = Vec::new();
+    let mut files = Vec::with_capacity(paths.len());
+    for path in &paths {
+        if remaining == 0 {
+            files.push(CandidateDiffFile {
+                path: path.clone(),
+                status: DiffCoverageStatus::Omitted,
+                excerpt_bytes: 0,
+            });
+            continue;
+        }
+        let diff = git_output(
+            candidate,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--unified=12",
+                acceptance_commit,
+                candidate_sha,
+                "--",
+                path.as_str(),
+            ],
+        )
+        .await?;
+        if !diff.status.success() {
+            files.push(CandidateDiffFile {
+                path: path.clone(),
+                status: DiffCoverageStatus::Omitted,
+                excerpt_bytes: 0,
+            });
+            continue;
+        }
+        let raw = String::from_utf8_lossy(&diff.stdout);
+        let per_file_cap = 8 * 1024;
+        let cap = remaining.min(per_file_cap);
+        let excerpt = raw.chars().take(cap).collect::<String>();
+        let excerpt_bytes = excerpt.len();
+        let status = if excerpt_bytes < raw.len() {
+            DiffCoverageStatus::Excerpted
+        } else {
+            DiffCoverageStatus::Included
+        };
+        if excerpt_bytes > 0 {
+            excerpts.push(format!("--- FILE: {path} ---\n{excerpt}"));
+        }
+        remaining = remaining.saturating_sub(excerpt_bytes);
+        files.push(CandidateDiffFile {
+            path: path.clone(),
+            status,
+            excerpt_bytes,
+        });
+    }
+    let omitted_files = files
+        .iter()
+        .filter(|file| file.status == DiffCoverageStatus::Omitted)
+        .count();
+    let diff_manifest = CandidateDiffManifest {
+        total_changed_files: files.len(),
+        omitted_files,
+        files,
+    };
     let repo_intel = crate::repo_intelligence::bounded_slice(
         candidate,
         cache_root,
@@ -447,7 +524,8 @@ async fn candidate_review_context(
     Ok(CandidateReviewContext {
         candidate_sha: candidate_sha.to_string(),
         acceptance_commit: acceptance_commit.to_string(),
-        diff,
+        diff: excerpts.join("\n\n"),
+        diff_manifest,
         acceptance_summary: acceptance_summary
             .chars()
             .take(candidate_review::MAX_CONTEXT_BYTES / 4)
@@ -472,7 +550,8 @@ async fn run_candidate_reviews(
     )
     .await?;
     let mut receipts: Vec<SemanticReviewReceipt> = Vec::new();
-    let mut review_error = None;
+    let mut lens_states = Vec::new();
+    let mut errors = Vec::new();
     for lens in [
         ReviewLens::TestQuality,
         ReviewLens::ErrorHandling,
@@ -490,12 +569,30 @@ async fn run_candidate_reviews(
                 &execution.root_session_id,
                 &execution.text,
             ) {
-                Ok(receipt) => receipts.push(receipt),
-                Err(error) => review_error = Some(error),
+                Ok(receipt) => {
+                    lens_states.push(ReviewLensState {
+                        reviewer_type: lens,
+                        status: ReviewLensStatus::Complete,
+                        detail: None,
+                    });
+                    receipts.push(receipt);
+                }
+                Err(error) => {
+                    errors.push(format!("{}: {error}", lens.as_str()));
+                    lens_states.push(ReviewLensState {
+                        reviewer_type: lens,
+                        status: ReviewLensStatus::Failed,
+                        detail: Some(error),
+                    });
+                }
             },
             Err(error) => {
-                review_error = Some(error);
-                break;
+                errors.push(format!("{}: {error}", lens.as_str()));
+                lens_states.push(ReviewLensState {
+                    reviewer_type: lens,
+                    status: ReviewLensStatus::Unavailable,
+                    detail: Some(error),
+                });
             }
         }
     }
@@ -505,7 +602,13 @@ async fn run_candidate_reviews(
         acceptance_commit: acceptance_commit.to_string(),
         receipts,
         deduplicated_findings,
-        review_error,
+        lens_states,
+        diff_manifest: context.diff_manifest,
+        review_error: if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        },
     })
 }
 
