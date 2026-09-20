@@ -4,7 +4,7 @@ use crate::evidence_gates::{
     GateInput, ReviewerRestatement,
 };
 use crate::pipeline_contract::{
-    ArchitectureCompetitionMode, ArchitectureSynthesis, ResolvedInputManifest,
+    ArchitectureCompetitionMode, ArchitectureSynthesis, ProductRoute, ResolvedInputManifest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -205,6 +205,8 @@ pub struct ProductAuthorityRecords {
     pub project_id: String,
     pub project_revision: u64,
     pub vision_version: u64,
+    #[serde(default)]
+    pub route: ProductRoute,
     pub objective: String,
     pub target_user: String,
     pub requirements: Vec<String>,
@@ -888,6 +890,18 @@ fn input_for_records(
             .map(|ambiguity| ambiguity.affected_commitment.clone()),
         reviewer_restatement: records.reviewer_restatement.clone(),
         decision_outcome: records.decision_outcome,
+        research_required: records.route == ProductRoute::NewProduct,
+        research_omission_reason: match records.route {
+            ProductRoute::NewProduct => None,
+            ProductRoute::ExistingFeature => Some(
+                "existing feature route uses repository/context inspection instead of broad market discovery"
+                    .to_string(),
+            ),
+            ProductRoute::Incident => Some(
+                "incident route begins with reproduction/diagnosis instead of broad market discovery"
+                    .to_string(),
+            ),
+        },
         owner_decision_required,
         owner_decision_recorded: !owner_decision_required,
         reuse_scan_complete: !records.reuse_decisions.is_empty(),
@@ -994,6 +1008,7 @@ mod tests {
             project_id: "project-1".to_string(),
             project_revision: 1,
             vision_version: 1,
+            route: ProductRoute::NewProduct,
             objective: "Make the bounded candidate change".to_string(),
             target_user: "founder".to_string(),
             requirements: vec!["one requirement".to_string()],
