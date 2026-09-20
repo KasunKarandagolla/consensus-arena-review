@@ -1,7 +1,7 @@
 use crate::context_manager::TurnRecord;
 use crate::errors::AgentError;
 use crate::orchestrator::SessionConfig;
-use rusqlite::{Connection, Error as SqliteError, params};
+use rusqlite::{Connection, Error as SqliteError, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
