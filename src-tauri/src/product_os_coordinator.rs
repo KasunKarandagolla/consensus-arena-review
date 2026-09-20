@@ -1585,17 +1585,19 @@ async fn record_if_independently_verified(
     run: &mut ProductCoordinatorRun,
     evidence_id: String,
 ) -> Result<(), String> {
-    let snapshot = product_os_runtime::snapshot(
-        ctx.db.clone(),
-        ctx.runtime.clone(),
-        run.project_id.clone(),
-    )
-    .await?
-    .ok_or_else(|| "Product OS project disappeared while classifying experiment evidence".to_string())?;
+    let snapshot =
+        product_os_runtime::snapshot(ctx.db.clone(), ctx.runtime.clone(), run.project_id.clone())
+            .await?
+            .ok_or_else(|| {
+                "Product OS project disappeared while classifying experiment evidence".to_string()
+            })?;
     if snapshot.records.evidence.iter().any(|item| {
         item.evidence_id == evidence_id
             && item.verification == Some(EvidenceVerification::IndependentlyVerified)
-    }) && !run.verified_evidence_ids.iter().any(|id| id == &evidence_id)
+    }) && !run
+        .verified_evidence_ids
+        .iter()
+        .any(|id| id == &evidence_id)
     {
         run.verified_evidence_ids.push(evidence_id);
     }
