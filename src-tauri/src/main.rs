@@ -169,6 +169,7 @@ fn main() {
             commands::get_product_functional_state,
             commands::answer_product_question,
             commands::request_product_consultation,
+            commands::recover_product_consultation,
             commands::cancel_product_project,
             commands::resume_product_project,
             commands::resume_delivery,
