@@ -2373,7 +2373,10 @@ pub async fn start(
     let timestamp = now();
     let initial_directive =
         crate::work_graph::owner_directive_from_text(&founder_idea, 1, timestamp)?;
-    let initial_mandate = crate::work_graph::research_mandate_for(&initial_directive);
+    let initial_mandate = crate::work_graph::research_mandate_for(&initial_directive).or_else(|| {
+        (route == ProductRoute::NewProduct)
+            .then(|| crate::work_graph::default_new_product_research_mandate(&initial_directive))
+    });
     let initial_phase = match route {
         ProductRoute::Incident => CoordinatorPhase::ReproduceDiagnose,
         ProductRoute::ExistingFeature => CoordinatorPhase::ProductReview,
