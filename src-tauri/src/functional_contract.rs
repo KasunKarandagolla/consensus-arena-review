@@ -581,6 +581,73 @@ pub fn build_functional_state(
     }
 }
 
+pub async fn load_functional_state(
+    db: std::sync::Arc<std::sync::Mutex<crate::transcript_store::TranscriptStore>>,
+    run_id: String,
+) -> Result<ProductFunctionalState, String> {
+    crate::db_helpers::run_blocking(move || {
+        let store = db.lock().map_err(|_| {
+            crate::errors::AgentError::DatabaseError(
+                "functional state store lock poisoned".to_string(),
+            )
+        })?;
+        let run = store
+            .get_product_coordinator_run(&run_id)?
+            .ok_or_else(|| {
+                crate::errors::AgentError::DatabaseError(
+                    "Product OS run is unknown".to_string(),
+                )
+            })?;
+        let raw_records = store
+            .get_product_authority(&run.project_id)?
+            .ok_or_else(|| {
+                crate::errors::AgentError::DatabaseError(
+                    "Product OS authority is missing".to_string(),
+                )
+            })?;
+        let records: ProductAuthorityRecords =
+            serde_json::from_str(&raw_records).map_err(|error| {
+                crate::errors::AgentError::DatabaseError(format!(
+                    "parse Product OS authority for functional state: {error}"
+                ))
+            })?;
+        let work_orders = store.list_product_work_orders(&run.project_id)?;
+        let delivery = match run.delivery_session_id.as_deref() {
+            Some(session_id) => store
+                .get_delivery_state(session_id)?
+                .map(|raw| {
+                    serde_json::from_str::<DeliveryState>(&raw).map_err(|error| {
+                        crate::errors::AgentError::DatabaseError(format!(
+                            "parse Delivery state for functional state: {error}"
+                        ))
+                    })
+                })
+                .transpose()?,
+            None => None,
+        };
+        let mut consultations = Vec::new();
+        for request_id in &run.consultation_request_ids {
+            if let Some(order) = store.get_consultation_work_order(request_id)? {
+                consultations.push(order);
+            }
+        }
+        let mut tool_receipts = Vec::new();
+        for order in &work_orders {
+            tool_receipts.extend(store.list_tool_use_receipts(&order.work_order_id)?);
+        }
+        Ok(build_functional_state(
+            &run,
+            &records,
+            &work_orders,
+            delivery.as_ref(),
+            &consultations,
+            &tool_receipts,
+        ))
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
