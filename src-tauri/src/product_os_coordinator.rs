@@ -101,6 +101,10 @@ pub struct ProductCoordinatorRun {
     pub feasibility_work_order_id: Option<String>,
     #[serde(default)]
     pub pending_experiment: Option<pipeline_contract::ExperimentContract>,
+    #[serde(default)]
+    pub consultation_request_ids: Vec<String>,
+    #[serde(default)]
+    pub consultation_evidence_ids: Vec<String>,
     pub build_package_id: Option<String>,
     pub delivery_session_id: Option<String>,
     pub terminal_outcome: Option<String>,
@@ -1727,6 +1731,8 @@ pub async fn start(
         dissent_work_order_id: None,
         feasibility_work_order_id: None,
         pending_experiment: None,
+        consultation_request_ids: Vec::new(),
+        consultation_evidence_ids: Vec::new(),
         build_package_id: None,
         delivery_session_id: None,
         terminal_outcome: None,
@@ -1764,6 +1770,106 @@ pub async fn status(
     })
     .await
     .map_err(|error| error.to_string())
+}
+
+pub async fn request_consultation(
+    ctx: CoordinatorContext,
+    run_id: String,
+    provider: crate::consultation_broker::ConsultationProvider,
+    question: String,
+) -> Result<ProductCoordinatorRun, String> {
+    let _guard = ctx.coordinator_lock.lock().await;
+    let mut run = load_run(&ctx, &run_id).await?;
+    if question.trim().is_empty() || question.len() > MAX_IDEA_BYTES {
+        return Err("consultation question is empty or oversized".to_string());
+    }
+    if matches!(
+        run.status,
+        CoordinatorStatus::Completed
+            | CoordinatorStatus::Cancelled
+            | CoordinatorStatus::Failed
+            | CoordinatorStatus::Stopped
+            | CoordinatorStatus::Pivoted
+    ) {
+        return Err("terminal Product OS runs cannot start consultation".to_string());
+    }
+    if run.status == CoordinatorStatus::Running
+        && ctx.runtime.current_owner().is_some()
+    {
+        return Err(
+            "Product OS consultation waits until the current owned task reaches a safe boundary"
+                .to_string(),
+        );
+    }
+    let snapshot = product_os_runtime::snapshot(
+        ctx.db.clone(),
+        ctx.runtime.clone(),
+        run.project_id.clone(),
+    )
+    .await?
+    .ok_or_else(|| "Product OS authority snapshot is missing".to_string())?;
+    let decision_id = format!(
+        "owner-consultation:{}:{}",
+        run.run_id,
+        run.consultation_request_ids.len().saturating_add(1)
+    );
+    let data_root = ctx
+        .delivery_state_path
+        .parent()
+        .ok_or_else(|| "Arena data directory is unavailable".to_string())?;
+    let profile_root = data_root.join("consultation-browser-profiles");
+    let outcome = crate::consultation_runtime::execute_owned_external_browser_consultation(
+        ctx.runtime.clone(),
+        ctx.db.clone(),
+        PathBuf::from(&run.repository_path),
+        profile_root,
+        run.project_id.clone(),
+        run.run_id.clone(),
+        decision_id,
+        crate::consultation_broker::ConsultationReason::OwnerRequested,
+        provider,
+        run.execution_epoch.max(1),
+        snapshot.records.project_revision,
+        question,
+        format!(
+            "Product OS project {} revision {}; owner-requested bounded consultation",
+            run.project_id, snapshot.records.project_revision
+        ),
+    )
+    .await?;
+    match outcome {
+        crate::consultation_runtime::ConsultationExecutionOutcome::Complete(result) => {
+            let request_id = result.request_id.clone();
+            let evidence = product_os_runtime::admit_consultation_result(
+                ctx.db.clone(),
+                run.project_id.clone(),
+                result,
+            )
+            .await?;
+            run.consultation_request_ids.push(request_id);
+            run.consultation_evidence_ids.push(evidence.evidence_id);
+            run.error = None;
+        }
+        crate::consultation_runtime::ConsultationExecutionOutcome::UnknownOutcome(order) => {
+            run.consultation_request_ids.push(order.request_id);
+            run.status = CoordinatorStatus::Blocked;
+            run.error = Some(
+                "Consultation send outcome is unknown; Arena will observe/reconcile and will not resend automatically."
+                    .to_string(),
+            );
+        }
+        crate::consultation_runtime::ConsultationExecutionOutcome::PreSendBlocked(order) => {
+            run.consultation_request_ids.push(order.request_id);
+            run.status = CoordinatorStatus::Blocked;
+            run.error = order.failure.or_else(|| {
+                Some("Consultation was blocked before physical submission.".to_string())
+            });
+        }
+    }
+    run.revision = run.revision.saturating_add(1);
+    run.updated_at = now();
+    save_run(&ctx, &run).await?;
+    Ok(run)
 }
 
 pub async fn answer_owner_question(
@@ -2039,6 +2145,8 @@ mod tests {
             dissent_work_order_id: Some("dissent-1".to_string()),
             feasibility_work_order_id: Some("feasibility-1".to_string()),
             pending_experiment: None,
+            consultation_request_ids: vec!["consultation-1".to_string()],
+            consultation_evidence_ids: vec!["consultation-evidence-1".to_string()],
             build_package_id: Some("package-1".to_string()),
             delivery_session_id: Some("delivery-1".to_string()),
             terminal_outcome: None,
