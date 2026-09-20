@@ -991,12 +991,24 @@ pub async fn run_product_role_work_order(
             })
             .await
             .map_err(db_error)?;
+            let started_at = now();
             let result =
                 crate::opencode_adapter::run_profile_prompt(prompt, execution_profile).await;
             match result {
                 Ok(output) => {
+                    let completed_at = now();
                     let root_session_id = output.root_session_id.clone();
                     let root_session_id_for_db = root_session_id.clone();
+                    let tool_names = output.tool_names.clone();
+                    let tool_receipt = crate::quality_workflows::ToolUseReceipt::from_observed_tools(
+                        &id,
+                        &root_session_id,
+                        &format!("{execution_profile:?}"),
+                        &tool_names,
+                        "complete",
+                        started_at,
+                        completed_at,
+                    )?;
                     let db_for_finalize = db.clone();
                     let finalized = db_helpers::run_blocking(move || {
                         let mut store = db_for_finalize.lock().map_err(|_| {
@@ -1016,11 +1028,12 @@ pub async fn run_product_role_work_order(
                         }
                         order.status = ProductWorkOrderStatus::Completed;
                         order.runtime_session_id = Some(root_session_id_for_db.clone());
-                        order.result_ref = Some(
-                            "bounded semantic result retained in memory for Arena admission"
-                                .to_string(),
-                        );
-                        order.updated_at = now();
+                        order.result_ref = Some(format!(
+                            "bounded semantic result retained in memory; observed tool receipt {}",
+                            tool_receipt.receipt_id
+                        ));
+                        order.updated_at = completed_at;
+                        store.save_tool_use_receipt(&tool_receipt)?;
                         store.save_product_work_order(&order)?;
                         Ok(order)
                     })
