@@ -351,6 +351,29 @@ pub fn research_mandate_for(directive: &OwnerDirective) -> Option<ResearchMandat
     mandate.validate().ok().map(|_| mandate)
 }
 
+pub fn default_new_product_research_mandate(
+    directive: &OwnerDirective,
+) -> ResearchMandate {
+    ResearchMandate {
+        mandate_id: format!("research-mandate:{}", uuid::Uuid::new_v4()),
+        directive_id: directive.directive_id.clone(),
+        topic: format!(
+            "Establish decision-critical problem, alternatives, reuse/prior-art, and technical evidence for: {}",
+            directive.text
+        ),
+        channels: vec![ResearchChannel::Web, ResearchChannel::Github],
+        mandatory_channels: Vec::new(),
+        depth: ResearchDepth::Standard,
+        must_complete_before_decision: true,
+        minimum_distinct_sources: 4,
+        max_cycles: 4,
+        status: ResearchMandateStatus::Pending,
+        child_work_order_ids: Vec::new(),
+        evidence_ids: Vec::new(),
+        unavailable_channels: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
