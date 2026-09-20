@@ -19,7 +19,7 @@ mod tests {
         ExperimentContract, ExperimentExecutorKind, ExperimentOperation, GateRemediationOutcome,
         OwnerDecisionKind, ProductRoute, ResourceClass, ResourceScheduler,
         architecture_planning_mode, owner_decision_for_option, route_gate_remediation, route_plan,
-        select_route,
+        select_route, select_route_with_context,
     };
 
     fn now() -> i64 {
@@ -66,6 +66,17 @@ mod tests {
         assert_eq!(
             architecture_planning_mode(route, "new product with uncertain architecture"),
             ArchitecturePlanningMode::CompetingProposals
+        );
+    }
+
+    #[test]
+    fn scenario_a_greenfield_intent_survives_nonempty_scaffold_context() {
+        assert_eq!(
+            select_route_with_context(
+                "Build a new desktop product from scratch for audit evidence review",
+                true,
+            ),
+            ProductRoute::NewProduct
         );
     }
 
@@ -277,6 +288,16 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn fault_apply_authority_requires_the_exact_owner_action() {
+        assert_eq!(
+            owner_decision_for_option(None, "approve_apply"),
+            Ok(OwnerDecisionKind::ApproveApply)
+        );
+        assert!(owner_decision_for_option(None, "apply it").is_err());
+        assert!(owner_decision_for_option(None, "authorize_narrow_build").is_err());
     }
 
     #[test]
