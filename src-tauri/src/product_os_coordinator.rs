@@ -939,7 +939,27 @@ async fn run_dynamic_research_campaigns(
             save_run(ctx, run).await?;
         }
 
-        let mandate = &run.research_mandates[mandate_index];
+        let mandate = run.research_mandates[mandate_index].clone();
+        if mandate.status == crate::work_graph::ResearchMandateStatus::Satisfied {
+            remember_derived_product_event(
+                ctx,
+                run,
+                "investigated",
+                format!(
+                    "Research mandate satisfied: {}; channels={}; admitted evidence={}",
+                    mandate.topic,
+                    mandate
+                        .completed_channels
+                        .iter()
+                        .map(|channel| channel.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    mandate.evidence_ids.len()
+                ),
+                "observed",
+            )
+            .await;
+        }
         if mandate.must_complete_before_decision && !mandate.can_advance() {
             run.status = CoordinatorStatus::Blocked;
             run.error = Some(format!(
@@ -2907,6 +2927,16 @@ pub async fn start(
         updated_at: timestamp,
     };
     save_run(&ctx, &run).await?;
+    if let Some(directive) = run.owner_directives.first() {
+        remember_derived_product_event(
+            &ctx,
+            &run,
+            "user_preference",
+            format!("Owner directive: {}", directive.text),
+            "user",
+        )
+        .await;
+    }
     spawn(ctx, run.run_id.clone());
     Ok(run)
 }
@@ -2982,6 +3012,14 @@ pub async fn inject_owner_guidance(
     run.error = Some("New owner guidance admitted; Arena is safely re-planning.".to_string());
     run.updated_at = now();
     save_run(&ctx, &run).await?;
+    remember_derived_product_event(
+        &ctx,
+        &run,
+        "user_preference",
+        format!("Owner mid-run directive: {}", directive.text),
+        "user",
+    )
+    .await;
 
     if let Some(owner) = ctx.runtime.current_owner()
         && run_owns_runtime_session(&run, &owner.session_id)
