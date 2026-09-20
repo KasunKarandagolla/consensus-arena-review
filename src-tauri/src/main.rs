@@ -128,6 +128,17 @@ fn main() {
                     }),
                 );
             }
+            let consultation_db = app_state.transcript_store.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) =
+                    crate::consultation_runtime::reconcile_after_restart(consultation_db).await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "consultation restart reconciliation did not complete"
+                    );
+                }
+            });
             app.manage(app_state);
 
             Ok(())
@@ -155,6 +166,7 @@ fn main() {
             commands::start_product_project,
             commands::get_product_coordinator_status,
             commands::answer_product_question,
+            commands::request_product_consultation,
             commands::cancel_product_project,
             commands::resume_product_project,
             commands::resume_delivery,
