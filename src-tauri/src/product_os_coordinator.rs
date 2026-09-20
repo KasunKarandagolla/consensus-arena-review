@@ -1480,6 +1480,152 @@ async fn load_work_order(ctx: &CoordinatorContext, id: &str) -> Result<ProductWo
     .map_err(|error| error.to_string())
 }
 
+async fn repair_build_readiness(
+    ctx: &CoordinatorContext,
+    run: &mut ProductCoordinatorRun,
+    reason: &str,
+) -> Result<(), String> {
+    let snapshot = product_os_runtime::snapshot(
+        ctx.db.clone(),
+        ctx.runtime.clone(),
+        run.project_id.clone(),
+    )
+    .await?
+    .ok_or_else(|| "Product OS authority disappeared during BuildReadiness repair".to_string())?;
+    let order = product_os_runtime::create_product_director_work_order(
+        ctx.db.clone(),
+        run.project_id.clone(),
+        format!("Repair incomplete BuildReadiness scope: {reason}"),
+    )
+    .await?;
+    run.product_director_work_order_id = Some(order.work_order_id.clone());
+    save_run(ctx, run).await?;
+    let prompt = role_prompt(
+        "BuildReadiness repair reviewer",
+        &format!(
+            "The current Arena-owned scope is incomplete for deterministic BuildReadiness. Repair only the missing/invalid scope fields identified by this gate; do not expand the founder mandate, do not change architecture authority, and do not claim gate passage. Current authority:\n{}\nGate failure: {}\nReturn ONLY JSON: {{\"objective\":\"...\",\"target_user\":\"...\",\"requirements\":[\"...\"],\"constraints\":[\"...\"],\"non_goals\":[\"...\"],\"interfaces\":[\"...\"],\"risks\":[\"...\"],\"acceptance_scenarios\":[\"...\"],\"reviewer_restatement\":{{\"intended_outcome\":\"...\",\"success_condition\":\"...\",\"invented_behaviors\":[]}}}}",
+            records_brief(&snapshot.records, run.route),
+            reason
+        ),
+    );
+    let execution = run_scheduled_role(
+        ctx,
+        run,
+        order.work_order_id,
+        prompt,
+    )
+    .await?;
+    let scope: ScopeOutput = parse_json(&execution.output)?;
+    let admission = ProductScopeAdmission {
+        objective: text(&scope.objective, "scope objective")?,
+        target_user: text(&scope.target_user, "scope target user")?,
+        requirements: list(&scope.requirements, "scope requirements")?,
+        constraints: list(&scope.constraints, "scope constraints")?,
+        non_goals: list(&scope.non_goals, "scope non-goals")?,
+        interfaces: list(&scope.interfaces, "scope interfaces")?,
+        risks: list(&scope.risks, "scope risks")?,
+        acceptance_scenarios: list(&scope.acceptance_scenarios, "scope acceptance scenarios")?,
+        reviewer_restatement: scope.reviewer_restatement,
+    };
+    if !admission.reviewer_restatement.invented_behaviors.is_empty() {
+        return Err("BuildReadiness repair invented unsupported behavior".to_string());
+    }
+    product_os_runtime::admit_product_scope_from_review(
+        ctx.db.clone(),
+        run.project_id.clone(),
+        execution.work_order.work_order_id,
+        admission,
+    )
+    .await?;
+    // Scope admission deliberately invalidates the prior product-direction
+    // decision. Return through ProductReview so owner authority is refreshed
+    // before the repaired scope can reach Package again.
+    run.product_review_outcome = None;
+    run.pending_owner_decision = None;
+    run.owner_ambiguity_id = None;
+    run.owner_question_id = None;
+    run.build_package_id = None;
+    run.phase = CoordinatorPhase::ProductReview;
+    run.stage = PipelineStage::Decide;
+    run.status = CoordinatorStatus::Running;
+    run.execution_epoch = run.execution_epoch.saturating_add(1);
+    run.error = None;
+    run.updated_at = now();
+    save_run(ctx, run).await
+}
+
+async fn persist_gate_owner_question(
+    ctx: &CoordinatorContext,
+    run: &mut ProductCoordinatorRun,
+    gate: crate::evidence_gates::GateId,
+    reason: &str,
+) -> Result<(), String> {
+    let order = product_os_runtime::create_product_director_work_order(
+        ctx.db.clone(),
+        run.project_id.clone(),
+        format!("Owner remediation question for {gate:?}: {reason}"),
+    )
+    .await?;
+    run.product_director_work_order_id = Some(order.work_order_id.clone());
+    save_run(ctx, run).await?;
+    let execution = run_scheduled_role(
+        ctx,
+        run,
+        order.work_order_id,
+        role_prompt(
+            "gate owner-question reviewer",
+            &format!(
+                "Arena reached gate {gate:?} and requires an explicit owner authority decision before it may continue. Gate reason: {reason}. Return JSON: {{\"summary\":\"...\",\"findings\":[\"...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}. This is advisory wording only; do not authorize the decision yourself."
+            ),
+        ),
+    )
+    .await?;
+    let output: ReviewOutput = parse_json(&execution.output)?;
+    let admitted = admit_review(
+        ctx,
+        &run.project_id,
+        execution.work_order,
+        EvidenceKind::Dissent,
+        text(&output.summary, "gate owner-question summary")?,
+        format!(
+            "{}; {}; {}",
+            output.findings.join(" | "),
+            output.rejected_alternative,
+            output.rationale
+        ),
+    )
+    .await?;
+    let ambiguity_id = format!("{}:gate-owner:{gate:?}", run.project_id);
+    let question_id = format!("{}:gate-owner-question:{gate:?}", run.project_id);
+    product_os_runtime::admit_ambiguity(
+        ctx.db.clone(),
+        run.project_id.clone(),
+        admitted.work_order_id,
+        ambiguity_id.clone(),
+        question_id.clone(),
+        format!(
+            "Arena is blocked at {gate:?}: {reason}. Do you authorize Arena to continue only if the gate becomes valid after this owner decision?"
+        ),
+        format!("progress beyond the blocked {gate:?} gate"),
+        AmbiguitySeverity::High,
+        vec![
+            admitted
+                .evidence_id
+                .ok_or_else(|| "gate owner-question evidence was not admitted".to_string())?,
+        ],
+    )
+    .await?;
+    run.owner_ambiguity_id = Some(ambiguity_id);
+    run.owner_question_id = Some(question_id);
+    run.pending_owner_decision = Some(OwnerDecisionKind::AuthorizeBuild);
+    run.status = CoordinatorStatus::WaitingForOwner;
+    run.phase = CoordinatorPhase::Package;
+    run.stage = PipelineStage::Decide;
+    run.error = Some(reason.to_string());
+    run.updated_at = now();
+    save_run(ctx, run).await
+}
+
 async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), String> {
     let mut run = load_run(&ctx, &run_id).await?;
     if matches!(
