@@ -520,14 +520,14 @@ async fn run_research_wave(
     ctx: &CoordinatorContext,
     run: &mut ProductCoordinatorRun,
 ) -> Result<(), String> {
-    if run.route != ProductRoute::NewProduct {
+    let targeted_question = run.remediation_question.take();
+    if run.route != ProductRoute::NewProduct && targeted_question.is_none() {
         run.stage = PipelineStage::Decide;
         run.omitted_stage_reasons = pipeline_contract::route_plan(run.route).omitted_stages;
         run.updated_at = now();
         save_run(ctx, run).await?;
         return Ok(());
     }
-    let targeted_question = run.remediation_question.take();
     let questions = if let Some(question) = targeted_question {
         vec![(
             ProductResearchCategory::TechnicalCurrentFact,
@@ -2433,9 +2433,13 @@ pub async fn answer_owner_question(
     if decision == OwnerDecisionKind::ContinueEvaluation {
         let mut resumed = run;
         resumed.status = CoordinatorStatus::Running;
-        resumed.phase = CoordinatorPhase::ProductReview;
-        resumed.stage = PipelineStage::Decide;
+        resumed.phase = CoordinatorPhase::Research;
+        resumed.stage = PipelineStage::Discover;
         resumed.product_review_outcome = Some("continue_evaluation".to_string());
+        resumed.remediation_question = Some(format!(
+            "The owner rejected the prior {:?} recommendation. Gather fresh, bounded, decision-critical evidence that could materially confirm or overturn that recommendation without repeating already-admitted claims.",
+            resumed.pending_owner_decision
+        ));
         resumed.pending_owner_decision = None;
         resumed.owner_ambiguity_id = None;
         resumed.owner_question_id = None;
