@@ -1262,6 +1262,277 @@ pub fn advance_candidate_revision(work_order: &mut OpenCodeWorkOrder) {
     work_order.error = None;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateVerificationDisposition {
+    Pass,
+    Fail,
+    Inconclusive,
+}
+
+fn acceptance_summary(state: &DeliveryState) -> String {
+    state
+        .contract
+        .as_ref()
+        .map(|contract| {
+            contract
+                .acceptance_criteria
+                .iter()
+                .map(|criterion| format!("{}: {}", criterion.id, criterion.description))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|| "Frozen acceptance summary unavailable".to_string())
+}
+
+async fn run_advisory_candidate_checks(
+    app: Option<&AppHandle>,
+    state_path: &Path,
+    delivery_slot: &Arc<tokio::sync::Mutex<Option<DeliveryState>>>,
+    transcript: &Arc<std::sync::Mutex<TranscriptStore>>,
+    state: &mut DeliveryState,
+    candidate: &Path,
+    acceptance_commit: &str,
+    candidate_sha: &str,
+) -> Result<(), String> {
+    let review_summary = run_candidate_reviews(
+        candidate,
+        acceptance_commit,
+        candidate_sha,
+        &acceptance_summary(state),
+        state_path.parent().unwrap_or(Path::new(".")),
+    )
+    .await;
+    match review_summary {
+        Ok(summary) => {
+            let blocking_count = summary
+                .deduplicated_findings
+                .iter()
+                .filter(|finding| {
+                    matches!(
+                        finding.recommended_disposition,
+                        candidate_review::FindingDisposition::BlockingRepair
+                    )
+                })
+                .count();
+            let manifest_json = serde_json::to_string(&summary.diff_manifest)
+                .unwrap_or_else(|_| "{\"error\":\"manifest serialization failed\"}".to_string());
+            let incomplete_lenses = summary
+                .lens_states
+                .iter()
+                .filter(|lens_state| lens_state.status != ReviewLensStatus::Complete)
+                .count();
+            state.evidence.push(OpenCodeEvidence {
+                evidence_id: format!(
+                    "{}:candidate-review-context:{}",
+                    state.session_id, state.attempt
+                ),
+                kind: "candidate_review_context".to_string(),
+                summary: format!(
+                    "Candidate review covered {} changed file(s), explicitly omitted {}, with {} incomplete lens(es).",
+                    summary.diff_manifest.total_changed_files,
+                    summary.diff_manifest.omitted_files,
+                    incomplete_lenses
+                ),
+                result_ref: manifest_json,
+            });
+            state.semantic_reviews = summary.receipts;
+            if let Some(error) = summary.review_error {
+                state.last_worker_summary = Some(format!(
+                    "Semantic review was advisory and incomplete: {error}"
+                ));
+            } else if blocking_count > 0 {
+                state.last_worker_summary = Some(format!(
+                    "Semantic review recorded {blocking_count} blocking-repair recommendation(s); deterministic verification remains authoritative"
+                ));
+            }
+        }
+        Err(error) => {
+            state.last_worker_summary = Some(format!(
+                "Semantic review was unavailable; deterministic verification remains authoritative: {error}"
+            ));
+        }
+    }
+
+    let browser_paths = changed_paths(candidate, acceptance_commit).await?;
+    if browser_impacting_candidate(&browser_paths) {
+        match run_browser_qa_advisory(
+            candidate,
+            state,
+            candidate_sha,
+            &browser_paths,
+            transcript,
+        )
+        .await
+        {
+            Ok(evidence) => state.evidence.push(evidence),
+            Err(error) => state.evidence.push(OpenCodeEvidence {
+                evidence_id: format!(
+                    "{}:browser-qa-unavailable:{}",
+                    state.session_id, state.attempt
+                ),
+                kind: "browser_qa_advisory".to_string(),
+                summary: format!(
+                    "BrowserQa was required by browser-impacting paths but remained advisory/unavailable: {error}"
+                ),
+                result_ref: "unavailable".to_string(),
+            }),
+        }
+    }
+
+    let after_review = verification::candidate_sha(candidate).await?;
+    let review_tree =
+        git_output(candidate, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    if after_review != candidate_sha || !review_tree.status.success() || !review_tree.stdout.is_empty()
+    {
+        if after_review == candidate_sha {
+            let _ = discard_candidate_changes(candidate, candidate_sha).await;
+        }
+        if let Some(work_order) = state.work_order.as_mut() {
+            work_order.task_state = OpenCodeTaskState::Invalid;
+            work_order.error = Some(
+                "advisory review changed the candidate; review output was rejected".to_string(),
+            );
+        }
+        return Err("advisory review changed the exact candidate".to_string());
+    }
+    crate::delivery::persist_emit(app, state_path, delivery_slot, transcript, state).await
+}
+
+async fn verify_exact_candidate(
+    app: Option<&AppHandle>,
+    state_path: &Path,
+    delivery_slot: &Arc<tokio::sync::Mutex<Option<DeliveryState>>>,
+    transcript: &Arc<std::sync::Mutex<TranscriptStore>>,
+    state: &mut DeliveryState,
+    candidate: &Path,
+    profile: &VerificationProfile,
+    protected_before: &[(String, String)],
+    evidence_dir: &Path,
+    acceptance_commit: &str,
+    authority_version: &str,
+    candidate_sha: &str,
+) -> Result<CandidateVerificationDisposition, String> {
+    let clean = git_output(candidate, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    if !clean.status.success()
+        || !clean.stdout.is_empty()
+        || verification::candidate_sha(candidate).await? != candidate_sha
+    {
+        return Err("candidate changed before independent verification".to_string());
+    }
+    state.candidate_commit = Some(candidate_sha.to_string());
+    state.phase = DeliveryPhase::Verifying;
+    crate::delivery::persist_emit(app, state_path, delivery_slot, transcript, state).await?;
+
+    let contract_revision = state
+        .work_order
+        .as_ref()
+        .ok_or_else(|| "OpenCode work order was lost before verification".to_string())?
+        .candidate_revision
+        .try_into()
+        .map_err(|_| "candidate revision exceeds verifier contract range".to_string())?;
+    let receipt = verification::verify(
+        &state.session_id,
+        &format!("{}/attempt/{}", state.session_id, state.attempt),
+        acceptance_commit,
+        candidate,
+        profile,
+        protected_before,
+        evidence_dir,
+        contract_revision,
+    )
+    .await?;
+    state.last_verification = Some(receipt.clone());
+
+    let ingest_result = {
+        let work_order = state
+            .work_order
+            .as_mut()
+            .ok_or_else(|| "OpenCode work order was lost before verification".to_string())?;
+        ingest_verification(work_order, candidate_sha, authority_version, &receipt)
+    };
+    let disposition = match receipt.verdict.as_str() {
+        "pass" => {
+            ingest_result?;
+            CandidateVerificationDisposition::Pass
+        }
+        "fail" | "inconclusive" => {
+            // ingest_verification deliberately rejects non-PASS as authority,
+            // but it records the correlated verification identity first. Only
+            // that exact expected rejection is eligible for repair/retry.
+            if ingest_result.is_ok() {
+                return Err("non-PASS verifier result was unexpectedly admitted".to_string());
+            }
+            let work_order = state
+                .work_order
+                .as_mut()
+                .ok_or_else(|| "OpenCode work order was lost after verification".to_string())?;
+            let correlated = work_order.verification_id.as_deref()
+                == Some(receipt.verification_id.as_str())
+                && work_order.verification_status.as_deref()
+                    == Some(receipt.verdict.as_str())
+                && work_order.task_state == OpenCodeTaskState::Failed
+                && work_order.error.as_deref()
+                    == Some("independent verifier did not PASS the candidate");
+            if !correlated {
+                return Err(
+                    "non-PASS verifier receipt failed candidate/authority correlation".to_string(),
+                );
+            }
+            if receipt.verdict == "inconclusive" {
+                // Preserve the exact candidate as EvidenceReady so restart can
+                // rerun only the frozen verifier when infrastructure recovers.
+                work_order.task_state = OpenCodeTaskState::EvidenceReady;
+                work_order.error = Some(
+                    "verification was inconclusive; implementation repair is forbidden"
+                        .to_string(),
+                );
+                CandidateVerificationDisposition::Inconclusive
+            } else {
+                CandidateVerificationDisposition::Fail
+            }
+        }
+        _ => return Err("independent verifier returned an unknown verdict".to_string()),
+    };
+
+    let after = git_output(candidate, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    if !after.status.success()
+        || !after.stdout.is_empty()
+        || verification::candidate_sha(candidate).await? != candidate_sha
+    {
+        if let Some(work_order) = state.work_order.as_mut() {
+            work_order.task_state = OpenCodeTaskState::Invalid;
+            work_order.error =
+                Some("candidate changed during verification; receipt is stale".to_string());
+        }
+        return Err("candidate changed during independent verification".to_string());
+    }
+    Ok(disposition)
+}
+
+fn repair_prompt(state: &DeliveryState) -> String {
+    let evidence = state
+        .last_verification
+        .as_ref()
+        .map(|receipt| {
+            receipt
+                .checks
+                .iter()
+                .map(|check| {
+                    format!(
+                        "{} status={} exit={:?}",
+                        check.id, check.status, check.exit_code
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|| "no correlated verifier detail".to_string());
+    format!(
+        "{}\n\nREPAIR ONLY. The frozen acceptance/profile must not change. The prior exact candidate received verifier FAIL. Diagnose and repair only the implementation behavior proven wrong by these frozen checks:\n{}",
+        state.objective, evidence
+    )
+}
+
 pub async fn run_delivery(
     app: Option<&AppHandle>,
     mut state: DeliveryState,
@@ -1289,14 +1560,128 @@ pub async fn run_delivery(
                 ));
             }
         }
+    } else {
+        return Err("OpenCode Product OS Delivery requires a current Build Package".to_string());
     }
+
     let candidate = PathBuf::from(&state.worktree_path);
     let canonical = PathBuf::from(&state.source_workspace);
+    let evidence_dir = state_path
+        .parent()
+        .ok_or_else(|| "delivery state path has no parent directory".to_string())?
+        .join("delivery-evidence")
+        .join(&state.session_id);
+
+    if state.acceptance_commit.is_none() {
+        state.phase = DeliveryPhase::AuthoringAcceptance;
+        crate::delivery::persist_emit(
+            app,
+            &state_path,
+            &delivery_slot,
+            &transcript,
+            &mut state,
+        )
+        .await?;
+        let freeze = match author_and_freeze_acceptance(
+            &canonical,
+            &candidate,
+            &state,
+            &evidence_dir,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some(error);
+                crate::delivery::persist_emit(
+                    app,
+                    &state_path,
+                    &delivery_slot,
+                    &transcript,
+                    &mut state,
+                )
+                .await?;
+                return Ok(state);
+            }
+        };
+        state.acceptance_commit = Some(freeze.acceptance_commit);
+        state.verification_commands = freeze.profile.commands.clone();
+        state.protected_files = freeze.profile.protected_paths.clone();
+        state.protected_hashes = verification::protected_hashes(
+            &candidate,
+            &state.protected_files,
+        )?
+        .into_iter()
+        .map(|(path, sha256)| ProtectedFileHash { path, sha256 })
+        .collect();
+        state.evidence.push(freeze.evidence);
+        state.phase = DeliveryPhase::AcceptanceReady;
+        crate::delivery::persist_emit(
+            app,
+            &state_path,
+            &delivery_slot,
+            &transcript,
+            &mut state,
+        )
+        .await?;
+    }
+
+    let acceptance_commit = state
+        .acceptance_commit
+        .clone()
+        .ok_or_else(|| "OpenCode Delivery has no frozen acceptance commit".to_string())?;
     let profile = verification::load_profile(&candidate)?;
+    verification::validate_profile(&profile, &candidate)?;
+    if profile.commands != state.verification_commands
+        || profile.protected_paths != state.protected_files
+    {
+        state.phase = DeliveryPhase::Failed;
+        state.last_worker_summary = Some(
+            "frozen verification profile differs from persisted Delivery authority".to_string(),
+        );
+        crate::delivery::persist_emit(
+            app,
+            &state_path,
+            &delivery_slot,
+            &transcript,
+            &mut state,
+        )
+        .await?;
+        return Ok(state);
+    }
+    let protected_before = state
+        .protected_hashes
+        .iter()
+        .map(|value| (value.path.clone(), value.sha256.clone()))
+        .collect::<Vec<_>>();
+    if protected_before.is_empty()
+        || !verification::protected_files_unchanged(&candidate, &protected_before)
+    {
+        state.phase = DeliveryPhase::Failed;
+        state.last_worker_summary =
+            Some("frozen acceptance files changed before implementation".to_string());
+        crate::delivery::persist_emit(
+            app,
+            &state_path,
+            &delivery_slot,
+            &transcript,
+            &mut state,
+        )
+        .await?;
+        return Ok(state);
+    }
+    let ancestry = git_output(
+        &candidate,
+        &["merge-base", "--is-ancestor", &acceptance_commit, "HEAD"],
+    )
+    .await?;
+    if !ancestry.status.success() {
+        return Err("candidate no longer descends from frozen acceptance commit".to_string());
+    }
+
     let profile_hash = verification::profile_hash(&profile)?;
-    let protected_before = verification::protected_hashes(&candidate, &profile.protected_paths)?;
-    let canonical_before = verification::protected_hashes(&canonical, &profile.protected_paths)?;
-    let authority_version = format!("{}:{profile_hash}", state.base_commit);
+    let authority_version = format!("{acceptance_commit}:{profile_hash}");
     if state.work_order.is_none() {
         state.work_order = Some(OpenCodeWorkOrder {
             work_order_id: format!("{}:work-order:1", state.session_id),
@@ -1305,7 +1690,7 @@ pub async fn run_delivery(
             candidate_id: state.branch_name.clone(),
             candidate_revision: 1,
             authority_version: authority_version.clone(),
-            acceptance_commit: state.base_commit.clone(),
+            acceptance_commit: acceptance_commit.clone(),
             task_state: OpenCodeTaskState::Admitted,
             evidence_ref: None,
             result_ref: None,
@@ -1327,9 +1712,13 @@ pub async fn run_delivery(
                 .map(|package| package.authority_fingerprint.clone()),
         });
     }
-    if let Some(work_order) = state.work_order.as_mut() {
+    {
+        let work_order = state
+            .work_order
+            .as_mut()
+            .ok_or_else(|| "OpenCode work order was not admitted".to_string())?;
         work_order.authority_version = authority_version.clone();
-        work_order.acceptance_commit = state.base_commit.clone();
+        work_order.acceptance_commit = acceptance_commit.clone();
         if let Some(package) = state.build_package.as_ref() {
             let current_identity = (
                 work_order.build_package_id.as_deref(),
@@ -1354,42 +1743,217 @@ pub async fn run_delivery(
             work_order.build_package_fingerprint = Some(package.authority_fingerprint.clone());
         }
     }
-    state.verification_commands = profile.commands.clone();
-    state.protected_files = profile.protected_paths.clone();
-    state.protected_hashes = protected_before
-        .iter()
-        .map(|(path, sha256)| ProtectedFileHash {
-            path: path.clone(),
-            sha256: sha256.clone(),
-        })
-        .collect();
-    state.acceptance_commit = Some(state.base_commit.clone());
-    state.phase = DeliveryPhase::Implementing;
-    crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
-        .await?;
-    let evidence_dir = match state_path.parent() {
-        Some(parent) => parent.join("delivery-evidence").join(&state.session_id),
-        None => return Err("delivery state path has no parent directory".to_string()),
-    };
-    let execution_result = {
-        let work_order = state
-            .work_order
-            .as_mut()
-            .ok_or_else(|| "OpenCode work order was not admitted".to_string())?;
-        execute_candidate(
-            &canonical,
+
+    // Recovery after an infrastructure-only verifier INCONCLUSIVE reuses the
+    // exact candidate and same frozen profile. No implementation model reruns.
+    if state.phase == DeliveryPhase::Verifying
+        && state
+            .last_verification
+            .as_ref()
+            .is_some_and(|receipt| receipt.verdict == "inconclusive")
+    {
+        let candidate_sha = state
+            .candidate_commit
+            .clone()
+            .ok_or_else(|| "inconclusive verifier recovery lost candidate identity".to_string())?;
+        let disposition = verify_exact_candidate(
+            app,
+            &state_path,
+            &delivery_slot,
+            &transcript,
+            &mut state,
             &candidate,
-            &state.objective,
-            work_order,
+            &profile,
             &protected_before,
-            &canonical_before,
             &evidence_dir,
+            &acceptance_commit,
+            &authority_version,
+            &candidate_sha,
+        )
+        .await;
+        match disposition {
+            Ok(CandidateVerificationDisposition::Pass) => {
+                state.phase = DeliveryPhase::Verified;
+                state.last_worker_summary =
+                    Some("Frozen verification passed on exact recovered candidate".to_string());
+                crate::delivery::persist_emit(
+                    app,
+                    &state_path,
+                    &delivery_slot,
+                    &transcript,
+                    &mut state,
+                )
+                .await?;
+                return Ok(state);
+            }
+            Ok(CandidateVerificationDisposition::Inconclusive) => {
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some(
+                    "Verification remains inconclusive; no implementation repair was attempted."
+                        .to_string(),
+                );
+                crate::delivery::persist_emit(
+                    app,
+                    &state_path,
+                    &delivery_slot,
+                    &transcript,
+                    &mut state,
+                )
+                .await?;
+                return Ok(state);
+            }
+            Ok(CandidateVerificationDisposition::Fail) => {
+                if !crate::delivery::attempts_remaining(state.attempt) {
+                    state.phase = DeliveryPhase::Failed;
+                    state.last_worker_summary =
+                        Some("Frozen verification failed and repair budget is exhausted".to_string());
+                    crate::delivery::persist_emit(
+                        app,
+                        &state_path,
+                        &delivery_slot,
+                        &transcript,
+                        &mut state,
+                    )
+                    .await?;
+                    return Ok(state);
+                }
+                if let Some(work_order) = state.work_order.as_mut() {
+                    advance_candidate_revision(work_order);
+                }
+                state.phase = DeliveryPhase::Repairing;
+                crate::delivery::persist_emit(
+                    app,
+                    &state_path,
+                    &delivery_slot,
+                    &transcript,
+                    &mut state,
+                )
+                .await?;
+            }
+            Err(error) => {
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some(error);
+                crate::delivery::persist_emit(
+                    app,
+                    &state_path,
+                    &delivery_slot,
+                    &transcript,
+                    &mut state,
+                )
+                .await?;
+                return Ok(state);
+            }
+        }
+    }
+
+    while crate::delivery::attempts_remaining(state.attempt) {
+        let repair = state.phase == DeliveryPhase::Repairing
+            || state
+                .last_verification
+                .as_ref()
+                .is_some_and(|receipt| receipt.verdict == "fail");
+        state.attempt = state.attempt.saturating_add(1);
+        state.phase = if repair {
+            DeliveryPhase::Repairing
+        } else {
+            DeliveryPhase::Implementing
+        };
+        crate::delivery::persist_emit(
+            app,
+            &state_path,
+            &delivery_slot,
+            &transcript,
+            &mut state,
+        )
+        .await?;
+
+        let prompt = if repair {
+            repair_prompt(&state)
+        } else {
+            state.objective.clone()
+        };
+        let execution_profile = if repair {
+            ExecutionProfile::DebugRepair
+        } else {
+            ExecutionProfile::Implementation
+        };
+        let execution_result = {
+            let work_order = state
+                .work_order
+                .as_mut()
+                .ok_or_else(|| "OpenCode work order was not admitted".to_string())?;
+            execute_candidate_with_profile(
+                &canonical,
+                &candidate,
+                &prompt,
+                work_order,
+                &protected_before,
+                &[],
+                &evidence_dir,
+                execution_profile,
+            )
+            .await
+        };
+        let execution = match execution_result {
+            Ok(execution) => execution,
+            Err(error) => {
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some(error);
+                crate::delivery::persist_emit(
+                    app,
+                    &state_path,
+                    &delivery_slot,
+                    &transcript,
+                    &mut state,
+                )
+                .await?;
+                return Ok(state);
+            }
+        };
+        if execution.protected_violation || execution.canonical_violation {
+            state.phase = DeliveryPhase::Failed;
+            state.last_worker_summary =
+                Some("OpenCode violated protected/canonical state".to_string());
+            crate::delivery::persist_emit(
+                app,
+                &state_path,
+                &delivery_slot,
+                &transcript,
+                &mut state,
+            )
+            .await?;
+            return Ok(state);
+        }
+        state.candidate_commit = Some(execution.candidate_sha.clone());
+        state.last_worker_summary = Some(format!(
+            "OpenCode {:?} attempt returned correlated evidence with {} tool call(s).",
+            execution_profile, execution.tool_count
+        ));
+        state.evidence.push(OpenCodeEvidence {
+            evidence_id: execution.evidence_ref.clone(),
+            kind: if repair {
+                "opencode_repair_result".to_string()
+            } else {
+                "opencode_result".to_string()
+            },
+            summary:
+                "Bounded worker result retained as candidate evidence; Arena remains verification authority."
+                    .to_string(),
+            result_ref: execution.evidence_ref.clone(),
+        });
+
+        if let Err(error) = run_advisory_candidate_checks(
+            app,
+            &state_path,
+            &delivery_slot,
+            &transcript,
+            &mut state,
+            &candidate,
+            &acceptance_commit,
+            &execution.candidate_sha,
         )
         .await
-    };
-    let execution = match execution_result {
-        Ok(execution) => execution,
-        Err(error) => {
+        {
             state.phase = DeliveryPhase::Failed;
             state.last_worker_summary = Some(error);
             crate::delivery::persist_emit(
@@ -1402,195 +1966,116 @@ pub async fn run_delivery(
             .await?;
             return Ok(state);
         }
-    };
-    state.last_worker_summary = Some(format!(
-        "OpenCode returned correlated evidence with {} tool call(s).",
-        execution.tool_count
-    ));
-    state.evidence.push(OpenCodeEvidence {
-        evidence_id: execution.evidence_ref.clone(),
-        kind: "opencode_result".to_string(),
-        summary: "Bounded worker result retained as candidate evidence; Arena performed admission and verification.".to_string(),
-        result_ref: execution.evidence_ref.clone(),
-    });
 
-    // Semantic review is advisory and exact-candidate bound. It runs before
-    // the deterministic verifier, but neither review output nor a skill can
-    // produce a PASS/Verified transition.
-    let review_summary = run_candidate_reviews(
-        &candidate,
-        &state.base_commit,
-        &execution.candidate_sha,
-        &state
-            .contract
-            .as_ref()
-            .map(|contract| {
-                contract
-                    .acceptance_criteria
-                    .iter()
-                    .map(|criterion| format!("{}: {}", criterion.id, criterion.description))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_else(|| "Frozen acceptance summary unavailable".to_string()),
-        state_path.parent().unwrap_or(Path::new(".")),
-    )
-    .await;
-    match review_summary {
-        Ok(summary) => {
-            let blocking_count = summary
-                .deduplicated_findings
-                .iter()
-                .filter(|finding| {
-                    matches!(
-                        finding.recommended_disposition,
-                        candidate_review::FindingDisposition::BlockingRepair
-                    )
-                })
-                .count();
-            let manifest_json = serde_json::to_string(&summary.diff_manifest)
-                .unwrap_or_else(|_| "{\"error\":\"manifest serialization failed\"}".to_string());
-            let incomplete_lenses = summary
-                .lens_states
-                .iter()
-                .filter(|state| state.status != ReviewLensStatus::Complete)
-                .count();
-            state.evidence.push(OpenCodeEvidence {
-                evidence_id: format!("{}:candidate-review-context:{}", state.session_id, state.attempt),
-                kind: "candidate_review_context".to_string(),
-                summary: format!(
-                    "Candidate review covered {} changed file(s), explicitly omitted {}, with {} incomplete lens(es).",
-                    summary.diff_manifest.total_changed_files,
-                    summary.diff_manifest.omitted_files,
-                    incomplete_lenses
-                ),
-                result_ref: manifest_json,
-            });
-            state.semantic_reviews = summary.receipts;
-            if let Some(error) = summary.review_error {
-                state.last_worker_summary = Some(format!(
-                    "Semantic review was advisory and incomplete: {error}"
-                ));
-            } else if blocking_count > 0 {
-                state.last_worker_summary = Some(format!(
-                    "Semantic review recorded {blocking_count} blocking-repair recommendation(s); deterministic verification remains authoritative"
-                ));
-            }
-        }
-        Err(error) => {
-            state.last_worker_summary = Some(format!(
-                "Semantic review was unavailable; deterministic verification remains authoritative: {error}"
-            ));
-        }
-    };
-    let browser_paths = changed_paths(&candidate, &state.base_commit).await?;
-    if browser_impacting_candidate(&browser_paths) {
-        match run_browser_qa_advisory(
-            &candidate,
-            &state,
-            &execution.candidate_sha,
-            &browser_paths,
+        let disposition = verify_exact_candidate(
+            app,
+            &state_path,
+            &delivery_slot,
             &transcript,
-        )
-        .await
-        {
-            Ok(evidence) => state.evidence.push(evidence),
-            Err(error) => state.evidence.push(OpenCodeEvidence {
-                evidence_id: format!("{}:browser-qa-unavailable:{}", state.session_id, state.attempt),
-                kind: "browser_qa_advisory".to_string(),
-                summary: format!(
-                    "BrowserQa was required by browser-impacting paths but remained advisory/unavailable: {error}"
-                ),
-                result_ref: "unavailable".to_string(),
-            }),
-        }
-        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
-            .await?;
-    }
-
-    let candidate_after_review = verification::candidate_sha(&candidate).await?;
-    let review_tree = git_output(
-        &candidate,
-        &["status", "--porcelain", "--untracked-files=all"],
-    )
-    .await?;
-    if candidate_after_review != execution.candidate_sha || !review_tree.stdout.is_empty() {
-        if candidate_after_review == execution.candidate_sha {
-            let _ = discard_candidate_changes(&candidate, &execution.candidate_sha).await;
-        }
-        state.phase = DeliveryPhase::Failed;
-        if let Some(work_order) = state.work_order.as_mut() {
-            work_order.task_state = OpenCodeTaskState::Invalid;
-            work_order.error = Some(
-                "semantic review changed the candidate; review output was rejected".to_string(),
-            );
-        }
-        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
-            .await?;
-        return Ok(state);
-    }
-    state.phase = DeliveryPhase::Verifying;
-    crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
-        .await?;
-    let receipt = verification::verify(
-        &state.session_id,
-        &format!("{}/attempt/{}", state.session_id, state.attempt),
-        &state.base_commit,
-        &candidate,
-        &profile,
-        &protected_before,
-        &evidence_dir,
-        1,
-    )
-    .await?;
-    state.last_verification = Some(receipt.clone());
-    let ingest = {
-        let work_order = state
-            .work_order
-            .as_mut()
-            .ok_or_else(|| "OpenCode work order was lost before verification".to_string())?;
-        ingest_verification(
-            work_order,
-            &execution.candidate_sha,
+            &mut state,
+            &candidate,
+            &profile,
+            &protected_before,
+            &evidence_dir,
+            &acceptance_commit,
             &authority_version,
-            &receipt,
+            &execution.candidate_sha,
         )
-    };
-    if execution.protected_violation || execution.canonical_violation || ingest.is_err() {
-        state.phase = DeliveryPhase::Failed;
-        if let Some(work_order) = state.work_order.as_mut() {
-            if work_order.error.is_none() {
-                work_order.error =
-                    Some("OpenCode candidate was rejected by Arena authority checks".to_string());
+        .await;
+        match disposition {
+            Ok(CandidateVerificationDisposition::Pass) => {
+                state.phase = DeliveryPhase::Verified;
+                state.last_worker_summary = Some(format!(
+                    "Independent verifier PASS on attempt {}; exact candidate is Verified",
+                    state.attempt
+                ));
+                crate::delivery::persist_emit(
+                    app,
+                    &state_path,
+                    &delivery_slot,
+                    &transcript,
+                    &mut state,
+                )
+                .await?;
+                return Ok(state);
+            }
+            Ok(CandidateVerificationDisposition::Inconclusive) => {
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some(
+                    "Verification inconclusive; no implementation repair was attempted. Resolve the verification environment and resume to rerun the same frozen checks."
+                        .to_string(),
+                );
+                crate::delivery::persist_emit(
+                    app,
+                    &state_path,
+                    &delivery_slot,
+                    &transcript,
+                    &mut state,
+                )
+                .await?;
+                return Ok(state);
+            }
+            Ok(CandidateVerificationDisposition::Fail) => {
+                if !crate::delivery::attempts_remaining(state.attempt) {
+                    state.phase = DeliveryPhase::Failed;
+                    state.last_worker_summary = Some(format!(
+                        "Independent verifier FAIL after {} bounded implementation attempt(s)",
+                        state.attempt
+                    ));
+                    crate::delivery::persist_emit(
+                        app,
+                        &state_path,
+                        &delivery_slot,
+                        &transcript,
+                        &mut state,
+                    )
+                    .await?;
+                    return Ok(state);
+                }
+                if let Some(work_order) = state.work_order.as_mut() {
+                    advance_candidate_revision(work_order);
+                }
+                state.phase = DeliveryPhase::Repairing;
+                crate::delivery::persist_emit(
+                    app,
+                    &state_path,
+                    &delivery_slot,
+                    &transcript,
+                    &mut state,
+                )
+                .await?;
+            }
+            Err(error) => {
+                state.phase = DeliveryPhase::Failed;
+                state.last_worker_summary = Some(error);
+                if let Some(work_order) = state.work_order.as_mut() {
+                    if work_order.task_state != OpenCodeTaskState::Invalid {
+                        work_order.task_state = OpenCodeTaskState::Invalid;
+                    }
+                }
+                crate::delivery::persist_emit(
+                    app,
+                    &state_path,
+                    &delivery_slot,
+                    &transcript,
+                    &mut state,
+                )
+                .await?;
+                return Ok(state);
             }
         }
-        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
-            .await?;
-        return Ok(state);
     }
-    let clean = git_output(
-        &candidate,
-        &["status", "--porcelain", "--untracked-files=all"],
+
+    state.phase = DeliveryPhase::Failed;
+    state.last_worker_summary = Some("OpenCode implementation budget exhausted".to_string());
+    crate::delivery::persist_emit(
+        app,
+        &state_path,
+        &delivery_slot,
+        &transcript,
+        &mut state,
     )
     .await?;
-    if !clean.status.success()
-        || !clean.stdout.is_empty()
-        || verification::candidate_sha(&candidate).await? != execution.candidate_sha
-    {
-        state.phase = DeliveryPhase::Failed;
-        if let Some(work_order) = state.work_order.as_mut() {
-            work_order.task_state = OpenCodeTaskState::Invalid;
-            work_order.error =
-                Some("candidate changed after verification; result is stale".to_string());
-        }
-        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
-            .await?;
-        return Ok(state);
-    }
-    state.candidate_commit = Some(execution.candidate_sha.clone());
-    state.phase = DeliveryPhase::Verified;
-    crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
-        .await?;
     Ok(state)
 }
 
