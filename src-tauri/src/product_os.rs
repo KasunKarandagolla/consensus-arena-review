@@ -139,6 +139,14 @@ pub struct ProductWorkOrder {
     #[serde(default)]
     pub research_category: Option<ProductResearchCategory>,
     pub parent_work_order_id: Option<String>,
+    /// Arena-owned per-work-order model binding. None inherits the configured
+    /// default; workers cannot choose or mutate this value themselves.
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// Bounded hierarchy depth for manager -> specialist -> child specialist
+    /// delegation. Arena, not the model, creates the actual child work order.
+    #[serde(default)]
+    pub delegation_depth: u8,
     pub evidence_id: Option<String>,
     #[serde(default)]
     pub evidence_ids: Vec<String>,
