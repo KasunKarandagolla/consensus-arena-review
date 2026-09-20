@@ -558,7 +558,7 @@ async fn verify_campaign_evidence(
         .iter()
         .filter(|evidence_id| {
             snapshot.records.evidence.iter().any(|item| {
-                item.evidence_id == ***evidence_id
+                item.evidence_id == evidence_id.as_str()
                     && item.current
                     && item.kind == Some(EvidenceKind::ResearchClaim)
                     && item.decision_impact
