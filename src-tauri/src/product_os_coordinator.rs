@@ -2237,10 +2237,26 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
             return Ok(());
         }
     }
+    if pending_research_mandate(&run)
+        && matches!(
+            run.phase,
+            CoordinatorPhase::ProductReview
+                | CoordinatorPhase::Architecture
+                | CoordinatorPhase::Package
+        )
+    {
+        run.phase = CoordinatorPhase::Research;
+        run.stage = PipelineStage::Discover;
+        run.updated_at = now();
+        save_run(&ctx, &run).await?;
+    }
     if run.phase == CoordinatorPhase::Research {
         run.stage = PipelineStage::Discover;
         if let Err(error) = run_research_wave(&ctx, &mut run).await {
             mark_failed(&ctx, &mut run, error).await;
+            return Ok(());
+        }
+        if run.status == CoordinatorStatus::Blocked {
             return Ok(());
         }
         run.phase = CoordinatorPhase::ProductReview;
