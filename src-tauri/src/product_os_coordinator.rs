@@ -3892,6 +3892,7 @@ mod tests {
             delivery_state_path: root.join("delivery-state.json"),
             delivery_slot: Arc::new(tokio::sync::Mutex::new(None)),
             settings,
+            memory: Arc::new(Mutex::new(crate::memory_store::MemoryStore::new_empty())),
             ask_user_tx: Arc::new(tokio::sync::Mutex::new(None)),
             app: None,
             role_scheduler: Arc::new(crate::pipeline_contract::ResourceScheduler::default()),
