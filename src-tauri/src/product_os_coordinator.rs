@@ -732,7 +732,7 @@ async fn run_product_review(
     let prompt = role_prompt(
         "Product Director",
         &format!(
-            "{}\n{}{}\nReturn JSON: {{\"outcome\":\"stop|pivot|validation_experiment|narrow_build\",\"scope\":null or {{\"objective\":\"...\",\"target_user\":\"...\",\"requirements\":[\"...\"],\"constraints\":[\"...\"],\"non_goals\":[\"...\"],\"interfaces\":[\"...\"],\"risks\":[\"...\"],\"acceptance_scenarios\":[\"...\"],\"reviewer_restatement\":{{\"intended_outcome\":\"...\",\"success_condition\":\"...\",\"invented_behaviors\":[]}}}},\"experiment_contract\":null or {{\"experiment_id\":\"...\",\"synthesis_identity\":\"...\",\"assumption\":\"...\",\"executor_kind\":\"deterministic_command|tool_probe\",\"operation\":{{\"kind\":\"cargo_check_locked|frontend_build|github_repository_metadata|file_contains\"}},\"expected_observation\":\"...\",\"pass_condition\":\"...\",\"fail_condition\":\"...\",\"inconclusive_condition\":\"...\",\"environment\":\"...\",\"timeout_seconds\":120,\"allowed_effects\":[\"...\"],\"protected_paths\":[\"...\"]}},\"owner_question\":\"...\",\"rationale\":\"...\",\"no_build_argument\":\"...\"}}. Choose NarrowBuild only when the bounded route-specific evidence supports it. If choosing ValidationExperiment, provide the exact typed ExperimentContract from Arena's closed operation set; never describe one experiment and expect Arena to substitute another. If the needed experiment cannot be represented safely, do not choose ValidationExperiment.",
+            "{}\n{}{}\nReturn JSON: {{\"outcome\":\"stop|pivot|validation_experiment|narrow_build\",\"scope\":null or {{\"objective\":\"...\",\"target_user\":\"...\",\"requirements\":[\"...\"],\"constraints\":[\"...\"],\"non_goals\":[\"...\"],\"interfaces\":[\"...\"],\"risks\":[\"...\"],\"acceptance_scenarios\":[\"...\"],\"reviewer_restatement\":{{\"intended_outcome\":\"...\",\"success_condition\":\"...\",\"invented_behaviors\":[]}}}},\"experiment_contract\":null or {{\"experiment_id\":\"...\",\"synthesis_identity\":\"...\",\"assumption\":\"...\",\"executor_kind\":\"deterministic_command|tool_probe\",\"operation\":{{\"kind\":\"cargo_check_locked|frontend_build|github_repository_metadata|file_contains\"}},\"expected_observation\":\"...\",\"pass_condition\":\"...\",\"fail_condition\":\"...\",\"inconclusive_condition\":\"...\",\"environment\":\"...\",\"timeout_seconds\":120,\"allowed_effects\":[\"...\"],\"protected_paths\":[\"...\"]}},\"owner_question\":\"...\",\"rationale\":\"...\",\"no_build_argument\":\"...\"}}. Scope may be null only for Stop or Pivot. NarrowBuild and ValidationExperiment both require a bounded typed scope because Arena must know what commitment/experiment is being authorized. Choose NarrowBuild only when the bounded route-specific evidence supports it. If choosing ValidationExperiment, provide the exact typed ExperimentContract from Arena's closed operation set; never describe one experiment and expect Arena to substitute another. If the needed experiment cannot be represented safely, do not choose ValidationExperiment.",
             product_review_route_instruction(run.route),
             records_brief(&snapshot.records, run.route),
             intelligence
@@ -766,15 +766,9 @@ async fn run_product_review(
         return Ok(false);
     }
     let Some(scope) = output.scope else {
-        if outcome == "validation_experiment" {
-            run.status = CoordinatorStatus::Blocked;
-            run.phase = CoordinatorPhase::Terminal;
-            run.terminal_outcome = Some("validation_experiment".to_string());
-            run.updated_at = now();
-            save_run(ctx, run).await?;
-            return Ok(false);
-        }
-        return Err("NarrowBuild proposal omitted a bounded scope".to_string());
+        return Err(format!(
+            "{outcome} proposal omitted the bounded scope required for Arena authority"
+        ));
     };
     run.product_review_outcome = Some(outcome.clone());
     let scope_invented_behavior = !scope.reviewer_restatement.invented_behaviors.is_empty();
