@@ -1934,8 +1934,16 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
                         },
                         expected_observation:
                             "the selected deterministic project validation command succeeds without canonical source mutation".to_string(),
-                        pass_condition: "cargo check exits zero".to_string(),
-                        fail_condition: "cargo check exits non-zero".to_string(),
+                        pass_condition: if Path::new(&run.repository_path).join("Cargo.toml").is_file() {
+                            "cargo check --locked exits zero".to_string()
+                        } else {
+                            "npm run build exits zero".to_string()
+                        },
+                        fail_condition: if Path::new(&run.repository_path).join("Cargo.toml").is_file() {
+                            "cargo check --locked exits non-zero".to_string()
+                        } else {
+                            "npm run build exits non-zero".to_string()
+                        },
                         inconclusive_condition: "timeout or cancelled process".to_string(),
                         environment: "isolated project repository validation environment".to_string(),
                         timeout_seconds: 180,
@@ -2538,6 +2546,12 @@ pub async fn answer_owner_question(
     let pending = run
         .pending_owner_decision
         .ok_or_else(|| "coordinator owner-question authority is missing".to_string())?;
+    if pending == OwnerDecisionKind::ApproveApply {
+        return Err(
+            "Verified candidates are applied only through the explicit Safe Apply action; product-question answers cannot execute or substitute for Apply"
+                .to_string(),
+        );
+    }
     if !pipeline_contract::owner_decision_matches_pending(pending, decision) {
         return Err("owner decision option does not match the pending question".to_string());
     }
@@ -3050,6 +3064,17 @@ mod tests {
             pipeline_contract::owner_decision_for_option(None, "pivot"),
             Ok(OwnerDecisionKind::PivotRun)
         );
+    }
+
+    #[test]
+    fn apply_approval_is_not_a_generic_product_question_action() {
+        assert!(pipeline_contract::owner_decision_matches_pending(
+            OwnerDecisionKind::ApproveApply,
+            OwnerDecisionKind::ApproveApply,
+        ));
+        // The coordinator deliberately rejects this pair before ambiguity
+        // adoption; the only executable owner Apply path is apply_delivery.
+        assert_eq!(OwnerDecisionKind::ApproveApply, OwnerDecisionKind::ApproveApply);
     }
 
     #[test]
