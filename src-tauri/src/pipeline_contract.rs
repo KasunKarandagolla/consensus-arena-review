@@ -18,6 +18,12 @@ pub enum ProductRoute {
     Incident,
 }
 
+impl Default for ProductRoute {
+    fn default() -> Self {
+        Self::NewProduct
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum PipelineStage {
