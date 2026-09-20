@@ -83,6 +83,7 @@ pub enum EvidenceKind {
     RedTeamReview,
     Dissent,
     IncidentDiagnosis,
+    ConsultationAdvice,
     General,
 }
 
