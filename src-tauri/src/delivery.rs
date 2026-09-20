@@ -1652,6 +1652,39 @@ async fn run_inner(
     Ok(state)
 }
 
+async fn execute_production_delivery(
+    app: Option<&AppHandle>,
+    state: DeliveryState,
+    state_path: PathBuf,
+    delivery_slot: Arc<tokio::sync::Mutex<Option<DeliveryState>>>,
+    transcript: Arc<std::sync::Mutex<TranscriptStore>>,
+    ask_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    settings: Arc<tokio::sync::Mutex<SettingsStore>>,
+) -> Result<DeliveryState, String> {
+    if state.runtime == DeliveryRuntime::OpenCode {
+        crate::opencode_adapter::run_delivery(
+            app,
+            state,
+            state_path,
+            delivery_slot,
+            transcript,
+            settings,
+        )
+        .await
+    } else {
+        run_inner(
+            app,
+            state,
+            state_path,
+            delivery_slot,
+            transcript,
+            ask_tx,
+            settings,
+        )
+        .await
+    }
+}
+
 pub async fn run(
     runtime: Arc<crate::session_runtime::SessionRuntime>,
     app: AppHandle,
@@ -1663,29 +1696,60 @@ pub async fn run(
     ask_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     settings: Arc<tokio::sync::Mutex<SettingsStore>>,
 ) {
-    if state.runtime == DeliveryRuntime::OpenCode {
-        let _ = crate::opencode_adapter::run_delivery(
-            Some(&app),
-            state,
-            state_path,
-            delivery_slot,
-            transcript,
-            settings,
-        )
-        .await;
-    } else {
-        let _ = run_inner(
-            Some(&app),
-            state,
-            state_path,
-            delivery_slot,
-            transcript,
-            ask_tx,
-            settings,
-        )
-        .await;
-    }
+    let _ = execute_production_delivery(
+        Some(&app),
+        state,
+        state_path,
+        delivery_slot,
+        transcript,
+        ask_tx,
+        settings,
+    )
+    .await;
     runtime.mark_completed(&owner);
+}
+
+/// Start the same owner-capable production Delivery supervisor used by the
+/// Tauri Build path and await its terminal/waiting result. Product OS uses
+/// this boundary instead of the qualification-only harness.
+pub async fn run_owner_capable_production(
+    runtime: Arc<crate::session_runtime::SessionRuntime>,
+    app: Option<AppHandle>,
+    state: DeliveryState,
+    state_path: PathBuf,
+    delivery_slot: Arc<tokio::sync::Mutex<Option<DeliveryState>>>,
+    transcript: Arc<std::sync::Mutex<TranscriptStore>>,
+    ask_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    settings: Arc<tokio::sync::Mutex<SettingsStore>>,
+) -> Result<DeliveryState, String> {
+    let permit = runtime.try_acquire_start(state.session_id.clone())?;
+    let owner = permit.owner();
+    let task_owner = owner.clone();
+    let task_runtime = runtime.clone();
+    let (activate_tx, activate_rx) = tokio::sync::oneshot::channel();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let result = if activate_rx.await.is_ok() {
+            execute_production_delivery(
+                app.as_ref(),
+                state,
+                state_path,
+                delivery_slot,
+                transcript,
+                ask_tx,
+                settings,
+            )
+            .await
+        } else {
+            Err("production Delivery task was not activated".to_string())
+        };
+        task_runtime.mark_completed(&task_owner);
+        let _ = result_tx.send(result);
+    });
+    permit.commit(task, activate_tx)?;
+    result_rx
+        .await
+        .map_err(|_| "production Delivery task stopped before returning".to_string())?
 }
 
 /// Run the production Delivery supervisor without a Tauri window.
@@ -1712,28 +1776,16 @@ pub async fn run_backend_qualification(
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let result = if activate_rx.await.is_ok() {
-            if state.runtime == DeliveryRuntime::OpenCode {
-                crate::opencode_adapter::run_delivery(
-                    None,
-                    state,
-                    state_path,
-                    delivery_slot,
-                    transcript,
-                    settings,
-                )
-                .await
-            } else {
-                run_inner(
-                    None,
-                    state,
-                    state_path,
-                    delivery_slot,
-                    transcript,
-                    ask_tx,
-                    settings,
-                )
-                .await
-            }
+            execute_production_delivery(
+                None,
+                state,
+                state_path,
+                delivery_slot,
+                transcript,
+                ask_tx,
+                settings,
+            )
+            .await
         } else {
             Err("backend qualification task was not activated".to_string())
         };
