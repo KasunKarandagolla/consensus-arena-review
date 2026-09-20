@@ -788,6 +788,16 @@ pub async fn create_product_role_work_order(
     subject: String,
     role: ProductWorkOrderRole,
 ) -> Result<ProductWorkOrder, String> {
+    create_product_role_work_order_with_model(db, project_id, subject, role, None).await
+}
+
+pub async fn create_product_role_work_order_with_model(
+    db: Arc<Mutex<TranscriptStore>>,
+    project_id: String,
+    subject: String,
+    role: ProductWorkOrderRole,
+    model_id: Option<String>,
+) -> Result<ProductWorkOrder, String> {
     if project_id.trim().is_empty() || subject.trim().is_empty() {
         return Err("Product role work order requires project identity and subject".to_string());
     }
@@ -797,12 +807,16 @@ pub async fn create_product_role_work_order(
     ) {
         return Err("research roles use their dedicated work-order operations".to_string());
     }
+    let model_id = model_id
+        .as_deref()
+        .map(crate::opencode_adapter::validate_model_identifier)
+        .transpose()?;
     db_helpers::run_blocking(move || {
         let mut store = db
             .lock()
             .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
         let records = load_records(&store, &project_id).map_err(AgentError::DatabaseError)?;
-        let order = new_work_order(
+        let mut order = new_work_order(
             &project_id,
             Some(subject.clone()),
             role.clone(),
@@ -812,6 +826,7 @@ pub async fn create_product_role_work_order(
             None,
             None,
         );
+        order.model_id = model_id;
         persist_records_and_order(&mut store, &records, &order)
             .map_err(AgentError::DatabaseError)?;
         Ok(order)
