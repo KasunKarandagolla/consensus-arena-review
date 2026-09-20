@@ -193,11 +193,16 @@ fn persist_records_and_order(
         .map_err(db_error)
 }
 
-fn initial_records(project_id: &str, question: &str) -> ProductAuthorityRecords {
+fn initial_records(
+    project_id: &str,
+    question: &str,
+    route: crate::pipeline_contract::ProductRoute,
+) -> ProductAuthorityRecords {
     ProductAuthorityRecords {
         project_id: project_id.to_string(),
         project_revision: 1,
         vision_version: 1,
+        route,
         objective: question.to_string(),
         target_user: "founder".to_string(),
         requirements: vec!["Research the bounded question from a primary source".to_string()],
@@ -632,7 +637,11 @@ pub async fn create_research_work_order(
             Some(raw) => serde_json::from_str(&raw).map_err(|error| {
                 AgentError::DatabaseError(format!("parse Product OS authority: {error}"))
             })?,
-            None => initial_records(&project_id_for_db, &question_for_db),
+            None => initial_records(
+                &project_id_for_db,
+                &question_for_db,
+                crate::pipeline_contract::ProductRoute::NewProduct,
+            ),
         };
         if records.project_id != project_id_for_db {
             return Err(AgentError::DatabaseError(
@@ -688,7 +697,11 @@ pub async fn create_web_discovery_work_order(
             Some(raw) => serde_json::from_str(&raw).map_err(|error| {
                 AgentError::DatabaseError(format!("parse Product OS authority: {error}"))
             })?,
-            None => initial_records(&project_id_for_db, &question_for_db),
+            None => initial_records(
+                &project_id_for_db,
+                &question_for_db,
+                crate::pipeline_contract::ProductRoute::NewProduct,
+            ),
         };
         let order = new_work_order(
             &project_id_for_db,
@@ -836,6 +849,7 @@ pub async fn create_product_project(
     db: Arc<Mutex<TranscriptStore>>,
     project_id: String,
     founder_idea: String,
+    route: crate::pipeline_contract::ProductRoute,
 ) -> Result<ProductAuthorityRecords, String> {
     if project_id.trim().is_empty() || founder_idea.trim().is_empty() {
         return Err("founder project requires identity and idea".to_string());
@@ -853,7 +867,7 @@ pub async fn create_product_project(
                 "Product OS project identity already exists".to_string(),
             ));
         }
-        let records = initial_records(&project_id, founder_idea.trim());
+        let records = initial_records(&project_id, founder_idea.trim(), route);
         let raw = serialize_records(&records).map_err(AgentError::DatabaseError)?;
         store.save_product_authority(&project_id, &raw, now())?;
         Ok(records)
