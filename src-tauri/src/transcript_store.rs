@@ -354,6 +354,29 @@ impl TranscriptStore {
         }
     }
 
+    pub fn find_product_coordinator_by_delivery_session(
+        &self,
+        delivery_session_id: &str,
+    ) -> Result<Option<crate::product_os_coordinator::ProductCoordinatorRun>, AgentError> {
+        let mut statement = self.conn.prepare(
+            "SELECT run_json FROM product_coordinator_runs ORDER BY updated_at DESC, run_id DESC",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let raw = row?;
+            let run: crate::product_os_coordinator::ProductCoordinatorRun =
+                serde_json::from_str(&raw).map_err(|error| {
+                    AgentError::DatabaseError(format!(
+                        "parse Product OS coordinator run: {error}"
+                    ))
+                })?;
+            if run.delivery_session_id.as_deref() == Some(delivery_session_id) {
+                return Ok(Some(run));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn get_latest_product_coordinator_run(
         &self,
     ) -> Result<Option<crate::product_os_coordinator::ProductCoordinatorRun>, AgentError> {
