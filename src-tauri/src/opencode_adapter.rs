@@ -612,6 +612,100 @@ async fn run_candidate_reviews(
     })
 }
 
+fn browser_impacting_candidate(paths: &[String]) -> bool {
+    paths.iter().any(|path| {
+        let lower = path.to_ascii_lowercase();
+        lower.ends_with(".tsx")
+            || lower.ends_with(".jsx")
+            || lower.ends_with(".css")
+            || lower.ends_with(".html")
+            || lower.contains("/frontend/")
+            || lower.starts_with("src/")
+            || lower.contains("browser_backend")
+            || lower.contains("browser_lifecycle")
+            || lower.contains("response_router")
+    })
+}
+
+async fn persist_observed_tool_receipt(
+    transcript: &Arc<std::sync::Mutex<TranscriptStore>>,
+    work_order_id: &str,
+    execution: &SemanticExecution,
+    profile: ExecutionProfile,
+    started_at: i64,
+    completed_at: i64,
+    status: &str,
+) -> Result<crate::quality_workflows::ToolUseReceipt, String> {
+    let receipt = crate::quality_workflows::ToolUseReceipt::from_observed_tools(
+        work_order_id,
+        &execution.root_session_id,
+        &format!("{profile:?}"),
+        &execution.tool_names,
+        status,
+        started_at,
+        completed_at,
+    )?;
+    let db = transcript.clone();
+    let value = receipt.clone();
+    crate::db_helpers::run_blocking(move || {
+        let mut store = db.lock().map_err(|_| {
+            crate::errors::AgentError::DatabaseError(
+                "transcript store lock poisoned while persisting tool receipt".to_string(),
+            )
+        })?;
+        store.save_tool_use_receipt(&value)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(receipt)
+}
+
+async fn run_browser_qa_advisory(
+    candidate: &Path,
+    state: &DeliveryState,
+    candidate_sha: &str,
+    changed: &[String],
+    transcript: &Arc<std::sync::Mutex<TranscriptStore>>,
+) -> Result<OpenCodeEvidence, String> {
+    let work_order_id = format!("{}:browser-qa:{}", state.session_id, state.attempt);
+    let changed_manifest = changed.join("\n");
+    let prompt = format!(
+        "Inspect the exact browser-impacting candidate SHA {candidate_sha}. This is advisory BrowserQa only: do not edit files, do not claim PASS/Verified, and do not authorize Apply. Use the configured Playwright MCP only when a runnable target is available. Report concise observations and limitations. Changed paths:\n{changed_manifest}"
+    );
+    let started_at = chrono::Utc::now().timestamp();
+    let execution =
+        run_profile_prompt_in_workspace(prompt, ExecutionProfile::BrowserQa, candidate).await?;
+    let completed_at = chrono::Utc::now().timestamp();
+    let status = if execution
+        .tool_names
+        .iter()
+        .any(|tool| tool.to_ascii_lowercase().contains("playwright"))
+    {
+        "complete"
+    } else {
+        "unavailable"
+    };
+    let receipt = persist_observed_tool_receipt(
+        transcript,
+        &work_order_id,
+        &execution,
+        ExecutionProfile::BrowserQa,
+        started_at,
+        completed_at,
+        status,
+    )
+    .await?;
+    Ok(OpenCodeEvidence {
+        evidence_id: receipt.receipt_id.clone(),
+        kind: "browser_qa_advisory".to_string(),
+        summary: format!(
+            "BrowserQa {status}; observed {} tool event(s). This evidence is advisory and cannot satisfy verifier PASS.",
+            receipt.tool_count
+        ),
+        result_ref: receipt.receipt_id,
+    })
+}
+
 fn safe_evidence_id(work_order_id: &str) -> String {
     work_order_id
         .chars()
@@ -1150,6 +1244,24 @@ pub async fn run_delivery(
                     )
                 })
                 .count();
+            let manifest_json = serde_json::to_string(&summary.diff_manifest)
+                .unwrap_or_else(|_| "{\"error\":\"manifest serialization failed\"}".to_string());
+            let incomplete_lenses = summary
+                .lens_states
+                .iter()
+                .filter(|state| state.status != ReviewLensStatus::Complete)
+                .count();
+            state.evidence.push(OpenCodeEvidence {
+                evidence_id: format!("{}:candidate-review-context:{}", state.session_id, state.attempt),
+                kind: "candidate_review_context".to_string(),
+                summary: format!(
+                    "Candidate review covered {} changed file(s), explicitly omitted {}, with {} incomplete lens(es).",
+                    summary.diff_manifest.total_changed_files,
+                    summary.diff_manifest.omitted_files,
+                    incomplete_lenses
+                ),
+                result_ref: manifest_json,
+            });
             state.semantic_reviews = summary.receipts;
             if let Some(error) = summary.review_error {
                 state.last_worker_summary = Some(format!(
@@ -1167,6 +1279,31 @@ pub async fn run_delivery(
             ));
         }
     };
+    let browser_paths = changed_paths(&candidate, &state.base_commit).await?;
+    if browser_impacting_candidate(&browser_paths) {
+        match run_browser_qa_advisory(
+            &candidate,
+            &state,
+            &execution.candidate_sha,
+            &browser_paths,
+            &transcript,
+        )
+        .await
+        {
+            Ok(evidence) => state.evidence.push(evidence),
+            Err(error) => state.evidence.push(OpenCodeEvidence {
+                evidence_id: format!("{}:browser-qa-unavailable:{}", state.session_id, state.attempt),
+                kind: "browser_qa_advisory".to_string(),
+                summary: format!(
+                    "BrowserQa was required by browser-impacting paths but remained advisory/unavailable: {error}"
+                ),
+                result_ref: "unavailable".to_string(),
+            }),
+        }
+        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+            .await?;
+    }
+
     let candidate_after_review = verification::candidate_sha(&candidate).await?;
     let review_tree = git_output(
         &candidate,
