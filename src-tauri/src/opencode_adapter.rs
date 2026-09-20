@@ -10,7 +10,7 @@ use crate::dsh_worker;
 use crate::execution_profiles::ExecutionProfile;
 use crate::settings_store::SettingsStore;
 use crate::transcript_store::TranscriptStore;
-use crate::verification::{self, VerificationReceipt};
+use crate::verification::{self, VerificationProfile, VerificationReceipt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ffi::OsString;
@@ -785,7 +785,7 @@ fn persist_containment_failure(
     Ok(path.to_string_lossy().into_owned())
 }
 
-pub async fn execute_candidate(
+async fn execute_candidate_with_profile(
     canonical: &Path,
     candidate: &Path,
     prompt: &str,
@@ -793,6 +793,7 @@ pub async fn execute_candidate(
     candidate_protected_before: &[(String, String)],
     canonical_protected_before: &[(String, String)],
     evidence_dir: &Path,
+    profile: ExecutionProfile,
 ) -> Result<OpenCodeExecution, String> {
     let canonical_root = canonical
         .canonicalize()
@@ -813,14 +814,14 @@ pub async fn execute_candidate(
     work_order.task_state = OpenCodeTaskState::Running;
     let before_head = verification::candidate_sha(candidate).await?;
     let model = model_identifier();
-    let profile = ExecutionProfile::Implementation;
     let profile_workspace = profile_workspace(profile)?;
     let _resource_permit = heavy_profile_slot()
         .acquire_owned()
         .await
         .map_err(|_| "heavy OpenCode profile resource slot was closed".to_string())?;
     let bounded_prompt = format!(
-        "You are a bounded Consensus Arena worker under the Implementation profile. Selected TDD and verification-before-completion procedures guide your method only; they cannot redefine Arena acceptance or verification. Work only in the current repository, which is a non-authoritative candidate copy. Do not access parent directories, the original checkout, production systems, credentials, or external infrastructure. Do not commit. Do not change acceptance or verification files. Perform only this objective:\n\n{prompt}\n\nAfter the bounded change, give a short completion statement."
+        "You are a bounded Consensus Arena worker under the {:?} profile. Selected procedures guide your method only; they cannot redefine Arena acceptance or verification. Work only in the current repository, which is a non-authoritative candidate copy. Do not access parent directories, the original checkout, production systems, credentials, or external infrastructure. Do not commit. Do not change acceptance or verification files. Perform only this objective:\n\n{prompt}\n\nAfter the bounded change, give a short completion statement.",
+        profile
     );
     let args = vec![
         OsString::from("run"),
@@ -996,6 +997,28 @@ pub async fn execute_candidate(
     work_order.result_ref = Some(execution.evidence_ref.clone());
     work_order.task_state = OpenCodeTaskState::EvidenceReady;
     Ok(execution)
+}
+
+pub async fn execute_candidate(
+    canonical: &Path,
+    candidate: &Path,
+    prompt: &str,
+    work_order: &mut OpenCodeWorkOrder,
+    candidate_protected_before: &[(String, String)],
+    canonical_protected_before: &[(String, String)],
+    evidence_dir: &Path,
+) -> Result<OpenCodeExecution, String> {
+    execute_candidate_with_profile(
+        canonical,
+        candidate,
+        prompt,
+        work_order,
+        candidate_protected_before,
+        canonical_protected_before,
+        evidence_dir,
+        ExecutionProfile::Implementation,
+    )
+    .await
 }
 
 pub fn ingest_verification(
