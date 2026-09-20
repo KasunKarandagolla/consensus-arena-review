@@ -977,6 +977,7 @@ pub async fn run_product_role_work_order(
         .map_err(db_error)?
     };
     let execution_profile = ExecutionProfile::for_product_role(&preflight.role);
+    let model_id = preflight.model_id.clone();
     let db_for_task = db.clone();
     let id_for_task = work_order_id.clone();
     let execution = execute_owned(runtime, work_order_id, move |generation| {
@@ -1012,7 +1013,7 @@ pub async fn run_product_role_work_order(
             let result = crate::opencode_adapter::run_profile_prompt_with_model(
                 prompt,
                 execution_profile,
-                preflight.model_id.as_deref(),
+                model_id.as_deref(),
             )
             .await;
             match result {
