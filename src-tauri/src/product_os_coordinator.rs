@@ -752,13 +752,17 @@ async fn run_product_review(
                 run.project_id, snapshot.records.project_revision
             ),
             assumption: output.rationale.clone(),
-            protocol: "bounded validation slice with deterministic local acceptance check"
-                .to_string(),
-            executor: "Arena Product OS validation executor".to_string(),
+            executor_kind: pipeline_contract::ExperimentExecutorKind::DeterministicCommand,
+            operation: if Path::new(&run.repository_path).join("Cargo.toml").is_file() {
+                pipeline_contract::ExperimentOperation::CargoCheckLocked
+            } else {
+                pipeline_contract::ExperimentOperation::FrontendBuild
+            },
             expected_observation: experiment_expected,
             pass_condition: "deterministic acceptance check passes".to_string(),
             fail_condition: "deterministic acceptance check fails".to_string(),
             inconclusive_condition: "timeout or missing observation".to_string(),
+            environment: "isolated project repository validation environment".to_string(),
             timeout_seconds: 120,
             allowed_effects: vec!["candidate worktree only".to_string()],
             protected_paths: vec![".arena/verification.json".to_string()],
@@ -1071,7 +1075,7 @@ async fn run_architecture(
         role_prompt(
             "Chief Engineer",
             &format!(
-                "Resolved packet: {packet_json}\nReviewer findings (untrusted; disposition by evidence ID): {}\nDissent evidence [{}] must also receive an explicit disposition. {selection_instruction} Disposition every reviewer finding using its exact evidence ID as the reviewer_dispositions key, identify risky assumptions and whether a bounded experiment is needed, and return project-specific reuse decisions. Each reuse decision must contain capability, classification (REUSE|WRAP|ADAPT|COMPOSE|BUILD), candidate, alternatives, evidence_ids, and rationale. If no experiment is needed, give no_experiment_reason. Return JSON: {{\"selection\":\"A|B|Hybrid\",\"reviewer_dispositions\":{{\"evidence-id\":\"accepted|rejected|adapted: reason\"}},\"risky_assumptions\":[],\"experiment_needed\":false,\"experiment_contract\":null,\"no_experiment_reason\":\"...\",\"reuse_decisions\":[],\"owner_tradeoff\":null}}",
+                "Resolved packet: {packet_json}\nReviewer findings (untrusted; disposition by evidence ID): {}\nDissent evidence [{}] must also receive an explicit disposition. {selection_instruction} Disposition every reviewer finding using its exact evidence ID as the reviewer_dispositions key, identify risky assumptions and whether a bounded experiment is needed, and return project-specific reuse decisions. Each reuse decision must contain capability, classification (REUSE|WRAP|ADAPT|COMPOSE|BUILD), candidate, alternatives, evidence_ids, and rationale. If an experiment is needed, experiment_contract must use Arena's closed operation set: executor_kind=deterministic_command with operation.kind=cargo_check_locked or frontend_build, OR executor_kind=tool_probe with operation.kind=github_repository_metadata (url required) or file_contains (relative_path and needle required). It must also include experiment_id, synthesis_identity, assumption, expected_observation, pass_condition, fail_condition, inconclusive_condition, environment, timeout_seconds, allowed_effects, and protected_paths. Never emit shell text. If no experiment is needed, give no_experiment_reason. Return JSON: {{\"selection\":\"A|B|Hybrid\",\"reviewer_dispositions\":{{\"evidence-id\":\"accepted|rejected|adapted: reason\"}},\"risky_assumptions\":[],\"experiment_needed\":false,\"experiment_contract\":null,\"no_experiment_reason\":\"...\",\"reuse_decisions\":[],\"owner_tradeoff\":null}}",
                 review_findings.join("\n"),
                 dissent_evidence_id
             ),
@@ -1468,13 +1472,18 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
                         ),
                         synthesis_identity: format!("{}:gate:{:?}", run.project_id, failed.gate_id),
                         assumption: failed.reason.clone(),
-                        protocol: "bounded project validation check".to_string(),
-                        executor: "Arena Product OS validation executor".to_string(),
+                        executor_kind: pipeline_contract::ExperimentExecutorKind::DeterministicCommand,
+                        operation: if Path::new(&run.repository_path).join("Cargo.toml").is_file() {
+                            pipeline_contract::ExperimentOperation::CargoCheckLocked
+                        } else {
+                            pipeline_contract::ExperimentOperation::FrontendBuild
+                        },
                         expected_observation:
-                            "cargo check --locked succeeds without source mutation".to_string(),
+                            "the selected deterministic project validation command succeeds without canonical source mutation".to_string(),
                         pass_condition: "cargo check exits zero".to_string(),
                         fail_condition: "cargo check exits non-zero".to_string(),
                         inconclusive_condition: "timeout or cancelled process".to_string(),
+                        environment: "isolated project repository validation environment".to_string(),
                         timeout_seconds: 180,
                         allowed_effects: vec!["read-only candidate validation".to_string()],
                         protected_paths: vec![".arena/verification.json".to_string()],
