@@ -2101,7 +2101,10 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
                 crate::delivery::DeliveryPhase::Applied => {
                     run.status = CoordinatorStatus::Completed;
                     run.phase = CoordinatorPhase::Terminal;
-                    run.terminal_outcome = Some("narrow_build_applied".to_string());
+                    run.stage = PipelineStage::Terminal;
+                    run.pending_owner_decision = None;
+                    run.terminal_outcome = Some("safe_apply_completed".to_string());
+                    run.error = None;
                     run.updated_at = now();
                     save_run(&ctx, &run).await?;
                     return Ok(());
