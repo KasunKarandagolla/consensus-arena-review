@@ -2980,10 +2980,8 @@ mod tests {
 
     #[test]
     fn repository_context_detection_distinguishes_code_workspace_from_empty_folder() {
-        let root = std::env::temp_dir().join(format!(
-            "arena-route-context-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("arena-route-context-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create route fixture");
         assert!(!repository_has_product_context(&root));
         std::fs::write(root.join("package.json"), "{}").expect("write manifest");
