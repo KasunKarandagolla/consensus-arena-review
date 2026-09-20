@@ -77,7 +77,15 @@ impl TranscriptStore {
                 status TEXT NOT NULL,
                 run_json TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS tool_use_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                work_order_id TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_use_receipts_work_order
+                ON tool_use_receipts(work_order_id, updated_at);",
             )
             .map_err(AgentError::from)
     }
@@ -337,6 +345,45 @@ impl TranscriptStore {
             Err(SqliteError::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(AgentError::from(error)),
         }
+    }
+
+    pub fn save_tool_use_receipt(
+        &mut self,
+        receipt: &crate::quality_workflows::ToolUseReceipt,
+    ) -> Result<(), AgentError> {
+        let receipt_json = serde_json::to_string(receipt).map_err(|error| {
+            AgentError::DatabaseError(format!("serialize tool-use receipt: {error}"))
+        })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tool_use_receipts (receipt_id, work_order_id, receipt_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                receipt.receipt_id,
+                receipt.work_order_id,
+                receipt_json,
+                receipt.completed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_tool_use_receipts(
+        &self,
+        work_order_id: &str,
+    ) -> Result<Vec<crate::quality_workflows::ToolUseReceipt>, AgentError> {
+        let mut statement = self.conn.prepare(
+            "SELECT receipt_json FROM tool_use_receipts
+             WHERE work_order_id = ?1 ORDER BY updated_at, receipt_id",
+        )?;
+        let rows = statement.query_map(params![work_order_id], |row| row.get::<_, String>(0))?;
+        let mut receipts = Vec::new();
+        for row in rows {
+            let raw = row.map_err(AgentError::from)?;
+            receipts.push(serde_json::from_str(&raw).map_err(|error| {
+                AgentError::DatabaseError(format!("parse tool-use receipt: {error}"))
+            })?);
+        }
+        Ok(receipts)
     }
 
     pub fn create_session(&mut self, config: &SessionConfig) -> Result<(), AgentError> {
