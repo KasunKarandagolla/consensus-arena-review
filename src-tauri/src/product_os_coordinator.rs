@@ -22,7 +22,7 @@ use crate::session_runtime::SessionRuntime;
 use crate::settings_store::SettingsStore;
 use crate::transcript_store::TranscriptStore;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
@@ -542,10 +542,404 @@ async fn admit_packet_review(
     .await
 }
 
+async fn verify_campaign_evidence(
+    ctx: &CoordinatorContext,
+    run: &mut ProductCoordinatorRun,
+    evidence_ids: &[String],
+) -> Result<(), String> {
+    let snapshot = product_os_runtime::snapshot(
+        ctx.db.clone(),
+        ctx.runtime.clone(),
+        run.project_id.clone(),
+    )
+    .await?
+    .ok_or_else(|| "Product OS project disappeared during campaign verification".to_string())?;
+    let mut selected = evidence_ids
+        .iter()
+        .filter(|evidence_id| {
+            snapshot.records.evidence.iter().any(|item| {
+                item.evidence_id == ***evidence_id
+                    && item.current
+                    && item.kind == Some(EvidenceKind::ResearchClaim)
+                    && item.decision_impact
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        selected.extend(evidence_ids.iter().take(1).cloned());
+    }
+    selected.truncate(4);
+    for evidence_id in selected {
+        let verifier = product_os_runtime::create_web_fact_verifier_work_order(
+            ctx.db.clone(),
+            run.project_id.clone(),
+            evidence_id.clone(),
+        )
+        .await?;
+        run.verifier_work_order_ids
+            .push(verifier.work_order_id.clone());
+        run.updated_at = now();
+        save_run(ctx, run).await?;
+        let verified = product_os_runtime::run_web_fact_verifier_work_order(
+            ctx.db.clone(),
+            ctx.runtime.clone(),
+            verifier.work_order_id,
+        )
+        .await?;
+        if verified.evidence_id.as_deref() == Some(evidence_id.as_str()) {
+            let current = product_os_runtime::snapshot(
+                ctx.db.clone(),
+                ctx.runtime.clone(),
+                run.project_id.clone(),
+            )
+            .await?
+            .ok_or_else(|| "Product OS project disappeared during campaign verification".to_string())?;
+            if current.records.evidence.iter().any(|item| {
+                item.evidence_id == evidence_id
+                    && item.verification == Some(EvidenceVerification::IndependentlyVerified)
+            }) && !run.verified_evidence_ids.iter().any(|id| id == &evidence_id)
+            {
+                run.verified_evidence_ids.push(evidence_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pending_research_mandate(run: &ProductCoordinatorRun) -> bool {
+    run.research_mandates.iter().any(|mandate| {
+        matches!(
+            mandate.status,
+            crate::work_graph::ResearchMandateStatus::Pending
+                | crate::work_graph::ResearchMandateStatus::Running
+        )
+    })
+}
+
+fn remediation_research_mandate(question: String) -> crate::work_graph::ResearchMandate {
+    crate::work_graph::ResearchMandate {
+        mandate_id: format!("research-mandate:{}", uuid::Uuid::new_v4()),
+        directive_id: format!("arena-remediation:{}", uuid::Uuid::new_v4()),
+        topic: format!(
+            "Resolve this decision-critical missing or contradicted claim before continuing: {question}"
+        ),
+        channels: vec![
+            crate::work_graph::ResearchChannel::Web,
+            crate::work_graph::ResearchChannel::Github,
+        ],
+        mandatory_channels: Vec::new(),
+        depth: crate::work_graph::ResearchDepth::Standard,
+        must_complete_before_decision: true,
+        minimum_distinct_sources: 2,
+        max_cycles: 4,
+        status: crate::work_graph::ResearchMandateStatus::Pending,
+        cycles_completed: 0,
+        child_work_order_ids: Vec::new(),
+        evidence_ids: Vec::new(),
+        completed_channels: Vec::new(),
+        unavailable_channels: Vec::new(),
+    }
+}
+
+async fn run_dynamic_research_campaigns(
+    ctx: &CoordinatorContext,
+    run: &mut ProductCoordinatorRun,
+) -> Result<bool, String> {
+    if let Some(question) = run.remediation_question.take() {
+        run.research_mandates.push(remediation_research_mandate(question));
+    }
+    if !pending_research_mandate(run) {
+        return Ok(false);
+    }
+
+    for mandate_index in 0..run.research_mandates.len() {
+        if !matches!(
+            run.research_mandates[mandate_index].status,
+            crate::work_graph::ResearchMandateStatus::Pending
+                | crate::work_graph::ResearchMandateStatus::Running
+        ) {
+            continue;
+        }
+        run.research_mandates[mandate_index]
+            .validate()
+            .map_err(|error| format!("invalid research mandate: {error}"))?;
+        run.research_mandates[mandate_index].status =
+            crate::work_graph::ResearchMandateStatus::Running;
+        run.updated_at = now();
+        save_run(ctx, run).await?;
+
+        loop {
+            let mandate = run.research_mandates[mandate_index].clone();
+            if mandate.cycles_completed >= mandate.max_cycles {
+                run.research_mandates[mandate_index].status =
+                    crate::work_graph::ResearchMandateStatus::Blocked;
+                break;
+            }
+
+            let snapshot = product_os_runtime::snapshot(
+                ctx.db.clone(),
+                ctx.runtime.clone(),
+                run.project_id.clone(),
+            )
+            .await?
+            .ok_or_else(|| "Product OS project disappeared during dynamic research".to_string())?;
+            let recent_evidence = snapshot
+                .records
+                .evidence
+                .iter()
+                .filter(|item| item.current && item.kind == Some(EvidenceKind::ResearchClaim))
+                .rev()
+                .take(20)
+                .map(|item| {
+                    format!(
+                        "id={}; verification={:?}; source={}; summary={}",
+                        item.evidence_id,
+                        item.verification,
+                        item.source_reference,
+                        item.summary.chars().take(360).collect::<String>()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let lead = product_os_runtime::create_product_role_work_order_with_model(
+                ctx.db.clone(),
+                run.project_id.clone(),
+                format!(
+                    "Research lead cycle {} for mandate {}",
+                    mandate.cycles_completed.saturating_add(1),
+                    mandate.mandate_id
+                ),
+                ProductWorkOrderRole::ResearchLead,
+                crate::work_graph::configured_research_lead_model()?,
+            )
+            .await?;
+            run.research_work_order_ids.push(lead.work_order_id.clone());
+            run.updated_at = now();
+            save_run(ctx, run).await?;
+
+            let mandate_json = serde_json::to_string(&mandate)
+                .map_err(|error| format!("serialize research mandate: {error}"))?;
+            let prompt = role_prompt(
+                "Research Lead",
+                &format!(
+                    "You manage a bounded evidence campaign, not ProductAuthority. Current mandate: {mandate_json}. Current research evidence:\n{recent_evidence}\nPropose the next small set of channel specialists only where they could materially improve the decision. You may revisit or deepen a channel. The owner-mandatory channels may not be silently omitted; Arena enforces them. Model IDs are hints only and Arena policy decides the actual model. Return JSON: {{\"complete\":false,\"completion_reason\":\"...\",\"tasks\":[{{\"channel\":\"web|github|youtube|reddit|x|rss|research_papers|douyin|tiktok\",\"question\":\"...\",\"model_id\":null}}],\"follow_up_focus\":null}}. Set complete=true only when further research is unlikely to change the bounded decision."
+                ),
+            );
+            let lead_execution = run_scheduled_role(
+                ctx,
+                run,
+                lead.work_order_id.clone(),
+                prompt,
+            )
+            .await?;
+            let mut plan: crate::work_graph::ResearchLeadPlan =
+                parse_json(&lead_execution.output)?;
+            plan.validate()?;
+
+            let mut represented = plan
+                .tasks
+                .iter()
+                .map(|task| task.channel)
+                .collect::<BTreeSet<_>>();
+            for channel in &mandate.mandatory_channels {
+                if !mandate.completed_channels.contains(channel)
+                    && !mandate.unavailable_channels.contains(channel)
+                    && represented.insert(*channel)
+                {
+                    plan.tasks.push(crate::work_graph::DelegatedResearchTask {
+                        channel: *channel,
+                        question: format!(
+                            "Owner-required {} research for: {}",
+                            channel.as_str(),
+                            mandate.topic
+                        ),
+                        model_id: None,
+                    });
+                }
+            }
+
+            if plan.complete
+                && mandate.evidence_ids.len() < usize::from(mandate.minimum_distinct_sources)
+            {
+                for channel in &mandate.channels {
+                    if plan.tasks.len() >= crate::work_graph::MAX_DELEGATED_CHILDREN {
+                        break;
+                    }
+                    if represented.insert(*channel) {
+                        plan.tasks.push(crate::work_graph::DelegatedResearchTask {
+                            channel: *channel,
+                            question: format!(
+                                "Find additional decision-critical evidence for: {}",
+                                mandate.topic
+                            ),
+                            model_id: None,
+                        });
+                    }
+                }
+                plan.complete = false;
+            }
+            plan.validate()?;
+
+            for task in plan.tasks {
+                let child_model = crate::work_graph::configured_channel_model(task.channel)?;
+                let child = product_os_runtime::create_delegated_channel_research_work_order(
+                    ctx.db.clone(),
+                    run.project_id.clone(),
+                    lead_execution.work_order.work_order_id.clone(),
+                    task.question,
+                    task.channel,
+                    ProductResearchCategory::TechnicalCurrentFact,
+                    child_model,
+                )
+                .await?;
+                run.research_work_order_ids.push(child.work_order_id.clone());
+                run.research_mandates[mandate_index]
+                    .child_work_order_ids
+                    .push(child.work_order_id.clone());
+                run.updated_at = now();
+                save_run(ctx, run).await?;
+
+                let completed = if child.research_mode == Some(ProductResearchMode::WebDiscovery) {
+                    product_os_runtime::run_web_discovery_work_order(
+                        ctx.db.clone(),
+                        ctx.runtime.clone(),
+                        child.work_order_id,
+                    )
+                    .await?
+                } else {
+                    product_os_runtime::run_channel_research_work_order(
+                        ctx.db.clone(),
+                        ctx.runtime.clone(),
+                        child.work_order_id,
+                        PathBuf::from(&run.repository_path),
+                    )
+                    .await?
+                };
+
+                match completed.status {
+                    crate::product_os::ProductWorkOrderStatus::Completed => {
+                        for evidence_id in &completed.evidence_ids {
+                            if !run.research_mandates[mandate_index]
+                                .evidence_ids
+                                .contains(evidence_id)
+                            {
+                                run.research_mandates[mandate_index]
+                                    .evidence_ids
+                                    .push(evidence_id.clone());
+                            }
+                        }
+                        if let Some(channel) = completed.research_channel
+                            && !run.research_mandates[mandate_index]
+                                .completed_channels
+                                .contains(&channel)
+                        {
+                            run.research_mandates[mandate_index]
+                                .completed_channels
+                                .push(channel);
+                        }
+                        verify_campaign_evidence(ctx, run, &completed.evidence_ids).await?;
+                    }
+                    crate::product_os::ProductWorkOrderStatus::Unavailable => {
+                        if let Some(channel) = completed.research_channel
+                            && !run.research_mandates[mandate_index]
+                                .unavailable_channels
+                                .contains(&channel)
+                        {
+                            run.research_mandates[mandate_index]
+                                .unavailable_channels
+                                .push(channel);
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "research specialist {} ended in {:?}",
+                            completed.work_order_id, completed.status
+                        ));
+                    }
+                }
+                run.updated_at = now();
+                save_run(ctx, run).await?;
+            }
+
+            run.research_mandates[mandate_index].cycles_completed = run.research_mandates
+                [mandate_index]
+                .cycles_completed
+                .saturating_add(1);
+
+            let required_channels_ready = run.research_mandates[mandate_index]
+                .mandatory_channels
+                .iter()
+                .all(|channel| {
+                    run.research_mandates[mandate_index]
+                        .completed_channels
+                        .contains(channel)
+                });
+            let required_unavailable = run.research_mandates[mandate_index]
+                .mandatory_channels
+                .iter()
+                .any(|channel| {
+                    run.research_mandates[mandate_index]
+                        .unavailable_channels
+                        .contains(channel)
+                });
+            let source_floor_met = run.research_mandates[mandate_index].evidence_ids.len()
+                >= usize::from(run.research_mandates[mandate_index].minimum_distinct_sources);
+
+            if required_unavailable {
+                run.research_mandates[mandate_index].status =
+                    crate::work_graph::ResearchMandateStatus::PartiallyUnavailable;
+                break;
+            }
+            if required_channels_ready && source_floor_met && plan.complete {
+                run.research_mandates[mandate_index].status =
+                    crate::work_graph::ResearchMandateStatus::Satisfied;
+                break;
+            }
+            if run.research_mandates[mandate_index].cycles_completed
+                >= run.research_mandates[mandate_index].max_cycles
+            {
+                run.research_mandates[mandate_index].status =
+                    crate::work_graph::ResearchMandateStatus::Blocked;
+                break;
+            }
+            run.updated_at = now();
+            save_run(ctx, run).await?;
+        }
+
+        let mandate = &run.research_mandates[mandate_index];
+        if mandate.must_complete_before_decision && !mandate.can_advance() {
+            run.status = CoordinatorStatus::Blocked;
+            run.error = Some(format!(
+                "Mandatory research mandate {} is {:?}; unavailable channels: {}. Arena will not pretend the requested research completed.",
+                mandate.mandate_id,
+                mandate.status,
+                mandate
+                    .unavailable_channels
+                    .iter()
+                    .map(|channel| channel.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            run.updated_at = now();
+            save_run(ctx, run).await?;
+            return Ok(true);
+        }
+    }
+
+    run.updated_at = now();
+    save_run(ctx, run).await?;
+    Ok(true)
+}
+
 async fn run_research_wave(
     ctx: &CoordinatorContext,
     run: &mut ProductCoordinatorRun,
 ) -> Result<(), String> {
+    if run_dynamic_research_campaigns(ctx, run).await? {
+        return Ok(());
+    }
     let targeted_question = run.remediation_question.take();
     if run.route != ProductRoute::NewProduct && targeted_question.is_none() {
         run.stage = PipelineStage::Decide;
