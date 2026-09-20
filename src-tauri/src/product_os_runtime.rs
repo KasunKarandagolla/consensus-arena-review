@@ -1100,6 +1100,7 @@ fn review_evidence(
             | EvidenceKind::RedTeamReview
             | EvidenceKind::Dissent
             | EvidenceKind::IncidentDiagnosis
+            | EvidenceKind::ProductChallenge
     ) {
         return Err("Product Director review kind is not admissible".to_string());
     }
