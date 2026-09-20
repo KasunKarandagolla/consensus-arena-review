@@ -1,0 +1,44 @@
+name: M09 One-Shot Rustfmt
+
+on:
+  push:
+    branches:
+      - chatgpt/arena-m09cd-rebuild
+    paths:
+      - 'src-tauri/**/*.rs'
+      - '.github/workflows/m09-rustfmt-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  rustfmt:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout recovery branch
+        uses: actions/checkout@v4
+        with:
+          ref: chatgpt/arena-m09cd-rebuild
+
+      - name: Setup Rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format Rust source
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml
+
+      - name: Commit formatter-only changes
+        shell: bash
+        run: |
+          if git diff --quiet -- src-tauri; then
+            echo "No rustfmt changes required."
+            exit 0
+          fi
+          git config user.name "Consensus Arena CI"
+          git config user.email "arena-ci@example.invalid"
+          git add src-tauri
+          git commit -m "[skip ci] M09D: apply rustfmt to recovery branch"
+          git push origin HEAD:chatgpt/arena-m09cd-rebuild
