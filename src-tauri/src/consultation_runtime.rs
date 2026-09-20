@@ -392,6 +392,130 @@ pub async fn execute_owned_external_browser_consultation(
         .map_err(|_| "consultation runtime stopped before returning".to_string())?
 }
 
+pub async fn recover_external_browser_consultation(
+    db: Arc<Mutex<TranscriptStore>>,
+    repository: PathBuf,
+    profile_root: PathBuf,
+    request_id: String,
+) -> Result<ConsultationExecutionOutcome, String> {
+    let mut order = load_order(db.clone(), request_id).await?;
+    if order.state == ConsultationTransactionState::UnknownOutcome {
+        order = consultation_broker::begin_owner_recovery(
+            db.clone(),
+            order.request_id.clone(),
+        )
+        .await?;
+    }
+    if !matches!(
+        order.state,
+        ConsultationTransactionState::OwnerRecovery
+            | ConsultationTransactionState::Observing
+    ) {
+        return Err(
+            "consultation recovery is observation-only and requires UnknownOutcome/OwnerRecovery/Observing"
+                .to_string(),
+        );
+    }
+    let anchor = load_anchor(db.clone(), order.anchor_id.clone()).await?;
+    let observation = match external_browser::recover_observe_once(
+        &repository,
+        &profile_root,
+        &order,
+        &anchor,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(format!(
+                "consultation recovery remains pending without resend: {error}"
+            ));
+        }
+    };
+    let Some(observation) = observation else {
+        return Ok(ConsultationExecutionOutcome::UnknownOutcome(order));
+    };
+
+    let current_anchor = load_anchor(db.clone(), order.anchor_id.clone()).await?;
+    let updated = consultation_broker::update_anchor(
+        db.clone(),
+        order.anchor_id.clone(),
+        ConversationAnchorUpdate {
+            expected_revision: current_anchor.revision,
+            availability: ConversationAvailability::Available,
+            established: true,
+            canonical_url: Some(observation.canonical_url.clone()),
+            provider_conversation_id: observation.provider_conversation_id.clone(),
+            provider_branch_id: observation.provider_branch_id.clone(),
+            pending_request_id: Some(order.request_id.clone()),
+            last_confirmed_user_turn_digest: Some(observation.user_turn_digest.clone()),
+            last_confirmed_assistant_turn_digest: Some(
+                observation.assistant_turn_digest.clone(),
+            ),
+            adapter_version: external_browser::AGENT_BROWSER_ADAPTER_VERSION.to_string(),
+        },
+    )
+    .await?;
+    let result = consultation_broker::admit_observation(db.clone(), observation).await?;
+    consultation_broker::commit_result(db.clone(), order.request_id.clone()).await?;
+    let _ = consultation_broker::update_anchor(
+        db,
+        updated.anchor_id.clone(),
+        ConversationAnchorUpdate {
+            expected_revision: updated.revision,
+            availability: ConversationAvailability::Available,
+            established: true,
+            canonical_url: updated.canonical_url.clone(),
+            provider_conversation_id: updated.provider_conversation_id.clone(),
+            provider_branch_id: updated.provider_branch_id.clone(),
+            pending_request_id: None,
+            last_confirmed_user_turn_digest: updated.last_confirmed_user_turn_digest.clone(),
+            last_confirmed_assistant_turn_digest: updated
+                .last_confirmed_assistant_turn_digest
+                .clone(),
+            adapter_version: external_browser::AGENT_BROWSER_ADAPTER_VERSION.to_string(),
+        },
+    )
+    .await;
+    Ok(ConsultationExecutionOutcome::Complete(result))
+}
+
+pub async fn recover_owned_external_browser_consultation(
+    runtime: Arc<crate::session_runtime::SessionRuntime>,
+    db: Arc<Mutex<TranscriptStore>>,
+    repository: PathBuf,
+    profile_root: PathBuf,
+    project_id: String,
+    request_id: String,
+) -> Result<ConsultationExecutionOutcome, String> {
+    let runtime_session_id = format!("consultation:{project_id}:recovery:{request_id}");
+    let permit = runtime.try_acquire_start(runtime_session_id)?;
+    let owner = permit.owner();
+    let task_owner = owner.clone();
+    let task_runtime = runtime.clone();
+    let (activate_tx, activate_rx) = tokio::sync::oneshot::channel();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let result = if activate_rx.await.is_ok() {
+            recover_external_browser_consultation(
+                db,
+                repository,
+                profile_root,
+                request_id,
+            )
+            .await
+        } else {
+            Err("consultation recovery runtime was not activated".to_string())
+        };
+        task_runtime.mark_completed(&task_owner);
+        let _ = result_tx.send(result);
+    });
+    permit.commit(task, activate_tx)?;
+    result_rx
+        .await
+        .map_err(|_| "consultation recovery stopped before returning".to_string())?
+}
+
 pub async fn reconcile_after_restart(
     db: Arc<Mutex<TranscriptStore>>,
 ) -> Result<Vec<ConsultationWorkOrder>, String> {
