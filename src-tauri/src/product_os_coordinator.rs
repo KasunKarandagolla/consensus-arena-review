@@ -757,11 +757,7 @@ async fn run_product_review(
         return Err("Product Director returned an unsupported outcome".to_string());
     }
     if matches!(outcome.as_str(), "stop" | "pivot") {
-        let recommendation = if outcome == "stop" {
-            "stop"
-        } else {
-            "pivot"
-        };
+        let recommendation = if outcome == "stop" { "stop" } else { "pivot" };
         let admitted = admit_review(
             ctx,
             &run.project_id,
@@ -775,8 +771,10 @@ async fn run_product_review(
         )
         .await?;
         let ambiguity_id = format!("{}:product-direction-recommendation", run.project_id);
-        let question_id =
-            format!("{}:product-direction-recommendation-question", run.project_id);
+        let question_id = format!(
+            "{}:product-direction-recommendation-question",
+            run.project_id
+        );
         product_os_runtime::admit_ambiguity(
             ctx.db.clone(),
             run.project_id.clone(),
