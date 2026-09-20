@@ -4152,12 +4152,7 @@ mod tests {
         )
         .await
         .expect("architecture admission");
-        authorize_narrow_build_for_test(
-            reopened_db.clone(),
-            project_id,
-            "m05c",
-        )
-        .await;
+        authorize_narrow_build_for_test(reopened_db.clone(), project_id, "m05c").await;
         adopt_narrow_build_direction(reopened_db.clone(), project_id.to_string())
             .await
             .expect("owner-adopted NarrowBuild direction");
