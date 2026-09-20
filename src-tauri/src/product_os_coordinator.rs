@@ -1448,11 +1448,17 @@ async fn run_incident_diagnosis(
     .await?;
     run.product_director_work_order_id = Some(order.work_order_id.clone());
     save_run(ctx, run).await?;
+    let intelligence = bounded_repo_intelligence(
+        ctx,
+        run,
+        "incident entry points error handling affected symbols and coupling",
+    )
+    .await;
     let prompt = role_prompt(
         "Incident diagnosis reviewer",
         &format!(
-            "This is an existing-product incident. Do not perform market research or ask whether Arena should build the product. Produce bounded diagnosis evidence with expected versus actual behavior, relevant source/log observations, deterministic reproduction steps when possible, ranked hypotheses, and a repair boundary. Repository: {}. Incident brief: {}. Return JSON: {{\"summary\":\"...\",\"findings\":[\"expected: ...\",\"actual: ...\",\"reproduction: ...\",\"hypothesis: ...\",\"repair boundary: ...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}",
-            run.repository_path, run.founder_idea
+            "This is an existing-product incident. Do not perform market research or ask whether Arena should build the product. Produce bounded diagnosis evidence with expected versus actual behavior, the supplied derived source context, deterministic reproduction steps when they can be stated, ranked hypotheses, and a repair boundary. Never claim that Arena executed a reproduction, observed runtime logs, or proved a hypothesis unless such runtime evidence is explicitly present in the admitted evidence. If execution is still required, say that a validation experiment is required rather than inventing a result. Repository: {}. Incident brief: {}{}\nReturn JSON: {{\"summary\":\"...\",\"findings\":[\"expected: ...\",\"actual: ...\",\"reproduction status: reported|derived|requires experiment ...\",\"hypothesis: ...\",\"repair boundary: ...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}",
+            run.repository_path, run.founder_idea, intelligence
         ),
     );
     let execution = run_scheduled_role(ctx, run, order.work_order_id, prompt).await?;
