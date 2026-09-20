@@ -2481,11 +2481,16 @@ pub async fn request_consultation(
         product_os_runtime::snapshot(ctx.db.clone(), ctx.runtime.clone(), run.project_id.clone())
             .await?
             .ok_or_else(|| "Product OS authority snapshot is missing".to_string())?;
-    let decision_id = format!(
-        "owner-consultation:{}:{}",
-        run.run_id,
-        run.consultation_request_ids.len().saturating_add(1)
-    );
+    // One consultation round is keyed to the actual unresolved owner
+    // question when one exists. Otherwise it is keyed to the current
+    // ProductAuthority revision and coordinator phase, so repeated clicks do
+    // not bypass the one-round-per-decision policy.
+    let decision_id = run.owner_question_id.clone().unwrap_or_else(|| {
+        format!(
+            "authority-decision:{}:{}:{:?}",
+            run.project_id, snapshot.records.project_revision, run.phase
+        )
+    });
     let data_root = ctx
         .delivery_state_path
         .parent()
