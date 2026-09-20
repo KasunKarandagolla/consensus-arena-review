@@ -579,8 +579,11 @@ pub fn adopt_owner_decision(
 
 fn validate_architecture(records: &ProductAuthorityRecords) -> Result<Vec<String>, String> {
     let architecture = &records.architecture;
+    if architecture.proposal_a_evidence_id.trim().is_empty() {
+        return Err("architecture requires proposal A evidence".to_string());
+    }
     if architecture.competition_mode == ArchitectureCompetitionMode::CompetingProposals
-        && (architecture.proposal_a_evidence_id.is_empty()
+        && (architecture.proposal_b_evidence_id.trim().is_empty()
             || architecture.proposal_a_evidence_id == architecture.proposal_b_evidence_id)
     {
         return Err("architecture requires two distinct independent proposals".to_string());
@@ -945,13 +948,11 @@ fn input_for_records(
             .iter()
             .any(|decision| decision.classification == ReuseClassification::Build),
         architecture: Some(evidence_gates::ArchitectureProof {
-            // Two proposals are necessary but not sufficient: the Chief
-            // Engineer synthesis is the Arena-adopted selection boundary.
-            proposal_count: if architecture.synthesis.is_some() {
-                2
-            } else {
-                1
-            },
+            // Count the actual admitted proposal identities. Established
+            // patterns may legitimately have one; competing architecture must
+            // have two distinct proposals.
+            proposal_count: u8::from(!architecture.proposal_a_evidence_id.is_empty())
+                + u8::from(!architecture.proposal_b_evidence_id.is_empty()),
             established_pattern: architecture.competition_mode
                 == ArchitectureCompetitionMode::EstablishedPattern,
             hard_constraints_checked: referenced_evidence(
@@ -1295,6 +1296,19 @@ mod tests {
             .evaluate_current(&records, GateId::Ambiguity)
             .expect("ambiguity gate");
         assert_eq!(decision.status, GateStatus::Pass);
+    }
+
+    #[test]
+    fn established_pattern_requires_real_proposal_and_reports_actual_count() {
+        let mut records = records();
+        records.architecture.competition_mode = ArchitectureCompetitionMode::EstablishedPattern;
+        records.architecture.proposal_b_evidence_id.clear();
+        let package = assemble_build_package(&records).expect("single established proposal is valid");
+        let input = input_for_records(&records, &package, GateId::Architecture).expect("gate input");
+        assert_eq!(input.architecture.expect("architecture proof").proposal_count, 1);
+
+        records.architecture.proposal_a_evidence_id.clear();
+        assert!(assemble_build_package(&records).is_err());
     }
 
     #[test]
