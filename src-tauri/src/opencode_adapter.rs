@@ -1288,7 +1288,7 @@ fn acceptance_summary(state: &DeliveryState) -> String {
 
 async fn run_advisory_candidate_checks(
     app: Option<&AppHandle>,
-    state_path: &Path,
+    state_path: &PathBuf,
     delivery_slot: &Arc<tokio::sync::Mutex<Option<DeliveryState>>>,
     transcript: &Arc<std::sync::Mutex<TranscriptStore>>,
     state: &mut DeliveryState,
@@ -1407,7 +1407,7 @@ async fn run_advisory_candidate_checks(
 
 async fn verify_exact_candidate(
     app: Option<&AppHandle>,
-    state_path: &Path,
+    state_path: &PathBuf,
     delivery_slot: &Arc<tokio::sync::Mutex<Option<DeliveryState>>>,
     transcript: &Arc<std::sync::Mutex<TranscriptStore>>,
     state: &mut DeliveryState,
