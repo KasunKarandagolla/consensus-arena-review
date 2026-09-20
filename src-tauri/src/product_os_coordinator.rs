@@ -214,6 +214,24 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+fn repository_has_product_context(repository: &Path) -> bool {
+    [
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "requirements.txt",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "src",
+        "app",
+        "lib",
+        "src-tauri",
+    ]
+    .iter()
+    .any(|entry| repository.join(entry).exists())
+}
+
 async fn run_scheduled_role(
     ctx: &CoordinatorContext,
     run: &ProductCoordinatorRun,
@@ -2282,7 +2300,10 @@ pub async fn start(
     if !repository.is_dir() {
         return Err("founder project repository does not exist".to_string());
     }
-    let route = pipeline_contract::select_route(&founder_idea);
+    let route = pipeline_contract::select_route_with_context(
+        &founder_idea,
+        repository_has_product_context(&repository),
+    );
     let route_plan = pipeline_contract::route_plan(route);
     let project_id = format!("arena-project:{}", uuid::Uuid::new_v4());
     product_os_runtime::create_product_project(
@@ -2955,6 +2976,19 @@ mod tests {
             pipeline_contract::owner_decision_for_option(None, "pivot"),
             Ok(OwnerDecisionKind::PivotRun)
         );
+    }
+
+    #[test]
+    fn repository_context_detection_distinguishes_code_workspace_from_empty_folder() {
+        let root = std::env::temp_dir().join(format!(
+            "arena-route-context-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create route fixture");
+        assert!(!repository_has_product_context(&root));
+        std::fs::write(root.join("package.json"), "{}").expect("write manifest");
+        assert!(repository_has_product_context(&root));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
