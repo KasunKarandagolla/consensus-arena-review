@@ -1682,16 +1682,17 @@ pub async fn start(
     if !repository.is_dir() {
         return Err("founder project repository does not exist".to_string());
     }
+    let route = pipeline_contract::select_route(&founder_idea);
+    let route_plan = pipeline_contract::route_plan(route);
     let project_id = format!("arena-project:{}", uuid::Uuid::new_v4());
     product_os_runtime::create_product_project(
         ctx.db.clone(),
         project_id.clone(),
         founder_idea.clone(),
+        route,
     )
     .await?;
     let timestamp = now();
-    let route = pipeline_contract::select_route(&founder_idea);
-    let route_plan = pipeline_contract::route_plan(route);
     let initial_phase = match route {
         ProductRoute::Incident => CoordinatorPhase::ReproduceDiagnose,
         ProductRoute::ExistingFeature => CoordinatorPhase::ProductReview,
