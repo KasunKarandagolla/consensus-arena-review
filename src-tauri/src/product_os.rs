@@ -73,6 +73,7 @@ pub struct AuthorityAmbiguityRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProductWorkOrderRole {
+    ResearchLead,
     Researcher,
     FactVerifier,
     ProductDirector,
