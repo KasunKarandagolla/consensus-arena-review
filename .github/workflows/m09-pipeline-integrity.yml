@@ -2,6 +2,9 @@ name: M09 Pipeline Integrity
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - chatgpt/arena-m09cd-rebuild
