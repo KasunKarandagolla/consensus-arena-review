@@ -975,6 +975,27 @@ pub async fn request_product_consultation(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn recover_product_consultation(
+    run_id: String,
+    request_id: String,
+    action: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let request_id = product_os_safe_text(request_id, state.inner()).await?;
+    let action = product_os_safe_text(action, state.inner()).await?;
+    let run = crate::product_os_coordinator::recover_consultation(
+        product_coordinator_context(state.inner(), Some(app)),
+        run_id,
+        request_id,
+        action,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn cancel_product_project(
     run_id: String,
     reason: String,
