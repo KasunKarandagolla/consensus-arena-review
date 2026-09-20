@@ -1166,10 +1166,7 @@ mod tests {
                     admitted_revision: 1,
                 },
             ],
-            owner_required_ambiguity_ids: vec![
-                "direction-ambiguity".to_string(),
-                "a1".to_string(),
-            ],
+            owner_required_ambiguity_ids: vec!["direction-ambiguity".to_string(), "a1".to_string()],
             reuse_decisions: vec![ReuseDecisionRecord {
                 capability: "Delivery".to_string(),
                 classification: ReuseClassification::Reuse,
