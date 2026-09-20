@@ -2231,6 +2231,7 @@ pub async fn answer_owner_question(
         decision,
         OwnerDecisionKind::AuthorizeValidationExperiment
             | OwnerDecisionKind::AuthorizeNarrowBuild
+            | OwnerDecisionKind::AuthorizeBuild
             | OwnerDecisionKind::StopRun
             | OwnerDecisionKind::PivotRun
     ) {
@@ -2274,6 +2275,20 @@ pub async fn answer_owner_question(
         terminal.updated_at = now();
         save_run(&ctx, &terminal).await?;
         return Ok(terminal);
+    }
+    if decision == OwnerDecisionKind::AuthorizeBuild {
+        let mut resumed = run;
+        resumed.status = CoordinatorStatus::Running;
+        resumed.phase = CoordinatorPhase::Package;
+        resumed.stage = PipelineStage::Decide;
+        resumed.pending_owner_decision = None;
+        resumed.owner_ambiguity_id = None;
+        resumed.owner_question_id = None;
+        resumed.error = None;
+        resumed.updated_at = now();
+        save_run(&ctx, &resumed).await?;
+        spawn(ctx, resumed.run_id.clone());
+        return Ok(resumed);
     }
     if decision == OwnerDecisionKind::AuthorizeValidationExperiment {
         let mut returned = run.clone();
