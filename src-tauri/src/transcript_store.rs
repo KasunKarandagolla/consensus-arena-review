@@ -366,9 +366,7 @@ impl TranscriptStore {
             let raw = row?;
             let run: crate::product_os_coordinator::ProductCoordinatorRun =
                 serde_json::from_str(&raw).map_err(|error| {
-                    AgentError::DatabaseError(format!(
-                        "parse Product OS coordinator run: {error}"
-                    ))
+                    AgentError::DatabaseError(format!("parse Product OS coordinator run: {error}"))
                 })?;
             if run.delivery_session_id.as_deref() == Some(delivery_session_id) {
                 return Ok(Some(run));
