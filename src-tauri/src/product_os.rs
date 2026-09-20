@@ -358,35 +358,40 @@ pub fn adopt_product_direction(
     if selected_option.trim() != "narrow_build" {
         return Err("Build Package admission requires the owner option narrow_build".to_string());
     }
-    if records.route == ProductRoute::NewProduct {
-        let fresh_owner_authorization = records.owner_decisions.iter().rev().any(|decision| {
-            decision.authority == DecisionAuthority::Owner
-                && decision.status == DecisionStatus::Adopted
-                && matches!(
-                    decision.selected_option.as_str(),
-                    "narrow_build" | "authorize_narrow_build"
-                )
-                && decision.revision.saturating_add(1) == records.project_revision
-        });
-        if !fresh_owner_authorization {
-            return Err(
+    let decision_id = if records.route == ProductRoute::NewProduct {
+        records
+            .owner_decisions
+            .iter()
+            .rev()
+            .find(|decision| {
+                decision.authority == DecisionAuthority::Owner
+                    && decision.status == DecisionStatus::Adopted
+                    && matches!(
+                        decision.selected_option.as_str(),
+                        "narrow_build" | "authorize_narrow_build"
+                    )
+                    && decision.revision.saturating_add(1) == records.project_revision
+            })
+            .map(|decision| decision.decision_id.clone())
+            .ok_or_else(|| {
                 "NewProduct NarrowBuild requires a fresh explicit owner decision before product-direction adoption"
-                    .to_string(),
-            );
-        }
-    }
-    let decision_id = format!(
-        "product-direction:{}:{}",
-        records.project_id, records.project_revision
-    );
-    records.owner_decisions.push(OwnerDecisionRecord {
-        decision_id: decision_id.clone(),
-        question_id: format!("product-direction:{}", records.project_id),
-        selected_option,
-        revision: records.project_revision,
-        status: DecisionStatus::Adopted,
-        authority: DecisionAuthority::Owner,
-    });
+                    .to_string()
+            })?
+    } else {
+        let decision_id = format!(
+            "product-direction:{}:{}",
+            records.project_id, records.project_revision
+        );
+        records.owner_decisions.push(OwnerDecisionRecord {
+            decision_id: decision_id.clone(),
+            question_id: format!("founder-mandate:{}", records.project_id),
+            selected_option,
+            revision: records.project_revision,
+            status: DecisionStatus::Adopted,
+            authority: DecisionAuthority::Owner,
+        });
+        decision_id
+    };
     records.decision_outcome = Some(DecisionOutcome::NarrowBuild);
     records.product_direction_decision_id = Some(decision_id.clone());
     records.project_revision = records.project_revision.saturating_add(1);
@@ -1233,9 +1238,26 @@ mod tests {
     fn bare_narrow_build_enum_cannot_admit_a_package() {
         let mut records = records();
         records.product_direction_decision_id = None;
+        records.decision_outcome = None;
+        records.owner_decisions.clear();
         assert!(assemble_build_package(&records).is_err());
+        assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_err());
+
+        let owner_revision = records.project_revision.saturating_sub(1);
+        records.owner_decisions.push(OwnerDecisionRecord {
+            decision_id: "explicit-current-owner-direction".to_string(),
+            question_id: "explicit-direction-question".to_string(),
+            selected_option: "narrow_build".to_string(),
+            revision: owner_revision,
+            status: DecisionStatus::Adopted,
+            authority: DecisionAuthority::Owner,
+        });
         let decision_id = adopt_product_direction(&mut records, "narrow_build".to_string())
-            .expect("owner direction");
+            .expect("fresh owner direction");
+        assert_eq!(
+            decision_id,
+            "explicit-current-owner-direction".to_string()
+        );
         assert_eq!(records.product_direction_decision_id, Some(decision_id));
         assert!(assemble_build_package(&records).is_ok());
     }
