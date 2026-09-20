@@ -1,0 +1,29 @@
+# Consensus Arena project-local Codex multi-agent configuration.
+# The lead session uses Terra; bounded spawned work defaults to Luna.
+
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 6
+default_subagent_model = "gpt-5.6-luna"
+default_subagent_reasoning_effort = "medium"
+
+[agents.source_scout]
+config_file = "./agents/source-scout.toml"
+
+[agents.verification_planner]
+config_file = "./agents/verification-planner.toml"
+
+[agents.implementation_worker]
+config_file = "./agents/implementation-worker.toml"
+
+[agents.fixture_worker]
+config_file = "./agents/fixture-worker.toml"
+
+[agents.docs_scout]
+config_file = "./agents/docs-scout.toml"
+
+[agents.pipeline_reviewer]
+config_file = "./agents/pipeline-reviewer.toml"
