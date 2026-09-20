@@ -431,6 +431,89 @@ pub async fn observe_once(
     }))
 }
 
+pub async fn recover_observe_once(
+    cwd: &Path,
+    profile_root: &Path,
+    order: &ConsultationWorkOrder,
+    anchor: &crate::consultation_broker::ConversationAnchor,
+) -> Result<Option<ConsultationObservation>, String> {
+    if order.transport != ConsultationTransportKind::ExternalBrowserAgent
+        || !matches!(
+            order.state,
+            crate::consultation_broker::ConsultationTransactionState::UnknownOutcome
+                | crate::consultation_broker::ConsultationTransactionState::OwnerRecovery
+                | crate::consultation_broker::ConsultationTransactionState::Observing
+        )
+    {
+        return Err("consultation is not in an observation-only recovery state".to_string());
+    }
+    if anchor.provider != order.provider
+        || anchor.profile_id != order.profile_id
+        || anchor.establishment
+            != crate::consultation_broker::ConversationEstablishment::Established
+    {
+        return Err(
+            "consultation recovery has no established ConversationAnchor; owner action is required"
+                .to_string(),
+        );
+    }
+    let target = anchor
+        .canonical_url
+        .as_deref()
+        .ok_or_else(|| "consultation recovery anchor has no canonical URL".to_string())?;
+    let target = validate_application_url(order.provider, target, true)?;
+    let status = runtime_status(cwd).await;
+    if !status.compatible {
+        return Err(status.message);
+    }
+    let profile_path = bounded_profile_path(profile_root, order)?;
+    std::fs::create_dir_all(&profile_path)
+        .map_err(|error| format!("open Arena consultation browser profile: {error}"))?;
+    let session_id = format!("arena-consult-{}", safe_component(&order.request_id));
+    // Observation-only recovery may navigate back to the already-established
+    // thread. It never fills a composer and never performs a Send gesture.
+    command(cwd, &session_id, &profile_path, &["open", target.as_str()]).await?;
+    let _ = command(cwd, &session_id, &profile_path, &["wait", "1500"]).await;
+    let current_url = command(cwd, &session_id, &profile_path, &["get", "url"])
+        .await?
+        .stdout
+        .trim()
+        .to_string();
+    let rendered = command(cwd, &session_id, &profile_path, &["read"])
+        .await?
+        .stdout;
+    match page_classification(&current_url, &rendered) {
+        ConversationAvailability::NeedsAuth => {
+            return Err("consultation recovery requires manual provider authentication".to_string())
+        }
+        ConversationAvailability::Challenge => {
+            return Err("consultation recovery encountered a provider challenge".to_string())
+        }
+        _ => {}
+    }
+    let marker = request_marker(&order.request_id);
+    let Some(advisory_text) = extract_advisory_after_marker(&rendered, &marker) else {
+        return Ok(None);
+    };
+    let canonical_url = validate_application_url(order.provider, &current_url, true)?;
+    let assistant_turn_digest =
+        format!("sha256:{:x}", Sha256::digest(advisory_text.as_bytes()));
+    Ok(Some(ConsultationObservation {
+        request_id: order.request_id.clone(),
+        execution_epoch: order.execution_epoch,
+        provider: order.provider,
+        provider_config_id: order.provider_config_id.clone(),
+        profile_id: order.profile_id.clone(),
+        canonical_url,
+        user_turn_digest: order.prompt_digest.clone(),
+        assistant_turn_digest,
+        advisory_text,
+        provider_conversation_id: provider_conversation_id(order.provider, &current_url)
+            .or_else(|| anchor.provider_conversation_id.clone()),
+        provider_branch_id: anchor.provider_branch_id.clone(),
+    }))
+}
+
 pub async fn close_owned_session(cwd: &Path, staged: &StagedBrowserSubmission) {
     let _ = command(cwd, &staged.session_id, &staged.profile_path, &["close"]).await;
 }
