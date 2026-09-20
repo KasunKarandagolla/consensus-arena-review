@@ -2371,6 +2371,9 @@ pub async fn start(
     )
     .await?;
     let timestamp = now();
+    let initial_directive =
+        crate::work_graph::owner_directive_from_text(&founder_idea, 1, timestamp)?;
+    let initial_mandate = crate::work_graph::research_mandate_for(&initial_directive);
     let initial_phase = match route {
         ProductRoute::Incident => CoordinatorPhase::ReproduceDiagnose,
         ProductRoute::ExistingFeature => CoordinatorPhase::ProductReview,
@@ -2394,24 +2397,8 @@ pub async fn start(
         remediation_counts: BTreeMap::new(),
         remediation_question: None,
         last_remediation: None,
-        owner_directives: {
-            let directive = crate::work_graph::owner_directive_from_text(
-                &founder_idea,
-                1,
-                timestamp,
-            )?;
-            vec![directive]
-        },
-        research_mandates: {
-            let directive = crate::work_graph::owner_directive_from_text(
-                &founder_idea,
-                1,
-                timestamp,
-            )?;
-            crate::work_graph::research_mandate_for(&directive)
-                .into_iter()
-                .collect()
-        },
+        owner_directives: vec![initial_directive],
+        research_mandates: initial_mandate.into_iter().collect(),
         research_work_order_ids: Vec::new(),
         verifier_work_order_ids: Vec::new(),
         verified_evidence_ids: Vec::new(),
