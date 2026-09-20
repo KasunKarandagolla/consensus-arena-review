@@ -913,7 +913,15 @@ fn input_for_records(
             reuse_scan_complete: !records.reuse_decisions.is_empty(),
             risky_assumptions_tested: architecture.synthesis.as_ref().is_some_and(|synthesis| {
                 !synthesis.experiment_needed
-                    || !architecture.risk_experiment_evidence_ids.is_empty()
+                    || architecture.risk_experiment_evidence_ids.iter().any(|evidence_id| {
+                        records.evidence.iter().any(|item| {
+                            item.current
+                                && item.evidence_id == *evidence_id
+                                && item.kind == Some(EvidenceKind::RiskExperiment)
+                                && item.verification
+                                    == Some(EvidenceVerification::IndependentlyVerified)
+                        })
+                    })
             }),
             red_team_complete: referenced_evidence(records, &architecture.red_team_evidence_id)
                 .is_ok(),
@@ -1227,6 +1235,33 @@ mod tests {
         adopt_owner_decision(&mut records, "a2", "q2", "proceed".to_string())
             .expect("current owner decision");
         assert!(assemble_build_package(&records).is_ok());
+    }
+
+    #[test]
+    fn failed_risk_experiment_cannot_satisfy_architecture_gate() {
+        let mut records = records();
+        let experiment_id = records.architecture.risk_experiment_evidence_ids[0].clone();
+        let experiment = records
+            .evidence
+            .iter_mut()
+            .find(|item| item.evidence_id == experiment_id)
+            .expect("risk experiment evidence");
+        experiment.kind = Some(EvidenceKind::RiskExperiment);
+        experiment.verification = Some(EvidenceVerification::Contradicted);
+        records
+            .architecture
+            .synthesis
+            .as_mut()
+            .expect("synthesis")
+            .experiment_needed = true;
+        let package = assemble_build_package(&records).expect("package remains inspectable");
+        assert_ne!(
+            package
+                .evaluate_current(&records, GateId::Architecture)
+                .expect("evaluate")
+                .status,
+            GateStatus::Pass
+        );
     }
 
     #[test]
