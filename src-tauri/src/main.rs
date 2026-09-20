@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent_brain;
+mod agent_reach;
 mod agentic_manager;
 mod blueprint_store;
 mod browser_backend;
