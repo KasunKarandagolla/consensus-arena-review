@@ -18,8 +18,8 @@ mod tests {
         ArchitecturePlanningMode, ArchitectureProposalInput, ArchitectureReviewPacket,
         ExperimentContract, ExperimentExecutorKind, ExperimentOperation, GateRemediationOutcome,
         OwnerDecisionKind, ProductRoute, ResourceClass, ResourceScheduler,
-        architecture_planning_mode, owner_decision_for_option, route_gate_remediation, route_plan,
-        select_route, select_route_with_context,
+        architecture_planning_mode, owner_decision_for_option, owner_decision_matches_pending,
+        route_gate_remediation, route_plan, select_route, select_route_with_context,
     };
 
     fn now() -> i64 {
@@ -288,6 +288,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn fault_owner_answer_cannot_cross_authority_question_boundaries() {
+        assert!(!owner_decision_matches_pending(
+            OwnerDecisionKind::AuthorizeValidationExperiment,
+            OwnerDecisionKind::AuthorizeBuild,
+        ));
+        assert!(!owner_decision_matches_pending(
+            OwnerDecisionKind::AuthorizeBuild,
+            OwnerDecisionKind::ContinueEvaluation,
+        ));
+        assert!(owner_decision_matches_pending(
+            OwnerDecisionKind::StopRun,
+            OwnerDecisionKind::ContinueEvaluation,
+        ));
+        assert!(owner_decision_matches_pending(
+            OwnerDecisionKind::ApproveApply,
+            OwnerDecisionKind::ApproveApply,
+        ));
     }
 
     #[test]
