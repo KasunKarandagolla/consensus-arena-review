@@ -166,6 +166,7 @@ fn main() {
             commands::provide_product_owner_decision,
             commands::start_product_project,
             commands::get_product_coordinator_status,
+            commands::get_product_functional_state,
             commands::answer_product_question,
             commands::request_product_consultation,
             commands::cancel_product_project,
