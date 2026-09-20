@@ -15,6 +15,7 @@ pub const PLAYWRIGHT_MCP_VERSION: &str = "0.0.82";
 pub enum ExecutionProfile {
     SemanticNoTools,
     WebResearch,
+    AcceptanceAuthoring,
     Implementation,
     DebugRepair,
     CandidateReview,
@@ -68,6 +69,19 @@ impl ExecutionProfile {
                 max_prompt_bytes: 48 * 1024,
                 max_result_bytes: 64 * 1024,
                 resource_policy: ResourcePolicy::Light,
+            },
+            Self::AcceptanceAuthoring => ProfileSpec {
+                agent: "build",
+                allowed_tools: &[
+                    "read", "edit", "glob", "grep", "list", "bash", "lsp", "skill",
+                ],
+                selected_skills: &["test-driven-development", "verification-before-completion"],
+                lsp: true,
+                context7: false,
+                timeout_seconds: 1_800,
+                max_prompt_bytes: 48 * 1024,
+                max_result_bytes: 64 * 1024,
+                resource_policy: ResourcePolicy::HeavyLsp,
             },
             Self::Implementation => ProfileSpec {
                 agent: "build",
@@ -243,6 +257,7 @@ mod tests {
     fn only_code_roles_enable_lsp() {
         assert!(!ExecutionProfile::SemanticNoTools.spec().lsp);
         assert!(!ExecutionProfile::WebResearch.spec().lsp);
+        assert!(ExecutionProfile::AcceptanceAuthoring.spec().lsp);
         assert!(ExecutionProfile::Implementation.spec().lsp);
         assert!(ExecutionProfile::DebugRepair.spec().lsp);
         assert!(ExecutionProfile::CandidateReview.spec().lsp);
@@ -250,6 +265,10 @@ mod tests {
 
     #[test]
     fn selected_skills_are_pinned_by_profile_policy() {
+        assert_eq!(
+            ExecutionProfile::AcceptanceAuthoring.spec().selected_skills,
+            &["test-driven-development", "verification-before-completion"]
+        );
         assert_eq!(
             ExecutionProfile::Implementation.spec().selected_skills,
             &["test-driven-development", "verification-before-completion"]
