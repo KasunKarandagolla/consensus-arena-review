@@ -1754,21 +1754,8 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
                     return Ok(());
                 }
                 pipeline_contract::GateRemediationOutcome::NeedsRepair => {
-                    let repair = product_os_runtime::create_product_director_work_order(
-                        ctx.db.clone(),
-                        run.project_id.clone(),
-                        format!(
-                            "BuildReadiness predicate repair: resolve the exact missing package or acceptance capability described here: {}",
-                            failed.reason
-                        ),
-                    )
-                    .await?;
-                    run.product_director_work_order_id = Some(repair.work_order_id);
-                    run.status = CoordinatorStatus::Blocked;
-                    run.phase = CoordinatorPhase::Package;
-                    run.stage = PipelineStage::Decide;
-                    run.terminal_outcome = Some("build_readiness_repair_queued".to_string());
-                    save_run(&ctx, &run).await?;
+                    repair_build_readiness(&ctx, &mut run, &failed.reason).await?;
+                    spawn(ctx, run_id);
                     return Ok(());
                 }
                 pipeline_contract::GateRemediationOutcome::NeedsExperiment => {
@@ -1863,15 +1850,18 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
                     save_run(&ctx, &run).await?;
                     return Ok(());
                 }
-                _ => {
-                    // Ordinary missing evidence never becomes an unlabelled
-                    // terminal failure. It remains resumable and carries the
-                    // Arena-owned typed remediation in durable state.
-                    run.status = CoordinatorStatus::WaitingForOwner;
-                    run.phase = CoordinatorPhase::ProductReview;
-                    run.stage = PipelineStage::Decide;
-                    save_run(&ctx, &run).await?;
+                pipeline_contract::GateRemediationOutcome::NeedsOwnerDecision => {
+                    persist_gate_owner_question(
+                        &ctx,
+                        &mut run,
+                        failed.gate_id,
+                        &failed.reason,
+                    )
+                    .await?;
                     return Ok(());
+                }
+                pipeline_contract::GateRemediationOutcome::Satisfied => {
+                    return Err("non-PASS gate cannot route to Satisfied remediation".to_string());
                 }
             }
         }
