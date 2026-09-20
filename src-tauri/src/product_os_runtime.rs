@@ -908,7 +908,8 @@ fn current_admitted_director(
 fn is_semantic_review_role(role: &ProductWorkOrderRole) -> bool {
     matches!(
         role,
-        ProductWorkOrderRole::ProductDirector
+        ProductWorkOrderRole::ResearchLead
+            | ProductWorkOrderRole::ProductDirector
             | ProductWorkOrderRole::ArchitectA
             | ProductWorkOrderRole::ArchitectB
             | ProductWorkOrderRole::ChiefEngineer
