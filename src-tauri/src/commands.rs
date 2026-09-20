@@ -935,6 +935,20 @@ pub async fn answer_product_question(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn get_product_functional_state(
+    run_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let view = crate::functional_contract::load_functional_state(
+        state.transcript_store.clone(),
+        run_id,
+    )
+    .await?;
+    serde_json::to_string(&view).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn request_product_consultation(
     run_id: String,
     provider: String,
