@@ -757,7 +757,8 @@ pub async fn update_anchor(
         let current = store.get_conversation_anchor(&anchor_id)?.ok_or_else(|| {
             AgentError::DatabaseError("ConversationAnchor is unknown".to_string())
         })?;
-        let next = apply_anchor_update(&current, update.clone()).map_err(AgentError::DatabaseError)?;
+        let next =
+            apply_anchor_update(&current, update.clone()).map_err(AgentError::DatabaseError)?;
         store.save_conversation_anchor(&next)?;
         Ok(next)
     })
