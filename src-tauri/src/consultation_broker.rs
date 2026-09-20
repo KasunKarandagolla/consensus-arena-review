@@ -502,7 +502,7 @@ pub async fn create_request(
             store.save_conversation_anchor(&anchor)?;
         }
         store.save_consultation_work_order(&order)?;
-        Ok(order)
+        Ok(order.clone())
     })
     .await
     .map_err(|error| error.to_string())
@@ -541,7 +541,7 @@ async fn mutate_request<F>(
     mutation: F,
 ) -> Result<ConsultationWorkOrder, String>
 where
-    F: FnOnce(&mut ConsultationWorkOrder) -> Result<(), String> + Send + 'static,
+    F: Fn(&mut ConsultationWorkOrder) -> Result<(), String> + Send + Sync + 'static,
 {
     db_helpers::run_blocking(move || {
         let mut store = db.lock().map_err(|_| {
@@ -586,7 +586,7 @@ pub async fn record_submission_outcome(
                 "consultation send effect receipt is stale or mismatched".to_string(),
             ));
         }
-        match receipt.outcome {
+        match &receipt.outcome {
             TransportSubmissionOutcome::Submitted { canonical_url } => {
                 order.submitted_at = Some(now());
                 order
@@ -595,8 +595,8 @@ pub async fn record_submission_outcome(
                 // Persist a provider-created conversation locator immediately
                 // after Send when it is already observable. A setup/new-chat
                 // URL is ignored rather than weakening an established anchor.
-                if let Some(raw_url) = canonical_url
-                    && let Ok(canonical) = validate_application_url(order.provider, &raw_url, true)
+                if let Some(raw_url) = canonical_url.as_deref()
+                    && let Ok(canonical) = validate_application_url(order.provider, raw_url, true)
                     && let Some(mut anchor) = store.get_conversation_anchor(&order.anchor_id)?
                 {
                     if anchor.provider == order.provider && anchor.profile_id == order.profile_id {
@@ -757,7 +757,7 @@ pub async fn update_anchor(
         let current = store.get_conversation_anchor(&anchor_id)?.ok_or_else(|| {
             AgentError::DatabaseError("ConversationAnchor is unknown".to_string())
         })?;
-        let next = apply_anchor_update(&current, update).map_err(AgentError::DatabaseError)?;
+        let next = apply_anchor_update(&current, update.clone()).map_err(AgentError::DatabaseError)?;
         store.save_conversation_anchor(&next)?;
         Ok(next)
     })
@@ -846,10 +846,10 @@ pub async fn admit_observation(
             execution_epoch: order.execution_epoch,
             provider: order.provider,
             canonical_url: canonical,
-            user_turn_digest: observation.user_turn_digest,
-            assistant_turn_digest: observation.assistant_turn_digest,
+            user_turn_digest: observation.user_turn_digest.clone(),
+            assistant_turn_digest: observation.assistant_turn_digest.clone(),
             content_digest: digest_text(&observation.advisory_text),
-            advisory_text: observation.advisory_text,
+            advisory_text: observation.advisory_text.clone(),
             completed_at: now(),
         };
         store.save_consultation_result(&result)?;
