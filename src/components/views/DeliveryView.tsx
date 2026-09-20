@@ -76,7 +76,10 @@ export default function DeliveryView() {
 
   async function resume() {
     try {
-      if (coordinator && !state?.build_package_id) {
+      if (
+        coordinator &&
+        !['completed', 'stopped', 'pivoted', 'cancelled'].includes(coordinator.status)
+      ) {
         await invoke('resume_product_project', { run_id: coordinator.run_id })
       } else {
         await invoke('resume_delivery')
@@ -88,7 +91,10 @@ export default function DeliveryView() {
 
   async function abort() {
     try {
-      if (coordinator && !state?.build_package_id) {
+      if (
+        coordinator &&
+        !['completed', 'stopped', 'pivoted', 'cancelled'].includes(coordinator.status)
+      ) {
         await invoke('cancel_product_project', {
           run_id: coordinator.run_id,
           reason: 'Stopped by owner',
