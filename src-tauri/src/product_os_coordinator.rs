@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tauri::AppHandle;
 
 const MAX_IDEA_BYTES: usize = 8 * 1024;
 
@@ -125,6 +126,9 @@ pub struct CoordinatorContext {
     pub delivery_state_path: PathBuf,
     pub delivery_slot: Arc<tokio::sync::Mutex<Option<crate::delivery::DeliveryState>>>,
     pub settings: Arc<tokio::sync::Mutex<SettingsStore>>,
+    pub ask_user_tx:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    pub app: Option<AppHandle>,
     pub role_scheduler: Arc<crate::pipeline_contract::ResourceScheduler>,
 }
 
@@ -1620,15 +1624,15 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
         .await?;
         run.delivery_session_id = Some(delivery_id);
         save_run(&ctx, &run).await?;
-        let settings = ctx.settings.clone();
-        let result = crate::delivery::run_backend_qualification(
+        let result = crate::delivery::run_owner_capable_production(
             ctx.runtime.clone(),
+            ctx.app.clone(),
             state,
             ctx.delivery_state_path.clone(),
             ctx.delivery_slot.clone(),
             ctx.db.clone(),
-            Arc::new(tokio::sync::Mutex::new(None)),
-            settings,
+            ctx.ask_user_tx.clone(),
+            ctx.settings.clone(),
         )
         .await;
         match result {
@@ -2107,6 +2111,8 @@ mod tests {
             delivery_state_path: root.join("delivery-state.json"),
             delivery_slot: Arc::new(tokio::sync::Mutex::new(None)),
             settings,
+            ask_user_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            app: None,
             role_scheduler: Arc::new(crate::pipeline_contract::ResourceScheduler::default()),
         };
         let started = start(
