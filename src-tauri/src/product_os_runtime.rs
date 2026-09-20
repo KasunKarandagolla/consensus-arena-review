@@ -586,6 +586,8 @@ fn new_work_order(
         status: ProductWorkOrderStatus::Admitted,
         project_revision,
         parent_work_order_id,
+        model_id: None,
+        delegation_depth: 0,
         evidence_id: None,
         evidence_ids: Vec::new(),
         input_manifest: Some(ResolvedInputManifest {
