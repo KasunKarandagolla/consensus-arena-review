@@ -484,8 +484,13 @@ pub enum ExperimentExecutorKind {
 pub enum ExperimentOperation {
     CargoCheckLocked,
     FrontendBuild,
-    GitHubRepositoryMetadata { url: String },
-    FileContains { relative_path: String, needle: String },
+    GitHubRepositoryMetadata {
+        url: String,
+    },
+    FileContains {
+        relative_path: String,
+        needle: String,
+    },
 }
 
 impl ExperimentOperation {

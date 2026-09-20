@@ -1015,15 +1015,16 @@ pub async fn run_product_role_work_order(
                     let root_session_id = output.root_session_id.clone();
                     let root_session_id_for_db = root_session_id.clone();
                     let tool_names = output.tool_names.clone();
-                    let tool_receipt = crate::quality_workflows::ToolUseReceipt::from_observed_tools(
-                        &id,
-                        &root_session_id,
-                        &format!("{execution_profile:?}"),
-                        &tool_names,
-                        "complete",
-                        started_at,
-                        completed_at,
-                    )?;
+                    let tool_receipt =
+                        crate::quality_workflows::ToolUseReceipt::from_observed_tools(
+                            &id,
+                            &root_session_id,
+                            &format!("{execution_profile:?}"),
+                            &tool_names,
+                            "complete",
+                            started_at,
+                            completed_at,
+                        )?;
                     let db_for_finalize = db.clone();
                     let finalized = db_helpers::run_blocking(move || {
                         let mut store = db_for_finalize.lock().map_err(|_| {
@@ -1380,7 +1381,8 @@ async fn execute_experiment_operation(
                 Ok(value) if value.timed_out => ExperimentObservation {
                     disposition: ExperimentDisposition::Inconclusive,
                     source_reference: description,
-                    summary: "cargo check --locked timed out before a valid observation".to_string(),
+                    summary: "cargo check --locked timed out before a valid observation"
+                        .to_string(),
                 },
                 Ok(value) if value.exit_code == Some(0) => ExperimentObservation {
                     disposition: ExperimentDisposition::Pass,
@@ -1390,10 +1392,7 @@ async fn execute_experiment_operation(
                 Ok(value) => ExperimentObservation {
                     disposition: ExperimentDisposition::Fail,
                     source_reference: description,
-                    summary: format!(
-                        "cargo check --locked exited with {:?}",
-                        value.exit_code
-                    ),
+                    summary: format!("cargo check --locked exited with {:?}", value.exit_code),
                 },
                 Err(_) => ExperimentObservation {
                     disposition: ExperimentDisposition::Inconclusive,
@@ -1490,20 +1489,24 @@ async fn execute_experiment_operation(
                         Err(_) => ExperimentObservation {
                             disposition: ExperimentDisposition::Inconclusive,
                             source_reference: relative_path.clone(),
-                            summary: "bounded file probe could not read the selected file".to_string(),
+                            summary: "bounded file probe could not read the selected file"
+                                .to_string(),
                         },
                     }
                 }
                 Ok(_) => ExperimentObservation {
                     disposition: ExperimentDisposition::Inconclusive,
                     source_reference: relative_path.clone(),
-                    summary: "bounded file probe rejected a non-file or oversized input".to_string(),
+                    summary: "bounded file probe rejected a non-file or oversized input"
+                        .to_string(),
                 },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => ExperimentObservation {
-                    disposition: ExperimentDisposition::Fail,
-                    source_reference: relative_path.clone(),
-                    summary: "bounded file probe did not find the selected file".to_string(),
-                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ExperimentObservation {
+                        disposition: ExperimentDisposition::Fail,
+                        source_reference: relative_path.clone(),
+                        summary: "bounded file probe did not find the selected file".to_string(),
+                    }
+                }
                 Err(_) => ExperimentObservation {
                     disposition: ExperimentDisposition::Inconclusive,
                     source_reference: relative_path.clone(),
@@ -1547,9 +1550,8 @@ async fn execute_isolated_experiment_operation(
         return ExperimentObservation {
             disposition: ExperimentDisposition::Inconclusive,
             source_reference: contract.operation.description(),
-            summary:
-                "canonical checkout is not clean; isolated experiment admission was refused"
-                    .to_string(),
+            summary: "canonical checkout is not clean; isolated experiment admission was refused"
+                .to_string(),
         };
     }
 
@@ -1606,9 +1608,7 @@ async fn execute_isolated_experiment_operation(
     };
     let _ = std::fs::remove_dir_all(&worktree);
 
-    let cleanup_ok = cleanup
-        .as_ref()
-        .is_ok_and(|output| output.status.success());
+    let cleanup_ok = cleanup.as_ref().is_ok_and(|output| output.status.success());
     let after = crate::delivery::snapshot_canonical_checkout(repository).await;
     let canonical_unchanged = after
         .as_ref()
@@ -1799,13 +1799,15 @@ pub async fn admit_consultation_result(
     result: crate::consultation_broker::ConsultationResult,
 ) -> Result<EvidenceItem, String> {
     db_helpers::run_blocking(move || {
-        let mut store = db.lock().map_err(|_| {
-            AgentError::DatabaseError("transcript store lock poisoned".to_string())
-        })?;
+        let mut store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
         let mut records = load_records(&store, &project_id).map_err(AgentError::DatabaseError)?;
         let order = store
             .get_consultation_work_order(&result.request_id)?
-            .ok_or_else(|| AgentError::DatabaseError("consultation work order is missing".to_string()))?;
+            .ok_or_else(|| {
+                AgentError::DatabaseError("consultation work order is missing".to_string())
+            })?;
         if order.project_id != project_id
             || order.result_id.as_deref() != Some(result.result_id.as_str())
             || order.state != crate::consultation_broker::ConsultationTransactionState::Complete
@@ -1815,7 +1817,11 @@ pub async fn admit_consultation_result(
             ));
         }
         let evidence_id = format!("{}:advisory", result.result_id);
-        if records.evidence.iter().any(|item| item.evidence_id == evidence_id) {
+        if records
+            .evidence
+            .iter()
+            .any(|item| item.evidence_id == evidence_id)
+        {
             return Err(AgentError::DatabaseError(
                 "consultation advisory evidence was already admitted".to_string(),
             ));

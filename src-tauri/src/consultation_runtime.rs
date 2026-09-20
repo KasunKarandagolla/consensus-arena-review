@@ -102,7 +102,9 @@ async fn persist_pre_send_failure(
         })?;
         let mut order = store
             .get_consultation_work_order(&request_id)?
-            .ok_or_else(|| AgentError::DatabaseError("consultation request is missing".to_string()))?;
+            .ok_or_else(|| {
+                AgentError::DatabaseError("consultation request is missing".to_string())
+            })?;
         if order.state.is_post_arm() {
             return Err(AgentError::DatabaseError(
                 "pre-send failure cannot rewrite a post-Armed request".to_string(),
@@ -132,13 +134,7 @@ pub async fn execute_external_browser_consultation(
     prompt: String,
     disclosure_summary: String,
 ) -> Result<ConsultationExecutionOutcome, String> {
-    if decision_already_consulted(
-        db.clone(),
-        project_id.clone(),
-        decision_id.clone(),
-    )
-    .await?
-    {
+    if decision_already_consulted(db.clone(), project_id.clone(), decision_id.clone()).await? {
         return Err("this Product OS decision already has a consultation round".to_string());
     }
     if !repository.is_dir() || !profile_root.is_absolute() {
@@ -212,9 +208,7 @@ pub async fn execute_external_browser_consultation(
             provider_conversation_id: current_anchor.provider_conversation_id.clone(),
             provider_branch_id: current_anchor.provider_branch_id.clone(),
             pending_request_id: Some(order.request_id.clone()),
-            last_confirmed_user_turn_digest: current_anchor
-                .last_confirmed_user_turn_digest
-                .clone(),
+            last_confirmed_user_turn_digest: current_anchor.last_confirmed_user_turn_digest.clone(),
             last_confirmed_assistant_turn_digest: current_anchor
                 .last_confirmed_assistant_turn_digest
                 .clone(),
@@ -223,25 +217,15 @@ pub async fn execute_external_browser_consultation(
     )
     .await?;
 
-    let staged_order = consultation_broker::stage_request(
-        db.clone(),
-        order.request_id.clone(),
-    )
-    .await?;
-    let (armed_order, permit) = consultation_broker::arm_for_send(
-        db.clone(),
-        staged_order.request_id.clone(),
-    )
-    .await?;
+    let staged_order =
+        consultation_broker::stage_request(db.clone(), order.request_id.clone()).await?;
+    let (armed_order, permit) =
+        consultation_broker::arm_for_send(db.clone(), staged_order.request_id.clone()).await?;
     let effect = external_browser::submit_once(&repository, permit, &staged).await;
-    let mut current =
-        consultation_broker::record_submission_outcome(db.clone(), effect).await?;
+    let mut current = consultation_broker::record_submission_outcome(db.clone(), effect).await?;
     if current.state == ConsultationTransactionState::Submitted {
-        current = consultation_broker::mark_observing(
-            db.clone(),
-            armed_order.request_id.clone(),
-        )
-        .await?;
+        current =
+            consultation_broker::mark_observing(db.clone(), armed_order.request_id.clone()).await?;
     }
 
     for _ in 0..8 {
@@ -256,32 +240,21 @@ pub async fn execute_external_browser_consultation(
                         availability: ConversationAvailability::Available,
                         established: true,
                         canonical_url: Some(observation.canonical_url.clone()),
-                        provider_conversation_id: observation
-                            .provider_conversation_id
-                            .clone(),
+                        provider_conversation_id: observation.provider_conversation_id.clone(),
                         provider_branch_id: observation.provider_branch_id.clone(),
                         pending_request_id: Some(current.request_id.clone()),
-                        last_confirmed_user_turn_digest: Some(
-                            observation.user_turn_digest.clone(),
-                        ),
+                        last_confirmed_user_turn_digest: Some(observation.user_turn_digest.clone()),
                         last_confirmed_assistant_turn_digest: Some(
                             observation.assistant_turn_digest.clone(),
                         ),
-                        adapter_version:
-                            external_browser::AGENT_BROWSER_ADAPTER_VERSION.to_string(),
+                        adapter_version: external_browser::AGENT_BROWSER_ADAPTER_VERSION
+                            .to_string(),
                     },
                 )
                 .await?;
-                let result = consultation_broker::admit_observation(
-                    db.clone(),
-                    observation,
-                )
-                .await?;
-                consultation_broker::commit_result(
-                    db.clone(),
-                    current.request_id.clone(),
-                )
-                .await?;
+                let result =
+                    consultation_broker::admit_observation(db.clone(), observation).await?;
+                consultation_broker::commit_result(db.clone(), current.request_id.clone()).await?;
                 let _ = consultation_broker::update_anchor(
                     db.clone(),
                     updated.anchor_id.clone(),
@@ -299,8 +272,8 @@ pub async fn execute_external_browser_consultation(
                         last_confirmed_assistant_turn_digest: updated
                             .last_confirmed_assistant_turn_digest
                             .clone(),
-                        adapter_version:
-                            external_browser::AGENT_BROWSER_ADAPTER_VERSION.to_string(),
+                        adapter_version: external_browser::AGENT_BROWSER_ADAPTER_VERSION
+                            .to_string(),
                     },
                 )
                 .await;
@@ -400,16 +373,12 @@ pub async fn recover_external_browser_consultation(
 ) -> Result<ConsultationExecutionOutcome, String> {
     let mut order = load_order(db.clone(), request_id).await?;
     if order.state == ConsultationTransactionState::UnknownOutcome {
-        order = consultation_broker::begin_owner_recovery(
-            db.clone(),
-            order.request_id.clone(),
-        )
-        .await?;
+        order =
+            consultation_broker::begin_owner_recovery(db.clone(), order.request_id.clone()).await?;
     }
     if !matches!(
         order.state,
-        ConsultationTransactionState::OwnerRecovery
-            | ConsultationTransactionState::Observing
+        ConsultationTransactionState::OwnerRecovery | ConsultationTransactionState::Observing
     ) {
         return Err(
             "consultation recovery is observation-only and requires UnknownOutcome/OwnerRecovery/Observing"
@@ -417,21 +386,17 @@ pub async fn recover_external_browser_consultation(
         );
     }
     let anchor = load_anchor(db.clone(), order.anchor_id.clone()).await?;
-    let observation = match external_browser::recover_observe_once(
-        &repository,
-        &profile_root,
-        &order,
-        &anchor,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return Err(format!(
-                "consultation recovery remains pending without resend: {error}"
-            ));
-        }
-    };
+    let observation =
+        match external_browser::recover_observe_once(&repository, &profile_root, &order, &anchor)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(format!(
+                    "consultation recovery remains pending without resend: {error}"
+                ));
+            }
+        };
     let Some(observation) = observation else {
         return Ok(ConsultationExecutionOutcome::UnknownOutcome(order));
     };
@@ -449,9 +414,7 @@ pub async fn recover_external_browser_consultation(
             provider_branch_id: observation.provider_branch_id.clone(),
             pending_request_id: Some(order.request_id.clone()),
             last_confirmed_user_turn_digest: Some(observation.user_turn_digest.clone()),
-            last_confirmed_assistant_turn_digest: Some(
-                observation.assistant_turn_digest.clone(),
-            ),
+            last_confirmed_assistant_turn_digest: Some(observation.assistant_turn_digest.clone()),
             adapter_version: external_browser::AGENT_BROWSER_ADAPTER_VERSION.to_string(),
         },
     )
@@ -497,13 +460,7 @@ pub async fn recover_owned_external_browser_consultation(
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let result = if activate_rx.await.is_ok() {
-            recover_external_browser_consultation(
-                db,
-                repository,
-                profile_root,
-                request_id,
-            )
-            .await
+            recover_external_browser_consultation(db, repository, profile_root, request_id).await
         } else {
             Err("consultation recovery runtime was not activated".to_string())
         };

@@ -798,10 +798,9 @@ async fn author_and_freeze_acceptance(
     state: &DeliveryState,
     evidence_dir: &Path,
 ) -> Result<AcceptanceFreeze, String> {
-    let package = state
-        .build_package
-        .as_ref()
-        .ok_or_else(|| "Product OS Delivery has no Build Package for acceptance authoring".to_string())?;
+    let package = state.build_package.as_ref().ok_or_else(|| {
+        "Product OS Delivery has no Build Package for acceptance authoring".to_string()
+    })?;
     let before_head = verification::candidate_sha(candidate).await?;
     if before_head != state.base_commit {
         return Err(
@@ -930,7 +929,11 @@ async fn author_and_freeze_acceptance(
     )
     .await?;
     let acceptance_commit = verification::candidate_sha(candidate).await?;
-    let clean = git_output(candidate, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    let clean = git_output(
+        candidate,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )
+    .await?;
     if !clean.status.success() || !clean.stdout.is_empty() {
         return Err("frozen acceptance commit left a dirty candidate worktree".to_string());
     }
@@ -958,9 +961,8 @@ async fn author_and_freeze_acceptance(
         evidence: OpenCodeEvidence {
             evidence_id,
             kind: "acceptance_freeze".to_string(),
-            summary:
-                "Arena froze product-specific executable acceptance before implementation."
-                    .to_string(),
+            summary: "Arena froze product-specific executable acceptance before implementation."
+                .to_string(),
             result_ref: evidence_path.to_string_lossy().into_owned(),
         },
     })
@@ -1380,9 +1382,14 @@ async fn run_advisory_candidate_checks(
     }
 
     let after_review = verification::candidate_sha(candidate).await?;
-    let review_tree =
-        git_output(candidate, &["status", "--porcelain", "--untracked-files=all"]).await?;
-    if after_review != candidate_sha || !review_tree.status.success() || !review_tree.stdout.is_empty()
+    let review_tree = git_output(
+        candidate,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )
+    .await?;
+    if after_review != candidate_sha
+        || !review_tree.status.success()
+        || !review_tree.stdout.is_empty()
     {
         if after_review == candidate_sha {
             let _ = discard_candidate_changes(candidate, candidate_sha).await;
@@ -1412,7 +1419,11 @@ async fn verify_exact_candidate(
     authority_version: &str,
     candidate_sha: &str,
 ) -> Result<CandidateVerificationDisposition, String> {
-    let clean = git_output(candidate, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    let clean = git_output(
+        candidate,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )
+    .await?;
     if !clean.status.success()
         || !clean.stdout.is_empty()
         || verification::candidate_sha(candidate).await? != candidate_sha
@@ -1468,8 +1479,7 @@ async fn verify_exact_candidate(
                 .ok_or_else(|| "OpenCode work order was lost after verification".to_string())?;
             let correlated = work_order.verification_id.as_deref()
                 == Some(receipt.verification_id.as_str())
-                && work_order.verification_status.as_deref()
-                    == Some(receipt.verdict.as_str())
+                && work_order.verification_status.as_deref() == Some(receipt.verdict.as_str())
                 && work_order.task_state == OpenCodeTaskState::Failed
                 && work_order.error.as_deref()
                     == Some("independent verifier did not PASS the candidate");
@@ -1483,8 +1493,7 @@ async fn verify_exact_candidate(
                 // rerun only the frozen verifier when infrastructure recovers.
                 work_order.task_state = OpenCodeTaskState::EvidenceReady;
                 work_order.error = Some(
-                    "verification was inconclusive; implementation repair is forbidden"
-                        .to_string(),
+                    "verification was inconclusive; implementation repair is forbidden".to_string(),
                 );
                 CandidateVerificationDisposition::Inconclusive
             } else {
@@ -1494,7 +1503,11 @@ async fn verify_exact_candidate(
         _ => return Err("independent verifier returned an unknown verdict".to_string()),
     };
 
-    let after = git_output(candidate, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    let after = git_output(
+        candidate,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )
+    .await?;
     if !after.status.success()
         || !after.stdout.is_empty()
         || verification::candidate_sha(candidate).await? != candidate_sha
@@ -1574,57 +1587,38 @@ pub async fn run_delivery(
 
     if state.acceptance_commit.is_none() {
         state.phase = DeliveryPhase::AuthoringAcceptance;
-        crate::delivery::persist_emit(
-            app,
-            &state_path,
-            &delivery_slot,
-            &transcript,
-            &mut state,
-        )
-        .await?;
-        let freeze = match author_and_freeze_acceptance(
-            &canonical,
-            &candidate,
-            &state,
-            &evidence_dir,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                state.phase = DeliveryPhase::Failed;
-                state.last_worker_summary = Some(error);
-                crate::delivery::persist_emit(
-                    app,
-                    &state_path,
-                    &delivery_slot,
-                    &transcript,
-                    &mut state,
-                )
-                .await?;
-                return Ok(state);
-            }
-        };
+        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+            .await?;
+        let freeze =
+            match author_and_freeze_acceptance(&canonical, &candidate, &state, &evidence_dir).await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    state.phase = DeliveryPhase::Failed;
+                    state.last_worker_summary = Some(error);
+                    crate::delivery::persist_emit(
+                        app,
+                        &state_path,
+                        &delivery_slot,
+                        &transcript,
+                        &mut state,
+                    )
+                    .await?;
+                    return Ok(state);
+                }
+            };
         state.acceptance_commit = Some(freeze.acceptance_commit);
         state.verification_commands = freeze.profile.commands.clone();
         state.protected_files = freeze.profile.protected_paths.clone();
-        state.protected_hashes = verification::protected_hashes(
-            &candidate,
-            &state.protected_files,
-        )?
-        .into_iter()
-        .map(|(path, sha256)| ProtectedFileHash { path, sha256 })
-        .collect();
+        state.protected_hashes =
+            verification::protected_hashes(&candidate, &state.protected_files)?
+                .into_iter()
+                .map(|(path, sha256)| ProtectedFileHash { path, sha256 })
+                .collect();
         state.evidence.push(freeze.evidence);
         state.phase = DeliveryPhase::AcceptanceReady;
-        crate::delivery::persist_emit(
-            app,
-            &state_path,
-            &delivery_slot,
-            &transcript,
-            &mut state,
-        )
-        .await?;
+        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+            .await?;
     }
 
     let acceptance_commit = state
@@ -1640,14 +1634,8 @@ pub async fn run_delivery(
         state.last_worker_summary = Some(
             "frozen verification profile differs from persisted Delivery authority".to_string(),
         );
-        crate::delivery::persist_emit(
-            app,
-            &state_path,
-            &delivery_slot,
-            &transcript,
-            &mut state,
-        )
-        .await?;
+        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+            .await?;
         return Ok(state);
     }
     let protected_before = state
@@ -1661,14 +1649,8 @@ pub async fn run_delivery(
         state.phase = DeliveryPhase::Failed;
         state.last_worker_summary =
             Some("frozen acceptance files changed before implementation".to_string());
-        crate::delivery::persist_emit(
-            app,
-            &state_path,
-            &delivery_slot,
-            &transcript,
-            &mut state,
-        )
-        .await?;
+        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+            .await?;
         return Ok(state);
     }
     let ancestry = git_output(
@@ -1801,8 +1783,9 @@ pub async fn run_delivery(
             Ok(CandidateVerificationDisposition::Fail) => {
                 if !crate::delivery::attempts_remaining(state.attempt) {
                     state.phase = DeliveryPhase::Failed;
-                    state.last_worker_summary =
-                        Some("Frozen verification failed and repair budget is exhausted".to_string());
+                    state.last_worker_summary = Some(
+                        "Frozen verification failed and repair budget is exhausted".to_string(),
+                    );
                     crate::delivery::persist_emit(
                         app,
                         &state_path,
@@ -1854,14 +1837,8 @@ pub async fn run_delivery(
         } else {
             DeliveryPhase::Implementing
         };
-        crate::delivery::persist_emit(
-            app,
-            &state_path,
-            &delivery_slot,
-            &transcript,
-            &mut state,
-        )
-        .await?;
+        crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+            .await?;
 
         let prompt = if repair {
             repair_prompt(&state)
@@ -2064,14 +2041,8 @@ pub async fn run_delivery(
 
     state.phase = DeliveryPhase::Failed;
     state.last_worker_summary = Some("OpenCode implementation budget exhausted".to_string());
-    crate::delivery::persist_emit(
-        app,
-        &state_path,
-        &delivery_slot,
-        &transcript,
-        &mut state,
-    )
-    .await?;
+    crate::delivery::persist_emit(app, &state_path, &delivery_slot, &transcript, &mut state)
+        .await?;
     Ok(state)
 }
 

@@ -174,7 +174,10 @@ mod tests {
             "work-order",
             "browser-session",
             "browser_qa",
-            &["playwright.inspect".to_string(), "playwright.inspect".to_string()],
+            &[
+                "playwright.inspect".to_string(),
+                "playwright.inspect".to_string(),
+            ],
             "complete",
             10,
             11,

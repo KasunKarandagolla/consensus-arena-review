@@ -910,9 +910,11 @@ pub async fn get_product_coordinator_status(
         Some(value) => Some(product_os_safe_text(value, state.inner()).await?),
         None => None,
     };
-    let status =
-        crate::product_os_coordinator::status(&product_coordinator_context(state.inner(), None), run_id)
-            .await?;
+    let status = crate::product_os_coordinator::status(
+        &product_coordinator_context(state.inner(), None),
+        run_id,
+    )
+    .await?;
     serde_json::to_string(&status).map_err(|error| error.to_string())
 }
 
@@ -940,11 +942,9 @@ pub async fn get_product_functional_state(
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let run_id = product_os_safe_text(run_id, state.inner()).await?;
-    let view = crate::functional_contract::load_functional_state(
-        state.transcript_store.clone(),
-        run_id,
-    )
-    .await?;
+    let view =
+        crate::functional_contract::load_functional_state(state.transcript_store.clone(), run_id)
+            .await?;
     serde_json::to_string(&view).map_err(|error| error.to_string())
 }
 
@@ -1019,12 +1019,11 @@ pub async fn resume_product_project(
     app: AppHandle,
 ) -> Result<String, String> {
     let run_id = product_os_safe_text(run_id, state.inner()).await?;
-    let run =
-        crate::product_os_coordinator::resume(
-            product_coordinator_context(state.inner(), Some(app)),
-            run_id,
-        )
-            .await?;
+    let run = crate::product_os_coordinator::resume(
+        product_coordinator_context(state.inner(), Some(app)),
+        run_id,
+    )
+    .await?;
     serde_json::to_string(&run).map_err(|error| error.to_string())
 }
 

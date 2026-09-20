@@ -134,8 +134,7 @@ pub struct CoordinatorContext {
     pub delivery_state_path: PathBuf,
     pub delivery_slot: Arc<tokio::sync::Mutex<Option<crate::delivery::DeliveryState>>>,
     pub settings: Arc<tokio::sync::Mutex<SettingsStore>>,
-    pub ask_user_tx:
-        Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    pub ask_user_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     pub app: Option<AppHandle>,
     pub role_scheduler: Arc<crate::pipeline_contract::ResourceScheduler>,
 }
@@ -304,13 +303,21 @@ fn coordinator_status_is_terminal(status: &CoordinatorStatus) -> bool {
 }
 
 fn run_owns_runtime_session(run: &ProductCoordinatorRun, session_id: &str) -> bool {
-    run.research_work_order_ids.iter().any(|id| id == session_id)
-        || run.verifier_work_order_ids.iter().any(|id| id == session_id)
+    run.research_work_order_ids
+        .iter()
+        .any(|id| id == session_id)
+        || run
+            .verifier_work_order_ids
+            .iter()
+            .any(|id| id == session_id)
         || run
             .product_director_work_order_id
             .as_deref()
             .is_some_and(|id| id == session_id)
-        || run.architecture_work_order_ids.iter().any(|id| id == session_id)
+        || run
+            .architecture_work_order_ids
+            .iter()
+            .any(|id| id == session_id)
         || run
             .reuse_work_order_id
             .as_deref()
@@ -345,9 +352,9 @@ async fn project_consultations(
     let db = ctx.db.clone();
     let project_id = project_id.to_string();
     db_helpers::run_blocking(move || {
-        let store = db.lock().map_err(|_| {
-            AgentError::DatabaseError("transcript store lock poisoned".to_string())
-        })?;
+        let store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
         store.list_project_consultation_work_orders(&project_id)
     })
     .await
@@ -393,9 +400,7 @@ async fn save_run(ctx: &CoordinatorContext, run: &ProductCoordinatorRun) -> Resu
                     "cancellation authority prevents stale coordinator writes".to_string(),
                 ));
             }
-            if coordinator_status_is_terminal(&current.status)
-                && current.status != run.status
-            {
+            if coordinator_status_is_terminal(&current.status) && current.status != run.status {
                 return Err(AgentError::DatabaseError(
                     "terminal coordinator state cannot be overwritten".to_string(),
                 ));
@@ -876,13 +881,9 @@ async fn run_product_review(
     run.owner_ambiguity_id = Some(ambiguity_id);
     run.owner_question_id = Some(question_id);
     if outcome == "validation_experiment" {
-        let mut contract = output
-            .experiment_contract
-            .clone()
-            .ok_or_else(|| {
-                "ValidationExperiment outcome omitted the exact typed ExperimentContract"
-                    .to_string()
-            })?;
+        let mut contract = output.experiment_contract.clone().ok_or_else(|| {
+            "ValidationExperiment outcome omitted the exact typed ExperimentContract".to_string()
+        })?;
         contract.synthesis_identity = format!(
             "{}:product-review:{}",
             run.project_id, snapshot.records.project_revision
@@ -1479,13 +1480,12 @@ async fn repair_build_readiness(
     run: &mut ProductCoordinatorRun,
     reason: &str,
 ) -> Result<(), String> {
-    let snapshot = product_os_runtime::snapshot(
-        ctx.db.clone(),
-        ctx.runtime.clone(),
-        run.project_id.clone(),
-    )
-    .await?
-    .ok_or_else(|| "Product OS authority disappeared during BuildReadiness repair".to_string())?;
+    let snapshot =
+        product_os_runtime::snapshot(ctx.db.clone(), ctx.runtime.clone(), run.project_id.clone())
+            .await?
+            .ok_or_else(|| {
+                "Product OS authority disappeared during BuildReadiness repair".to_string()
+            })?;
     let order = product_os_runtime::create_product_director_work_order(
         ctx.db.clone(),
         run.project_id.clone(),
@@ -1502,13 +1502,7 @@ async fn repair_build_readiness(
             reason
         ),
     );
-    let execution = run_scheduled_role(
-        ctx,
-        run,
-        order.work_order_id,
-        prompt,
-    )
-    .await?;
+    let execution = run_scheduled_role(ctx, run, order.work_order_id, prompt).await?;
     let scope: ScopeOutput = parse_json(&execution.output)?;
     let admission = ProductScopeAdmission {
         objective: text(&scope.objective, "scope objective")?,
@@ -1845,13 +1839,8 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
                     return Ok(());
                 }
                 pipeline_contract::GateRemediationOutcome::NeedsOwnerDecision => {
-                    persist_gate_owner_question(
-                        &ctx,
-                        &mut run,
-                        failed.gate_id,
-                        &failed.reason,
-                    )
-                    .await?;
+                    persist_gate_owner_question(&ctx, &mut run, failed.gate_id, &failed.reason)
+                        .await?;
                     return Ok(());
                 }
                 pipeline_contract::GateRemediationOutcome::Satisfied => {
@@ -1882,7 +1871,8 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
             || !package.is_current_for(&snapshot.records)?
         {
             run.status = CoordinatorStatus::Blocked;
-            run.error = Some("Build Package became stale before Delivery admission/resume".to_string());
+            run.error =
+                Some("Build Package became stale before Delivery admission/resume".to_string());
             run.updated_at = now();
             save_run(&ctx, &run).await?;
             return Ok(());
@@ -2252,9 +2242,7 @@ pub async fn request_consultation(
     ) {
         return Err("terminal Product OS runs cannot start consultation".to_string());
     }
-    if run.status == CoordinatorStatus::Running
-        && ctx.runtime.current_owner().is_some()
-    {
+    if run.status == CoordinatorStatus::Running && ctx.runtime.current_owner().is_some() {
         return Err(
             "Product OS consultation waits until the current owned task reaches a safe boundary"
                 .to_string(),
@@ -2264,13 +2252,10 @@ pub async fn request_consultation(
     run.consultation_return_error = run.error.clone();
     run.updated_at = now();
     save_run(&ctx, &run).await?;
-    let snapshot = product_os_runtime::snapshot(
-        ctx.db.clone(),
-        ctx.runtime.clone(),
-        run.project_id.clone(),
-    )
-    .await?
-    .ok_or_else(|| "Product OS authority snapshot is missing".to_string())?;
+    let snapshot =
+        product_os_runtime::snapshot(ctx.db.clone(), ctx.runtime.clone(), run.project_id.clone())
+            .await?
+            .ok_or_else(|| "Product OS authority snapshot is missing".to_string())?;
     let decision_id = format!(
         "owner-consultation:{}:{}",
         run.run_id,
@@ -2517,7 +2502,10 @@ pub async fn cancel(
     let _ = crate::consultation_broker::cancel_project_open_requests(
         ctx.db.clone(),
         run.project_id.clone(),
-        format!("Product OS run cancelled by owner: {}", reason.chars().take(240).collect::<String>()),
+        format!(
+            "Product OS run cancelled by owner: {}",
+            reason.chars().take(240).collect::<String>()
+        ),
     )
     .await?;
 
@@ -2543,8 +2531,7 @@ pub async fn cancel(
             && let Ok(mut delivery) = serde_json::from_str::<crate::delivery::DeliveryState>(&raw)
             && !matches!(
                 delivery.phase,
-                crate::delivery::DeliveryPhase::Applied
-                    | crate::delivery::DeliveryPhase::Cancelled
+                crate::delivery::DeliveryPhase::Applied | crate::delivery::DeliveryPhase::Cancelled
             )
         {
             delivery.phase = crate::delivery::DeliveryPhase::Cancelled;
@@ -2621,7 +2608,11 @@ pub async fn recover_consultation(
                     result.clone(),
                 )
                 .await?;
-                if !run.consultation_request_ids.iter().any(|id| id == &result.request_id) {
+                if !run
+                    .consultation_request_ids
+                    .iter()
+                    .any(|id| id == &result.request_id)
+                {
                     run.consultation_request_ids.push(result.request_id);
                 }
                 if !run
@@ -2651,16 +2642,13 @@ pub async fn recover_consultation(
     }
 
     run.error = run.consultation_return_error.take();
-    run.status = run
-        .consultation_return_status
-        .take()
-        .unwrap_or_else(|| {
-            if run.pending_owner_decision.is_some() {
-                CoordinatorStatus::WaitingForOwner
-            } else {
-                CoordinatorStatus::Running
-            }
-        });
+    run.status = run.consultation_return_status.take().unwrap_or_else(|| {
+        if run.pending_owner_decision.is_some() {
+            CoordinatorStatus::WaitingForOwner
+        } else {
+            CoordinatorStatus::Running
+        }
+    });
     run.updated_at = now();
     save_run(&ctx, &run).await?;
     if run.status == CoordinatorStatus::Running {

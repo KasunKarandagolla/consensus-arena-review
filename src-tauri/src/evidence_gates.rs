@@ -396,7 +396,10 @@ pub fn evaluate(input: &GateInput) -> GateDecision {
                         GateStatus::Pass,
                         format!(
                             "research gate explicitly omitted for this route: {}",
-                            input.research_omission_reason.as_deref().unwrap_or_default()
+                            input
+                                .research_omission_reason
+                                .as_deref()
+                                .unwrap_or_default()
                         ),
                     )
                 } else {

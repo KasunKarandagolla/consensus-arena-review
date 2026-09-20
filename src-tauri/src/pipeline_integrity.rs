@@ -8,17 +8,18 @@
 #[cfg(test)]
 mod tests {
     use crate::consultation_broker::{
-        apply_anchor_update, validate_application_url, ConsultationProvider, ConsultationReason,
-        ConsultationTransactionState, ConsultationTransportKind, ConsultationWorkOrder,
-        ConversationAnchor, ConversationAnchorUpdate, ConversationAvailability,
-        ConversationEstablishment,
+        ConsultationProvider, ConsultationReason, ConsultationTransactionState,
+        ConsultationTransportKind, ConsultationWorkOrder, ConversationAnchor,
+        ConversationAnchorUpdate, ConversationAvailability, ConversationEstablishment,
+        apply_anchor_update, validate_application_url,
     };
     use crate::evidence_gates::{GateId, GateStatus};
     use crate::pipeline_contract::{
+        ArchitecturePlanningMode, ArchitectureProposalInput, ArchitectureReviewPacket,
+        ExperimentContract, ExperimentExecutorKind, ExperimentOperation, GateRemediationOutcome,
+        OwnerDecisionKind, ProductRoute, ResourceClass, ResourceScheduler,
         architecture_planning_mode, owner_decision_for_option, route_gate_remediation, route_plan,
-        select_route, ArchitecturePlanningMode, ArchitectureProposalInput,
-        ArchitectureReviewPacket, ExperimentContract, ExperimentExecutorKind, ExperimentOperation,
-        GateRemediationOutcome, OwnerDecisionKind, ProductRoute, ResourceClass, ResourceScheduler,
+        select_route,
     };
 
     fn now() -> i64 {
@@ -114,18 +115,20 @@ mod tests {
 
     #[test]
     fn scenario_d_existing_feature_skips_market_discovery_and_can_use_established_pattern() {
-        let idea =
-            "Add CSV export to this existing repo using the existing utility and established pattern";
+        let idea = "Add CSV export to this existing repo using the existing utility and established pattern";
         let route = select_route(idea);
         assert_eq!(route, ProductRoute::ExistingFeature);
         let plan = route_plan(route);
-        assert!(!plan
-            .stages
-            .contains(&crate::pipeline_contract::PipelineStage::Discover));
-        assert!(plan
-            .omitted_stages
-            .iter()
-            .any(|stage| stage.stage == crate::pipeline_contract::PipelineStage::Discover));
+        assert!(
+            !plan
+                .stages
+                .contains(&crate::pipeline_contract::PipelineStage::Discover)
+        );
+        assert!(
+            plan.omitted_stages
+                .iter()
+                .any(|stage| stage.stage == crate::pipeline_contract::PipelineStage::Discover)
+        );
         assert_eq!(
             architecture_planning_mode(route, idea),
             ArchitecturePlanningMode::EstablishedPattern
@@ -143,9 +146,11 @@ mod tests {
             plan.stages.first(),
             Some(&crate::pipeline_contract::PipelineStage::ReproduceDiagnose)
         );
-        assert!(!plan
-            .stages
-            .contains(&crate::pipeline_contract::PipelineStage::Discover));
+        assert!(
+            !plan
+                .stages
+                .contains(&crate::pipeline_contract::PipelineStage::Discover)
+        );
     }
 
     #[test]
@@ -154,9 +159,11 @@ mod tests {
         let first = scheduler
             .try_claim("research-a", 1, ResourceClass::ExclusiveSessionRuntime)
             .expect("first owner");
-        assert!(scheduler
-            .try_claim("architect-b", 1, ResourceClass::ExclusiveSessionRuntime)
-            .is_err());
+        assert!(
+            scheduler
+                .try_claim("architect-b", 1, ResourceClass::ExclusiveSessionRuntime)
+                .is_err()
+        );
         scheduler.release(&first).expect("exact owner releases");
     }
 
@@ -180,13 +187,7 @@ mod tests {
             risks: Vec::new(),
             content: String::new(),
         };
-        assert!(ArchitectureReviewPacket::resolve(
-            "project".to_string(),
-            1,
-            a,
-            missing
-        )
-        .is_err());
+        assert!(ArchitectureReviewPacket::resolve("project".to_string(), 1, a, missing).is_err());
     }
 
     #[test]
@@ -201,25 +202,33 @@ mod tests {
         order
             .transition(ConsultationTransactionState::UnknownOutcome)
             .expect("unknown");
-        assert!(order
-            .transition(ConsultationTransactionState::Armed)
-            .is_err());
-        assert!(order
-            .transition(ConsultationTransactionState::Staged)
-            .is_err());
-        assert!(order
-            .transition(ConsultationTransactionState::Observing)
-            .is_ok());
+        assert!(
+            order
+                .transition(ConsultationTransactionState::Armed)
+                .is_err()
+        );
+        assert!(
+            order
+                .transition(ConsultationTransactionState::Staged)
+                .is_err()
+        );
+        assert!(
+            order
+                .transition(ConsultationTransactionState::Observing)
+                .is_ok()
+        );
     }
 
     #[test]
     fn fault_anchor_origin_and_revision_drift_are_rejected() {
-        assert!(validate_application_url(
-            ConsultationProvider::ChatGpt,
-            "https://chatgpt.com.evil.example/c/123",
-            true
-        )
-        .is_err());
+        assert!(
+            validate_application_url(
+                ConsultationProvider::ChatGpt,
+                "https://chatgpt.com.evil.example/c/123",
+                true
+            )
+            .is_err()
+        );
 
         let order = consultation_order();
         let current = ConversationAnchor {
@@ -254,16 +263,20 @@ mod tests {
             ),
             Ok(OwnerDecisionKind::AuthorizeValidationExperiment)
         );
-        assert!(owner_decision_for_option(
-            Some(crate::evidence_gates::DecisionOutcome::ValidationExperiment),
-            "yes go ahead"
-        )
-        .is_err());
-        assert!(owner_decision_for_option(
-            Some(crate::evidence_gates::DecisionOutcome::NarrowBuild),
-            "authorize_validation_experiment"
-        )
-        .is_err());
+        assert!(
+            owner_decision_for_option(
+                Some(crate::evidence_gates::DecisionOutcome::ValidationExperiment),
+                "yes go ahead"
+            )
+            .is_err()
+        );
+        assert!(
+            owner_decision_for_option(
+                Some(crate::evidence_gates::DecisionOutcome::NarrowBuild),
+                "authorize_validation_experiment"
+            )
+            .is_err()
+        );
     }
 
     #[test]

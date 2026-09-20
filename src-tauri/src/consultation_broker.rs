@@ -179,8 +179,10 @@ impl ConsultationWorkOrder {
             || budget_units == 0
             || execution_epoch == 0
         {
-            return Err("consultation request requires prompt, future deadline, budget, and epoch"
-                .to_string());
+            return Err(
+                "consultation request requires prompt, future deadline, budget, and epoch"
+                    .to_string(),
+            );
         }
         let request_id = uuid::Uuid::new_v4().to_string();
         let timestamp = now();
@@ -261,7 +263,8 @@ impl ConsultationWorkOrder {
                 ConsultationTransactionState::OwnerRecovery,
                 ConsultationTransactionState::Observing
             )
-        ) || (!self.state.is_terminal() && next == ConsultationTransactionState::Cancelled);
+        ) || (!self.state.is_terminal()
+            && next == ConsultationTransactionState::Cancelled);
         if !valid {
             return Err(format!(
                 "invalid consultation transition {:?} -> {:?}",
@@ -370,12 +373,8 @@ pub struct TransportEffectReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportSubmissionOutcome {
-    Submitted {
-        canonical_url: Option<String>,
-    },
-    UnknownOutcome {
-        diagnostic: String,
-    },
+    Submitted { canonical_url: Option<String> },
+    UnknownOutcome { diagnostic: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,8 +411,8 @@ pub fn validate_application_url(
     raw_url: &str,
     established_identity: bool,
 ) -> Result<String, String> {
-    let mut url =
-        reqwest::Url::parse(raw_url).map_err(|_| "consultation application URL is invalid".to_string())?;
+    let mut url = reqwest::Url::parse(raw_url)
+        .map_err(|_| "consultation application URL is invalid".to_string())?;
     if url.scheme() != "https" || url.host_str() != Some(provider.expected_host()) {
         return Err("consultation application URL has the wrong origin".to_string());
     }
@@ -455,7 +454,10 @@ pub fn apply_anchor_update(
             .as_deref()
             .ok_or_else(|| "established ConversationAnchor requires a canonical URL".to_string())?;
         let canonical = validate_application_url(current.provider, raw_url, true)?;
-        if update.provider_conversation_id.as_deref().is_none_or(str::is_empty)
+        if update
+            .provider_conversation_id
+            .as_deref()
+            .is_none_or(str::is_empty)
             && canonical == current.provider.home_url()
         {
             return Err("established anchor has no durable conversation identity".to_string());
@@ -488,15 +490,15 @@ pub async fn create_request(
         let mut store = db.lock().map_err(|_| {
             AgentError::DatabaseError("consultation store lock poisoned".to_string())
         })?;
-        if store.get_consultation_work_order(&order.request_id)?.is_some() {
+        if store
+            .get_consultation_work_order(&order.request_id)?
+            .is_some()
+        {
             return Err(AgentError::DatabaseError(
                 "consultation request identity already exists".to_string(),
             ));
         }
-        if store
-            .get_conversation_anchor(&anchor.anchor_id)?
-            .is_none()
-        {
+        if store.get_conversation_anchor(&anchor.anchor_id)?.is_none() {
             store.save_conversation_anchor(&anchor)?;
         }
         store.save_consultation_work_order(&order)?;
@@ -547,7 +549,9 @@ where
         })?;
         let mut order = store
             .get_consultation_work_order(&request_id)?
-            .ok_or_else(|| AgentError::DatabaseError("consultation request is unknown".to_string()))?;
+            .ok_or_else(|| {
+                AgentError::DatabaseError("consultation request is unknown".to_string())
+            })?;
         mutation(&mut order).map_err(AgentError::DatabaseError)?;
         store.save_consultation_work_order(&order)?;
         Ok(order)
@@ -561,7 +565,9 @@ pub async fn record_submission_outcome(
     receipt: TransportEffectReceipt,
 ) -> Result<ConsultationWorkOrder, String> {
     if now().saturating_sub(receipt.issued_at) > 120 {
-        return Err("consultation send effect receipt expired before durable admission".to_string());
+        return Err(
+            "consultation send effect receipt expired before durable admission".to_string(),
+        );
     }
     db_helpers::run_blocking(move || {
         let mut store = db.lock().map_err(|_| {
@@ -569,7 +575,9 @@ pub async fn record_submission_outcome(
         })?;
         let mut order = store
             .get_consultation_work_order(&receipt.request_id)?
-            .ok_or_else(|| AgentError::DatabaseError("consultation request is unknown".to_string()))?;
+            .ok_or_else(|| {
+                AgentError::DatabaseError("consultation request is unknown".to_string())
+            })?;
         if order.state != ConsultationTransactionState::Armed
             || order.execution_epoch != receipt.execution_epoch
             || order.transport != receipt.transport
@@ -588,13 +596,10 @@ pub async fn record_submission_outcome(
                 // after Send when it is already observable. A setup/new-chat
                 // URL is ignored rather than weakening an established anchor.
                 if let Some(raw_url) = canonical_url
-                    && let Ok(canonical) =
-                        validate_application_url(order.provider, &raw_url, true)
+                    && let Ok(canonical) = validate_application_url(order.provider, &raw_url, true)
                     && let Some(mut anchor) = store.get_conversation_anchor(&order.anchor_id)?
                 {
-                    if anchor.provider == order.provider
-                        && anchor.profile_id == order.profile_id
-                    {
+                    if anchor.provider == order.provider && anchor.profile_id == order.profile_id {
                         anchor.establishment = ConversationEstablishment::Established;
                         anchor.availability = ConversationAvailability::Available;
                         anchor.canonical_url = Some(canonical);
@@ -749,9 +754,9 @@ pub async fn update_anchor(
         let mut store = db.lock().map_err(|_| {
             AgentError::DatabaseError("consultation store lock poisoned".to_string())
         })?;
-        let current = store
-            .get_conversation_anchor(&anchor_id)?
-            .ok_or_else(|| AgentError::DatabaseError("ConversationAnchor is unknown".to_string()))?;
+        let current = store.get_conversation_anchor(&anchor_id)?.ok_or_else(|| {
+            AgentError::DatabaseError("ConversationAnchor is unknown".to_string())
+        })?;
         let next = apply_anchor_update(&current, update).map_err(AgentError::DatabaseError)?;
         store.save_conversation_anchor(&next)?;
         Ok(next)
@@ -775,7 +780,9 @@ pub async fn admit_observation(
         })?;
         let mut order = store
             .get_consultation_work_order(&observation.request_id)?
-            .ok_or_else(|| AgentError::DatabaseError("consultation request is unknown".to_string()))?;
+            .ok_or_else(|| {
+                AgentError::DatabaseError("consultation request is unknown".to_string())
+            })?;
         if order.execution_epoch != observation.execution_epoch
             || order.provider != observation.provider
             || order.provider_config_id != observation.provider_config_id
@@ -799,7 +806,9 @@ pub async fn admit_observation(
         }
         let anchor = store
             .get_conversation_anchor(&order.anchor_id)?
-            .ok_or_else(|| AgentError::DatabaseError("ConversationAnchor is missing".to_string()))?;
+            .ok_or_else(|| {
+                AgentError::DatabaseError("ConversationAnchor is missing".to_string())
+            })?;
         if anchor.provider != observation.provider
             || anchor.profile_id != observation.profile_id
             || anchor.establishment != ConversationEstablishment::Established
@@ -808,8 +817,9 @@ pub async fn admit_observation(
                 "consultation observation does not match the established anchor".to_string(),
             ));
         }
-        let canonical = validate_application_url(observation.provider, &observation.canonical_url, true)
-            .map_err(AgentError::DatabaseError)?;
+        let canonical =
+            validate_application_url(observation.provider, &observation.canonical_url, true)
+                .map_err(AgentError::DatabaseError)?;
         if anchor.canonical_url.as_deref() != Some(canonical.as_str())
             && anchor.provider_conversation_id.as_deref()
                 != observation.provider_conversation_id.as_deref()
@@ -851,7 +861,8 @@ pub async fn admit_observation(
         ) {
             order.state = ConsultationTransactionState::Observing;
         }
-        order.transition(ConsultationTransactionState::ReadyToCommit)
+        order
+            .transition(ConsultationTransactionState::ReadyToCommit)
             .map_err(AgentError::DatabaseError)?;
         store.save_consultation_work_order(&order)?;
         Ok(result)
@@ -866,7 +877,9 @@ pub async fn commit_result(
 ) -> Result<ConsultationWorkOrder, String> {
     mutate_request(db, request_id, |order| {
         if order.result_id.is_none() {
-            return Err("consultation result cannot commit without correlated evidence".to_string());
+            return Err(
+                "consultation result cannot commit without correlated evidence".to_string(),
+            );
         }
         order.transition(ConsultationTransactionState::Complete)
     })
@@ -900,16 +913,28 @@ mod tests {
     #[test]
     fn post_arm_state_cannot_return_to_staged() {
         let mut value = order();
-        value.transition(ConsultationTransactionState::Staged).unwrap();
-        value.transition(ConsultationTransactionState::Armed).unwrap();
-        assert!(value.transition(ConsultationTransactionState::Staged).is_err());
+        value
+            .transition(ConsultationTransactionState::Staged)
+            .unwrap();
+        value
+            .transition(ConsultationTransactionState::Armed)
+            .unwrap();
+        assert!(
+            value
+                .transition(ConsultationTransactionState::Staged)
+                .is_err()
+        );
     }
 
     #[test]
     fn unknown_outcome_requires_observation_or_owner_recovery_not_resend() {
         let mut value = order();
-        value.transition(ConsultationTransactionState::Staged).unwrap();
-        value.transition(ConsultationTransactionState::Armed).unwrap();
+        value
+            .transition(ConsultationTransactionState::Staged)
+            .unwrap();
+        value
+            .transition(ConsultationTransactionState::Armed)
+            .unwrap();
         value
             .transition(ConsultationTransactionState::UnknownOutcome)
             .unwrap();
@@ -952,7 +977,10 @@ mod tests {
             adapter_version: "adapter-v1".to_string(),
         };
         assert!(apply_anchor_update(&current, update).is_err());
-        assert_eq!(current.canonical_url.as_deref(), Some("https://chatgpt.com/c/123"));
+        assert_eq!(
+            current.canonical_url.as_deref(),
+            Some("https://chatgpt.com/c/123")
+        );
     }
 
     #[test]
@@ -976,23 +1004,29 @@ mod tests {
 
     #[test]
     fn established_provider_urls_are_origin_strict() {
-        assert!(validate_application_url(
-            ConsultationProvider::ChatGpt,
-            "https://chatgpt.com/c/123",
-            true
-        )
-        .is_ok());
-        assert!(validate_application_url(
-            ConsultationProvider::ChatGpt,
-            "https://chatgpt.com.evil.example/c/123",
-            true
-        )
-        .is_err());
-        assert!(validate_application_url(
-            ConsultationProvider::Qwen,
-            "https://chat.qwen.ai/chat/abc",
-            true
-        )
-        .is_ok());
+        assert!(
+            validate_application_url(
+                ConsultationProvider::ChatGpt,
+                "https://chatgpt.com/c/123",
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_application_url(
+                ConsultationProvider::ChatGpt,
+                "https://chatgpt.com.evil.example/c/123",
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            validate_application_url(
+                ConsultationProvider::Qwen,
+                "https://chat.qwen.ai/chat/abc",
+                true
+            )
+            .is_ok()
+        );
     }
 }

@@ -4,16 +4,12 @@
 //! selectors, and workflow-internal storage details. It is a pure projection
 //! of durable Arena authority and runtime evidence.
 
-use crate::consultation_broker::{
-    ConsultationTransactionState, ConsultationWorkOrder,
-};
+use crate::consultation_broker::{ConsultationTransactionState, ConsultationWorkOrder};
 use crate::delivery::{DeliveryPhase, DeliveryState};
 use crate::evidence_gates::EvidenceVerification;
 use crate::pipeline_contract::{OwnerDecisionKind, ProductRoute};
 use crate::product_os::{ProductAuthorityRecords, ProductWorkOrder, ProductWorkOrderStatus};
-use crate::product_os_coordinator::{
-    CoordinatorPhase, CoordinatorStatus, ProductCoordinatorRun,
-};
+use crate::product_os_coordinator::{CoordinatorPhase, CoordinatorStatus, ProductCoordinatorRun};
 use crate::quality_workflows::ToolUseReceipt;
 use serde::{Deserialize, Serialize};
 
@@ -202,10 +198,7 @@ fn lifecycle(status: &CoordinatorStatus) -> FunctionalLifecycle {
     }
 }
 
-fn stage(
-    run: &ProductCoordinatorRun,
-    delivery: Option<&DeliveryState>,
-) -> FunctionalStage {
+fn stage(run: &ProductCoordinatorRun, delivery: Option<&DeliveryState>) -> FunctionalStage {
     if let Some(delivery) = delivery {
         return match delivery.phase {
             DeliveryPhase::Preparing | DeliveryPhase::AuthoringAcceptance => {
@@ -246,9 +239,7 @@ fn stage(
                 FunctionalStage::ArchitectureProposals
             } else if run.feasibility_work_order_id.is_some() {
                 FunctionalStage::ExperimentRunning
-            } else if run.architecture_evidence_ids.len() >= 1
-                && run.build_package_id.is_none()
-            {
+            } else if run.architecture_evidence_ids.len() >= 1 && run.build_package_id.is_none() {
                 FunctionalStage::ArchitectureReview
             } else {
                 FunctionalStage::ArchitectureSynthesis
@@ -338,9 +329,7 @@ pub fn build_functional_state(
         independently_verified: records
             .evidence
             .iter()
-            .filter(|item| {
-                item.verification == Some(EvidenceVerification::IndependentlyVerified)
-            })
+            .filter(|item| item.verification == Some(EvidenceVerification::IndependentlyVerified))
             .count(),
         unresolved: records
             .evidence
@@ -355,7 +344,9 @@ pub fn build_functional_state(
         consultation_advice: records
             .evidence
             .iter()
-            .filter(|item| item.kind == Some(crate::evidence_gates::EvidenceKind::ConsultationAdvice))
+            .filter(|item| {
+                item.kind == Some(crate::evidence_gates::EvidenceKind::ConsultationAdvice)
+            })
             .count(),
     };
     let synthesis = records.architecture.synthesis.as_ref();
@@ -368,7 +359,10 @@ pub fn build_functional_state(
                 .or_else(|| value.no_experiment_reason.clone())
         }),
         packet_hash: synthesis.map(|value| value.packet_hash.clone()),
-        unresolved_blockers: records.architecture.unresolved_high_blocker_evidence_ids.len(),
+        unresolved_blockers: records
+            .architecture
+            .unresolved_high_blocker_evidence_ids
+            .len(),
     };
     let latest_experiment_evidence = records
         .architecture
@@ -406,9 +400,18 @@ pub fn build_functional_state(
             .last_remediation
             .as_ref()
             .map(|value| format!("{:?}", value.outcome)),
-        reason: run.last_remediation.as_ref().map(|value| value.reason.clone()),
-        action: run.last_remediation.as_ref().map(|value| value.action.clone()),
-        blocker: run.error.clone().or_else(|| run.remediation_question.clone()),
+        reason: run
+            .last_remediation
+            .as_ref()
+            .map(|value| value.reason.clone()),
+        action: run
+            .last_remediation
+            .as_ref()
+            .map(|value| value.action.clone()),
+        blocker: run
+            .error
+            .clone()
+            .or_else(|| run.remediation_question.clone()),
     };
     let consultation = ConsultationActivity {
         request_count: consultations.len(),
@@ -502,11 +505,7 @@ pub fn build_functional_state(
             false,
             "Verified candidate is eligible for explicit owner-authorized Safe Apply".to_string(),
         ),
-        Some(DeliveryPhase::Applied) => (
-            false,
-            true,
-            "Safe Apply completed".to_string(),
-        ),
+        Some(DeliveryPhase::Applied) => (false, true, "Safe Apply completed".to_string()),
         _ => (
             false,
             false,
@@ -591,13 +590,9 @@ pub async fn load_functional_state(
                 "functional state store lock poisoned".to_string(),
             )
         })?;
-        let run = store
-            .get_product_coordinator_run(&run_id)?
-            .ok_or_else(|| {
-                crate::errors::AgentError::DatabaseError(
-                    "Product OS run is unknown".to_string(),
-                )
-            })?;
+        let run = store.get_product_coordinator_run(&run_id)?.ok_or_else(|| {
+            crate::errors::AgentError::DatabaseError("Product OS run is unknown".to_string())
+        })?;
         let raw_records = store
             .get_product_authority(&run.project_id)?
             .ok_or_else(|| {

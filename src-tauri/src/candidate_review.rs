@@ -356,7 +356,10 @@ mod tests {
         assert!(prompt.contains("candidate"));
         assert!(prompt.contains("frozen check"));
         assert!(prompt.contains("advisory analysis only"));
-        assert!(prompt.contains("changed-file coverage manifest") || prompt.contains("Changed-file coverage manifest"));
+        assert!(
+            prompt.contains("changed-file coverage manifest")
+                || prompt.contains("Changed-file coverage manifest")
+        );
         assert!(prompt.contains("src/lib.rs"));
     }
 

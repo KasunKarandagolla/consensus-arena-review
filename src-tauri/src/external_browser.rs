@@ -117,7 +117,12 @@ pub async fn runtime_status(cwd: &Path) -> AgentBrowserRuntimeStatus {
             let observed = combined
                 .split_whitespace()
                 .map(|token| token.trim_start_matches('v'))
-                .find(|token| token.chars().next().is_some_and(|value| value.is_ascii_digit()))
+                .find(|token| {
+                    token
+                        .chars()
+                        .next()
+                        .is_some_and(|value| value.is_ascii_digit())
+                })
                 .map(ToString::to_string);
             let compatible = observed.as_deref() == Some(AGENT_BROWSER_VERSION);
             AgentBrowserRuntimeStatus {
@@ -241,7 +246,10 @@ fn provider_conversation_id(provider: ConsultationProvider, url: &str) -> Option
     }
 }
 
-fn bounded_profile_path(profile_root: &Path, order: &ConsultationWorkOrder) -> Result<PathBuf, String> {
+fn bounded_profile_path(
+    profile_root: &Path,
+    order: &ConsultationWorkOrder,
+) -> Result<PathBuf, String> {
     if !profile_root.is_absolute() {
         return Err("Arena consultation profile root must be absolute".to_string());
     }
@@ -290,10 +298,10 @@ pub async fn stage(
         .stdout;
     match page_classification(&current_url, &snapshot) {
         ConversationAvailability::NeedsAuth => {
-            return Err("consultation browser requires manual authentication".to_string())
+            return Err("consultation browser requires manual authentication".to_string());
         }
         ConversationAvailability::Challenge => {
-            return Err("consultation browser encountered a provider challenge".to_string())
+            return Err("consultation browser encountered a provider challenge".to_string());
         }
         _ => {}
     }
@@ -344,21 +352,38 @@ pub async fn submit_once(
     let result = match staged.send_gesture {
         SendGesture::ClickRef => match staged.send_ref.as_deref() {
             Some(reference) => {
-                command(cwd, &staged.session_id, &staged.profile_path, &["click", reference]).await
+                command(
+                    cwd,
+                    &staged.session_id,
+                    &staged.profile_path,
+                    &["click", reference],
+                )
+                .await
             }
             None => Err("staged click gesture lost its send reference".to_string()),
         },
         SendGesture::PressEnter => {
-            command(cwd, &staged.session_id, &staged.profile_path, &["press", "Enter"]).await
+            command(
+                cwd,
+                &staged.session_id,
+                &staged.profile_path,
+                &["press", "Enter"],
+            )
+            .await
         }
     };
     let outcome = match result {
         Ok(_) => {
-            let url = command(cwd, &staged.session_id, &staged.profile_path, &["get", "url"])
-                .await
-                .ok()
-                .map(|value| value.stdout.trim().to_string())
-                .filter(|value| !value.is_empty());
+            let url = command(
+                cwd,
+                &staged.session_id,
+                &staged.profile_path,
+                &["get", "url"],
+            )
+            .await
+            .ok()
+            .map(|value| value.stdout.trim().to_string())
+            .filter(|value| !value.is_empty());
             TransportSubmissionOutcome::Submitted { canonical_url: url }
         }
         Err(error) => TransportSubmissionOutcome::UnknownOutcome {
@@ -377,7 +402,10 @@ fn extract_advisory_after_marker(rendered: &str, marker: &str) -> Option<String>
     if suffix.len() < 8 {
         return None;
     }
-    let bounded = suffix.chars().take(MAX_OBSERVATION_BYTES).collect::<String>();
+    let bounded = suffix
+        .chars()
+        .take(MAX_OBSERVATION_BYTES)
+        .collect::<String>();
     (!bounded.trim().is_empty()).then_some(bounded)
 }
 
@@ -392,25 +420,37 @@ pub async fn observe_once(
     {
         return Err("consultation observation is not admitted for this transaction".to_string());
     }
-    let _ = command(cwd, &staged.session_id, &staged.profile_path, &["wait", "1500"]).await;
-    let current_url = command(cwd, &staged.session_id, &staged.profile_path, &["get", "url"])
-        .await?
-        .stdout
-        .trim()
-        .to_string();
+    let _ = command(
+        cwd,
+        &staged.session_id,
+        &staged.profile_path,
+        &["wait", "1500"],
+    )
+    .await;
+    let current_url = command(
+        cwd,
+        &staged.session_id,
+        &staged.profile_path,
+        &["get", "url"],
+    )
+    .await?
+    .stdout
+    .trim()
+    .to_string();
     let rendered = command(cwd, &staged.session_id, &staged.profile_path, &["read"])
         .await?
         .stdout;
     match page_classification(&current_url, &rendered) {
         ConversationAvailability::NeedsAuth => {
-            return Err("consultation observation lost provider authentication".to_string())
+            return Err("consultation observation lost provider authentication".to_string());
         }
         ConversationAvailability::Challenge => {
-            return Err("consultation observation encountered a provider challenge".to_string())
+            return Err("consultation observation encountered a provider challenge".to_string());
         }
         _ => {}
     }
-    let Some(advisory_text) = extract_advisory_after_marker(&rendered, &staged.prompt_marker) else {
+    let Some(advisory_text) = extract_advisory_after_marker(&rendered, &staged.prompt_marker)
+    else {
         return Ok(None);
     };
     let canonical_url = validate_application_url(order.provider, &current_url, true)?;
@@ -484,10 +524,10 @@ pub async fn recover_observe_once(
         .stdout;
     match page_classification(&current_url, &rendered) {
         ConversationAvailability::NeedsAuth => {
-            return Err("consultation recovery requires manual provider authentication".to_string())
+            return Err("consultation recovery requires manual provider authentication".to_string());
         }
         ConversationAvailability::Challenge => {
-            return Err("consultation recovery encountered a provider challenge".to_string())
+            return Err("consultation recovery encountered a provider challenge".to_string());
         }
         _ => {}
     }
@@ -496,8 +536,7 @@ pub async fn recover_observe_once(
         return Ok(None);
     };
     let canonical_url = validate_application_url(order.provider, &current_url, true)?;
-    let assistant_turn_digest =
-        format!("sha256:{:x}", Sha256::digest(advisory_text.as_bytes()));
+    let assistant_turn_digest = format!("sha256:{:x}", Sha256::digest(advisory_text.as_bytes()));
     Ok(Some(ConsultationObservation {
         request_id: order.request_id.clone(),
         execution_epoch: order.execution_epoch,
@@ -540,11 +579,13 @@ mod tests {
             .as_deref(),
             Some("qwen-thread")
         );
-        assert!(provider_conversation_id(
-            ConsultationProvider::ChatGpt,
-            "https://chatgpt.com.evil.example/c/abc"
-        )
-        .is_none());
+        assert!(
+            provider_conversation_id(
+                ConsultationProvider::ChatGpt,
+                "https://chatgpt.com.evil.example/c/abc"
+            )
+            .is_none()
+        );
     }
 
     #[test]
