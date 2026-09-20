@@ -1133,9 +1133,10 @@ async fn run_architecture(
         }
         review_orders.push((kind, label, order));
     }
-    // Admit all packet-bound orders at the same project revision before the
-    // first review can advance authority revision. This keeps every reviewer
-    // bound to the same immutable packet while results are admitted serially.
+    // Bind every independent reviewer to the same immutable packet/revision.
+    // Reviewer execution does not mutate ProductAuthority. Only after the
+    // complete wave returns do we admit all typed results atomically, so one
+    // reviewer cannot stale the remaining reviewers.
     for (_, label, order) in &review_orders {
         product_os_runtime::bind_input_manifest(
             ctx.db.clone(),
@@ -1145,30 +1146,53 @@ async fn run_architecture(
         .await?;
     }
     save_run(ctx, run).await?;
-    let mut review_evidence = Vec::new();
-    let mut review_findings = Vec::new();
+
+    let mut review_results = Vec::new();
+    let mut batch_admissions = Vec::new();
     for (kind, label, order) in review_orders {
-        let order_id = order.work_order_id;
-        let execution = run_scheduled_role(ctx, run, order_id, review_prompt(label)).await?;
+        let execution =
+            run_scheduled_role(ctx, run, order.work_order_id, review_prompt(label)).await?;
         let output: ReviewOutput = parse_json(&execution.output)?;
+        let evidence_id = format!("arena-evidence:{}", uuid::Uuid::new_v4());
         let summary = format!(
             "{}; findings: {}",
             output.summary,
             output.findings.join(" | ")
         );
-        let admitted = admit_packet_review(
-            ctx,
-            &run.project_id,
-            execution.work_order,
-            kind,
-            text(&output.summary, "review summary")?,
-            summary,
-            packet.packet_hash.clone(),
-        )
-        .await?;
-        let evidence_id = admitted
-            .evidence_id
-            .ok_or_else(|| "review evidence was not admitted".to_string())?;
+        batch_admissions.push((
+            execution.work_order.work_order_id.clone(),
+            ProductReviewAdmission {
+                evidence_id: evidence_id.clone(),
+                kind,
+                claim: text(&output.summary, "review summary")?,
+                summary,
+                source_reference: "Arena-owned packet-bound semantic review work order"
+                    .to_string(),
+                decision_impact: true,
+                packet_hash: Some(packet.packet_hash.clone()),
+            },
+        ));
+        review_results.push((kind, label, evidence_id, output));
+    }
+
+    let admitted_orders = product_os_runtime::admit_packet_review_batch(
+        ctx.db.clone(),
+        run.project_id.clone(),
+        batch_admissions,
+    )
+    .await?;
+    if admitted_orders.len() != review_results.len() {
+        return Err("packet review batch lost a reviewer result".to_string());
+    }
+
+    let mut review_evidence = Vec::new();
+    let mut review_findings = Vec::new();
+    for ((kind, label, evidence_id, output), admitted) in
+        review_results.into_iter().zip(admitted_orders)
+    {
+        if admitted.evidence_id.as_deref() != Some(evidence_id.as_str()) {
+            return Err("packet review batch returned mismatched evidence identity".to_string());
+        }
         review_evidence.push(evidence_id.clone());
         review_findings.push(format!(
             "{label} [{evidence_id}] summary={} findings={} rejected_alternative={} rationale={}",
