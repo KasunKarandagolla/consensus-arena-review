@@ -118,8 +118,8 @@ pub fn select_route_with_context(
     // Repository contents are a useful disambiguator for terse requests such
     // as "add export" or "fix the crash", but a starter/scaffold repository
     // must not override an explicit founder statement that this is greenfield.
-    let existing_context =
-        explicit_existing_context || (repository_has_product_context && !explicit_greenfield_context);
+    let existing_context = explicit_existing_context
+        || (repository_has_product_context && !explicit_greenfield_context);
     let incident_language = [
         "incident",
         "outage",
