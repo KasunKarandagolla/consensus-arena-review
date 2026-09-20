@@ -344,6 +344,58 @@ pub async fn execute_external_browser_consultation(
     Ok(ConsultationExecutionOutcome::UnknownOutcome(current))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_owned_external_browser_consultation(
+    runtime: Arc<crate::session_runtime::SessionRuntime>,
+    db: Arc<Mutex<TranscriptStore>>,
+    repository: PathBuf,
+    profile_root: PathBuf,
+    project_id: String,
+    originating_run_id: String,
+    decision_id: String,
+    reason: ConsultationReason,
+    provider: ConsultationProvider,
+    execution_epoch: u64,
+    authority_revision: u64,
+    prompt: String,
+    disclosure_summary: String,
+) -> Result<ConsultationExecutionOutcome, String> {
+    let runtime_session_id = format!("consultation:{project_id}:{decision_id}");
+    let permit = runtime.try_acquire_start(runtime_session_id)?;
+    let owner = permit.owner();
+    let task_owner = owner.clone();
+    let task_runtime = runtime.clone();
+    let (activate_tx, activate_rx) = tokio::sync::oneshot::channel();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let result = if activate_rx.await.is_ok() {
+            execute_external_browser_consultation(
+                db,
+                repository,
+                profile_root,
+                project_id,
+                originating_run_id,
+                decision_id,
+                reason,
+                provider,
+                execution_epoch,
+                authority_revision,
+                prompt,
+                disclosure_summary,
+            )
+            .await
+        } else {
+            Err("consultation runtime was not activated".to_string())
+        };
+        task_runtime.mark_completed(&task_owner);
+        let _ = result_tx.send(result);
+    });
+    permit.commit(task, activate_tx)?;
+    result_rx
+        .await
+        .map_err(|_| "consultation runtime stopped before returning".to_string())?
+}
+
 pub async fn reconcile_after_restart(
     db: Arc<Mutex<TranscriptStore>>,
 ) -> Result<Vec<ConsultationWorkOrder>, String> {
