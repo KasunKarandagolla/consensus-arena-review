@@ -1320,9 +1320,17 @@ mod tests {
         let mut records = records();
         records.architecture.competition_mode = ArchitectureCompetitionMode::EstablishedPattern;
         records.architecture.proposal_b_evidence_id.clear();
-        let package = assemble_build_package(&records).expect("single established proposal is valid");
-        let input = input_for_records(&records, &package, GateId::Architecture).expect("gate input");
-        assert_eq!(input.architecture.expect("architecture proof").proposal_count, 1);
+        let package =
+            assemble_build_package(&records).expect("single established proposal is valid");
+        let input =
+            input_for_records(&records, &package, GateId::Architecture).expect("gate input");
+        assert_eq!(
+            input
+                .architecture
+                .expect("architecture proof")
+                .proposal_count,
+            1
+        );
 
         records.architecture.proposal_a_evidence_id.clear();
         assert!(assemble_build_package(&records).is_err());
@@ -1334,7 +1342,9 @@ mod tests {
         records.decision_outcome = None;
         records.product_direction_decision_id = None;
         records.owner_decisions.clear();
-        assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_err());
+        assert!(
+            adopt_product_direction(&mut records, "narrow_build".to_string()).is_err()
+        );
 
         records.owner_decisions.push(OwnerDecisionRecord {
             decision_id: "explicit-owner".to_string(),
@@ -1344,7 +1354,9 @@ mod tests {
             status: DecisionStatus::Adopted,
             authority: DecisionAuthority::Owner,
         });
-        assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_ok());
+        assert!(
+            adopt_product_direction(&mut records, "narrow_build".to_string()).is_ok()
+        );
     }
 
     #[test]
