@@ -3017,8 +3017,7 @@ mod tests {
             pipeline_contract::owner_decision_matches_pending(
                 OwnerDecisionKind::AuthorizeValidationExperiment,
                 OwnerDecisionKind::AuthorizeBuild,
-            )
-            == false
+) == false
         );
         assert!(pipeline_contract::owner_decision_matches_pending(
             OwnerDecisionKind::AuthorizeValidationExperiment,
