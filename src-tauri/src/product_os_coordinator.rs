@@ -673,6 +673,7 @@ async fn run_product_review(
         return Err("NarrowBuild proposal omitted a bounded scope".to_string());
     };
     run.product_review_outcome = Some(outcome.clone());
+    let scope_invented_behavior = !scope.reviewer_restatement.invented_behaviors.is_empty();
     let scope = ProductScopeAdmission {
         objective: text(&scope.objective, "scope objective")?,
         target_user: text(&scope.target_user, "scope target user")?,
@@ -696,6 +697,7 @@ async fn run_product_review(
         run.route,
         ProductRoute::ExistingFeature | ProductRoute::Incident
     ) && outcome == "narrow_build"
+        && !scope_invented_behavior
     {
         // The selected route already carries explicit owner intent for a
         // bounded change/repair. Do not ask the founder to authorize the same
