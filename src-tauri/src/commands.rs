@@ -868,6 +868,7 @@ pub async fn get_dsh_prerequisite() -> Result<String, String> {
 
 fn product_coordinator_context(
     state: &AppState,
+    app: Option<AppHandle>,
 ) -> crate::product_os_coordinator::CoordinatorContext {
     crate::product_os_coordinator::CoordinatorContext {
         db: state.transcript_store.clone(),
@@ -876,6 +877,8 @@ fn product_coordinator_context(
         delivery_state_path: state.delivery_state_path.clone(),
         delivery_slot: state.delivery_state.clone(),
         settings: state.settings_store.clone(),
+        ask_user_tx: state.ask_user_tx.clone(),
+        app,
         role_scheduler: Arc::new(crate::pipeline_contract::ResourceScheduler::default()),
     }
 }
@@ -885,11 +888,12 @@ pub async fn start_product_project(
     founder_idea: String,
     repo_path: String,
     state: tauri::State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<String, String> {
     let founder_idea = product_os_safe_text(founder_idea, state.inner()).await?;
     let repo_path = product_os_safe_text(repo_path, state.inner()).await?;
     let run = crate::product_os_coordinator::start(
-        product_coordinator_context(state.inner()),
+        product_coordinator_context(state.inner(), Some(app)),
         founder_idea,
         repo_path,
     )
@@ -907,7 +911,7 @@ pub async fn get_product_coordinator_status(
         None => None,
     };
     let status =
-        crate::product_os_coordinator::status(&product_coordinator_context(state.inner()), run_id)
+        crate::product_os_coordinator::status(&product_coordinator_context(state.inner(), None), run_id)
             .await?;
     serde_json::to_string(&status).map_err(|error| error.to_string())
 }
@@ -917,11 +921,12 @@ pub async fn answer_product_question(
     run_id: String,
     selected_option: String,
     state: tauri::State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<String, String> {
     let run_id = product_os_safe_text(run_id, state.inner()).await?;
     let selected_option = product_os_safe_text(selected_option, state.inner()).await?;
     let run = crate::product_os_coordinator::answer_owner_question(
-        product_coordinator_context(state.inner()),
+        product_coordinator_context(state.inner(), Some(app)),
         run_id,
         selected_option,
     )
@@ -938,7 +943,7 @@ pub async fn cancel_product_project(
     let run_id = product_os_safe_text(run_id, state.inner()).await?;
     let reason = product_os_safe_text(reason, state.inner()).await?;
     let run = crate::product_os_coordinator::cancel(
-        product_coordinator_context(state.inner()),
+        product_coordinator_context(state.inner(), None),
         run_id,
         reason,
     )
@@ -950,10 +955,14 @@ pub async fn cancel_product_project(
 pub async fn resume_product_project(
     run_id: String,
     state: tauri::State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<String, String> {
     let run_id = product_os_safe_text(run_id, state.inner()).await?;
     let run =
-        crate::product_os_coordinator::resume(product_coordinator_context(state.inner()), run_id)
+        crate::product_os_coordinator::resume(
+            product_coordinator_context(state.inner(), Some(app)),
+            run_id,
+        )
             .await?;
     serde_json::to_string(&run).map_err(|error| error.to_string())
 }
