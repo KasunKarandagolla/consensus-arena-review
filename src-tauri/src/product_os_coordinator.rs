@@ -2091,9 +2091,13 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
 
             match existing.phase {
                 crate::delivery::DeliveryPhase::Verified => {
-                    run.status = CoordinatorStatus::Completed;
+                    run.status = CoordinatorStatus::WaitingForOwner;
                     run.phase = CoordinatorPhase::Terminal;
-                    run.terminal_outcome = Some("narrow_build_verified".to_string());
+                    run.stage = PipelineStage::Release;
+                    run.pending_owner_decision = Some(OwnerDecisionKind::ApproveApply);
+                    run.terminal_outcome =
+                        Some("narrow_build_verified_waiting_for_apply".to_string());
+                    run.error = None;
                     run.updated_at = now();
                     save_run(&ctx, &run).await?;
                     return Ok(());
