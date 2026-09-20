@@ -183,6 +183,7 @@ pub enum OwnerDecisionKind {
     AuthorizeValidationExperiment,
     AuthorizeNarrowBuild,
     AuthorizeBuild,
+    ContinueEvaluation,
     StopRun,
     PivotRun,
     ApproveApply,
@@ -206,6 +207,7 @@ pub fn owner_decision_for_option(
             OwnerDecisionKind::AuthorizeNarrowBuild
         }
         "authorize_build" => OwnerDecisionKind::AuthorizeBuild,
+        "continue_evaluation" => OwnerDecisionKind::ContinueEvaluation,
         "stop" => OwnerDecisionKind::StopRun,
         "pivot" => OwnerDecisionKind::PivotRun,
         "approve_apply" => OwnerDecisionKind::ApproveApply,
@@ -800,6 +802,14 @@ mod tests {
         assert_eq!(
             architecture_planning_mode(ProductRoute::ExistingFeature, "add a new billing model"),
             ArchitecturePlanningMode::CompetingProposals
+        );
+    }
+
+    #[test]
+    fn owner_can_reject_semantic_stop_or_pivot_recommendation() {
+        assert_eq!(
+            owner_decision_for_option(None, "continue_evaluation"),
+            Ok(OwnerDecisionKind::ContinueEvaluation)
         );
     }
 
