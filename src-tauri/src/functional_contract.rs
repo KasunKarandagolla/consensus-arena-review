@@ -310,9 +310,10 @@ fn decision_options(kind: Option<OwnerDecisionKind>) -> Vec<String> {
             "stop".to_string(),
             "pivot".to_string(),
         ],
-        Some(OwnerDecisionKind::ApproveApply) => {
-            vec!["approve_apply".to_string(), "stop".to_string()]
-        }
+        // Safe Apply is intentionally a separate protected action surface.
+        // The functional contract exposes it through ApplyState, never as a
+        // generic owner-question option.
+        Some(OwnerDecisionKind::ApproveApply) => Vec::new()
         Some(OwnerDecisionKind::ApproveRelease) => {
             vec!["approve_release".to_string(), "stop".to_string()]
         }
@@ -670,9 +671,9 @@ mod tests {
 
     #[test]
     fn owner_options_are_typed_not_free_form() {
-        assert_eq!(
-            decision_options(Some(OwnerDecisionKind::ApproveApply)),
-            vec!["approve_apply".to_string(), "stop".to_string()]
+        assert!(
+            decision_options(Some(OwnerDecisionKind::ApproveApply)).is_empty(),
+            "Safe Apply must use the dedicated Apply action, not a generic product question"
         );
         assert!(decision_options(None).is_empty());
     }
