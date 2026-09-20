@@ -923,7 +923,7 @@ async fn run_architecture(
     .ok_or_else(|| "Product OS project disappeared before architecture".to_string())?;
     let brief = format!(
         "{}{}",
-        records_brief(&snapshot.records),
+        records_brief(&snapshot.records, run.route),
         bounded_repo_intelligence(ctx, run, "architecture symbols and coupling").await
     );
     let planning_mode = pipeline_contract::architecture_planning_mode(run.route, &run.founder_idea);
