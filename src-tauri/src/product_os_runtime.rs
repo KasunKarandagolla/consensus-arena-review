@@ -1514,6 +1514,115 @@ async fn execute_experiment_operation(
     }
 }
 
+fn experiment_requires_isolated_worktree(operation: &ExperimentOperation) -> bool {
+    matches!(
+        operation,
+        ExperimentOperation::CargoCheckLocked
+            | ExperimentOperation::FrontendBuild
+            | ExperimentOperation::FileContains { .. }
+    )
+}
+
+async fn execute_isolated_experiment_operation(
+    repository: &std::path::Path,
+    contract: &ExperimentContract,
+) -> ExperimentObservation {
+    if !experiment_requires_isolated_worktree(&contract.operation) {
+        return execute_experiment_operation(repository, contract).await;
+    }
+
+    let before = match crate::delivery::snapshot_canonical_checkout(repository).await {
+        Ok(value) => value,
+        Err(error) => {
+            return ExperimentObservation {
+                disposition: ExperimentDisposition::Inconclusive,
+                source_reference: contract.operation.description(),
+                summary: format!(
+                    "could not snapshot canonical checkout before experiment: {error}"
+                ),
+            };
+        }
+    };
+    if !before.status.trim().is_empty() {
+        return ExperimentObservation {
+            disposition: ExperimentDisposition::Inconclusive,
+            source_reference: contract.operation.description(),
+            summary:
+                "canonical checkout is not clean; isolated experiment admission was refused"
+                    .to_string(),
+        };
+    }
+
+    let worktree = std::env::temp_dir().join(format!(
+        "consensus-arena-experiment-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let add = crate::git_runtime::output_owned(
+        repository,
+        &[
+            std::ffi::OsString::from("worktree"),
+            std::ffi::OsString::from("add"),
+            std::ffi::OsString::from("--detach"),
+            worktree.as_os_str().to_os_string(),
+            std::ffi::OsString::from(before.head.clone()),
+        ],
+    )
+    .await;
+    let added = match add {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            return ExperimentObservation {
+                disposition: ExperimentDisposition::Inconclusive,
+                source_reference: contract.operation.description(),
+                summary: format!(
+                    "could not create isolated experiment worktree: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            };
+        }
+        Err(error) => {
+            return ExperimentObservation {
+                disposition: ExperimentDisposition::Inconclusive,
+                source_reference: contract.operation.description(),
+                summary: format!("could not create isolated experiment worktree: {error}"),
+            };
+        }
+    };
+
+    let mut observation = execute_experiment_operation(&worktree, contract).await;
+    let cleanup = if added {
+        crate::git_runtime::output_owned(
+            repository,
+            &[
+                std::ffi::OsString::from("worktree"),
+                std::ffi::OsString::from("remove"),
+                std::ffi::OsString::from("--force"),
+                worktree.as_os_str().to_os_string(),
+            ],
+        )
+        .await
+    } else {
+        unreachable!("isolated experiment worktree must be admitted before execution")
+    };
+    let _ = std::fs::remove_dir_all(&worktree);
+
+    let cleanup_ok = cleanup
+        .as_ref()
+        .is_ok_and(|output| output.status.success());
+    let after = crate::delivery::snapshot_canonical_checkout(repository).await;
+    let canonical_unchanged = after
+        .as_ref()
+        .is_ok_and(|value| !crate::delivery::canonical_checkout_changed(&before, value));
+    if !cleanup_ok || !canonical_unchanged {
+        observation.disposition = ExperimentDisposition::Inconclusive;
+        observation.summary = format!(
+            "{}; experiment isolation cleanup/canonical-integrity check failed",
+            observation.summary
+        );
+    }
+    observation
+}
+
 /// Execute exactly the typed, Arena-owned experiment operation frozen in the
 /// ExperimentContract. The model never supplies shell text and evidence always
 /// records the operation that actually ran.
@@ -1589,7 +1698,8 @@ pub async fn run_product_feasibility_spike(
             .await
             .map_err(db_error)?;
 
-            let observation = execute_experiment_operation(&repository, &contract).await;
+            let observation =
+                execute_isolated_experiment_operation(&repository, &contract).await;
             db_helpers::run_blocking(move || {
                 let mut store = db.lock().map_err(|_| {
                     AgentError::DatabaseError("transcript store lock poisoned".to_string())
@@ -1642,8 +1752,10 @@ pub async fn run_product_feasibility_spike(
                         title: Some("Arena bounded ExperimentContract execution".to_string()),
                         checked_at: Utc::now().to_rfc3339(),
                         version_or_scope: format!(
-                            "executor={:?}; operation={operation_description}; environment={}",
-                            contract.executor_kind, contract.environment
+                            "executor={:?}; operation={operation_description}; environment={}; local_workspace_isolation={}",
+                            contract.executor_kind,
+                            contract.environment,
+                            experiment_requires_isolated_worktree(&contract.operation)
                         ),
                     }),
                     verifier_work_order_id: Some(order.work_order_id.clone()),
