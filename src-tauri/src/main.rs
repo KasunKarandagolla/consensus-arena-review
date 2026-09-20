@@ -187,6 +187,7 @@ fn main() {
             commands::get_product_coordinator_status,
             commands::get_product_functional_state,
             commands::answer_product_question,
+            commands::inject_product_guidance,
             commands::request_product_consultation,
             commands::recover_product_consultation,
             commands::cancel_product_project,
