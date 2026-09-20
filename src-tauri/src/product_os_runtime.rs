@@ -453,7 +453,10 @@ fn web_verification_prompt(
     )
 }
 
-async fn run_opencode_web_prompt(prompt: String) -> Result<OpenCodeWebOutput, String> {
+async fn run_opencode_web_prompt(
+    prompt: String,
+    model_override: Option<&str>,
+) -> Result<OpenCodeWebOutput, String> {
     if prompt.len() > MAX_WEB_RESULT_BYTES {
         return Err("web research prompt exceeded the bounded size".to_string());
     }
@@ -470,7 +473,12 @@ async fn run_opencode_web_prompt(prompt: String) -> Result<OpenCodeWebOutput, St
         OsString::from("--agent"),
         OsString::from("plan"),
         OsString::from("--model"),
-        OsString::from(crate::opencode_adapter::model_identifier()),
+        OsString::from(match model_override {
+            Some(model) => crate::opencode_adapter::validate_model_identifier(model)?,
+            None => crate::opencode_adapter::validate_model_identifier(
+                &crate::opencode_adapter::model_identifier(),
+            )?,
+        }),
         OsString::from("--format"),
         OsString::from("json"),
         OsString::from(prompt),
@@ -2951,7 +2959,7 @@ pub async fn run_web_discovery_work_order(
             })
             .await
             .map_err(db_error)?;
-            let output = match run_opencode_web_prompt(prompt).await {
+            let output = match run_opencode_web_prompt(prompt, preflight.model_id.as_deref()).await {
                 Ok(output) => output,
                 Err(error) => {
                     mark_failed(db.clone(), &id, generation, &error).await;
@@ -3455,7 +3463,7 @@ pub async fn run_web_fact_verifier_work_order(
             })
             .await
             .map_err(db_error)?;
-            let output = match run_opencode_web_prompt(prompt).await {
+            let output = match run_opencode_web_prompt(prompt, preflight.model_id.as_deref()).await {
                 Ok(output) => output,
                 Err(error) => {
                     mark_failed(db.clone(), &id, generation, &error).await;
