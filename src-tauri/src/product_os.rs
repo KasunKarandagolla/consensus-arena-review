@@ -372,6 +372,18 @@ pub fn invalidate_downstream_for_owner_guidance(
 ) {
     records.decision_outcome = None;
     records.product_direction_decision_id = None;
+    for ambiguity in &mut records.ambiguities {
+        if ambiguity.resolver == AmbiguityResolver::Owner
+            && ambiguity.status == AmbiguityStatus::Open
+        {
+            ambiguity.status = AmbiguityStatus::Deferred;
+            ambiguity.mitigation =
+                Some("superseded by newer durable owner guidance".to_string());
+            ambiguity.revisit_trigger =
+                Some("re-open only if the newer owner guidance requires this choice".to_string());
+        }
+    }
+    records.owner_required_ambiguity_ids.clear();
     records.reuse_decisions.clear();
     records.architecture = ArchitectureEvidenceRecords {
         architecture_version: records.architecture.architecture_version.saturating_add(1),
