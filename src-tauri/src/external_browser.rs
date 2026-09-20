@@ -524,7 +524,9 @@ pub async fn recover_observe_once(
         .stdout;
     match page_classification(&current_url, &rendered) {
         ConversationAvailability::NeedsAuth => {
-            return Err("consultation recovery requires manual provider authentication".to_string());
+            return Err(
+                "consultation recovery requires manual provider authentication".to_string(),
+            );
         }
         ConversationAvailability::Challenge => {
             return Err("consultation recovery encountered a provider challenge".to_string());
