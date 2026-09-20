@@ -3836,6 +3836,47 @@ mod tests {
         .expect("admit typed Product Director evidence")
     }
 
+    async fn authorize_narrow_build_for_test(
+        db: Arc<Mutex<TranscriptStore>>,
+        project_id: &str,
+        label: &str,
+    ) {
+        let evidence_id = format!("{label}-owner-direction-evidence");
+        let review = admit_review_for_test(
+            db.clone(),
+            project_id,
+            &format!("{label} owner build-direction review"),
+            &evidence_id,
+            EvidenceKind::Dissent,
+            "The bounded product direction now requires the human owner to authorize NarrowBuild.",
+        )
+        .await;
+        let ambiguity_id = format!("{label}-owner-build-direction");
+        let question_id = format!("{label}-owner-build-direction-question");
+        admit_ambiguity(
+            db.clone(),
+            project_id.to_string(),
+            review.work_order_id,
+            ambiguity_id.clone(),
+            question_id.clone(),
+            "Authorize the current bounded NarrowBuild direction?".to_string(),
+            "current bounded implementation commitment".to_string(),
+            AmbiguitySeverity::High,
+            vec![review.evidence_id.expect("owner-direction evidence")],
+        )
+        .await
+        .expect("admit explicit owner build-direction question");
+        adopt_owner_decision(
+            db,
+            project_id.to_string(),
+            ambiguity_id,
+            question_id,
+            "authorize_narrow_build".to_string(),
+        )
+        .await
+        .expect("adopt explicit owner NarrowBuild authorization");
+    }
+
     #[tokio::test]
     async fn real_verified_research_reopens_into_current_build_package_gates() {
         let path =
@@ -4111,6 +4152,12 @@ mod tests {
         )
         .await
         .expect("architecture admission");
+        authorize_narrow_build_for_test(
+            reopened_db.clone(),
+            project_id,
+            "m05c",
+        )
+        .await;
         adopt_narrow_build_direction(reopened_db.clone(), project_id.to_string())
             .await
             .expect("owner-adopted NarrowBuild direction");
@@ -4809,6 +4856,7 @@ mod tests {
         // The direction is adopted only after the research, no-build argument,
         // ambiguity decision, competing architecture, reuse, red-team, and
         // executable spike are current.
+        authorize_narrow_build_for_test(db.clone(), &project_id, "m06").await;
         adopt_narrow_build_direction(db.clone(), project_id.clone())
             .await
             .expect("adopt evidence-backed bounded build direction");
