@@ -1580,6 +1580,107 @@ async fn repair_build_readiness(
     save_run(ctx, run).await
 }
 
+async fn record_if_independently_verified(
+    ctx: &CoordinatorContext,
+    run: &mut ProductCoordinatorRun,
+    evidence_id: String,
+) -> Result<(), String> {
+    let snapshot = product_os_runtime::snapshot(
+        ctx.db.clone(),
+        ctx.runtime.clone(),
+        run.project_id.clone(),
+    )
+    .await?
+    .ok_or_else(|| "Product OS project disappeared while classifying experiment evidence".to_string())?;
+    if snapshot.records.evidence.iter().any(|item| {
+        item.evidence_id == evidence_id
+            && item.verification == Some(EvidenceVerification::IndependentlyVerified)
+    }) && !run.verified_evidence_ids.iter().any(|id| id == &evidence_id)
+    {
+        run.verified_evidence_ids.push(evidence_id);
+    }
+    Ok(())
+}
+
+async fn persist_gate_direction_recommendation(
+    ctx: &CoordinatorContext,
+    run: &mut ProductCoordinatorRun,
+    gate: crate::evidence_gates::GateId,
+    reason: &str,
+    recommendation: OwnerDecisionKind,
+) -> Result<(), String> {
+    let label = match recommendation {
+        OwnerDecisionKind::StopRun => "stop",
+        OwnerDecisionKind::PivotRun => "pivot",
+        _ => return Err("gate direction recommendation must be stop or pivot".to_string()),
+    };
+    let order = product_os_runtime::create_product_director_work_order(
+        ctx.db.clone(),
+        run.project_id.clone(),
+        format!("Owner {label} recommendation for {gate:?}: {reason}"),
+    )
+    .await?;
+    run.product_director_work_order_id = Some(order.work_order_id.clone());
+    save_run(ctx, run).await?;
+    let execution = run_scheduled_role(
+        ctx,
+        run,
+        order.work_order_id,
+        role_prompt(
+            "gate direction reviewer",
+            &format!(
+                "Arena exhausted bounded remediation at gate {gate:?}. Reason: {reason}. Explain the {label} recommendation and the strongest case for continuing evaluation. Return JSON: {{\"summary\":\"...\",\"findings\":[\"...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}. This is advisory wording only; the owner decides."
+            ),
+        ),
+    )
+    .await?;
+    let output: ReviewOutput = parse_json(&execution.output)?;
+    let admitted = admit_review(
+        ctx,
+        &run.project_id,
+        execution.work_order,
+        EvidenceKind::Dissent,
+        text(&output.summary, "gate direction recommendation")?,
+        format!(
+            "{}; {}; {}",
+            output.findings.join(" | "),
+            output.rejected_alternative,
+            output.rationale
+        ),
+    )
+    .await?;
+    let ambiguity_id = format!("{}:gate-direction:{gate:?}", run.project_id);
+    let question_id = format!("{}:gate-direction-question:{gate:?}", run.project_id);
+    product_os_runtime::admit_ambiguity(
+        ctx.db.clone(),
+        run.project_id.clone(),
+        admitted.work_order_id,
+        ambiguity_id.clone(),
+        question_id.clone(),
+        format!(
+            "Arena recommends {label} after bounded remediation at {gate:?}. Do you accept Stop/Pivot, or continue evaluation with fresh bounded evidence?"
+        ),
+        format!("owner direction after exhausted {gate:?} remediation"),
+        AmbiguitySeverity::High,
+        vec![
+            admitted
+                .evidence_id
+                .ok_or_else(|| "gate direction evidence was not admitted".to_string())?,
+        ],
+    )
+    .await?;
+    run.owner_ambiguity_id = Some(ambiguity_id);
+    run.owner_question_id = Some(question_id);
+    run.pending_owner_decision = Some(recommendation);
+    run.status = CoordinatorStatus::WaitingForOwner;
+    run.phase = CoordinatorPhase::ProductReview;
+    run.stage = PipelineStage::Decide;
+    run.terminal_outcome = Some(format!("recommend_{label}"));
+    run.error = Some(reason.to_string());
+    run.updated_at = now();
+    save_run(ctx, run).await
+}
+
 async fn persist_gate_owner_question(
     ctx: &CoordinatorContext,
     run: &mut ProductCoordinatorRun,
@@ -1833,7 +1934,8 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
                         Ok(completed) => {
                             run.pending_experiment = None;
                             if let Some(evidence_id) = completed.evidence_id {
-                                run.verified_evidence_ids.push(evidence_id);
+                                record_if_independently_verified(&ctx, &mut run, evidence_id)
+                                    .await?;
                             }
                             run.status = CoordinatorStatus::Running;
                             run.phase = CoordinatorPhase::ProductReview;
@@ -1853,19 +1955,25 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
                     return Ok(());
                 }
                 pipeline_contract::GateRemediationOutcome::RecommendStop => {
-                    run.status = CoordinatorStatus::Blocked;
-                    run.phase = CoordinatorPhase::ProductReview;
-                    run.stage = PipelineStage::Decide;
-                    run.terminal_outcome = Some("recommend_stop".to_string());
-                    save_run(&ctx, &run).await?;
+                    persist_gate_direction_recommendation(
+                        &ctx,
+                        &mut run,
+                        failed.gate_id,
+                        &failed.reason,
+                        OwnerDecisionKind::StopRun,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 pipeline_contract::GateRemediationOutcome::RecommendPivot => {
-                    run.status = CoordinatorStatus::Blocked;
-                    run.phase = CoordinatorPhase::ProductReview;
-                    run.stage = PipelineStage::Decide;
-                    run.terminal_outcome = Some("recommend_pivot".to_string());
-                    save_run(&ctx, &run).await?;
+                    persist_gate_direction_recommendation(
+                        &ctx,
+                        &mut run,
+                        failed.gate_id,
+                        &failed.reason,
+                        OwnerDecisionKind::PivotRun,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 pipeline_contract::GateRemediationOutcome::ExternalBlock => {
@@ -2499,7 +2607,7 @@ pub async fn answer_owner_question(
             Ok(completed) => {
                 returned.pending_experiment = None;
                 if let Some(evidence_id) = completed.evidence_id {
-                    returned.verified_evidence_ids.push(evidence_id);
+                    record_if_independently_verified(&ctx, &mut returned, evidence_id).await?;
                 }
                 returned.status = CoordinatorStatus::Running;
                 returned.phase = CoordinatorPhase::ProductReview;
