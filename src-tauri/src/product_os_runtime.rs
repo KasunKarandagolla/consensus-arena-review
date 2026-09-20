@@ -1217,6 +1217,107 @@ pub async fn admit_product_review(
     .map_err(db_error)
 }
 
+/// Admit one immutable packet-bound semantic review wave atomically.
+///
+/// Every reviewer must have executed against the same ProductAuthority
+/// revision and the same packet hash. Individual reviewer completion does not
+/// advance ProductAuthority; the complete wave advances it exactly once.
+pub async fn admit_packet_review_batch(
+    db: Arc<Mutex<TranscriptStore>>,
+    project_id: String,
+    admissions: Vec<(String, ProductReviewAdmission)>,
+) -> Result<Vec<ProductWorkOrder>, String> {
+    if admissions.is_empty() {
+        return Err("packet review batch requires at least one reviewer".to_string());
+    }
+    db_helpers::run_blocking(move || {
+        let mut store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        let mut records = load_records(&store, &project_id).map_err(AgentError::DatabaseError)?;
+        let base_revision = records.project_revision;
+        let mut seen_orders = HashSet::new();
+        let mut seen_evidence = records
+            .evidence
+            .iter()
+            .filter(|item| item.current)
+            .map(|item| item.evidence_id.clone())
+            .collect::<HashSet<_>>();
+        let mut packet_hash: Option<String> = None;
+        let mut completed_orders = Vec::with_capacity(admissions.len());
+
+        for (work_order_id, admission) in admissions {
+            if !seen_orders.insert(work_order_id.clone()) {
+                return Err(AgentError::DatabaseError(
+                    "packet review batch repeated a work-order identity".to_string(),
+                ));
+            }
+            if !seen_evidence.insert(admission.evidence_id.clone()) {
+                return Err(AgentError::DatabaseError(
+                    "packet review batch repeated a current evidence identity".to_string(),
+                ));
+            }
+            let admission_packet = admission.packet_hash.clone().ok_or_else(|| {
+                AgentError::DatabaseError(
+                    "packet review batch requires an immutable packet hash".to_string(),
+                )
+            })?;
+            if packet_hash
+                .as_ref()
+                .is_some_and(|expected| expected != &admission_packet)
+            {
+                return Err(AgentError::DatabaseError(
+                    "packet review batch crossed immutable packet identities".to_string(),
+                ));
+            }
+            packet_hash.get_or_insert(admission_packet.clone());
+
+            let mut order = store.get_product_work_order(&work_order_id)?.ok_or_else(|| {
+                AgentError::DatabaseError("packet review work order is unknown".to_string())
+            })?;
+            if order.project_id != project_id
+                || !is_semantic_review_role(&order.role)
+                || order.status != ProductWorkOrderStatus::Completed
+                || order.project_revision != base_revision
+            {
+                return Err(AgentError::DatabaseError(
+                    "packet review work order is stale or not completed at the frozen revision"
+                        .to_string(),
+                ));
+            }
+            let manifest = order.input_manifest.as_ref().ok_or_else(|| {
+                AgentError::DatabaseError("packet review input manifest is missing".to_string())
+            })?;
+            manifest.validate().map_err(AgentError::DatabaseError)?;
+            if manifest.packet_hash.as_deref() != Some(admission_packet.as_str()) {
+                return Err(AgentError::DatabaseError(
+                    "packet review result is not bound to its frozen packet".to_string(),
+                ));
+            }
+
+            let evidence = review_evidence(&admission, &order.work_order_id)
+                .map_err(AgentError::DatabaseError)?;
+            records.evidence.push(evidence);
+            order.evidence_id = Some(admission.evidence_id);
+            order.result_ref = Some("typed packet review admitted atomically".to_string());
+            order.updated_at = now();
+            completed_orders.push(order);
+        }
+
+        records.project_revision = records.project_revision.saturating_add(1);
+        let records_json = serialize_records(&records).map_err(AgentError::DatabaseError)?;
+        store.save_product_authority_and_work_orders(
+            &project_id,
+            &records_json,
+            &completed_orders,
+            now(),
+        )?;
+        Ok(completed_orders)
+    })
+    .await
+    .map_err(db_error)
+}
+
 /// Perform a bounded, real primary-source risk experiment under the existing
 /// SessionRuntime lease. It records an observation, not a caller-supplied
 /// success boolean.
