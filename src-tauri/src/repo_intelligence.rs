@@ -252,7 +252,8 @@ mod tests {
     #[test]
     fn repository_intelligence_has_no_arena_specific_target_path() {
         let source = include_str!("repo_intelligence.rs");
-        assert!(!source.contains("src-tauri/src/opencode_adapter.rs"));
+        let forbidden = ["src-tauri/src/", "opencode_adapter.rs"].concat();
+        assert!(!source.contains(&forbidden));
     }
 
     #[test]
