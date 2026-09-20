@@ -1966,7 +1966,25 @@ pub async fn admit_consultation_result(
             decision_question: Some(order.decision_id),
         };
         records.evidence.push(evidence.clone());
-        records.project_revision = records.project_revision.saturating_add(1);
+        let next_revision = records.project_revision.saturating_add(1);
+        // When consultation was requested specifically to inform a currently
+        // open owner question, incorporate the advisory evidence into that
+        // exact question and refresh only its admission revision. The advice
+        // remains Unverified/Consultation-origin and gains no decision
+        // authority; this merely prevents the owner's pending answer from
+        // becoming stale because Arena added the evidence they requested.
+        if let Some(ambiguity) = records.ambiguities.iter_mut().find(|ambiguity| {
+            ambiguity.arena_admitted
+                && ambiguity.resolver == crate::product_os::AmbiguityResolver::Owner
+                && ambiguity.status == crate::evidence_gates::AmbiguityStatus::Open
+                && ambiguity.question_id == order.decision_id
+        }) {
+            if !ambiguity.evidence_ids.iter().any(|id| id == &evidence_id) {
+                ambiguity.evidence_ids.push(evidence_id.clone());
+            }
+            ambiguity.admitted_revision = next_revision;
+        }
+        records.project_revision = next_revision;
         save_records(&mut store, &records).map_err(AgentError::DatabaseError)?;
         Ok(evidence)
     })
