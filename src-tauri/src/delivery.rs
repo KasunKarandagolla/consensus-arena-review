@@ -1395,6 +1395,9 @@ pub fn recovery_requires_worktree_reset(state: &DeliveryState, implementation: b
     if !implementation {
         return true;
     }
+    if state.phase == DeliveryPhase::Verifying && state.candidate_commit.is_some() {
+        return false;
+    }
     !state
         .last_verification
         .as_ref()
