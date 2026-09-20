@@ -1440,6 +1440,31 @@ async fn run_incident_diagnosis(
     save_run(ctx, run).await
 }
 
+async fn load_delivery_state(
+    ctx: &CoordinatorContext,
+    session_id: &str,
+) -> Result<Option<crate::delivery::DeliveryState>, String> {
+    let db = ctx.db.clone();
+    let session_id = session_id.to_string();
+    db_helpers::run_blocking(move || {
+        let store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        store
+            .get_delivery_state(&session_id)?
+            .map(|raw| {
+                serde_json::from_str::<crate::delivery::DeliveryState>(&raw).map_err(|error| {
+                    AgentError::DatabaseError(format!(
+                        "parse persisted Product OS Delivery state: {error}"
+                    ))
+                })
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 async fn load_work_order(ctx: &CoordinatorContext, id: &str) -> Result<ProductWorkOrder, String> {
     let db = ctx.db.clone();
     let id = id.to_string();
@@ -1713,7 +1738,7 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
     if run.phase == CoordinatorPhase::Delivery {
         let snapshot = product_os_runtime::snapshot(
             ctx.db.clone(),
-            Arc::new(SessionRuntime::new()),
+            ctx.runtime.clone(),
             run.project_id.clone(),
         )
         .await?
@@ -1726,51 +1751,218 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
         if package.package_id != run.build_package_id.clone().unwrap_or_default()
             || !package.is_current_for(&snapshot.records)?
         {
-            mark_failed(
-                &ctx,
-                &mut run,
-                "Build Package became stale before Delivery admission".to_string(),
-            )
-            .await;
+            run.status = CoordinatorStatus::Blocked;
+            run.error = Some("Build Package became stale before Delivery admission/resume".to_string());
+            run.updated_at = now();
+            save_run(&ctx, &run).await?;
             return Ok(());
         }
-        let delivery_id = format!("{}:delivery", run.run_id);
-        let state = crate::delivery::admit_build_package(
-            &PathBuf::from(&run.repository_path),
-            ctx.delivery_state_path
-                .parent()
-                .ok_or_else(|| "delivery state path has no parent".to_string())?,
-            delivery_id.clone(),
-            package.objective.clone(),
-            snapshot.records,
-            package,
-            crate::delivery::DeliveryRuntime::OpenCode,
-        )
-        .await?;
-        crate::delivery::persist_state(
-            &ctx.delivery_state_path,
-            &ctx.delivery_slot,
-            &ctx.db,
-            &mut state.clone(),
-        )
-        .await?;
+
+        let delivery_id = run
+            .delivery_session_id
+            .clone()
+            .unwrap_or_else(|| format!("{}:delivery", run.run_id));
+        let persisted = load_delivery_state(&ctx, &delivery_id).await?;
+        let (mut state, resume_delivery) = if let Some(mut existing) = persisted {
+            if existing.session_id != delivery_id
+                || existing.source_workspace != run.repository_path
+                || existing.runtime != crate::delivery::DeliveryRuntime::OpenCode
+            {
+                run.status = CoordinatorStatus::Blocked;
+                run.error = Some(
+                    "persisted Delivery identity does not match the Product OS run".to_string(),
+                );
+                run.updated_at = now();
+                save_run(&ctx, &run).await?;
+                return Ok(());
+            }
+            let Some(bound_package) = existing.build_package.as_ref() else {
+                run.status = CoordinatorStatus::Blocked;
+                run.error = Some("persisted Delivery lost its Build Package binding".to_string());
+                run.updated_at = now();
+                save_run(&ctx, &run).await?;
+                return Ok(());
+            };
+            if bound_package.package_id != package.package_id
+                || bound_package.package_revision != package.package_revision
+                || bound_package.authority_fingerprint != package.authority_fingerprint
+            {
+                run.status = CoordinatorStatus::Blocked;
+                run.error = Some(
+                    "persisted Delivery is bound to a stale Build Package and cannot resume"
+                        .to_string(),
+                );
+                run.updated_at = now();
+                save_run(&ctx, &run).await?;
+                return Ok(());
+            }
+
+            match existing.phase {
+                crate::delivery::DeliveryPhase::Verified => {
+                    run.status = CoordinatorStatus::Completed;
+                    run.phase = CoordinatorPhase::Terminal;
+                    run.terminal_outcome = Some("narrow_build_verified".to_string());
+                    run.updated_at = now();
+                    save_run(&ctx, &run).await?;
+                    return Ok(());
+                }
+                crate::delivery::DeliveryPhase::Applied => {
+                    run.status = CoordinatorStatus::Completed;
+                    run.phase = CoordinatorPhase::Terminal;
+                    run.terminal_outcome = Some("narrow_build_applied".to_string());
+                    run.updated_at = now();
+                    save_run(&ctx, &run).await?;
+                    return Ok(());
+                }
+                crate::delivery::DeliveryPhase::Cancelled => {
+                    run.status = CoordinatorStatus::Cancelled;
+                    run.phase = CoordinatorPhase::Terminal;
+                    run.stage = PipelineStage::Terminal;
+                    run.updated_at = now();
+                    save_run(&ctx, &run).await?;
+                    return Ok(());
+                }
+                crate::delivery::DeliveryPhase::Failed => {
+                    let verifier_inconclusive = existing
+                        .last_verification
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.verdict == "inconclusive");
+                    if verifier_inconclusive && existing.candidate_commit.is_some() {
+                        existing.phase = crate::delivery::DeliveryPhase::Verifying;
+                    } else if existing.acceptance_commit.is_some()
+                        && crate::delivery::attempts_remaining(existing.attempt)
+                    {
+                        crate::delivery::reset_for_recovery(&existing, true).await?;
+                        existing.phase = crate::delivery::DeliveryPhase::Repairing;
+                    } else if existing.acceptance_commit.is_none() {
+                        crate::delivery::reset_for_recovery(&existing, false).await?;
+                        existing.phase = crate::delivery::DeliveryPhase::AuthoringAcceptance;
+                    } else {
+                        run.status = CoordinatorStatus::Blocked;
+                        run.error = Some(
+                            "Delivery repair budget is exhausted; Arena will not restart implementation automatically"
+                                .to_string(),
+                        );
+                        run.updated_at = now();
+                        save_run(&ctx, &run).await?;
+                        return Ok(());
+                    }
+                }
+                crate::delivery::DeliveryPhase::Preparing
+                | crate::delivery::DeliveryPhase::AuthoringAcceptance => {
+                    crate::delivery::reset_for_recovery(&existing, false).await?;
+                    existing.phase = crate::delivery::DeliveryPhase::AuthoringAcceptance;
+                }
+                crate::delivery::DeliveryPhase::Implementing
+                | crate::delivery::DeliveryPhase::Repairing => {
+                    if !crate::delivery::attempts_remaining(existing.attempt) {
+                        run.status = CoordinatorStatus::Blocked;
+                        run.error = Some(
+                            "Delivery implementation was interrupted after the repair budget was exhausted"
+                                .to_string(),
+                        );
+                        run.updated_at = now();
+                        save_run(&ctx, &run).await?;
+                        return Ok(());
+                    }
+                    crate::delivery::reset_for_recovery(&existing, true).await?;
+                    existing.phase = crate::delivery::DeliveryPhase::Repairing;
+                }
+                crate::delivery::DeliveryPhase::Verifying => {
+                    if existing.candidate_commit.is_none() {
+                        if !crate::delivery::attempts_remaining(existing.attempt) {
+                            run.status = CoordinatorStatus::Blocked;
+                            run.error = Some(
+                                "Delivery verification lost candidate identity after repair budget exhaustion"
+                                    .to_string(),
+                            );
+                            run.updated_at = now();
+                            save_run(&ctx, &run).await?;
+                            return Ok(());
+                        }
+                        crate::delivery::reset_for_recovery(&existing, true).await?;
+                        existing.phase = crate::delivery::DeliveryPhase::Repairing;
+                    } else {
+                        crate::delivery::reset_for_recovery(&existing, true).await?;
+                        existing.phase = crate::delivery::DeliveryPhase::Verifying;
+                    }
+                }
+                crate::delivery::DeliveryPhase::AcceptanceReady => {}
+                crate::delivery::DeliveryPhase::WaitingForUser => {
+                    run.status = CoordinatorStatus::Blocked;
+                    run.error = Some(
+                        "persisted OpenCode Product OS Delivery unexpectedly requires an owner answer; use the explicit Delivery recovery surface"
+                            .to_string(),
+                    );
+                    run.updated_at = now();
+                    save_run(&ctx, &run).await?;
+                    return Ok(());
+                }
+            }
+            crate::delivery::persist_state(
+                &ctx.delivery_state_path,
+                &ctx.delivery_slot,
+                &ctx.db,
+                &mut existing,
+            )
+            .await?;
+            (existing, true)
+        } else {
+            let mut admitted = crate::delivery::admit_build_package(
+                &PathBuf::from(&run.repository_path),
+                ctx.delivery_state_path
+                    .parent()
+                    .ok_or_else(|| "delivery state path has no parent".to_string())?,
+                delivery_id.clone(),
+                package.objective.clone(),
+                snapshot.records,
+                package,
+                crate::delivery::DeliveryRuntime::OpenCode,
+            )
+            .await?;
+            crate::delivery::persist_state(
+                &ctx.delivery_state_path,
+                &ctx.delivery_slot,
+                &ctx.db,
+                &mut admitted,
+            )
+            .await?;
+            (admitted, false)
+        };
+
         run.delivery_session_id = Some(delivery_id);
+        run.error = None;
         save_run(&ctx, &run).await?;
-        let result = crate::delivery::run_owner_capable_production(
-            ctx.runtime.clone(),
-            ctx.app.clone(),
-            state,
-            ctx.delivery_state_path.clone(),
-            ctx.delivery_slot.clone(),
-            ctx.db.clone(),
-            ctx.ask_user_tx.clone(),
-            ctx.settings.clone(),
-        )
-        .await;
+        let result = if resume_delivery {
+            crate::delivery::resume_owner_capable_production(
+                ctx.runtime.clone(),
+                ctx.app.clone(),
+                state,
+                ctx.delivery_state_path.clone(),
+                ctx.delivery_slot.clone(),
+                ctx.db.clone(),
+                ctx.ask_user_tx.clone(),
+                ctx.settings.clone(),
+            )
+            .await
+        } else {
+            crate::delivery::run_owner_capable_production(
+                ctx.runtime.clone(),
+                ctx.app.clone(),
+                state,
+                ctx.delivery_state_path.clone(),
+                ctx.delivery_slot.clone(),
+                ctx.db.clone(),
+                ctx.ask_user_tx.clone(),
+                ctx.settings.clone(),
+            )
+            .await
+        };
         match result {
             Ok(state) if state.phase == crate::delivery::DeliveryPhase::Verified => {
                 run.status = CoordinatorStatus::Completed;
                 run.phase = CoordinatorPhase::Terminal;
+                run.stage = PipelineStage::Release;
                 run.terminal_outcome = Some(
                     if run.product_review_outcome.as_deref() == Some("validation_experiment") {
                         "validation_experiment_verified".to_string()
@@ -1782,14 +1974,20 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
                 save_run(&ctx, &run).await?;
             }
             Ok(state) => {
-                mark_failed(
-                    &ctx,
-                    &mut run,
-                    format!("Delivery ended in {:?}", state.phase),
-                )
-                .await
+                run.status = CoordinatorStatus::Blocked;
+                run.error = Some(format!(
+                    "Delivery paused/ended in {:?}; explicit recovery is required",
+                    state.phase
+                ));
+                run.updated_at = now();
+                save_run(&ctx, &run).await?;
             }
-            Err(error) => mark_failed(&ctx, &mut run, error).await,
+            Err(error) => {
+                run.status = CoordinatorStatus::Blocked;
+                run.error = Some(error.chars().take(240).collect());
+                run.updated_at = now();
+                save_run(&ctx, &run).await?;
+            }
         }
     }
     Ok(())
