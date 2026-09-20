@@ -1711,10 +1711,7 @@ pub async fn run(
     runtime.mark_completed(&owner);
 }
 
-/// Start the same owner-capable production Delivery supervisor used by the
-/// Tauri Build path and await its terminal/waiting result. Product OS uses
-/// this boundary instead of the qualification-only harness.
-pub async fn run_owner_capable_production(
+async fn run_owner_capable_production_with_mode(
     runtime: Arc<crate::session_runtime::SessionRuntime>,
     app: Option<AppHandle>,
     state: DeliveryState,
@@ -1723,8 +1720,13 @@ pub async fn run_owner_capable_production(
     transcript: Arc<std::sync::Mutex<TranscriptStore>>,
     ask_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     settings: Arc<tokio::sync::Mutex<SettingsStore>>,
+    resume: bool,
 ) -> Result<DeliveryState, String> {
-    let permit = runtime.try_acquire_start(state.session_id.clone())?;
+    let permit = if resume {
+        runtime.try_acquire_resume(state.session_id.clone())?
+    } else {
+        runtime.try_acquire_start(state.session_id.clone())?
+    };
     let owner = permit.owner();
     let task_owner = owner.clone();
     let task_runtime = runtime.clone();
@@ -1752,6 +1754,60 @@ pub async fn run_owner_capable_production(
     result_rx
         .await
         .map_err(|_| "production Delivery task stopped before returning".to_string())?
+}
+
+/// Start the same owner-capable production Delivery supervisor used by the
+/// Tauri Build path and await its result. Product OS uses this boundary instead
+/// of the qualification-only harness.
+pub async fn run_owner_capable_production(
+    runtime: Arc<crate::session_runtime::SessionRuntime>,
+    app: Option<AppHandle>,
+    state: DeliveryState,
+    state_path: PathBuf,
+    delivery_slot: Arc<tokio::sync::Mutex<Option<DeliveryState>>>,
+    transcript: Arc<std::sync::Mutex<TranscriptStore>>,
+    ask_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    settings: Arc<tokio::sync::Mutex<SettingsStore>>,
+) -> Result<DeliveryState, String> {
+    run_owner_capable_production_with_mode(
+        runtime,
+        app,
+        state,
+        state_path,
+        delivery_slot,
+        transcript,
+        ask_tx,
+        settings,
+        false,
+    )
+    .await
+}
+
+/// Resume the exact persisted production Delivery state after process/runtime
+/// interruption. This never re-admits a new worktree or new acceptance
+/// authority for an existing Delivery session.
+pub async fn resume_owner_capable_production(
+    runtime: Arc<crate::session_runtime::SessionRuntime>,
+    app: Option<AppHandle>,
+    state: DeliveryState,
+    state_path: PathBuf,
+    delivery_slot: Arc<tokio::sync::Mutex<Option<DeliveryState>>>,
+    transcript: Arc<std::sync::Mutex<TranscriptStore>>,
+    ask_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    settings: Arc<tokio::sync::Mutex<SettingsStore>>,
+) -> Result<DeliveryState, String> {
+    run_owner_capable_production_with_mode(
+        runtime,
+        app,
+        state,
+        state_path,
+        delivery_slot,
+        transcript,
+        ask_tx,
+        settings,
+        true,
+    )
+    .await
 }
 
 /// Run the production Delivery supervisor without a Tauri window.
