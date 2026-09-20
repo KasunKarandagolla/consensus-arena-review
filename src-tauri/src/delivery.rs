@@ -540,8 +540,8 @@ pub async fn admit_build_package(
             .map(|(path, sha256)| ProtectedFileHash { path, sha256 })
             .collect(),
         verification_commands: profile.commands.clone(),
-        acceptance_commit: Some(base),
-        attempt: 1,
+        acceptance_commit: None,
+        attempt: 0,
         pending_question: None,
         waiting_phase: None,
         candidate_commit: None,
@@ -588,13 +588,15 @@ async fn git_names(repo: &std::path::Path, base: &str) -> Result<Vec<String>, St
     Ok(names)
 }
 
-fn acceptance_path(path: &str) -> bool {
+pub(crate) fn acceptance_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     if lower.contains(".arena-runtime") || lower.contains("..") {
         return false;
     }
     let file = lower.rsplit('/').next().unwrap_or(&lower);
-    lower.contains("/tests/")
+    lower == ".arena/verification.json"
+        || lower.ends_with("/.arena/verification.json")
+        || lower.contains("/tests/")
         || lower.starts_with("tests/")
         || lower.contains("/test/")
         || file.contains(".test.")
