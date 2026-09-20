@@ -1667,6 +1667,80 @@ pub async fn run_product_feasibility_spike(
     }
 }
 
+pub async fn admit_consultation_result(
+    db: Arc<Mutex<TranscriptStore>>,
+    project_id: String,
+    result: crate::consultation_broker::ConsultationResult,
+) -> Result<EvidenceItem, String> {
+    db_helpers::run_blocking(move || {
+        let mut store = db.lock().map_err(|_| {
+            AgentError::DatabaseError("transcript store lock poisoned".to_string())
+        })?;
+        let mut records = load_records(&store, &project_id).map_err(AgentError::DatabaseError)?;
+        let order = store
+            .get_consultation_work_order(&result.request_id)?
+            .ok_or_else(|| AgentError::DatabaseError("consultation work order is missing".to_string()))?;
+        if order.project_id != project_id
+            || order.result_id.as_deref() != Some(result.result_id.as_str())
+            || order.state != crate::consultation_broker::ConsultationTransactionState::Complete
+        {
+            return Err(AgentError::DatabaseError(
+                "consultation result is not current and committed".to_string(),
+            ));
+        }
+        let evidence_id = format!("{}:advisory", result.result_id);
+        if records.evidence.iter().any(|item| item.evidence_id == evidence_id) {
+            return Err(AgentError::DatabaseError(
+                "consultation advisory evidence was already admitted".to_string(),
+            ));
+        }
+        let summary = result
+            .advisory_text
+            .chars()
+            .take(4 * 1024)
+            .collect::<String>();
+        let evidence = EvidenceItem {
+            evidence_id: evidence_id.clone(),
+            claim: format!(
+                "External consultation advice for Product OS decision {}",
+                order.decision_id
+            ),
+            source_reference: result.canonical_url.clone(),
+            captured_at: Utc::now().to_rfc3339(),
+            summary,
+            provenance: EvidenceProvenance::SourceConfirmed,
+            current: true,
+            origin: Some(EvidenceOrigin::Consultation),
+            verification: Some(EvidenceVerification::Unverified),
+            kind: Some(EvidenceKind::ConsultationAdvice),
+            source: Some(EvidenceSource {
+                reference: result.canonical_url.clone(),
+                url: Some(result.canonical_url.clone()),
+                title: Some(format!("{:?} consumer-web consultation", result.provider)),
+                checked_at: Utc::now().to_rfc3339(),
+                version_or_scope: format!(
+                    "request={}; result={}; advisory-only",
+                    result.request_id, result.result_id
+                ),
+            }),
+            verifier_work_order_id: None,
+            contradiction_ids: Vec::new(),
+            decision_impact: true,
+            revisit_trigger: Some(
+                "revisit when product authority, the decision question, or provider advice changes"
+                    .to_string(),
+            ),
+            decision_question: Some(order.decision_id),
+        };
+        records.evidence.push(evidence.clone());
+        records.project_revision = records.project_revision.saturating_add(1);
+        save_records(&mut store, &records).map_err(AgentError::DatabaseError)?;
+        Ok(evidence)
+    })
+    .await
+    .map_err(db_error)
+}
+
 #[allow(dead_code)]
 fn completed_director_evidence(
     store: &TranscriptStore,
