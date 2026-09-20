@@ -102,7 +102,24 @@ pub fn select_route_with_context(
     ]
     .iter()
     .any(|marker| lower.contains(marker));
-    let existing_context = explicit_existing_context || repository_has_product_context;
+    let explicit_greenfield_context = [
+        "new product",
+        "new app",
+        "new application",
+        "new service",
+        "greenfield",
+        "from scratch",
+        "build a new",
+        "create a new",
+        "start a new",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    // Repository contents are a useful disambiguator for terse requests such
+    // as "add export" or "fix the crash", but a starter/scaffold repository
+    // must not override an explicit founder statement that this is greenfield.
+    let existing_context =
+        explicit_existing_context || (repository_has_product_context && !explicit_greenfield_context);
     let incident_language = [
         "incident",
         "outage",
@@ -128,6 +145,8 @@ pub fn select_route_with_context(
             .any(|marker| lower.contains(marker)));
     if incident_language {
         ProductRoute::Incident
+    } else if explicit_greenfield_context && !explicit_existing_context {
+        ProductRoute::NewProduct
     } else if existing_context
         && [
             "existing feature",
@@ -832,6 +851,25 @@ mod tests {
         assert_eq!(
             select_route_with_context("Add CSV export", false),
             ProductRoute::NewProduct
+        );
+        assert_eq!(
+            select_route_with_context("Fix the crash", true),
+            ProductRoute::Incident
+        );
+    }
+
+    #[test]
+    fn explicit_greenfield_intent_is_not_overridden_by_a_scaffold_repository() {
+        assert_eq!(
+            select_route_with_context(
+                "Build a new desktop product for evidence review from scratch",
+                true
+            ),
+            ProductRoute::NewProduct
+        );
+        assert_eq!(
+            select_route_with_context("Add CSV export", true),
+            ProductRoute::ExistingFeature
         );
         assert_eq!(
             select_route_with_context("Fix the crash", true),
