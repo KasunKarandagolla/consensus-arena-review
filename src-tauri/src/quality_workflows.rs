@@ -6,46 +6,67 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// A bounded record of an exploratory tool call. It is deliberately advisory;
-/// it cannot satisfy a verifier or mutate ProductAuthority.
+/// A bounded record of tools actually observed in one OpenCode execution.
+/// Arguments and tool payloads are deliberately excluded so credentials or
+/// untrusted prompt material cannot enter durable Product OS state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolUseReceipt {
     pub receipt_id: String,
-    pub session_id: String,
+    pub work_order_id: String,
+    pub root_session_id: String,
     pub profile: String,
-    pub tool: String,
-    pub input_digest: String,
-    pub output_summary: String,
+    pub tools: Vec<String>,
+    pub tool_count: u32,
+    pub status: String,
+    pub started_at: i64,
+    pub completed_at: i64,
     pub advisory_only: bool,
 }
 
 impl ToolUseReceipt {
-    pub fn new(
-        session_id: &str,
+    pub fn from_observed_tools(
+        work_order_id: &str,
+        root_session_id: &str,
         profile: &str,
-        tool: &str,
-        input: &str,
-        output_summary: &str,
+        observed_tools: &[String],
+        status: &str,
+        started_at: i64,
+        completed_at: i64,
     ) -> Result<Self, String> {
-        if session_id.trim().is_empty()
+        if work_order_id.trim().is_empty()
+            || root_session_id.trim().is_empty()
             || profile.trim().is_empty()
-            || tool.trim().is_empty()
-            || output_summary.trim().is_empty()
-            || output_summary.len() > 8 * 1024
+            || status.trim().is_empty()
+            || completed_at < started_at
         {
-            return Err("tool receipt fields are missing or oversized".to_string());
+            return Err("tool receipt fields are missing or invalid".to_string());
         }
-        let digest = Sha256::digest(input.as_bytes());
+        let mut tools = observed_tools
+            .iter()
+            .map(|tool| tool.trim())
+            .filter(|tool| !tool.is_empty() && tool.len() <= 128)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        tools.sort();
+        tools.dedup();
+        if tools.len() > 64 {
+            return Err("tool receipt exceeded the bounded observed-tool set".to_string());
+        }
+        let tool_count = observed_tools.len().min(u32::MAX as usize) as u32;
+        let identity = format!(
+            "{work_order_id}:{root_session_id}:{profile}:{started_at}:{completed_at}:{}",
+            tools.join(",")
+        );
         Ok(Self {
-            receipt_id: format!(
-                "tool-{:x}",
-                Sha256::digest(format!("{session_id}:{tool}:{input}").as_bytes())
-            ),
-            session_id: session_id.to_string(),
+            receipt_id: format!("tool-{:x}", Sha256::digest(identity.as_bytes())),
+            work_order_id: work_order_id.to_string(),
+            root_session_id: root_session_id.to_string(),
             profile: profile.to_string(),
-            tool: tool.to_string(),
-            input_digest: format!("sha256:{digest:x}"),
-            output_summary: output_summary.to_string(),
+            tools,
+            tool_count,
+            status: status.to_string(),
+            started_at,
+            completed_at,
             advisory_only: true,
         })
     }
@@ -149,16 +170,30 @@ mod tests {
 
     #[test]
     fn tool_receipt_is_bounded_and_advisory() {
-        let receipt = ToolUseReceipt::new(
+        let receipt = ToolUseReceipt::from_observed_tools(
+            "work-order",
             "browser-session",
             "browser_qa",
-            "playwright.inspect",
-            "https://example.invalid",
-            "one locator discovered",
+            &["playwright.inspect".to_string(), "playwright.inspect".to_string()],
+            "complete",
+            10,
+            11,
         )
         .expect("receipt");
         assert!(receipt.advisory_only);
-        assert!(receipt.input_digest.starts_with("sha256:"));
-        assert!(ToolUseReceipt::new("", "browser_qa", "tool", "in", "out").is_err());
+        assert_eq!(receipt.tools, vec!["playwright.inspect"]);
+        assert_eq!(receipt.tool_count, 2);
+        assert!(
+            ToolUseReceipt::from_observed_tools(
+                "",
+                "browser-session",
+                "browser_qa",
+                &[],
+                "complete",
+                10,
+                11
+            )
+            .is_err()
+        );
     }
 }
