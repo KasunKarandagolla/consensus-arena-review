@@ -1138,6 +1138,11 @@ pub async fn apply_delivery(
     )
     .await?;
     crate::delivery::emit(&app, &value).await;
+    let _ = crate::product_os_coordinator::mark_delivery_applied(
+        &product_coordinator_context(state.inner(), Some(app)),
+        value.session_id.clone(),
+    )
+    .await?;
     Ok(())
 }
 
