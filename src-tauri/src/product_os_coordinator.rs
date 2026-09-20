@@ -142,6 +142,7 @@ pub struct CoordinatorContext {
     pub delivery_state_path: PathBuf,
     pub delivery_slot: Arc<tokio::sync::Mutex<Option<crate::delivery::DeliveryState>>>,
     pub settings: Arc<tokio::sync::Mutex<SettingsStore>>,
+    pub memory: Arc<Mutex<crate::memory_store::MemoryStore>>,
     pub ask_user_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     pub app: Option<AppHandle>,
     pub role_scheduler: Arc<crate::pipeline_contract::ResourceScheduler>,
@@ -435,6 +436,36 @@ async fn save_run(ctx: &CoordinatorContext, run: &ProductCoordinatorRun) -> Resu
     })
     .await
     .map_err(|error| error.to_string())
+}
+
+async fn remember_derived_product_event(
+    ctx: &CoordinatorContext,
+    run: &ProductCoordinatorRun,
+    category: &str,
+    content: String,
+    source_type: &str,
+) {
+    let memory = ctx.memory.clone();
+    let project_brief = run.founder_idea.clone();
+    let provenance = format!("Product OS run {}", run.run_id);
+    let category = category.to_string();
+    let bounded = content.chars().take(2_000).collect::<String>();
+    let source_type = source_type.to_string();
+    let _ = db_helpers::run_blocking(move || {
+        let mut store = memory.lock().map_err(|_| {
+            AgentError::DatabaseError("memory store lock poisoned".to_string())
+        })?;
+        store.add_project_memory_with_source(
+            &project_brief,
+            &category,
+            &bounded,
+            Some(&provenance),
+            None,
+            "arena-product-os",
+            &source_type,
+        )
+    })
+    .await;
 }
 
 async fn mark_failed(ctx: &CoordinatorContext, run: &mut ProductCoordinatorRun, error: String) {
