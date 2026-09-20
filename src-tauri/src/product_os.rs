@@ -324,6 +324,26 @@ pub fn admit_product_scope(
     records.reviewer_restatement = Some(scope.reviewer_restatement);
     records.decision_outcome = None;
     records.product_direction_decision_id = None;
+
+    // A material scope revision invalidates every downstream technical
+    // commitment. Research evidence remains available as historical/current
+    // input, but reuse classification, architecture synthesis, and acceptance
+    // profile must be rebuilt for the new scope before Delivery can re-enter.
+    records.reuse_decisions.clear();
+    records.architecture = ArchitectureEvidenceRecords {
+        architecture_version: records.architecture.architecture_version.saturating_add(1),
+        proposal_a_evidence_id: String::new(),
+        proposal_b_evidence_id: String::new(),
+        reuse_review_evidence_id: String::new(),
+        constraints_review_evidence_id: String::new(),
+        risk_experiment_evidence_ids: Vec::new(),
+        red_team_evidence_id: String::new(),
+        dissent_evidence_id: String::new(),
+        unresolved_high_blocker_evidence_ids: Vec::new(),
+        competition_mode: ArchitectureCompetitionMode::CompetingProposals,
+        synthesis: None,
+    };
+    records.acceptance_profile_version = None;
     records.vision_version = records.vision_version.saturating_add(1);
     records.project_revision = records.project_revision.saturating_add(1);
     Ok(())
