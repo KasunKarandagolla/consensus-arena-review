@@ -1342,9 +1342,7 @@ mod tests {
         records.decision_outcome = None;
         records.product_direction_decision_id = None;
         records.owner_decisions.clear();
-        assert!(
-            adopt_product_direction(&mut records, "narrow_build".to_string()).is_err()
-        );
+        assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_err());
 
         records.owner_decisions.push(OwnerDecisionRecord {
             decision_id: "explicit-owner".to_string(),
@@ -1354,9 +1352,7 @@ mod tests {
             status: DecisionStatus::Adopted,
             authority: DecisionAuthority::Owner,
         });
-        assert!(
-            adopt_product_direction(&mut records, "narrow_build".to_string()).is_ok()
-        );
+        assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_ok());
     }
 
     #[test]
@@ -1366,9 +1362,7 @@ mod tests {
         records.decision_outcome = None;
         records.product_direction_decision_id = None;
         records.owner_decisions.clear();
-        assert!(
-            adopt_product_direction(&mut records, "narrow_build".to_string()).is_ok()
-        );
+        assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_ok());
     }
 
     #[test]
