@@ -320,7 +320,10 @@ fn decision_options(kind: Option<OwnerDecisionKind>) -> Vec<String> {
         Some(OwnerDecisionKind::ApproveRelease) => {
             vec!["approve_release".to_string(), "stop".to_string()]
         }
-        Some(OwnerDecisionKind::StopRun) | Some(OwnerDecisionKind::PivotRun) | None => Vec::new(),
+        Some(OwnerDecisionKind::StopRun) | Some(OwnerDecisionKind::PivotRun) => {
+            vec!["stop".to_string(), "pivot".to_string()]
+        }
+        None => Vec::new(),
     }
 }
 
