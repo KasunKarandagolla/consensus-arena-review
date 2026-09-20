@@ -1254,10 +1254,7 @@ mod tests {
         });
         let decision_id = adopt_product_direction(&mut records, "narrow_build".to_string())
             .expect("fresh owner direction");
-        assert_eq!(
-            decision_id,
-            "explicit-current-owner-direction".to_string()
-        );
+        assert_eq!(decision_id, "explicit-current-owner-direction".to_string());
         assert_eq!(records.product_direction_decision_id, Some(decision_id));
         assert!(assemble_build_package(&records).is_ok());
     }
