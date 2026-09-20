@@ -53,6 +53,7 @@ mod token_budget;
 mod transcript_store;
 mod turn_manager;
 mod verification;
+mod work_graph;
 
 use orchestrator::AppState;
 use tauri::{Emitter, Manager};
