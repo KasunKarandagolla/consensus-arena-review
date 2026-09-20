@@ -6,8 +6,8 @@
 
 use crate::consultation_broker::{
     ArmedSendPermit, ConsultationObservation, ConsultationProvider, ConsultationTransportKind,
-    ConsultationWorkOrder, ConversationAvailability, TransportSubmissionOutcome,
-    validate_application_url,
+    ConsultationWorkOrder, ConversationAvailability, TransportEffectReceipt,
+    TransportSubmissionOutcome, validate_application_url,
 };
 use crate::dsh_worker;
 use serde::{Deserialize, Serialize};
@@ -331,15 +331,15 @@ pub async fn stage(
 
 pub async fn submit_once(
     cwd: &Path,
-    permit: &ArmedSendPermit,
+    permit: ArmedSendPermit,
     staged: &StagedBrowserSubmission,
-) -> TransportSubmissionOutcome {
+) -> TransportEffectReceipt {
     if permit.transport() != ConsultationTransportKind::ExternalBrowserAgent
         || permit.request_id() != staged.request_id
     {
-        return TransportSubmissionOutcome::UnknownOutcome {
+        return permit.complete(TransportSubmissionOutcome::UnknownOutcome {
             diagnostic: "external browser send permit did not match the staged request".to_string(),
-        };
+        });
     }
     let result = match staged.send_gesture {
         SendGesture::ClickRef => match staged.send_ref.as_deref() {
@@ -352,7 +352,7 @@ pub async fn submit_once(
             command(cwd, &staged.session_id, &staged.profile_path, &["press", "Enter"]).await
         }
     };
-    match result {
+    let outcome = match result {
         Ok(_) => {
             let url = command(cwd, &staged.session_id, &staged.profile_path, &["get", "url"])
                 .await
@@ -367,7 +367,8 @@ pub async fn submit_once(
                 error.chars().take(384).collect::<String>()
             ),
         },
-    }
+    };
+    permit.complete(outcome)
 }
 
 fn extract_advisory_after_marker(rendered: &str, marker: &str) -> Option<String> {
