@@ -305,13 +305,23 @@ fn decision_options(kind: Option<OwnerDecisionKind>) -> Vec<String> {
             "stop".to_string(),
             "pivot".to_string(),
         ],
+        Some(OwnerDecisionKind::ContinueEvaluation) => vec![
+            "continue_evaluation".to_string(),
+            "stop".to_string(),
+            "pivot".to_string(),
+        ],
         Some(OwnerDecisionKind::ApproveApply) => {
             vec!["approve_apply".to_string(), "stop".to_string()]
         }
         Some(OwnerDecisionKind::ApproveRelease) => {
             vec!["approve_release".to_string(), "stop".to_string()]
         }
-        Some(OwnerDecisionKind::StopRun) | Some(OwnerDecisionKind::PivotRun) | None => Vec::new(),
+        Some(OwnerDecisionKind::StopRun) | Some(OwnerDecisionKind::PivotRun) => vec![
+            "continue_evaluation".to_string(),
+            "stop".to_string(),
+            "pivot".to_string(),
+        ],
+        None => Vec::new(),
     }
 }
 
