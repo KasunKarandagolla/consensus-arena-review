@@ -117,6 +117,7 @@ pub enum ProductWorkOrderStatus {
     Cancelled,
     Superseded,
     Failed,
+    Unavailable,
     ReconciliationRequired,
 }
 
