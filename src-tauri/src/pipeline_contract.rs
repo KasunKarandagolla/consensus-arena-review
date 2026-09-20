@@ -78,8 +78,15 @@ pub fn architecture_planning_mode(route: ProductRoute, intent: &str) -> Architec
 }
 
 pub fn select_route(intent: &str) -> ProductRoute {
+    select_route_with_context(intent, false)
+}
+
+pub fn select_route_with_context(
+    intent: &str,
+    repository_has_product_context: bool,
+) -> ProductRoute {
     let lower = intent.to_ascii_lowercase();
-    let existing_context = [
+    let explicit_existing_context = [
         "existing app",
         "existing repo",
         "existing repository",
@@ -95,6 +102,7 @@ pub fn select_route(intent: &str) -> ProductRoute {
     ]
     .iter()
     .any(|marker| lower.contains(marker));
+    let existing_context = explicit_existing_context || repository_has_product_context;
     let incident_language = [
         "incident",
         "outage",
@@ -812,6 +820,22 @@ mod tests {
         assert_eq!(
             select_route("Build a new product that integrates with an existing app"),
             ProductRoute::NewProduct
+        );
+    }
+
+    #[test]
+    fn repository_context_routes_terse_change_requests_without_market_discovery() {
+        assert_eq!(
+            select_route_with_context("Add CSV export", true),
+            ProductRoute::ExistingFeature
+        );
+        assert_eq!(
+            select_route_with_context("Add CSV export", false),
+            ProductRoute::NewProduct
+        );
+        assert_eq!(
+            select_route_with_context("Fix the crash", true),
+            ProductRoute::Incident
         );
     }
 
