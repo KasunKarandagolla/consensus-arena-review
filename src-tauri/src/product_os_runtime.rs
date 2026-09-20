@@ -2264,6 +2264,38 @@ pub async fn run_product_feasibility_spike(
     }
 }
 
+pub async fn invalidate_for_owner_guidance(
+    db: Arc<Mutex<TranscriptStore>>,
+    project_id: String,
+    reason: String,
+) -> Result<ProductAuthorityRecords, String> {
+    db_helpers::run_blocking(move || {
+        let mut store = db.lock().map_err(|_| {
+            AgentError::DatabaseError("transcript store lock poisoned".to_string())
+        })?;
+        let mut records = load_records(&store, &project_id).map_err(AgentError::DatabaseError)?;
+        product_os::invalidate_downstream_for_owner_guidance(&mut records);
+        let timestamp = now();
+        for mut order in store.list_product_work_orders(&project_id)? {
+            if matches!(
+                order.status,
+                ProductWorkOrderStatus::Admitted
+                    | ProductWorkOrderStatus::Running
+                    | ProductWorkOrderStatus::ReconciliationRequired
+            ) {
+                order.status = ProductWorkOrderStatus::Superseded;
+                order.cancellation_reason = Some(reason.chars().take(320).collect());
+                order.updated_at = timestamp;
+                store.save_product_work_order(&order)?;
+            }
+        }
+        save_records(&mut store, &records).map_err(AgentError::DatabaseError)?;
+        Ok(records)
+    })
+    .await
+    .map_err(db_error)
+}
+
 pub async fn admit_consultation_result(
     db: Arc<Mutex<TranscriptStore>>,
     project_id: String,
