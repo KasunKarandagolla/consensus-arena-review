@@ -412,6 +412,29 @@ impl TranscriptStore {
         .transpose()
     }
 
+    pub fn find_consultation_for_decision(
+        &self,
+        project_id: &str,
+        decision_id: &str,
+    ) -> Result<Option<crate::consultation_broker::ConsultationWorkOrder>, AgentError> {
+        let mut statement = self.conn.prepare(
+            "SELECT order_json FROM consultation_work_orders
+             WHERE project_id = ?1 ORDER BY updated_at DESC, request_id DESC",
+        )?;
+        let rows = statement.query_map(params![project_id], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let raw = row?;
+            let value: crate::consultation_broker::ConsultationWorkOrder =
+                serde_json::from_str(&raw).map_err(|error| {
+                    AgentError::DatabaseError(format!("parse consultation work order: {error}"))
+                })?;
+            if value.decision_id == decision_id {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn list_open_consultation_work_orders(
         &self,
     ) -> Result<Vec<crate::consultation_broker::ConsultationWorkOrder>, AgentError> {
