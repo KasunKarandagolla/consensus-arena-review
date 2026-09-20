@@ -785,6 +785,187 @@ fn persist_containment_failure(
     Ok(path.to_string_lossy().into_owned())
 }
 
+#[derive(Debug)]
+struct AcceptanceFreeze {
+    acceptance_commit: String,
+    profile: VerificationProfile,
+    evidence: OpenCodeEvidence,
+}
+
+async fn author_and_freeze_acceptance(
+    canonical: &Path,
+    candidate: &Path,
+    state: &DeliveryState,
+    evidence_dir: &Path,
+) -> Result<AcceptanceFreeze, String> {
+    let package = state
+        .build_package
+        .as_ref()
+        .ok_or_else(|| "Product OS Delivery has no Build Package for acceptance authoring".to_string())?;
+    let before_head = verification::candidate_sha(candidate).await?;
+    if before_head != state.base_commit {
+        return Err(
+            "acceptance authoring must begin from the admitted clean base commit".to_string(),
+        );
+    }
+    let canonical_before = crate::delivery::snapshot_canonical_checkout(canonical).await?;
+    if !canonical_before.status.trim().is_empty() {
+        return Err("canonical Arena checkout was not clean at acceptance admission".to_string());
+    }
+    let scenarios = package
+        .acceptance_scenarios
+        .iter()
+        .enumerate()
+        .map(|(index, scenario)| format!("{}. {}", index + 1, scenario))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let constraints = package.constraints.join("\n- ");
+    let prompt = format!(
+        "AUTHOR EXECUTABLE ACCEPTANCE ONLY. Do not implement production behavior.\n\nObjective: {}\n\nFrozen product acceptance scenarios:\n{}\n\nConstraints:\n- {}\n\nCreate or update only acceptance/test files and .arena/verification.json. The verification profile must contain bounded executable commands that test the requested behavior. Do not weaken existing tests. Do not modify production source files. Do not commit.",
+        package.objective, scenarios, constraints
+    );
+    let profile = ExecutionProfile::AcceptanceAuthoring;
+    if prompt.len() > profile.spec().max_prompt_bytes {
+        return Err("acceptance authoring prompt exceeded the bounded size".to_string());
+    }
+    let profile_workspace = profile_workspace(profile)?;
+    let _resource_permit = heavy_profile_slot()
+        .acquire_owned()
+        .await
+        .map_err(|_| "acceptance authoring resource slot was closed".to_string())?;
+    let args = vec![
+        OsString::from("run"),
+        OsString::from("--agent"),
+        OsString::from(profile.spec().agent),
+        OsString::from("--model"),
+        OsString::from(model_identifier()),
+        OsString::from("--format"),
+        OsString::from("json"),
+        OsString::from(format!(
+            "Arena AcceptanceAuthoring profile. Acceptance is only a proposal until Arena validates and freezes it. Work only in this candidate repository. Do not access the canonical checkout, credentials, parent directories, network infrastructure, or production systems.\n\n{prompt}"
+        )),
+    ];
+    let execution = dsh_worker::run_contained_command_with_options(
+        &executable(),
+        &args,
+        candidate,
+        Duration::from_secs(profile.spec().timeout_seconds),
+        &dsh_worker::ContainedCommandOptions {
+            environment: profile_workspace.overrides.clone(),
+            ..dsh_worker::ContainedCommandOptions::default()
+        },
+    )
+    .await?;
+    let canonical_after = crate::delivery::snapshot_canonical_checkout(canonical).await?;
+    if crate::delivery::canonical_checkout_changed(&canonical_before, &canonical_after) {
+        let _ = discard_candidate_changes(candidate, &before_head).await;
+        return Err(
+            "acceptance author changed the canonical Arena checkout; proposal was rejected"
+                .to_string(),
+        );
+    }
+    if execution.timed_out || execution.exit_code != Some(0) {
+        let _ = discard_candidate_changes(candidate, &before_head).await;
+        return Err("acceptance authoring did not complete successfully".to_string());
+    }
+    let (root_session_id, tool_count) = parse_run_output(&execution.stdout);
+    let root_session_id = root_session_id
+        .ok_or_else(|| "acceptance author returned no correlated root session ID".to_string())?;
+    if verification::candidate_sha(candidate).await? != before_head {
+        let _ = discard_candidate_changes(candidate, &before_head).await;
+        return Err("acceptance author created a commit; proposal was rejected".to_string());
+    }
+    let mut changed = changed_paths(candidate, &before_head).await?;
+    if changed.is_empty()
+        || changed
+            .iter()
+            .any(|path| !crate::delivery::acceptance_path(path))
+    {
+        let _ = discard_candidate_changes(candidate, &before_head).await;
+        return Err(
+            "acceptance author modified a non-acceptance path or produced no acceptance change"
+                .to_string(),
+        );
+    }
+    let profile_path = candidate.join(".arena").join("verification.json");
+    if !profile_path.is_file() {
+        let _ = discard_candidate_changes(candidate, &before_head).await;
+        return Err(
+            "acceptance author must create .arena/verification.json before implementation"
+                .to_string(),
+        );
+    }
+
+    let mut frozen_profile = verification::load_profile(candidate)?;
+    changed.push(".arena/verification.json".to_string());
+    changed.extend(frozen_profile.protected_paths.clone());
+    changed.sort();
+    changed.dedup();
+    frozen_profile.protected_paths = changed.clone();
+    verification::validate_profile(&frozen_profile, candidate)?;
+    std::fs::write(
+        &profile_path,
+        serde_json::to_vec_pretty(&frozen_profile)
+            .map_err(|error| format!("serialize frozen verification profile: {error}"))?,
+    )
+    .map_err(|error| format!("write frozen verification profile: {error}"))?;
+    changed = changed_paths(candidate, &before_head).await?;
+    if changed.is_empty()
+        || changed
+            .iter()
+            .any(|path| !crate::delivery::acceptance_path(path))
+    {
+        let _ = discard_candidate_changes(candidate, &before_head).await;
+        return Err("Arena acceptance freeze escaped the bounded acceptance path set".to_string());
+    }
+    verification::validate_profile(&frozen_profile, candidate)?;
+    git_ok(candidate, &["add", "-A"]).await?;
+    git_ok(
+        candidate,
+        &[
+            "commit",
+            "-m",
+            &format!("arena: freeze acceptance {}", state.session_id),
+        ],
+    )
+    .await?;
+    let acceptance_commit = verification::candidate_sha(candidate).await?;
+    let clean = git_output(candidate, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    if !clean.status.success() || !clean.stdout.is_empty() {
+        return Err("frozen acceptance commit left a dirty candidate worktree".to_string());
+    }
+    let evidence_id = format!("{}:acceptance-author", state.session_id);
+    let evidence_path = evidence_dir.join(format!("{evidence_id}.json"));
+    std::fs::create_dir_all(evidence_dir)
+        .map_err(|error| format!("create acceptance evidence directory: {error}"))?;
+    std::fs::write(
+        &evidence_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "evidence_id": evidence_id,
+            "root_session_id": root_session_id,
+            "tool_count": tool_count,
+            "acceptance_commit": acceptance_commit,
+            "protected_paths": frozen_profile.protected_paths,
+            "profile_hash": verification::profile_hash(&frozen_profile)?,
+            "summary": "OpenCode proposed acceptance-only changes; Arena path-bounded, validated, committed, and froze them before implementation."
+        }))
+        .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("write acceptance evidence: {error}"))?;
+    Ok(AcceptanceFreeze {
+        acceptance_commit: acceptance_commit.clone(),
+        profile: frozen_profile,
+        evidence: OpenCodeEvidence {
+            evidence_id,
+            kind: "acceptance_freeze".to_string(),
+            summary:
+                "Arena froze product-specific executable acceptance before implementation."
+                    .to_string(),
+            result_ref: evidence_path.to_string_lossy().into_owned(),
+        },
+    })
+}
+
 async fn execute_candidate_with_profile(
     canonical: &Path,
     candidate: &Path,
