@@ -194,23 +194,7 @@ pub async fn bounded_slice(
     let snapshot = ensure_snapshot(repo, cache_root).await?;
     let lowered = request.to_ascii_lowercase();
     let mut args = vec![OsString::from("repo-intel"), OsString::from("query")];
-    if lowered.contains("coupling") {
-        args.extend([
-            OsString::from("coupling"),
-            OsString::from("--map-file"),
-            OsString::from(&snapshot.map_path),
-            OsString::from("src-tauri/src/opencode_adapter.rs"),
-            repo.as_os_str().to_os_string(),
-        ]);
-    } else if lowered.contains("symbol") {
-        args.extend([
-            OsString::from("symbols"),
-            OsString::from("--map-file"),
-            OsString::from(&snapshot.map_path),
-            OsString::from("src-tauri/src/opencode_adapter.rs"),
-            repo.as_os_str().to_os_string(),
-        ]);
-    } else if lowered.contains("entry") {
+    if lowered.contains("entry") {
         args.extend([
             OsString::from("entry-points"),
             OsString::from("--map-file"),
@@ -218,6 +202,10 @@ pub async fn bounded_slice(
             repo.as_os_str().to_os_string(),
         ]);
     } else {
+        // Keep Product OS repository intelligence repository-generic. A
+        // founder project cannot be assumed to contain Arena-specific files.
+        // The bounded find query works across repositories for architecture,
+        // coupling, symbols, and other semantic requests.
         args.extend([
             OsString::from("find"),
             OsString::from("--map-file"),
@@ -259,6 +247,12 @@ mod tests {
         let second = hash_key("/repo", "bbb");
         assert_ne!(first, second);
         assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn repository_intelligence_has_no_arena_specific_target_path() {
+        let source = include_str!("repo_intelligence.rs");
+        assert!(!source.contains("src-tauri/src/opencode_adapter.rs"));
     }
 
     #[test]
