@@ -2528,16 +2528,11 @@ pub async fn answer_owner_question(
         },
         selected_option.trim(),
     )?;
-    if !matches!(
-        decision,
-        OwnerDecisionKind::AuthorizeValidationExperiment
-            | OwnerDecisionKind::AuthorizeNarrowBuild
-            | OwnerDecisionKind::AuthorizeBuild
-            | OwnerDecisionKind::ContinueEvaluation
-            | OwnerDecisionKind::StopRun
-            | OwnerDecisionKind::PivotRun
-    ) {
-        return Err("owner decision option is not valid for this question".to_string());
+    let pending = run
+        .pending_owner_decision
+        .ok_or_else(|| "coordinator owner-question authority is missing".to_string())?;
+    if !pipeline_contract::owner_decision_matches_pending(pending, decision) {
+        return Err("owner decision option does not match the pending question".to_string());
     }
     let ambiguity_id = run
         .owner_ambiguity_id
@@ -3013,6 +3008,25 @@ mod tests {
         assert!(coordinator_status_is_terminal(&CoordinatorStatus::Pivoted));
         assert!(coordinator_status_is_terminal(
             &CoordinatorStatus::Cancelled
+        ));
+    }
+
+    #[test]
+    fn owner_answer_cannot_authorize_a_different_pending_action() {
+        assert!(
+            pipeline_contract::owner_decision_matches_pending(
+                OwnerDecisionKind::AuthorizeValidationExperiment,
+                OwnerDecisionKind::AuthorizeBuild,
+            )
+            == false
+        );
+        assert!(pipeline_contract::owner_decision_matches_pending(
+            OwnerDecisionKind::AuthorizeValidationExperiment,
+            OwnerDecisionKind::AuthorizeValidationExperiment,
+        ));
+        assert!(pipeline_contract::owner_decision_matches_pending(
+            OwnerDecisionKind::StopRun,
+            OwnerDecisionKind::ContinueEvaluation,
         ));
     }
 
