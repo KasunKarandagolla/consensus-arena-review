@@ -257,6 +257,67 @@ impl TranscriptStore {
         Ok(())
     }
 
+    pub fn save_product_authority_and_work_orders(
+        &mut self,
+        project_id: &str,
+        records_json: &str,
+        work_orders: &[crate::product_os::ProductWorkOrder],
+        updated_at: i64,
+    ) -> Result<(), AgentError> {
+        if work_orders.is_empty() {
+            return Err(AgentError::DatabaseError(
+                "atomic Product OS review batch requires at least one work order".to_string(),
+            ));
+        }
+        let mut rows = Vec::with_capacity(work_orders.len());
+        for work_order in work_orders {
+            if work_order.project_id != project_id {
+                return Err(AgentError::DatabaseError(
+                    "atomic Product OS review batch crossed project identity".to_string(),
+                ));
+            }
+            let work_order_json = serde_json::to_string(work_order).map_err(|error| {
+                AgentError::DatabaseError(format!("serialize Product OS work order: {error}"))
+            })?;
+            let status = serde_json::to_string(&work_order.status)
+                .map_err(|error| {
+                    AgentError::DatabaseError(format!("serialize work-order status: {error}"))
+                })?
+                .trim_matches('"')
+                .to_string();
+            let role = serde_json::to_string(&work_order.role)
+                .map_err(|error| {
+                    AgentError::DatabaseError(format!("serialize work-order role: {error}"))
+                })?
+                .trim_matches('"')
+                .to_string();
+            rows.push((work_order_json, status, role));
+        }
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO product_authority (project_id, records_json, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params![project_id, records_json, updated_at],
+        )?;
+        for (work_order, (work_order_json, status, role)) in work_orders.iter().zip(rows) {
+            transaction.execute(
+                "INSERT OR REPLACE INTO product_work_orders
+                 (work_order_id, project_id, status, role, work_order_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    work_order.work_order_id,
+                    work_order.project_id,
+                    status,
+                    role,
+                    work_order_json,
+                    work_order.updated_at,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn list_product_projects(&self) -> Result<Vec<String>, AgentError> {
         let mut statement = self
             .conn
