@@ -1129,15 +1129,22 @@ pub async fn apply_delivery(
     if value.session_id != session_id {
         return Err("The requested delivery is not the current delivery".to_string());
     }
-    crate::delivery::apply_verified_candidate(&mut value).await?;
-    crate::delivery::persist_state(
-        &state.delivery_state_path,
-        &state.delivery_state,
-        &state.transcript_store,
-        &mut value,
-    )
-    .await?;
-    crate::delivery::emit(&app, &value).await;
+    if value.phase == crate::delivery::DeliveryPhase::Verified {
+        crate::delivery::apply_verified_candidate(&mut value).await?;
+        crate::delivery::persist_state(
+            &state.delivery_state_path,
+            &state.delivery_state,
+            &state.transcript_store,
+            &mut value,
+        )
+        .await?;
+        crate::delivery::emit(&app, &value).await;
+    } else if value.phase != crate::delivery::DeliveryPhase::Applied {
+        return Err("Only a Verified delivery can be applied".to_string());
+    }
+    // If Safe Apply already succeeded but Product OS correlation failed or
+    // Arena crashed immediately afterward, this call is reconciliation-only:
+    // it never repeats the Git fast-forward.
     let _ = crate::product_os_coordinator::mark_delivery_applied(
         &product_coordinator_context(state.inner(), Some(app)),
         value.session_id.clone(),
