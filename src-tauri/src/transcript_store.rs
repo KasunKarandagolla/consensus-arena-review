@@ -435,6 +435,25 @@ impl TranscriptStore {
         Ok(None)
     }
 
+    pub fn list_project_consultation_work_orders(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<crate::consultation_broker::ConsultationWorkOrder>, AgentError> {
+        let mut statement = self.conn.prepare(
+            "SELECT order_json FROM consultation_work_orders
+             WHERE project_id = ?1 ORDER BY updated_at, request_id",
+        )?;
+        let rows = statement.query_map(params![project_id], |row| row.get::<_, String>(0))?;
+        let mut values = Vec::new();
+        for row in rows {
+            let raw = row?;
+            values.push(serde_json::from_str(&raw).map_err(|error| {
+                AgentError::DatabaseError(format!("parse consultation work order: {error}"))
+            })?);
+        }
+        Ok(values)
+    }
+
     pub fn list_open_consultation_work_orders(
         &self,
     ) -> Result<Vec<crate::consultation_broker::ConsultationWorkOrder>, AgentError> {
