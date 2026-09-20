@@ -371,6 +371,14 @@ pub fn adopt_product_direction(
                         "narrow_build" | "authorize_narrow_build"
                     )
                     && decision.revision.saturating_add(1) == records.project_revision
+                    && records.ambiguities.iter().any(|ambiguity| {
+                        ambiguity.arena_admitted
+                            && ambiguity.resolver == AmbiguityResolver::Owner
+                            && ambiguity.status == AmbiguityStatus::Resolved
+                            && ambiguity.question_id == decision.question_id
+                            && ambiguity.owner_decision_id.as_deref()
+                                == Some(decision.decision_id.as_str())
+                    })
             })
             .map(|decision| decision.decision_id.clone())
             .ok_or_else(|| {
@@ -1253,21 +1261,31 @@ mod tests {
         records.product_direction_decision_id = None;
         records.decision_outcome = None;
         records.owner_decisions.clear();
+        records.ambiguities.clear();
+        records.owner_required_ambiguity_ids.clear();
         assert!(assemble_build_package(&records).is_err());
         assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_err());
 
-        let owner_revision = records.project_revision.saturating_sub(1);
-        records.owner_decisions.push(OwnerDecisionRecord {
-            decision_id: "explicit-current-owner-direction".to_string(),
-            question_id: "explicit-direction-question".to_string(),
-            selected_option: "narrow_build".to_string(),
-            revision: owner_revision,
-            status: DecisionStatus::Adopted,
-            authority: DecisionAuthority::Owner,
-        });
-        let decision_id = adopt_product_direction(&mut records, "narrow_build".to_string())
-            .expect("fresh owner direction");
-        assert_eq!(decision_id, "explicit-current-owner-direction".to_string());
+        admit_ambiguity(
+            &mut records,
+            "explicit-direction".to_string(),
+            "explicit-direction-question".to_string(),
+            "Authorize the bounded build?".to_string(),
+            "product direction".to_string(),
+            AmbiguitySeverity::High,
+            vec!["e1".to_string()],
+        )
+        .expect("admit direction question");
+        let decision_id = adopt_owner_decision(
+            &mut records,
+            "explicit-direction",
+            "explicit-direction-question",
+            "narrow_build".to_string(),
+        )
+        .expect("fresh owner direction");
+        let adopted_id = adopt_product_direction(&mut records, "narrow_build".to_string())
+            .expect("adopt bound product direction");
+        assert_eq!(adopted_id, decision_id);
         assert_eq!(records.product_direction_decision_id, Some(decision_id));
         assert!(assemble_build_package(&records).is_ok());
     }
@@ -1374,17 +1392,21 @@ mod tests {
         records.decision_outcome = None;
         records.product_direction_decision_id = None;
         records.owner_decisions.clear();
+        records.ambiguities.clear();
+        records.owner_required_ambiguity_ids.clear();
         assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_err());
 
+        // A raw owner-looking record without an Arena-admitted owner question
+        // is still insufficient.
         records.owner_decisions.push(OwnerDecisionRecord {
-            decision_id: "explicit-owner".to_string(),
-            question_id: "question".to_string(),
+            decision_id: "forged-owner".to_string(),
+            question_id: "forged-question".to_string(),
             selected_option: "narrow_build".to_string(),
             revision: records.project_revision.saturating_sub(1),
             status: DecisionStatus::Adopted,
             authority: DecisionAuthority::Owner,
         });
-        assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_ok());
+        assert!(adopt_product_direction(&mut records, "narrow_build".to_string()).is_err());
     }
 
     #[test]
