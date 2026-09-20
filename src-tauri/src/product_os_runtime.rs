@@ -10,6 +10,7 @@ use crate::evidence_gates::{
     EvidenceSource, EvidenceVerification, GateDecision, GateId,
 };
 use crate::execution_profiles::ExecutionProfile;
+use crate::pipeline_contract::ResolvedInputManifest;
 use crate::product_os::{
     self, AuthorityAmbiguityRecord, ProductAuthorityRecords, ProductResearchCategory,
     ProductResearchMode, ProductScopeAdmission, ProductWorkOrder, ProductWorkOrderRole,
@@ -51,6 +52,8 @@ pub struct ProductReviewAdmission {
     pub summary: String,
     pub source_reference: String,
     pub decision_impact: bool,
+    #[serde(default)]
+    pub packet_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,6 +74,10 @@ pub struct ArchitectureAdmission {
     pub red_team_evidence_id: String,
     pub dissent_evidence_id: String,
     pub unresolved_high_blocker_evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub packet_hash: Option<String>,
+    #[serde(default)]
+    pub synthesis: Option<crate::pipeline_contract::ArchitectureSynthesis>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +221,7 @@ fn initial_records(project_id: &str, question: &str) -> ProductAuthorityRecords 
             red_team_evidence_id: String::new(),
             dissent_evidence_id: String::new(),
             unresolved_high_blocker_evidence_ids: Vec::new(),
+            synthesis: None,
         },
         acceptance_profile_version: None,
     }
@@ -563,12 +571,26 @@ fn new_work_order(
         session_id: format!("product-os:{work_order_id}"),
         runtime_session_id: None,
         run_generation: 0,
-        role,
+        role: role.clone(),
         status: ProductWorkOrderStatus::Admitted,
         project_revision,
         parent_work_order_id,
         evidence_id: None,
         evidence_ids: Vec::new(),
+        input_manifest: Some(ResolvedInputManifest {
+            project_id: project_id.to_string(),
+            project_revision,
+            role: format!("{role:?}"),
+            required_inputs: vec![
+                question
+                    .clone()
+                    .unwrap_or_else(|| "project authority".to_string()),
+            ],
+            resolved_content: question
+                .clone()
+                .unwrap_or_else(|| "project authority".to_string()),
+            packet_hash: None,
+        }),
         result_ref: None,
         cancellation_reason: None,
         superseded_by: None,
@@ -757,6 +779,42 @@ pub async fn create_product_role_work_order(
     .map_err(db_error)
 }
 
+pub async fn bind_input_manifest(
+    db: Arc<Mutex<TranscriptStore>>,
+    work_order_id: String,
+    manifest: ResolvedInputManifest,
+) -> Result<ProductWorkOrder, String> {
+    manifest.validate()?;
+    db_helpers::run_blocking(move || {
+        let mut store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        let mut order = store
+            .get_product_work_order(&work_order_id)?
+            .ok_or_else(|| {
+                AgentError::DatabaseError("input manifest work order is unknown".to_string())
+            })?;
+        if order.status != ProductWorkOrderStatus::Admitted {
+            return Err(AgentError::DatabaseError(
+                "input manifest can only bind an admitted work order".to_string(),
+            ));
+        }
+        if order.project_id != manifest.project_id
+            || order.project_revision != manifest.project_revision
+        {
+            return Err(AgentError::DatabaseError(
+                "input manifest is not current for the work order".to_string(),
+            ));
+        }
+        order.input_manifest = Some(manifest.clone());
+        order.updated_at = now();
+        store.save_product_work_order(&order)?;
+        Ok(order)
+    })
+    .await
+    .map_err(db_error)
+}
+
 pub async fn create_product_project(
     db: Arc<Mutex<TranscriptStore>>,
     project_id: String,
@@ -820,6 +878,7 @@ fn is_semantic_review_role(role: &ProductWorkOrderRole) -> bool {
         ProductWorkOrderRole::ProductDirector
             | ProductWorkOrderRole::ArchitectA
             | ProductWorkOrderRole::ArchitectB
+            | ProductWorkOrderRole::ChiefEngineer
             | ProductWorkOrderRole::ReuseReviewer
             | ProductWorkOrderRole::ConstraintsReviewer
             | ProductWorkOrderRole::RedTeamReviewer
@@ -865,6 +924,16 @@ pub async fn run_product_role_work_order(
                     "semantic role work order is stale for current authority".to_string(),
                 ));
             }
+            order
+                .input_manifest
+                .as_ref()
+                .ok_or_else(|| {
+                    AgentError::DatabaseError(
+                        "semantic role has no resolved input manifest".to_string(),
+                    )
+                })?
+                .validate()
+                .map_err(AgentError::DatabaseError)?;
             order.status = ProductWorkOrderStatus::Running;
             order.updated_at = now();
             store.save_product_work_order(&order)?;
@@ -980,6 +1049,7 @@ fn review_evidence(
     if !matches!(
         admission.kind,
         EvidenceKind::ArchitectureProposal
+            | EvidenceKind::ArchitectureSynthesis
             | EvidenceKind::ReuseReview
             | EvidenceKind::ConstraintsReview
             | EvidenceKind::RedTeamReview
@@ -1071,6 +1141,17 @@ pub async fn admit_product_review(
             return Err(AgentError::DatabaseError(
                 "current Product Director evidence identity already exists".to_string(),
             ));
+        }
+        if let Some(packet_hash) = admission.packet_hash.as_deref() {
+            let bound_packet = order
+                .input_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.packet_hash.as_deref());
+            if bound_packet != Some(packet_hash) {
+                return Err(AgentError::DatabaseError(
+                    "Product Director review packet binding is stale or missing".to_string(),
+                ));
+            }
         }
         let evidence =
             review_evidence(&admission, &order.work_order_id).map_err(AgentError::DatabaseError)?;
@@ -1422,9 +1503,18 @@ pub async fn adopt_product_reuse_decision(
     capability: String,
     classification: ReuseClassification,
     evidence_ids: Vec<String>,
+    candidate: String,
+    alternatives: Vec<String>,
+    rationale: String,
 ) -> Result<ProductAuthorityRecords, String> {
-    if capability.trim().is_empty() {
-        return Err("reuse decision requires a capability".to_string());
+    if capability.trim().is_empty() || candidate.trim().is_empty() || rationale.trim().is_empty() {
+        return Err("reuse decision requires capability, candidate, and rationale".to_string());
+    }
+    if candidate.trim() == capability.trim() {
+        return Err("reuse decision candidate must be project-specific".to_string());
+    }
+    if classification == ReuseClassification::Build && alternatives.is_empty() {
+        return Err("BUILD reuse classification requires mature alternatives".to_string());
     }
     db_helpers::run_blocking(move || {
         let mut store = db
@@ -1480,6 +1570,9 @@ pub async fn adopt_product_reuse_decision(
             capability: capability.clone(),
             classification: classification.clone(),
             evidence_ids: evidence_ids.clone(),
+            candidate: candidate.clone(),
+            alternatives: alternatives.clone(),
+            rationale: rationale.clone(),
         });
         records.project_revision = records.project_revision.saturating_add(1);
         save_records(&mut store, &records).map_err(AgentError::DatabaseError)?;
@@ -1596,6 +1689,24 @@ pub async fn adopt_product_architecture(
                 ));
             }
         }
+        if let Some(synthesis) = admission.synthesis.as_ref() {
+            if admission.packet_hash.as_deref() != Some(synthesis.packet_hash.as_str()) {
+                return Err(AgentError::DatabaseError(
+                    "architecture synthesis packet binding is stale or missing".to_string(),
+                ));
+            }
+            if synthesis.reuse_decisions.is_empty()
+                || synthesis
+                    .reuse_decisions
+                    .iter()
+                    .any(|decision| decision.validate().is_err())
+            {
+                return Err(AgentError::DatabaseError(
+                    "architecture synthesis has incomplete project-specific reuse decisions"
+                        .to_string(),
+                ));
+            }
+        }
         records.architecture = product_os::ArchitectureEvidenceRecords {
             architecture_version: records.architecture.architecture_version.saturating_add(1),
             proposal_a_evidence_id: admission.proposal_a_evidence_id.clone(),
@@ -1608,6 +1719,7 @@ pub async fn adopt_product_architecture(
             unresolved_high_blocker_evidence_ids: admission
                 .unresolved_high_blocker_evidence_ids
                 .clone(),
+            synthesis: admission.synthesis.clone(),
         };
         records.project_revision = records.project_revision.saturating_add(1);
         save_records(&mut store, &records).map_err(AgentError::DatabaseError)?;
@@ -2646,10 +2758,12 @@ pub async fn reconcile_after_restart(
 
 pub async fn snapshot(
     db: Arc<Mutex<TranscriptStore>>,
-    runtime: Arc<SessionRuntime>,
+    _runtime: Arc<SessionRuntime>,
     project_id: String,
 ) -> Result<Option<ProductAuthoritySnapshot>, String> {
-    reconcile_after_restart(db.clone(), runtime).await?;
+    // Snapshot is a pure read.  Restart reconciliation is an explicit
+    // startup/resume/recovery mutation and must never be hidden behind a
+    // status or UI read.
     db_helpers::run_blocking(move || {
         let store = db
             .lock()
@@ -3174,19 +3288,60 @@ mod tests {
 
         let reopened = TranscriptStore::open(path.to_string_lossy().as_ref())
             .expect("reopen Product OS store");
-        let snapshot = snapshot(
-            Arc::new(Mutex::new(reopened)),
-            Arc::new(SessionRuntime::new()),
-            "m05b-reconcile".to_string(),
-        )
-        .await
-        .expect("reconcile snapshot")
-        .expect("reconciled project");
+        let reopened_db = Arc::new(Mutex::new(reopened));
+        let runtime = Arc::new(SessionRuntime::new());
+        // Reconciliation is an explicit startup/recovery mutation.
+        reconcile_after_restart(reopened_db.clone(), runtime.clone())
+            .await
+            .expect("reconcile after reopen");
+        let snapshot = snapshot(reopened_db, runtime, "m05b-reconcile".to_string())
+            .await
+            .expect("reconcile snapshot")
+            .expect("reconciled project");
         assert_eq!(
             snapshot.work_orders[0].status,
             ProductWorkOrderStatus::ReconciliationRequired
         );
         assert!(snapshot.records.evidence.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_a_pure_read_and_does_not_reconcile_running_work() {
+        let path =
+            std::env::temp_dir().join(format!("arena-m09a-snapshot-{}.db", uuid::Uuid::new_v4()));
+        let db = Arc::new(Mutex::new(
+            TranscriptStore::open(path.to_string_lossy().as_ref()).expect("temporary store"),
+        ));
+        let order = create_research_work_order(
+            db.clone(),
+            "m09a-snapshot".to_string(),
+            "pure snapshot fixture".to_string(),
+            "https://api.github.com/repos/github/github-mcp-server".to_string(),
+        )
+        .await
+        .expect("admit work order");
+        {
+            let mut store = db.lock().expect("store lock");
+            let mut running = store
+                .get_product_work_order(&order.work_order_id)
+                .expect("load order")
+                .expect("order");
+            running.status = ProductWorkOrderStatus::Running;
+            store.save_product_work_order(&running).expect("save order");
+        }
+        let current = snapshot(
+            db.clone(),
+            Arc::new(SessionRuntime::new()),
+            "m09a-snapshot".to_string(),
+        )
+        .await
+        .expect("read snapshot")
+        .expect("project");
+        assert_eq!(
+            current.work_orders[0].status,
+            ProductWorkOrderStatus::Running
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -3238,6 +3393,7 @@ mod tests {
                 summary: format!("bounded internal validation review: {subject}"),
                 source_reference: format!("arena://internal-validation/{evidence_id}"),
                 decision_impact: true,
+                packet_hash: None,
             },
         )
         .await
@@ -3464,6 +3620,9 @@ mod tests {
             "official GitHub metadata retrieval".to_string(),
             ReuseClassification::Reuse,
             vec![reuse_review.evidence_id.clone().expect("reuse evidence")],
+            "official GitHub metadata adapter".to_string(),
+            vec!["new metadata adapter".to_string()],
+            "the existing adapter is bounded and source-specific".to_string(),
         )
         .await
         .expect("reuse decision");
@@ -3473,7 +3632,7 @@ mod tests {
             ArchitectureAdmission {
                 proposal_a_evidence_id: proposal_a.evidence_id.expect("proposal A evidence"),
                 proposal_b_evidence_id: proposal_b.evidence_id.expect("proposal B evidence"),
-                reuse_review_evidence_id: reuse_review.evidence_id.expect("reuse evidence"),
+                reuse_review_evidence_id: reuse_review.evidence_id.clone().expect("reuse evidence"),
                 constraints_review_evidence_id: constraints_review
                     .evidence_id
                     .expect("constraints evidence"),
@@ -3481,6 +3640,31 @@ mod tests {
                 red_team_evidence_id: red_team.evidence_id.expect("red-team evidence"),
                 dissent_evidence_id: dissent.evidence_id.expect("dissent evidence"),
                 unresolved_high_blocker_evidence_ids: Vec::new(),
+                packet_hash: Some("reopened-packet-1".to_string()),
+                synthesis: Some(crate::pipeline_contract::ArchitectureSynthesis {
+                    packet_hash: "reopened-packet-1".to_string(),
+                    selection: crate::pipeline_contract::ArchitectureSelection::B,
+                    reviewer_dispositions: std::collections::BTreeMap::from([(
+                        "reuse".to_string(),
+                        "retain the bounded official retrieval boundary".to_string(),
+                    )]),
+                    risky_assumptions: vec!["source remains explicitly bounded".to_string()],
+                    experiment_needed: false,
+                    reuse_decisions: vec![crate::pipeline_contract::ReuseProof {
+                        capability: "official GitHub metadata retrieval".to_string(),
+                        classification: "REUSE".to_string(),
+                        candidate: "official GitHub metadata adapter".to_string(),
+                        alternatives: vec!["new metadata adapter".to_string()],
+                        evidence_ids: vec![
+                            reuse_review.evidence_id.clone().expect("reuse evidence"),
+                        ],
+                        rationale: "the existing adapter is bounded and source-specific"
+                            .to_string(),
+                    }],
+                    owner_tradeoff: Some(
+                        "bounded retrieval preserves the current authority boundary".to_string(),
+                    ),
+                }),
             },
         )
         .await
@@ -4124,6 +4308,9 @@ mod tests {
             "bounded study slice runtime and verification".to_string(),
             ReuseClassification::Reuse,
             vec![reuse.evidence_id.clone().expect("reuse evidence")],
+            "existing Product OS runtime boundary".to_string(),
+            vec!["new orchestration boundary".to_string()],
+            "the existing runtime preserves authority and restart semantics".to_string(),
         )
         .await
         .expect("adopt M06 reuse decision");
@@ -4141,6 +4328,31 @@ mod tests {
                 red_team_evidence_id: red_team.evidence_id.expect("red-team evidence"),
                 dissent_evidence_id: dissent.evidence_id.expect("dissent evidence"),
                 unresolved_high_blocker_evidence_ids: Vec::new(),
+                packet_hash: Some("m06-packet-1".to_string()),
+                synthesis: Some(crate::pipeline_contract::ArchitectureSynthesis {
+                    packet_hash: "m06-packet-1".to_string(),
+                    selection: crate::pipeline_contract::ArchitectureSelection::Hybrid,
+                    reviewer_dispositions: std::collections::BTreeMap::from([(
+                        "reuse".to_string(),
+                        "retain the existing Product OS runtime boundary".to_string(),
+                    )]),
+                    risky_assumptions: vec![
+                        "the bounded study slice remains sufficient".to_string(),
+                    ],
+                    experiment_needed: false,
+                    reuse_decisions: vec![crate::pipeline_contract::ReuseProof {
+                        capability: "bounded study slice runtime and verification".to_string(),
+                        classification: "REUSE".to_string(),
+                        candidate: "existing Product OS runtime boundary".to_string(),
+                        alternatives: vec!["new orchestration boundary".to_string()],
+                        evidence_ids: vec![reuse.evidence_id.clone().expect("reuse evidence")],
+                        rationale: "the existing runtime preserves authority and restart semantics"
+                            .to_string(),
+                    }],
+                    owner_tradeoff: Some(
+                        "existing runtime keeps the first build bounded".to_string(),
+                    ),
+                }),
             },
         )
         .await

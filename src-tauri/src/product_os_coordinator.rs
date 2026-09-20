@@ -10,6 +10,9 @@ use crate::errors::AgentError;
 use crate::evidence_gates::{
     AmbiguitySeverity, EvidenceKind, EvidenceVerification, GateStatus, ReviewerRestatement,
 };
+use crate::pipeline_contract::{
+    self, GateRemediation, OwnerDecisionKind, PipelineStage, ProductRoute,
+};
 use crate::product_os::{
     ProductAuthorityRecords, ProductResearchCategory, ProductScopeAdmission, ProductWorkOrder,
     ProductWorkOrderRole, ReuseClassification,
@@ -19,6 +22,7 @@ use crate::session_runtime::SessionRuntime;
 use crate::settings_store::SettingsStore;
 use crate::transcript_store::TranscriptStore;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +32,7 @@ const MAX_IDEA_BYTES: usize = 8 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum CoordinatorPhase {
     Research,
+    ReproduceDiagnose,
     ProductReview,
     Architecture,
     Package,
@@ -56,13 +61,27 @@ pub struct ProductCoordinatorRun {
     pub founder_idea: String,
     pub repository_path: String,
     pub phase: CoordinatorPhase,
+    #[serde(default = "default_pipeline_stage")]
+    pub stage: PipelineStage,
+    #[serde(default = "default_product_route")]
+    pub route: ProductRoute,
+    #[serde(default)]
+    pub omitted_stage_reasons: Vec<pipeline_contract::OmittedStage>,
     pub status: CoordinatorStatus,
+    #[serde(default)]
+    pub execution_epoch: u64,
+    #[serde(default)]
+    pub remediation_counts: BTreeMap<String, u8>,
+    #[serde(default)]
+    pub last_remediation: Option<GateRemediation>,
     pub research_work_order_ids: Vec<String>,
     pub verifier_work_order_ids: Vec<String>,
     pub verified_evidence_ids: Vec<String>,
     pub product_director_work_order_id: Option<String>,
     #[serde(default)]
     pub product_review_outcome: Option<String>,
+    #[serde(default)]
+    pub pending_owner_decision: Option<OwnerDecisionKind>,
     pub owner_ambiguity_id: Option<String>,
     pub owner_question_id: Option<String>,
     pub architecture_work_order_ids: Vec<String>,
@@ -81,6 +100,14 @@ pub struct ProductCoordinatorRun {
     pub updated_at: i64,
 }
 
+fn default_product_route() -> ProductRoute {
+    ProductRoute::NewProduct
+}
+
+fn default_pipeline_stage() -> PipelineStage {
+    PipelineStage::Discover
+}
+
 #[derive(Clone)]
 pub struct CoordinatorContext {
     pub db: Arc<Mutex<TranscriptStore>>,
@@ -89,6 +116,7 @@ pub struct CoordinatorContext {
     pub delivery_state_path: PathBuf,
     pub delivery_slot: Arc<tokio::sync::Mutex<Option<crate::delivery::DeliveryState>>>,
     pub settings: Arc<tokio::sync::Mutex<SettingsStore>>,
+    pub role_scheduler: Arc<crate::pipeline_contract::ResourceScheduler>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,8 +169,54 @@ struct ReviewOutput {
     rationale: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SynthesisOutput {
+    selection: String,
+    #[serde(default)]
+    reviewer_dispositions: BTreeMap<String, String>,
+    #[serde(default)]
+    risky_assumptions: Vec<String>,
+    #[serde(default)]
+    experiment_needed: bool,
+    #[serde(default)]
+    reuse_decisions: Vec<pipeline_contract::ReuseProof>,
+    #[serde(default)]
+    owner_tradeoff: Option<String>,
+}
+
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+async fn run_scheduled_role(
+    ctx: &CoordinatorContext,
+    run: &ProductCoordinatorRun,
+    work_order_id: String,
+    prompt: String,
+) -> Result<product_os_runtime::ProductRoleExecution, String> {
+    let claim = ctx.role_scheduler.try_claim(
+        work_order_id.clone(),
+        run.execution_epoch,
+        pipeline_contract::ResourceClass::ExclusiveSessionRuntime,
+    )?;
+    let result = product_os_runtime::run_product_role_work_order(
+        ctx.db.clone(),
+        ctx.runtime.clone(),
+        work_order_id,
+        prompt,
+    )
+    .await;
+    let release = ctx.role_scheduler.release(&claim);
+    release?;
+    let result = result?;
+    let current = load_run(ctx, &run.run_id).await?;
+    if current.execution_epoch != claim.execution_epoch {
+        return Err(format!(
+            "stale execution epoch {} cannot be admitted after epoch {}",
+            claim.execution_epoch, current.execution_epoch
+        ));
+    }
+    Ok(result)
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
@@ -280,6 +354,33 @@ async fn admit_review(
             summary,
             source_reference: "Arena-owned semantic review work order".to_string(),
             decision_impact: true,
+            packet_hash: None,
+        },
+    )
+    .await
+}
+
+async fn admit_packet_review(
+    ctx: &CoordinatorContext,
+    project_id: &str,
+    order: ProductWorkOrder,
+    kind: EvidenceKind,
+    claim: String,
+    summary: String,
+    packet_hash: String,
+) -> Result<ProductWorkOrder, String> {
+    product_os_runtime::admit_product_review(
+        ctx.db.clone(),
+        project_id.to_string(),
+        order.work_order_id,
+        ProductReviewAdmission {
+            evidence_id: format!("arena-evidence:{}", uuid::Uuid::new_v4()),
+            kind,
+            claim,
+            summary,
+            source_reference: "Arena-owned packet-bound semantic review work order".to_string(),
+            decision_impact: true,
+            packet_hash: Some(packet_hash),
         },
     )
     .await
@@ -289,6 +390,13 @@ async fn run_research_wave(
     ctx: &CoordinatorContext,
     run: &mut ProductCoordinatorRun,
 ) -> Result<(), String> {
+    if run.route != ProductRoute::NewProduct {
+        run.stage = PipelineStage::Decide;
+        run.omitted_stage_reasons = pipeline_contract::route_plan(run.route).omitted_stages;
+        run.updated_at = now();
+        save_run(ctx, run).await?;
+        return Ok(());
+    }
     let questions = [
         (
             ProductResearchCategory::UserProblem,
@@ -569,6 +677,11 @@ async fn run_product_review(
     .await?;
     run.owner_ambiguity_id = Some(ambiguity_id);
     run.owner_question_id = Some(question_id);
+    run.pending_owner_decision = Some(if outcome == "validation_experiment" {
+        OwnerDecisionKind::AuthorizeValidationExperiment
+    } else {
+        OwnerDecisionKind::AuthorizeNarrowBuild
+    });
     run.status = CoordinatorStatus::WaitingForOwner;
     run.phase = CoordinatorPhase::ProductReview;
     run.updated_at = now();
@@ -596,7 +709,16 @@ async fn run_architecture(
         (ProductWorkOrderRole::ArchitectA, "Architect A"),
         (ProductWorkOrderRole::ArchitectB, "Architect B"),
     ];
-    let mut architect_orders = Vec::new();
+    let architect_prompt = |label: &str| {
+        role_prompt(
+            label,
+            &format!(
+                "{brief}\nPropose one materially distinct architecture. Do not read another architect's response. Return JSON: {{\"proposal\":\"...\",\"assumptions\":[\"...\"],\"reuse_choices\":[\"...\"],\"interfaces\":[\"...\"],\"risks\":[\"...\"]}}"
+            ),
+        )
+    };
+    let mut proposal_ids = Vec::new();
+    let mut proposal_inputs = Vec::new();
     for (role, label) in roles {
         let order = product_os_runtime::create_product_role_work_order(
             ctx.db.clone(),
@@ -607,35 +729,14 @@ async fn run_architecture(
         .await?;
         run.architecture_work_order_ids
             .push(order.work_order_id.clone());
-        architect_orders.push((order, label));
-    }
-    save_run(ctx, run).await?;
-    let architect_prompt = |label: &str| {
-        role_prompt(
-            label,
-            &format!(
-                "{brief}\nPropose one materially distinct architecture. Do not read another architect's response. Return JSON: {{\"proposal\":\"...\",\"assumptions\":[\"...\"],\"reuse_choices\":[\"...\"],\"interfaces\":[\"...\"],\"risks\":[\"...\"]}}"
-            ),
-        )
-    };
-    let (architect_a, architect_b) = tokio::try_join!(
-        product_os_runtime::run_product_role_work_order(
-            ctx.db.clone(),
-            ctx.runtime.clone(),
-            architect_orders[0].0.work_order_id.clone(),
-            architect_prompt(architect_orders[0].1),
-        ),
-        product_os_runtime::run_product_role_work_order(
-            ctx.db.clone(),
-            ctx.runtime.clone(),
-            architect_orders[1].0.work_order_id.clone(),
-            architect_prompt(architect_orders[1].1),
-        ),
-    )?;
-    let mut proposal_ids = Vec::new();
-    for execution in [architect_a, architect_b] {
+        save_run(ctx, run).await?;
+        // SessionRuntime is intentionally exclusive. These remain separate
+        // work orders, admitted deterministically one at a time.
+        let execution =
+            run_scheduled_role(ctx, run, order.work_order_id, architect_prompt(label)).await?;
         let output: ArchitectureOutput = parse_json(&execution.output)?;
         let claim = text(&output.proposal, "architecture proposal")?;
+        let proposal_content = claim.clone();
         let summary = format!(
             "assumptions: {}; reuse: {}; interfaces: {}; risks: {}",
             output.assumptions.join(" | "),
@@ -652,12 +753,34 @@ async fn run_architecture(
             summary,
         )
         .await?;
-        proposal_ids.push(
-            admitted
-                .evidence_id
-                .ok_or_else(|| "architecture evidence was not admitted".to_string())?,
-        );
+        let proposal_id = admitted
+            .evidence_id
+            .ok_or_else(|| "architecture evidence was not admitted".to_string())?;
+        proposal_ids.push(proposal_id.clone());
+        proposal_inputs.push(pipeline_contract::ArchitectureProposalInput {
+            evidence_id: proposal_id,
+            content: proposal_content,
+        });
     }
+    let current_snapshot = product_os_runtime::snapshot(
+        ctx.db.clone(),
+        Arc::new(SessionRuntime::new()),
+        run.project_id.clone(),
+    )
+    .await?
+    .ok_or_else(|| "Product OS project disappeared before architecture packet".to_string())?;
+    let packet = pipeline_contract::ArchitectureReviewPacket::resolve(
+        run.project_id.clone(),
+        current_snapshot.records.project_revision,
+        proposal_inputs
+            .first()
+            .cloned()
+            .ok_or_else(|| "architecture A packet input missing".to_string())?,
+        proposal_inputs
+            .get(1)
+            .cloned()
+            .ok_or_else(|| "architecture B packet input missing".to_string())?,
+    )?;
     run.architecture_evidence_ids = proposal_ids;
     save_run(ctx, run).await?;
 
@@ -678,6 +801,17 @@ async fn run_architecture(
             "Red-team reviewer",
         ),
     ];
+    let packet_json = serde_json::to_string(&packet)
+        .map_err(|error| format!("serialize architecture review packet: {error}"))?;
+    let review_prompt = |label: &str| {
+        role_prompt(
+            label,
+            &format!(
+                "{brief}\nResolved ArchitectureReviewPacket (packet_hash={}): {}\nChallenge reuse, constraints, security, platform, and trust boundaries as appropriate. Return JSON: {{\"summary\":\"...\",\"findings\":[\"...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}",
+                packet.packet_hash, packet_json
+            ),
+        )
+    };
     let mut review_orders = Vec::new();
     for (role, kind, label) in review_roles {
         let order = product_os_runtime::create_product_role_work_order(
@@ -687,66 +821,61 @@ async fn run_architecture(
             role,
         )
         .await?;
-        review_orders.push((order, kind, label));
+        let order_id = order.work_order_id.clone();
+        match kind {
+            EvidenceKind::ReuseReview => run.reuse_work_order_id = Some(order_id.clone()),
+            EvidenceKind::ConstraintsReview => {
+                run.constraints_work_order_id = Some(order_id.clone())
+            }
+            EvidenceKind::RedTeamReview => run.red_team_work_order_id = Some(order_id.clone()),
+            _ => {}
+        }
+        review_orders.push((kind, label, order));
     }
-    run.reuse_work_order_id = Some(review_orders[0].0.work_order_id.clone());
-    run.constraints_work_order_id = Some(review_orders[1].0.work_order_id.clone());
-    run.red_team_work_order_id = Some(review_orders[2].0.work_order_id.clone());
-    save_run(ctx, run).await?;
-    let review_prompt = |label: &str| {
-        role_prompt(
-            label,
-            &format!(
-                "{brief}\nThe independent proposals are now available by reference only. Challenge reuse, constraints, security, platform, and trust boundaries as appropriate. Return JSON: {{\"summary\":\"...\",\"findings\":[\"...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}"
-            ),
+    // Admit all packet-bound orders at the same project revision before the
+    // first review can advance authority revision. This keeps every reviewer
+    // bound to the same immutable packet while results are admitted serially.
+    for (_, label, order) in &review_orders {
+        product_os_runtime::bind_input_manifest(
+            ctx.db.clone(),
+            order.work_order_id.clone(),
+            packet.manifest(label)?,
         )
-    };
-    let (reuse_execution, constraints_execution, red_team_execution) = tokio::try_join!(
-        product_os_runtime::run_product_role_work_order(
-            ctx.db.clone(),
-            ctx.runtime.clone(),
-            review_orders[0].0.work_order_id.clone(),
-            review_prompt(review_orders[0].2),
-        ),
-        product_os_runtime::run_product_role_work_order(
-            ctx.db.clone(),
-            ctx.runtime.clone(),
-            review_orders[1].0.work_order_id.clone(),
-            review_prompt(review_orders[1].2),
-        ),
-        product_os_runtime::run_product_role_work_order(
-            ctx.db.clone(),
-            ctx.runtime.clone(),
-            review_orders[2].0.work_order_id.clone(),
-            review_prompt(review_orders[2].2),
-        ),
-    )?;
+        .await?;
+    }
+    save_run(ctx, run).await?;
     let mut review_evidence = Vec::new();
-    for (kind, execution) in [
-        (review_orders[0].1.clone(), reuse_execution),
-        (review_orders[1].1.clone(), constraints_execution),
-        (review_orders[2].1.clone(), red_team_execution),
-    ] {
+    let mut review_findings = Vec::new();
+    for (kind, label, order) in review_orders {
+        let order_id = order.work_order_id;
+        let execution = run_scheduled_role(ctx, run, order_id, review_prompt(label)).await?;
         let output: ReviewOutput = parse_json(&execution.output)?;
         let summary = format!(
             "{}; findings: {}",
             output.summary,
             output.findings.join(" | ")
         );
-        let admitted = admit_review(
+        let admitted = admit_packet_review(
             ctx,
             &run.project_id,
             execution.work_order,
             kind,
             text(&output.summary, "review summary")?,
             summary,
+            packet.packet_hash.clone(),
         )
         .await?;
-        review_evidence.push(
-            admitted
-                .evidence_id
-                .ok_or_else(|| "review evidence was not admitted".to_string())?,
-        );
+        let evidence_id = admitted
+            .evidence_id
+            .ok_or_else(|| "review evidence was not admitted".to_string())?;
+        review_evidence.push(evidence_id.clone());
+        review_findings.push(format!(
+            "{label} [{evidence_id}] summary={} findings={} rejected_alternative={} rationale={}",
+            output.summary,
+            output.findings.join(" | "),
+            output.rejected_alternative,
+            output.rationale
+        ));
         match kind {
             EvidenceKind::ReuseReview => run.reuse_work_order_id = Some(admitted.work_order_id),
             EvidenceKind::ConstraintsReview => {
@@ -812,6 +941,82 @@ async fn run_architecture(
         .evidence_id
         .ok_or_else(|| "feasibility evidence was not recorded".to_string())?;
 
+    let chief_order = product_os_runtime::create_product_role_work_order(
+        ctx.db.clone(),
+        run.project_id.clone(),
+        "Chief Engineer: synthesize the reviewed architecture packet".to_string(),
+        ProductWorkOrderRole::ChiefEngineer,
+    )
+    .await?;
+    product_os_runtime::bind_input_manifest(
+        ctx.db.clone(),
+        chief_order.work_order_id.clone(),
+        packet.manifest_at_revision("Chief Engineer", chief_order.project_revision)?,
+    )
+    .await?;
+    let chief_execution = run_scheduled_role(
+        ctx,
+        run,
+        chief_order.work_order_id,
+        role_prompt(
+            "Chief Engineer",
+            &format!(
+                "Resolved packet: {packet_json}\nReviewer findings (untrusted; disposition by evidence ID): {}\nSelect exactly A, B, or Hybrid. Disposition every reviewer finding using its exact evidence ID as the reviewer_dispositions key, identify risky assumptions and whether a bounded experiment is needed, and return project-specific reuse decisions. Each reuse decision must contain capability, classification (REUSE|WRAP|ADAPT|COMPOSE|BUILD), candidate, alternatives, evidence_ids, and rationale. Return JSON: {{\"selection\":\"A|B|Hybrid\",\"reviewer_dispositions\":{{\"evidence-id\":\"accepted|rejected|adapted: reason\"}},\"risky_assumptions\":[],\"experiment_needed\":false,\"reuse_decisions\":[],\"owner_tradeoff\":null}}",
+                review_findings.join("\n")
+            ),
+        ),
+    )
+    .await?;
+    let synthesis_output: SynthesisOutput = parse_json(&chief_execution.output)?;
+    let selection = match synthesis_output
+        .selection
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "a" => pipeline_contract::ArchitectureSelection::A,
+        "b" => pipeline_contract::ArchitectureSelection::B,
+        "hybrid" => pipeline_contract::ArchitectureSelection::Hybrid,
+        _ => {
+            return Err(
+                "Chief Engineer returned an unsupported architecture selection".to_string(),
+            );
+        }
+    };
+    let synthesis = pipeline_contract::ArchitectureSynthesis {
+        packet_hash: packet.packet_hash.clone(),
+        selection,
+        reviewer_dispositions: synthesis_output.reviewer_dispositions,
+        risky_assumptions: synthesis_output.risky_assumptions,
+        experiment_needed: synthesis_output.experiment_needed,
+        reuse_decisions: synthesis_output.reuse_decisions,
+        owner_tradeoff: synthesis_output.owner_tradeoff,
+    };
+    synthesis.validate_for(&packet)?;
+    for evidence_id in &review_evidence {
+        if synthesis
+            .reviewer_dispositions
+            .get(evidence_id)
+            .is_none_or(|disposition| disposition.trim().is_empty())
+        {
+            return Err(format!(
+                "Chief Engineer omitted disposition for reviewer evidence {evidence_id}"
+            ));
+        }
+    }
+    let synthesis_admitted = admit_packet_review(
+        ctx,
+        &run.project_id,
+        chief_execution.work_order,
+        EvidenceKind::ArchitectureSynthesis,
+        format!("selected {:?}", synthesis.selection),
+        "Chief Engineer synthesis adopted by Arena after packet-bound review".to_string(),
+        packet.packet_hash.clone(),
+    )
+    .await?;
+    run.architecture_work_order_ids
+        .push(synthesis_admitted.work_order_id.clone());
+
     let reuse_order_id = run
         .reuse_work_order_id
         .clone()
@@ -820,13 +1025,35 @@ async fn run_architecture(
         .first()
         .cloned()
         .ok_or_else(|| "reuse evidence was not retained".to_string())?;
+    let first_reuse = synthesis
+        .reuse_decisions
+        .first()
+        .ok_or_else(|| "Chief Engineer omitted project-specific reuse".to_string())?;
     product_os_runtime::adopt_product_reuse_decision(
         ctx.db.clone(),
         run.project_id.clone(),
         reuse_order_id,
-        "bounded implementation and verification capabilities".to_string(),
-        ReuseClassification::Reuse,
-        vec![reuse_evidence_id.clone()],
+        first_reuse.capability.clone(),
+        match first_reuse.classification.to_ascii_lowercase().as_str() {
+            "reuse" => ReuseClassification::Reuse,
+            "wrap" => ReuseClassification::Wrap,
+            "adapt" => ReuseClassification::Adapt,
+            "compose" => ReuseClassification::Compose,
+            "build" => ReuseClassification::Build,
+            _ => {
+                return Err(
+                    "Chief Engineer returned an unsupported reuse classification".to_string(),
+                );
+            }
+        },
+        if first_reuse.evidence_ids.is_empty() {
+            vec![reuse_evidence_id.clone()]
+        } else {
+            first_reuse.evidence_ids.clone()
+        },
+        first_reuse.candidate.clone(),
+        first_reuse.alternatives.clone(),
+        first_reuse.rationale.clone(),
     )
     .await?;
     let constraints = run
@@ -868,6 +1095,8 @@ async fn run_architecture(
             red_team_evidence_id: red_team_evidence,
             dissent_evidence_id: dissent_evidence,
             unresolved_high_blocker_evidence_ids: Vec::new(),
+            packet_hash: Some(packet.packet_hash),
+            synthesis: Some(synthesis),
         },
     )
     .await?;
@@ -901,14 +1130,27 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
         return Ok(());
     }
     run.status = CoordinatorStatus::Running;
+    run.stage = PipelineStage::Decide;
     run.updated_at = now();
     save_run(&ctx, &run).await?;
+    if run.phase == CoordinatorPhase::ReproduceDiagnose {
+        run.stage = PipelineStage::ReproduceDiagnose;
+        run.updated_at = now();
+        save_run(&ctx, &run).await?;
+        // The incident route enters the explicit diagnosis stage before the
+        // existing Decide controller.  Reproduction tools are M09B scope.
+        run.phase = CoordinatorPhase::ProductReview;
+        run.stage = PipelineStage::Decide;
+        save_run(&ctx, &run).await?;
+    }
     if run.phase == CoordinatorPhase::Research {
+        run.stage = PipelineStage::Discover;
         if let Err(error) = run_research_wave(&ctx, &mut run).await {
             mark_failed(&ctx, &mut run, error).await;
             return Ok(());
         }
         run.phase = CoordinatorPhase::ProductReview;
+        run.stage = PipelineStage::Decide;
         run.updated_at = now();
         save_run(&ctx, &run).await?;
     }
@@ -926,6 +1168,7 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
             return Ok(());
         }
         run.phase = CoordinatorPhase::Architecture;
+        run.stage = PipelineStage::Decide;
         run.updated_at = now();
         save_run(&ctx, &run).await?;
     }
@@ -935,6 +1178,7 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
             return Ok(());
         }
         run.phase = CoordinatorPhase::Package;
+        run.stage = PipelineStage::Decide;
         run.updated_at = now();
         save_run(&ctx, &run).await?;
     }
@@ -956,15 +1200,71 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
             .iter()
             .any(|decision| decision.status != GateStatus::Pass)
         {
-            mark_failed(
-                &ctx,
-                &mut run,
-                "current pre-implementation gates did not pass".to_string(),
-            )
-            .await;
-            return Ok(());
+            let failed = evaluation
+                .decisions
+                .iter()
+                .find(|decision| decision.status != GateStatus::Pass)
+                .cloned()
+                .ok_or_else(|| "gate remediation lost its failed decision".to_string())?;
+            let key = format!("{:?}", failed.gate_id);
+            let attempt = run.remediation_counts.get(&key).copied().unwrap_or(0);
+            let remediation =
+                pipeline_contract::route_gate_remediation(failed.gate_id, failed.status, attempt);
+            run.remediation_counts
+                .insert(key, remediation.attempt.saturating_add(1));
+            run.last_remediation = Some(remediation.clone());
+            run.error = Some(remediation.reason.clone());
+            run.updated_at = now();
+            match remediation.outcome {
+                pipeline_contract::GateRemediationOutcome::NeedsResearch => {
+                    run.phase = CoordinatorPhase::Research;
+                    run.stage = PipelineStage::Discover;
+                    run.status = CoordinatorStatus::Running;
+                    save_run(&ctx, &run).await?;
+                    spawn(ctx, run_id);
+                    return Ok(());
+                }
+                pipeline_contract::GateRemediationOutcome::NeedsArchitectureRevision => {
+                    run.phase = CoordinatorPhase::Architecture;
+                    run.stage = PipelineStage::Decide;
+                    run.status = CoordinatorStatus::Running;
+                    run.execution_epoch = run.execution_epoch.saturating_add(1);
+                    save_run(&ctx, &run).await?;
+                    spawn(ctx, run_id);
+                    return Ok(());
+                }
+                pipeline_contract::GateRemediationOutcome::NeedsRepair => {
+                    run.phase = CoordinatorPhase::Package;
+                    run.stage = PipelineStage::Decide;
+                    run.status = CoordinatorStatus::Running;
+                    run.execution_epoch = run.execution_epoch.saturating_add(1);
+                    save_run(&ctx, &run).await?;
+                    spawn(ctx, run_id);
+                    return Ok(());
+                }
+                pipeline_contract::GateRemediationOutcome::NeedsExperiment => {
+                    run.status = CoordinatorStatus::Completed;
+                    run.phase = CoordinatorPhase::ProductReview;
+                    run.stage = PipelineStage::Decide;
+                    run.terminal_outcome =
+                        Some("gate_requires_bounded_experiment_return_to_decide".to_string());
+                    save_run(&ctx, &run).await?;
+                    return Ok(());
+                }
+                _ => {
+                    // Ordinary missing evidence never becomes an unlabelled
+                    // terminal failure. It remains resumable and carries the
+                    // Arena-owned typed remediation in durable state.
+                    run.status = CoordinatorStatus::WaitingForOwner;
+                    run.phase = CoordinatorPhase::ProductReview;
+                    run.stage = PipelineStage::Decide;
+                    save_run(&ctx, &run).await?;
+                    return Ok(());
+                }
+            }
         }
         run.build_package_id = Some(evaluation.package.package_id.clone());
+        run.stage = PipelineStage::Deliver;
         run.phase = CoordinatorPhase::Delivery;
         run.updated_at = now();
         save_run(&ctx, &run).await?;
@@ -1077,18 +1377,36 @@ pub async fn start(
     )
     .await?;
     let timestamp = now();
+    let route = pipeline_contract::select_route(&founder_idea);
+    let route_plan = pipeline_contract::route_plan(route);
+    let initial_phase = match route {
+        ProductRoute::Incident => CoordinatorPhase::ReproduceDiagnose,
+        ProductRoute::ExistingFeature => CoordinatorPhase::ProductReview,
+        ProductRoute::NewProduct => CoordinatorPhase::Research,
+    };
     let run = ProductCoordinatorRun {
         run_id: format!("arena-coordinator:{}", uuid::Uuid::new_v4()),
         project_id,
         founder_idea,
         repository_path: repository.to_string_lossy().into_owned(),
-        phase: CoordinatorPhase::Research,
+        phase: initial_phase,
+        stage: route_plan
+            .stages
+            .first()
+            .copied()
+            .unwrap_or(PipelineStage::Decide),
+        route,
+        omitted_stage_reasons: route_plan.omitted_stages,
         status: CoordinatorStatus::Admitted,
+        execution_epoch: 1,
+        remediation_counts: BTreeMap::new(),
+        last_remediation: None,
         research_work_order_ids: Vec::new(),
         verifier_work_order_ids: Vec::new(),
         verified_evidence_ids: Vec::new(),
         product_director_work_order_id: None,
         product_review_outcome: None,
+        pending_owner_decision: None,
         owner_ambiguity_id: None,
         owner_question_id: None,
         architecture_work_order_ids: Vec::new(),
@@ -1146,7 +1464,23 @@ pub async fn answer_owner_question(
     if run.status != CoordinatorStatus::WaitingForOwner {
         return Err("coordinator is not waiting for an owner decision".to_string());
     }
-    if !matches!(selected_option.trim(), "narrow_build" | "stop" | "pivot") {
+    let decision = pipeline_contract::owner_decision_for_option(
+        match run.product_review_outcome.as_deref() {
+            Some("validation_experiment") => {
+                Some(crate::evidence_gates::DecisionOutcome::ValidationExperiment)
+            }
+            Some("narrow_build") => Some(crate::evidence_gates::DecisionOutcome::NarrowBuild),
+            _ => None,
+        },
+        selected_option.trim(),
+    )?;
+    if !matches!(
+        decision,
+        OwnerDecisionKind::AuthorizeValidationExperiment
+            | OwnerDecisionKind::AuthorizeNarrowBuild
+            | OwnerDecisionKind::StopRun
+            | OwnerDecisionKind::PivotRun
+    ) {
         return Err("owner decision option is not valid for this question".to_string());
     }
     let ambiguity_id = run
@@ -1165,20 +1499,43 @@ pub async fn answer_owner_question(
         selected_option.clone(),
     )
     .await?;
-    if selected_option.trim() != "narrow_build" {
+    if matches!(
+        decision,
+        OwnerDecisionKind::StopRun | OwnerDecisionKind::PivotRun
+    ) {
         let mut terminal = run.clone();
         terminal.status = CoordinatorStatus::Completed;
         terminal.phase = CoordinatorPhase::Terminal;
-        terminal.terminal_outcome = Some("owner_selected_stop_or_pivot".to_string());
+        terminal.stage = PipelineStage::Terminal;
+        terminal.pending_owner_decision = None;
+        terminal.terminal_outcome = Some(match decision {
+            OwnerDecisionKind::StopRun => "owner_selected_stop".to_string(),
+            OwnerDecisionKind::PivotRun => "owner_selected_pivot".to_string(),
+            _ => "owner_selected_terminal".to_string(),
+        });
         terminal.updated_at = now();
         save_run(&ctx, &terminal).await?;
         return Ok(terminal);
+    }
+    if decision == OwnerDecisionKind::AuthorizeValidationExperiment {
+        let mut returned = run.clone();
+        returned.status = CoordinatorStatus::Completed;
+        returned.phase = CoordinatorPhase::ProductReview;
+        returned.stage = PipelineStage::Decide;
+        returned.pending_owner_decision = None;
+        returned.terminal_outcome =
+            Some("validation_experiment_authorized_return_to_decide".to_string());
+        returned.updated_at = now();
+        save_run(&ctx, &returned).await?;
+        return Ok(returned);
     }
     product_os_runtime::adopt_narrow_build_direction(ctx.db.clone(), run.project_id.clone())
         .await?;
     let mut resumed = run;
     resumed.status = CoordinatorStatus::Running;
     resumed.phase = CoordinatorPhase::Architecture;
+    resumed.stage = PipelineStage::Decide;
+    resumed.pending_owner_decision = None;
     resumed.updated_at = now();
     save_run(&ctx, &resumed).await?;
     spawn(ctx, resumed.run_id.clone());
@@ -1236,6 +1593,7 @@ pub async fn resume(
     if run.status == CoordinatorStatus::WaitingForOwner {
         return Ok(run);
     }
+    product_os_runtime::reconcile_after_restart(ctx.db.clone(), ctx.runtime.clone()).await?;
     run.status = CoordinatorStatus::Running;
     run.updated_at = now();
     save_run(&ctx, &run).await?;
@@ -1291,12 +1649,19 @@ mod tests {
             founder_idea: "bounded idea".to_string(),
             repository_path: "/tmp/project".to_string(),
             phase: CoordinatorPhase::Package,
+            stage: PipelineStage::Decide,
+            route: ProductRoute::NewProduct,
+            omitted_stage_reasons: Vec::new(),
             status: CoordinatorStatus::Running,
+            execution_epoch: 3,
+            remediation_counts: BTreeMap::new(),
+            last_remediation: None,
             research_work_order_ids: vec!["research-1".to_string()],
             verifier_work_order_ids: vec!["verifier-1".to_string()],
             verified_evidence_ids: vec!["evidence-1".to_string()],
             product_director_work_order_id: Some("director-1".to_string()),
             product_review_outcome: Some("narrow_build".to_string()),
+            pending_owner_decision: Some(OwnerDecisionKind::AuthorizeNarrowBuild),
             owner_ambiguity_id: Some("ambiguity-1".to_string()),
             owner_question_id: Some("question-1".to_string()),
             architecture_work_order_ids: vec!["architect-a".to_string(), "architect-b".to_string()],
@@ -1378,6 +1743,7 @@ mod tests {
             delivery_state_path: root.join("delivery-state.json"),
             delivery_slot: Arc::new(tokio::sync::Mutex::new(None)),
             settings,
+            role_scheduler: Arc::new(crate::pipeline_contract::ResourceScheduler::default()),
         };
         let started = start(
             ctx.clone(),

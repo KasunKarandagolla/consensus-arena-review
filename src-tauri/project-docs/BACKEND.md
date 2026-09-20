@@ -260,3 +260,20 @@ The current Linux `.deb`, Windows workflow, official read-only GitHub MCP,
 non-Zen provider attempts, and native GUI result are recorded separately in
 the 08B permanent audit. None of these helpers can write ProductAuthority,
 acceptance, Verified, or Apply state.
+
+## M09A controller contracts
+
+`/home/kasun/Music/arena/consensus-arena/src-tauri/src/pipeline_contract.rs`
+is a deliberately small data/predicate module, not a workflow DSL. It owns
+route/stage enums and omission reasons, typed owner decisions, bounded gate
+remediation, resolved input manifests, the packet-bound
+`ArchitectureReviewPacket`/`ArchitectureSynthesis`, reuse proof validation,
+and the subordinate serial resource claim.
+
+`product_os_coordinator.rs` selects routes, persists execution epochs and
+remediation counters, calls an explicit restart reconciliation path, and uses
+pure snapshots for reads. The scheduler never supersedes `SessionRuntime`; it
+prevents overlapping exclusive role claims before the existing runtime
+admission. Architecture reviewers receive delivered proposal content through
+the manifest, not only proposal IDs. The current package gate requires a
+selected synthesis before Delivery can be reached.

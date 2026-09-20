@@ -12,6 +12,7 @@ interface CoordinatorRun {
   owner_ambiguity_id?: string | null
   owner_question_id?: string | null
   product_review_outcome?: string | null
+  pending_owner_decision?: string | null
   terminal_outcome?: string | null
   error?: string | null
 }
@@ -150,13 +151,16 @@ export default function DeliveryView() {
                     item => item.ambiguity_id === coordinator.owner_ambiguity_id,
                   )?.question || 'Arena needs your product direction.'}
                   <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                    <button className="btn-p" onClick={() => void answerOwner('narrow_build')}>
+                    <button className="btn-p" onClick={() => void answerOwner(coordinator.product_review_outcome === 'validation_experiment' ? 'authorize_validation_experiment' : 'authorize_narrow_build')}>
                       {coordinator.product_review_outcome === 'validation_experiment'
                         ? 'Run bounded validation experiment'
                         : 'Proceed with bounded build'}
                     </button>
                     <button className="sv-btn" onClick={() => void answerOwner('stop')}>
                       Stop
+                    </button>
+                    <button className="sv-btn" onClick={() => void answerOwner('pivot')}>
+                      Pivot
                     </button>
                   </div>
                 </div>

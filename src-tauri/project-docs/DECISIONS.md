@@ -210,3 +210,14 @@ profiles are not required.
 Q2 retains the same decision: semantic review, browser exploration, and
 performance procedures are derived evidence only. Sentry MCP, AgentSys
 skillers, and Flow-Next are not V1 runtime dependencies.
+
+## D-2026-23 — M09A controller integrity stays small and serial
+
+**Accepted for M09A.** Use explicit route/stage enums, typed owner decisions,
+resolved input manifests, packet-bound architecture synthesis, and typed
+bounded gate remediation in the existing Product OS persistence. Keep
+`SessionRuntime` as the live authority and add only a subordinate serial
+resource claim layer carrying work-order IDs and execution epochs. Snapshots
+are pure reads; restart/resume reconciliation is explicit. Do not introduce a
+workflow DSL, second task authority, worker-selected profiles, or any quality
+tool as ProductAuthority, acceptance, verification, or Apply authority.

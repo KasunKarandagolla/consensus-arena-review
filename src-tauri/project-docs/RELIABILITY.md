@@ -317,3 +317,25 @@ Linux package extraction/launch does not prove Windows WebView2 or native
 Tauri functional parity. Every external quality capability has an explicit
 required, optional-degradable, target-specific, or environment-blocked status
 in the 08B audit.
+
+## M09A controller and test-link reliability
+
+The controller now keeps `SessionRuntime` as the sole live session owner and
+uses a subordinate serial resource claim for semantic roles. Claims are bound
+to work-order ID and execution epoch; stale releases fail closed. Architecture
+proposals and review packets are independent records but are executed
+serially, so the low-memory host never receives overlapping exclusive role
+holders. Snapshot is a pure read; restart/resume calls explicit reconciliation.
+
+The supported focused Rust test command uses one Cargo job, disabled test
+debuginfo, GCC, and `--reduce-memory-overheads`. The successful M09A pipeline
+run measured `1,526,488 KiB` peak RSS (about `1.46 GiB`) and executed the new
+controller logic. This is a test-link measurement, not an Arena runtime
+performance claim. Heavy LSP/model/browser helpers remain single-slot and
+degrade to project-native checks when resources are insufficient.
+
+Decision-critical research claims are independently verified as a required
+set; incidental verified claims cannot mask an unverified critical claim.
+Typed owner decisions, packet-bound synthesis, and bounded remediation remain
+advisory/controller inputs only. ProductAuthority, verifier, and Apply
+authority boundaries are unchanged.

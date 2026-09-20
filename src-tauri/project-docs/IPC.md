@@ -104,6 +104,15 @@ GitHub MCP. The current WebDiscovery proof uses OpenCode 1.18.31/Muse Spark's
 hosted Exa websearch path without manual relay. Search output is not a verified
 fact until the independent verifier path succeeds.
 
+M09A extends the status payload with the Arena-owned route/stage context,
+omitted-stage reasons, execution epoch, bounded remediation state, and
+`pending_owner_decision`. Renderer options map to canonical backend decisions:
+`authorize_validation_experiment`, `authorize_narrow_build`, `stop`, and
+`pivot` (with the existing build/apply/release options retained where their
+question applies). Validation experiments return to Decide and never directly
+enter Delivery. These are serialized status/decision values, not renderer
+authority to mutate `ProductAuthorityRecords`, gates, verification, or Apply.
+
 ### Shared frontier consultation
 
 The backend `consultation` domain contract is provider-neutral at the Arena

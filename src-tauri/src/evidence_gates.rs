@@ -76,6 +76,7 @@ pub enum EvidenceVerification {
 pub enum EvidenceKind {
     ResearchClaim,
     ArchitectureProposal,
+    ArchitectureSynthesis,
     ReuseReview,
     ConstraintsReview,
     RiskExperiment,
@@ -373,16 +374,30 @@ pub fn evaluate(input: &GateInput) -> GateDecision {
             ),
         },
         GateId::ProblemResearch | GateId::Positioning => {
-            let verified = input
+            let research = input
                 .evidence
                 .iter()
-                .filter(|item| research_evidence_is_verified(item))
+                .filter(|item| item.current && item.kind == Some(EvidenceKind::ResearchClaim))
                 .collect::<Vec<_>>();
-            if verified.is_empty() {
+            let critical = research
+                .iter()
+                .filter(|item| item.decision_impact)
+                .copied()
+                .collect::<Vec<_>>();
+            let required = if critical.is_empty() {
+                research
+            } else {
+                critical
+            };
+            if required.is_empty()
+                || required
+                    .iter()
+                    .any(|item| !research_evidence_is_verified(item))
+            {
                 decision(
                     input,
                     GateStatus::MissingEvidence,
-                    "independently verified research evidence is missing",
+                    "every Arena-selected decision-critical research claim must be independently verified",
                 )
             } else if input.decision_outcome.is_none() {
                 decision(
@@ -631,6 +646,21 @@ mod tests {
         let mut input = base(GateId::ProblemResearch);
         input.authority_fingerprint.clear();
         assert_eq!(evaluate(&input).status, GateStatus::MissingEvidence);
+    }
+
+    #[test]
+    fn decision_critical_research_requires_independent_verification() {
+        let mut input = base(GateId::ProblemResearch);
+        let mut critical = input.evidence[0].clone();
+        critical.evidence_id = "critical".to_string();
+        critical.decision_impact = true;
+        critical.verification = Some(EvidenceVerification::Unverified);
+        let incidental = input.evidence[0].clone();
+        input.evidence = vec![critical, incidental];
+        assert_eq!(evaluate(&input).status, GateStatus::MissingEvidence);
+
+        input.evidence[0].verification = Some(EvidenceVerification::IndependentlyVerified);
+        assert_eq!(evaluate(&input).status, GateStatus::Pass);
     }
 
     #[test]

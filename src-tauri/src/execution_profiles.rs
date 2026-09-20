@@ -157,6 +157,7 @@ impl ExecutionProfile {
             ProductWorkOrderRole::ProductDirector
             | ProductWorkOrderRole::ArchitectA
             | ProductWorkOrderRole::ArchitectB
+            | ProductWorkOrderRole::ChiefEngineer
             | ProductWorkOrderRole::ReuseReviewer
             | ProductWorkOrderRole::ConstraintsReviewer
             | ProductWorkOrderRole::RedTeamReviewer

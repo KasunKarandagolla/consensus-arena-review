@@ -287,10 +287,11 @@ browser and performance procedures follow the same evidence boundary.
 ### 08A runtime closure
 
 Architect A/B and the independent light review roles are created and persisted
-before their executions and run concurrently through the existing
-`SessionRuntime`; this is bounded role concurrency, not a new scheduler. Heavy
-LSP/model/browser work remains single-slot on the low-resource host. Current
-runtime evidence proves OpenCode 1.18.31 on the plain/minimal and
+before their executions. M09A now schedules them deterministically and
+serially through the existing `SessionRuntime` plus a subordinate resource
+claim, preserving independent work-order identity without concurrent
+exclusive holders. Heavy LSP/model/browser work remains single-slot on the
+low-resource host. Current runtime evidence proves OpenCode 1.18.31 on the plain/minimal and
 Implementation/DebugRepair paths, rust-analyzer and TypeScript LSP through
 OpenCode configuration, selected Superpowers procedure influence, and
 exploratory Playwright MCP. Native Tauri WebdriverIO remains target-specific
@@ -312,3 +313,20 @@ retrieval is sufficient. ECC, gstack, DSH, and Dagu do not enter the accepted
 architecture. Windows packaging/runtime and native GUI functional proof stay
 separate release evidence; Linux package evidence does not imply Windows or
 WebView2 parity.
+
+### M09A controller and pipeline integrity
+
+The current coordinator has three Arena-owned routes: NewProduct,
+ExistingFeature, and Incident. It persists the current stage and explicit
+omission reasons, uses `ReproduceDiagnose` as the incident entry stage, and
+keeps validation experiments in Decide rather than Delivery. Every semantic
+work order receives a resolved input manifest. Architecture review packets
+contain both proposal IDs and their delivered content, and the Chief Engineer
+produces a packet-bound A/B/Hybrid synthesis with project-specific reuse proof.
+
+`SessionRuntime` remains the live ownership authority. The controller's small
+serial resource scheduler carries work-order IDs and execution epochs, while
+typed gate remediation and bounded counters prevent silent terminal failure or
+infinite retry. Snapshots are pure reads; restart reconciliation is an
+explicit mutating path. These additions do not grant workers product,
+acceptance, verification, or Apply authority.

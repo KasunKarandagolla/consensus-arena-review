@@ -3,6 +3,7 @@ use crate::evidence_gates::{
     EvidenceKind, EvidenceOrigin, EvidenceSource, EvidenceVerification, GateDecision, GateId,
     GateInput, ReviewerRestatement,
 };
+use crate::pipeline_contract::{ArchitectureSynthesis, ResolvedInputManifest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -75,6 +76,7 @@ pub enum ProductWorkOrderRole {
     ProductDirector,
     ArchitectA,
     ArchitectB,
+    ChiefEngineer,
     ReuseReviewer,
     ConstraintsReviewer,
     RedTeamReviewer,
@@ -137,6 +139,10 @@ pub struct ProductWorkOrder {
     pub evidence_id: Option<String>,
     #[serde(default)]
     pub evidence_ids: Vec<String>,
+    /// The resolved content delivered to the role. References alone are not
+    /// an input manifest and cannot satisfy an architecture review.
+    #[serde(default)]
+    pub input_manifest: Option<ResolvedInputManifest>,
     pub result_ref: Option<String>,
     pub cancellation_reason: Option<String>,
     pub superseded_by: Option<String>,
@@ -160,6 +166,12 @@ pub struct ReuseDecisionRecord {
     pub capability: String,
     pub classification: ReuseClassification,
     pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub candidate: String,
+    #[serde(default)]
+    pub alternatives: Vec<String>,
+    #[serde(default)]
+    pub rationale: String,
 }
 
 /// Architecture proof is represented by references to current evidence, not
@@ -176,6 +188,8 @@ pub struct ArchitectureEvidenceRecords {
     pub red_team_evidence_id: String,
     pub dissent_evidence_id: String,
     pub unresolved_high_blocker_evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub synthesis: Option<ArchitectureSynthesis>,
 }
 
 /// The minimum current Product OS records required to assemble a Build
@@ -731,7 +745,15 @@ pub fn assemble_build_package(records: &ProductAuthorityRecords) -> Result<Build
     }
     for decision in &records.reuse_decisions {
         non_empty(&decision.capability, "reuse capability")?;
+        non_empty(&decision.candidate, "reuse candidate")?;
+        non_empty(&decision.rationale, "reuse rationale")?;
+        if decision.candidate == decision.capability {
+            return Err("reuse decision must identify a project-specific candidate".to_string());
+        }
         if decision.classification == ReuseClassification::Build {
+            if decision.alternatives.is_empty() {
+                return Err("BUILD reuse decision requires mature alternatives".to_string());
+            }
             referenced_many(records, &decision.evidence_ids)?;
         }
     }
@@ -862,7 +884,13 @@ fn input_for_records(
             .iter()
             .any(|decision| decision.classification == ReuseClassification::Build),
         architecture: Some(evidence_gates::ArchitectureProof {
-            proposal_count: 2,
+            // Two proposals are necessary but not sufficient: the Chief
+            // Engineer synthesis is the Arena-adopted selection boundary.
+            proposal_count: if architecture.synthesis.is_some() {
+                2
+            } else {
+                1
+            },
             hard_constraints_checked: referenced_evidence(
                 records,
                 &architecture.constraints_review_evidence_id,
@@ -1006,6 +1034,9 @@ mod tests {
                 capability: "Delivery".to_string(),
                 classification: ReuseClassification::Reuse,
                 evidence_ids: vec!["e2".to_string()],
+                candidate: "existing Delivery boundary".to_string(),
+                alternatives: vec!["new Delivery subsystem".to_string()],
+                rationale: "the current boundary already owns delivery authority".to_string(),
             }],
             architecture: ArchitectureEvidenceRecords {
                 architecture_version: 1,
@@ -1017,6 +1048,26 @@ mod tests {
                 red_team_evidence_id: "e7".to_string(),
                 dissent_evidence_id: "e8".to_string(),
                 unresolved_high_blocker_evidence_ids: Vec::new(),
+                synthesis: Some(ArchitectureSynthesis {
+                    packet_hash: "packet-1".to_string(),
+                    selection: crate::pipeline_contract::ArchitectureSelection::A,
+                    reviewer_dispositions: std::collections::BTreeMap::from([(
+                        "reuse".to_string(),
+                        "retain existing Delivery boundary".to_string(),
+                    )]),
+                    risky_assumptions: vec!["candidate remains bounded".to_string()],
+                    experiment_needed: false,
+                    reuse_decisions: vec![crate::pipeline_contract::ReuseProof {
+                        capability: "Delivery".to_string(),
+                        classification: "REUSE".to_string(),
+                        candidate: "existing Delivery boundary".to_string(),
+                        alternatives: vec!["new Delivery subsystem".to_string()],
+                        evidence_ids: vec!["e2".to_string()],
+                        rationale: "the current boundary already owns delivery authority"
+                            .to_string(),
+                    }],
+                    owner_tradeoff: Some("bounded change preserves existing authority".to_string()),
+                }),
             },
             acceptance_profile_version: Some(1),
         }

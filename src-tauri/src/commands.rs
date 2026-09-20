@@ -891,6 +891,7 @@ fn product_coordinator_context(
         delivery_state_path: state.delivery_state_path.clone(),
         delivery_slot: state.delivery_state.clone(),
         settings: state.settings_store.clone(),
+        role_scheduler: Arc::new(crate::pipeline_contract::ResourceScheduler::default()),
     }
 }
 

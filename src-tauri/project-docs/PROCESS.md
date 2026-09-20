@@ -226,10 +226,23 @@ only for a bounded current/version-specific technical question. Do not put
 full repository maps, raw documentation sessions, credentials, or provider
 tokens into durable product authority.
 
-08A adds one bounded concurrency rule: create and persist independent light
-semantic work orders first, then run the independent Architect/reviewer calls
-concurrently through the existing runtime. The results are admitted in role
+08A established the bounded role boundary. M09A narrows this to deterministic
+serial scheduling: create and persist independent light semantic work orders
+first, then run Architect/reviewer calls one at a time through the existing
+runtime and subordinate resource claim. The results are admitted in role
 order and a failed call cannot fabricate consensus. Heavy LSP/model/browser
 tasks remain single-slot on the low-spec host. Current runtime proof and
 environment boundaries are recorded in
 `src-tauri/project-docs/audits/product-os-transition/08A-reliability-security-safe-apply-v2.md`.
+
+### M09A controller procedure
+
+Arena selects `NewProduct`, `ExistingFeature`, or `Incident` after bounded
+intent interpretation and records every omitted stage with a reason. Each
+semantic work order must be preloaded with a validated resolved input
+manifest. Architecture review uses one packet containing both proposals;
+Chief Engineer synthesis is the selection boundary, not a vote. A validation
+experiment returns to Decide, while Stop and Pivot are distinct owner
+commands. Non-PASS gates route to a typed bounded remediation and persist
+counters. Read/snapshot commands do not reconcile or mutate state;
+startup/resume invokes reconciliation explicitly.
