@@ -142,6 +142,8 @@ struct DirectorOutput {
     #[serde(default)]
     scope: Option<ScopeOutput>,
     #[serde(default)]
+    experiment_contract: Option<pipeline_contract::ExperimentContract>,
+    #[serde(default)]
     owner_question: Option<String>,
     #[serde(default)]
     rationale: String,
@@ -554,27 +556,47 @@ async fn run_research_wave(
     Ok(())
 }
 
-fn records_brief(records: &ProductAuthorityRecords) -> String {
-    let claims = records
+fn records_brief(records: &ProductAuthorityRecords, route: ProductRoute) -> String {
+    let evidence = records
         .evidence
         .iter()
-        .filter(|item| item.current && item.kind == Some(EvidenceKind::ResearchClaim))
+        .filter(|item| item.current)
+        .rev()
+        .take(16)
         .map(|item| {
+            let claim = item.claim.chars().take(320).collect::<String>();
+            let summary = item.summary.chars().take(480).collect::<String>();
             format!(
-                "{} [{}]",
-                item.claim,
-                item.verification
-                    .map(|v| format!("{v:?}"))
-                    .unwrap_or_default()
+                "- kind={:?}; verification={:?}; origin={:?}; claim={}; summary={}",
+                item.kind, item.verification, item.origin, claim, summary
             )
         })
         .collect::<Vec<_>>();
     format!(
-        "founder idea: {}\ncurrent revision: {}\nverified/unresolved research:\n{}",
+        "route: {:?}\nfounder idea/current objective: {}\ncurrent revision: {}\ncurrent bounded evidence (advisory/unverified items are not authority):\n{}",
+        route,
         records.objective,
         records.project_revision,
-        claims.join("\n")
+        if evidence.is_empty() {
+            "- no admitted evidence yet".to_string()
+        } else {
+            evidence.join("\n")
+        }
     )
+}
+
+fn product_review_route_instruction(route: ProductRoute) -> &'static str {
+    match route {
+        ProductRoute::NewProduct => {
+            "This is a NewProduct route. Challenge whether the product deserves to exist, use current research evidence, preserve the strongest no-build case, and avoid implementation commitment unless the evidence supports a bounded next step."
+        }
+        ProductRoute::ExistingFeature => {
+            "This is an ExistingFeature route. The owner has already asked for a change to an existing product. Do not repeat broad market validation or ask whether the product itself should exist. Inspect repository context, bound the requested feature, surface material scope drift/ambiguity, and prefer NarrowBuild only when the requested change can be safely and testably bounded."
+        }
+        ProductRoute::Incident => {
+            "This is an Incident route. Treat admitted IncidentDiagnosis evidence and repository context as the primary decision input. Do not perform greenfield product/market challenge. Decide whether there is a bounded repair, whether a specific validation experiment is required before repair, or whether the incident is too ambiguous/unsafe to proceed."
+        }
+    }
 }
 
 async fn run_product_review(
@@ -606,8 +628,9 @@ async fn run_product_review(
     let prompt = role_prompt(
         "Product Director",
         &format!(
-            "{}{}\nReturn JSON: {{\"outcome\":\"stop|pivot|validation_experiment|narrow_build\",\"scope\":null or {{\"objective\":\"...\",\"target_user\":\"...\",\"requirements\":[\"...\"],\"constraints\":[\"...\"],\"non_goals\":[\"...\"],\"interfaces\":[\"...\"],\"risks\":[\"...\"],\"acceptance_scenarios\":[\"...\"],\"reviewer_restatement\":{{\"intended_outcome\":\"...\",\"success_condition\":\"...\",\"invented_behaviors\":[]}}}},\"owner_question\":\"...\",\"rationale\":\"...\",\"no_build_argument\":\"...\"}}. Choose NarrowBuild only when the bounded evidence supports it; otherwise choose Stop or Pivot. If choosing ValidationExperiment, include a concrete bounded executable scope; if no such slice is justified, choose a terminal outcome. A NarrowBuild proposal still requires owner approval.",
-            records_brief(&snapshot.records),
+            "{}\n{}{}\nReturn JSON: {{\"outcome\":\"stop|pivot|validation_experiment|narrow_build\",\"scope\":null or {{\"objective\":\"...\",\"target_user\":\"...\",\"requirements\":[\"...\"],\"constraints\":[\"...\"],\"non_goals\":[\"...\"],\"interfaces\":[\"...\"],\"risks\":[\"...\"],\"acceptance_scenarios\":[\"...\"],\"reviewer_restatement\":{{\"intended_outcome\":\"...\",\"success_condition\":\"...\",\"invented_behaviors\":[]}}}},\"experiment_contract\":null or {{\"experiment_id\":\"...\",\"synthesis_identity\":\"...\",\"assumption\":\"...\",\"executor_kind\":\"deterministic_command|tool_probe\",\"operation\":{{\"kind\":\"cargo_check_locked|frontend_build|github_repository_metadata|file_contains\"}},\"expected_observation\":\"...\",\"pass_condition\":\"...\",\"fail_condition\":\"...\",\"inconclusive_condition\":\"...\",\"environment\":\"...\",\"timeout_seconds\":120,\"allowed_effects\":[\"...\"],\"protected_paths\":[\"...\"]}},\"owner_question\":\"...\",\"rationale\":\"...\",\"no_build_argument\":\"...\"}}. Choose NarrowBuild only when the bounded route-specific evidence supports it. If choosing ValidationExperiment, provide the exact typed ExperimentContract from Arena's closed operation set; never describe one experiment and expect Arena to substitute another. If the needed experiment cannot be represented safely, do not choose ValidationExperiment.",
+            product_review_route_instruction(run.route),
+            records_brief(&snapshot.records, run.route),
             intelligence
         ),
     );
@@ -753,28 +776,27 @@ async fn run_product_review(
     run.owner_ambiguity_id = Some(ambiguity_id);
     run.owner_question_id = Some(question_id);
     if outcome == "validation_experiment" {
-        run.pending_experiment = Some(pipeline_contract::ExperimentContract {
-            experiment_id: format!("{}:validation-experiment", run.project_id),
-            synthesis_identity: format!(
-                "{}:product-review:{}",
-                run.project_id, snapshot.records.project_revision
-            ),
-            assumption: output.rationale.clone(),
-            executor_kind: pipeline_contract::ExperimentExecutorKind::DeterministicCommand,
-            operation: if Path::new(&run.repository_path).join("Cargo.toml").is_file() {
-                pipeline_contract::ExperimentOperation::CargoCheckLocked
-            } else {
-                pipeline_contract::ExperimentOperation::FrontendBuild
-            },
-            expected_observation: experiment_expected,
-            pass_condition: "deterministic acceptance check passes".to_string(),
-            fail_condition: "deterministic acceptance check fails".to_string(),
-            inconclusive_condition: "timeout or missing observation".to_string(),
-            environment: "isolated project repository validation environment".to_string(),
-            timeout_seconds: 120,
-            allowed_effects: vec!["candidate worktree only".to_string()],
-            protected_paths: vec![".arena/verification.json".to_string()],
-        });
+        let mut contract = output
+            .experiment_contract
+            .clone()
+            .ok_or_else(|| {
+                "ValidationExperiment outcome omitted the exact typed ExperimentContract"
+                    .to_string()
+            })?;
+        contract.synthesis_identity = format!(
+            "{}:product-review:{}",
+            run.project_id, snapshot.records.project_revision
+        );
+        if contract.expected_observation.trim().is_empty() {
+            contract.expected_observation = experiment_expected;
+        }
+        contract.validate()?;
+        run.pending_experiment = Some(contract);
+    } else if output.experiment_contract.is_some() {
+        return Err(
+            "Product Director returned an experiment contract for a non-experiment outcome"
+                .to_string(),
+        );
     }
     run.pending_owner_decision = Some(if outcome == "validation_experiment" {
         OwnerDecisionKind::AuthorizeValidationExperiment
