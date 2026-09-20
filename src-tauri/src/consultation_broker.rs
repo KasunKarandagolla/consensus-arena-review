@@ -442,10 +442,7 @@ pub fn validate_application_url(
                 | "sign-in"
         )
     });
-    let blocked = lower.is_empty()
-        || lower == "/"
-        || lower == "/chat"
-        || blocked_segment;
+    let blocked = lower.is_empty() || lower == "/" || lower == "/chat" || blocked_segment;
     if established_identity && blocked {
         return Err("setup/auth/new-chat URL cannot establish a conversation anchor".to_string());
     }
