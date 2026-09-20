@@ -3,7 +3,9 @@ use crate::evidence_gates::{
     EvidenceKind, EvidenceOrigin, EvidenceSource, EvidenceVerification, GateDecision, GateId,
     GateInput, ReviewerRestatement,
 };
-use crate::pipeline_contract::{ArchitectureSynthesis, ResolvedInputManifest};
+use crate::pipeline_contract::{
+    ArchitectureCompetitionMode, ArchitectureSynthesis, ResolvedInputManifest,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -82,6 +84,7 @@ pub enum ProductWorkOrderRole {
     RedTeamReviewer,
     DissentReviewer,
     FeasibilityReviewer,
+    BrowserQa,
 }
 
 /// The two intentionally narrow research entry points. KnownSource preserves
@@ -188,6 +191,8 @@ pub struct ArchitectureEvidenceRecords {
     pub red_team_evidence_id: String,
     pub dissent_evidence_id: String,
     pub unresolved_high_blocker_evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub competition_mode: ArchitectureCompetitionMode,
     #[serde(default)]
     pub synthesis: Option<ArchitectureSynthesis>,
 }
@@ -552,27 +557,34 @@ pub fn adopt_owner_decision(
 
 fn validate_architecture(records: &ProductAuthorityRecords) -> Result<Vec<String>, String> {
     let architecture = &records.architecture;
-    if architecture.proposal_a_evidence_id == architecture.proposal_b_evidence_id {
+    if architecture.competition_mode == ArchitectureCompetitionMode::CompetingProposals
+        && (architecture.proposal_a_evidence_id.is_empty()
+            || architecture.proposal_a_evidence_id == architecture.proposal_b_evidence_id)
+    {
         return Err("architecture requires two distinct independent proposals".to_string());
     }
-    let ids = vec![
-        architecture.proposal_a_evidence_id.clone(),
-        architecture.proposal_b_evidence_id.clone(),
-        architecture.reuse_review_evidence_id.clone(),
-        architecture.constraints_review_evidence_id.clone(),
-        architecture.red_team_evidence_id.clone(),
-        architecture.dissent_evidence_id.clone(),
-    ];
-    referenced_kind(
-        records,
-        &architecture.proposal_a_evidence_id,
-        EvidenceKind::ArchitectureProposal,
-    )?;
-    referenced_kind(
-        records,
-        &architecture.proposal_b_evidence_id,
-        EvidenceKind::ArchitectureProposal,
-    )?;
+    let mut ids = Vec::new();
+    if !architecture.proposal_a_evidence_id.is_empty() {
+        referenced_kind(
+            records,
+            &architecture.proposal_a_evidence_id,
+            EvidenceKind::ArchitectureProposal,
+        )?;
+        ids.push(architecture.proposal_a_evidence_id.clone());
+    }
+    if !architecture.proposal_b_evidence_id.is_empty() {
+        referenced_kind(
+            records,
+            &architecture.proposal_b_evidence_id,
+            EvidenceKind::ArchitectureProposal,
+        )?;
+        ids.push(architecture.proposal_b_evidence_id.clone());
+    }
+    if architecture.competition_mode == ArchitectureCompetitionMode::CompetingProposals
+        && ids.len() != 2
+    {
+        return Err("competing architecture admission requires two proposals".to_string());
+    }
     referenced_kind(
         records,
         &architecture.reuse_review_evidence_id,
@@ -891,13 +903,18 @@ fn input_for_records(
             } else {
                 1
             },
+            established_pattern: architecture.competition_mode
+                == ArchitectureCompetitionMode::EstablishedPattern,
             hard_constraints_checked: referenced_evidence(
                 records,
                 &architecture.constraints_review_evidence_id,
             )
             .is_ok(),
             reuse_scan_complete: !records.reuse_decisions.is_empty(),
-            risky_assumptions_tested: !architecture.risk_experiment_evidence_ids.is_empty(),
+            risky_assumptions_tested: architecture.synthesis.as_ref().is_some_and(|synthesis| {
+                !synthesis.experiment_needed
+                    || !architecture.risk_experiment_evidence_ids.is_empty()
+            }),
             red_team_complete: referenced_evidence(records, &architecture.red_team_evidence_id)
                 .is_ok(),
             unresolved_high_technical_blocker: !architecture
@@ -960,6 +977,7 @@ mod tests {
             contradiction_ids: Vec::new(),
             decision_impact: false,
             revisit_trigger: None,
+            decision_question: None,
         }
     }
 
@@ -1048,6 +1066,8 @@ mod tests {
                 red_team_evidence_id: "e7".to_string(),
                 dissent_evidence_id: "e8".to_string(),
                 unresolved_high_blocker_evidence_ids: Vec::new(),
+                competition_mode:
+                    crate::pipeline_contract::ArchitectureCompetitionMode::CompetingProposals,
                 synthesis: Some(ArchitectureSynthesis {
                     packet_hash: "packet-1".to_string(),
                     selection: crate::pipeline_contract::ArchitectureSelection::A,
@@ -1057,6 +1077,8 @@ mod tests {
                     )]),
                     risky_assumptions: vec!["candidate remains bounded".to_string()],
                     experiment_needed: false,
+                    experiment_contract: None,
+                    no_experiment_reason: Some("current boundary is established".to_string()),
                     reuse_decisions: vec![crate::pipeline_contract::ReuseProof {
                         capability: "Delivery".to_string(),
                         classification: "REUSE".to_string(),
@@ -1248,6 +1270,7 @@ mod tests {
             contradiction_ids: Vec::new(),
             decision_impact: false,
             revisit_trigger: None,
+            decision_question: None,
         });
         assert!(package.is_current_for(&changed).expect("fingerprint"));
         assert_eq!(

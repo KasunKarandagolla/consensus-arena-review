@@ -78,7 +78,7 @@ pub enum DeliveryRuntime {
 
 impl Default for DeliveryRuntime {
     fn default() -> Self {
-        Self::Dsh
+        Self::OpenCode
     }
 }
 

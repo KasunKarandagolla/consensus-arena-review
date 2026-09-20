@@ -339,3 +339,9 @@ set; incidental verified claims cannot mask an unverified critical claim.
 Typed owner decisions, packet-bound synthesis, and bounded remediation remain
 advisory/controller inputs only. ProductAuthority, verifier, and Apply
 authority boundaries are unchanged.
+
+Restart reconciliation is represented explicitly by `Reconciling`; cancellation
+uses `Cancelling` before `Cancelled`, and stop/pivot/block states are not
+overloaded as successful completion. Stale packet hashes and execution epochs
+fail closed. Bounded experiments are admitted only through a typed contract
+with protected paths and deterministic result semantics.

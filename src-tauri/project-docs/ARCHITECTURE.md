@@ -321,8 +321,10 @@ ExistingFeature, and Incident. It persists the current stage and explicit
 omission reasons, uses `ReproduceDiagnose` as the incident entry stage, and
 keeps validation experiments in Decide rather than Delivery. Every semantic
 work order receives a resolved input manifest. Architecture review packets
-contain both proposal IDs and their delivered content, and the Chief Engineer
-produces a packet-bound A/B/Hybrid synthesis with project-specific reuse proof.
+contain complete delivered typed content; material forks carry distinct A/B
+proposals, while an established-pattern extension may carry one proposal under
+an explicit competition mode. The Chief Engineer produces a packet-bound
+synthesis with project-specific reuse proof.
 
 `SessionRuntime` remains the live ownership authority. The controller's small
 serial resource scheduler carries work-order IDs and execution epochs, while
@@ -330,3 +332,13 @@ typed gate remediation and bounded counters prevent silent terminal failure or
 infinite retry. Snapshots are pure reads; restart reconciliation is an
 explicit mutating path. These additions do not grant workers product,
 acceptance, verification, or Apply authority.
+
+### M09B source-audit corrections
+
+Every architecture reviewer, including Dissent, receives the same complete
+typed proposal packet and packet hash. Chief Engineer disposition includes all
+review artifacts. `ExperimentContract` is conditional evidence; repository
+hygiene is never risk-experiment evidence. Existing-feature extensions may use
+a single established-pattern adoption, while material forks retain A/B review.
+Browser MCP and semantic review remain advisory and cannot grant Product OS,
+verification, or Apply authority.

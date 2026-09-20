@@ -412,16 +412,15 @@ pub async fn start_delivery(
     }
     let base = crate::delivery::validate_clean_base(&repo).await?;
     let use_opencode = crate::opencode_adapter::enabled();
-    if use_opencode {
-        let opencode = crate::opencode_adapter::runtime_status().await;
-        if !opencode.compatible {
-            return Err(opencode.message);
-        }
-    } else {
-        let dsh = crate::dsh_worker::check_prerequisite().await;
-        if !dsh.compatible {
-            return Err(dsh.message);
-        }
+    if !use_opencode {
+        return Err(
+            "OpenCode is the only active V1 Delivery runtime; the legacy DSH fallback is not admitted"
+                .to_string(),
+        );
+    }
+    let opencode = crate::opencode_adapter::runtime_status().await;
+    if !opencode.compatible {
+        return Err(opencode.message);
     }
     let (saved_secrets, credentials_ready) = {
         let store = state.settings_store.lock().await;
@@ -434,20 +433,6 @@ pub async fn start_delivery(
         return Err(crate::credentials::secure_storage_help().to_string());
     }
     objective = prepare_delivery_objective(&objective, &saved_secrets);
-    if !use_opencode {
-        let brain = {
-            let store = state.settings_store.lock().await;
-            store
-                .get_agent_brain_config()
-                .map_err(|error| format!("read Agent Brain settings: {error}"))?
-        };
-        if brain.api_key.trim().is_empty()
-            || brain.base_url.trim().is_empty()
-            || brain.model.trim().is_empty()
-        {
-            return Err("Configure the primary Agent Brain before starting Build mode".to_string());
-        }
-    }
     let previous_state_file = match std::fs::read(&state.delivery_state_path) {
         Ok(contents) => Some(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,

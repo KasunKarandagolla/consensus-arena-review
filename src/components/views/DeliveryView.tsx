@@ -61,7 +61,7 @@ export default function DeliveryView() {
 
   const terminal =
     ['verified', 'applied', 'cancelled', 'failed'].includes(state?.phase ?? '') ||
-    ['completed', 'cancelled'].includes(coordinator?.status ?? '')
+    ['completed', 'stopped', 'pivoted', 'blocked', 'cancelled'].includes(coordinator?.status ?? '')
   const canResume =
     coordinator?.status === 'failed' ||
     ['cancelled', 'failed'].includes(state?.phase ?? '')
@@ -122,8 +122,12 @@ export default function DeliveryView() {
             {state?.status_text ||
               (coordinator?.status === 'waiting_for_owner'
                 ? 'Waiting for your decision…'
-                : coordinator?.status === 'completed'
-                  ? 'Product work complete'
+                : ['stopped', 'pivoted'].includes(coordinator?.status ?? '')
+                  ? `Product work ${coordinator?.status}`
+                  : coordinator?.status === 'blocked'
+                    ? 'Arena is blocked pending the next bounded action'
+                    : coordinator?.status === 'completed'
+                      ? 'Product work complete'
                   : coordinator?.status === 'failed'
                     ? 'Arena is blocked'
                     : 'Arena is progressing your project…')}

@@ -4,6 +4,52 @@
 //! and Verification code remains responsible for execution and authority.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// A bounded record of an exploratory tool call. It is deliberately advisory;
+/// it cannot satisfy a verifier or mutate ProductAuthority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolUseReceipt {
+    pub receipt_id: String,
+    pub session_id: String,
+    pub profile: String,
+    pub tool: String,
+    pub input_digest: String,
+    pub output_summary: String,
+    pub advisory_only: bool,
+}
+
+impl ToolUseReceipt {
+    pub fn new(
+        session_id: &str,
+        profile: &str,
+        tool: &str,
+        input: &str,
+        output_summary: &str,
+    ) -> Result<Self, String> {
+        if session_id.trim().is_empty()
+            || profile.trim().is_empty()
+            || tool.trim().is_empty()
+            || output_summary.trim().is_empty()
+            || output_summary.len() > 8 * 1024
+        {
+            return Err("tool receipt fields are missing or oversized".to_string());
+        }
+        let digest = Sha256::digest(input.as_bytes());
+        Ok(Self {
+            receipt_id: format!(
+                "tool-{:x}",
+                Sha256::digest(format!("{session_id}:{tool}:{input}").as_bytes())
+            ),
+            session_id: session_id.to_string(),
+            profile: profile.to_string(),
+            tool: tool.to_string(),
+            input_digest: format!("sha256:{digest:x}"),
+            output_summary: output_summary.to_string(),
+            advisory_only: true,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,5 +145,20 @@ mod tests {
         assert!(!procedure.is_complete());
         procedure.evidence_ref = Some("evidence/build.txt".to_string());
         assert!(procedure.is_complete());
+    }
+
+    #[test]
+    fn tool_receipt_is_bounded_and_advisory() {
+        let receipt = ToolUseReceipt::new(
+            "browser-session",
+            "browser_qa",
+            "playwright.inspect",
+            "https://example.invalid",
+            "one locator discovered",
+        )
+        .expect("receipt");
+        assert!(receipt.advisory_only);
+        assert!(receipt.input_digest.starts_with("sha256:"));
+        assert!(ToolUseReceipt::new("", "browser_qa", "tool", "in", "out").is_err());
     }
 }

@@ -10,7 +10,9 @@ use crate::evidence_gates::{
     EvidenceSource, EvidenceVerification, GateDecision, GateId,
 };
 use crate::execution_profiles::ExecutionProfile;
-use crate::pipeline_contract::ResolvedInputManifest;
+use crate::pipeline_contract::{
+    ArchitectureCompetitionMode, ExperimentContract, ResolvedInputManifest,
+};
 use crate::product_os::{
     self, AuthorityAmbiguityRecord, ProductAuthorityRecords, ProductResearchCategory,
     ProductResearchMode, ProductScopeAdmission, ProductWorkOrder, ProductWorkOrderRole,
@@ -74,6 +76,8 @@ pub struct ArchitectureAdmission {
     pub red_team_evidence_id: String,
     pub dissent_evidence_id: String,
     pub unresolved_high_blocker_evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub competition_mode: ArchitectureCompetitionMode,
     #[serde(default)]
     pub packet_hash: Option<String>,
     #[serde(default)]
@@ -221,6 +225,7 @@ fn initial_records(project_id: &str, question: &str) -> ProductAuthorityRecords 
             red_team_evidence_id: String::new(),
             dissent_evidence_id: String::new(),
             unresolved_high_blocker_evidence_ids: Vec::new(),
+            competition_mode: ArchitectureCompetitionMode::CompetingProposals,
             synthesis: None,
         },
         acceptance_profile_version: None,
@@ -739,6 +744,17 @@ pub async fn create_product_director_work_order(
     .map_err(db_error)
 }
 
+/// Admit the single BrowserQa entry point. Arena supplies the target and
+/// packet; the worker receives only the BrowserQa profile, whose Playwright
+/// MCP output is exploratory and never verifier authority.
+pub async fn create_browser_qa_work_order(
+    db: Arc<Mutex<TranscriptStore>>,
+    project_id: String,
+    question: String,
+) -> Result<ProductWorkOrder, String> {
+    create_product_role_work_order(db, project_id, question, ProductWorkOrderRole::BrowserQa).await
+}
+
 /// Admit one bounded semantic Product OS role. Role identity remains an
 /// Arena work-order fact; the external model only supplies a proposal.
 pub async fn create_product_role_work_order(
@@ -884,6 +900,7 @@ fn is_semantic_review_role(role: &ProductWorkOrderRole) -> bool {
             | ProductWorkOrderRole::RedTeamReviewer
             | ProductWorkOrderRole::DissentReviewer
             | ProductWorkOrderRole::FeasibilityReviewer
+            | ProductWorkOrderRole::BrowserQa
     )
 }
 
@@ -1054,6 +1071,7 @@ fn review_evidence(
             | EvidenceKind::ConstraintsReview
             | EvidenceKind::RedTeamReview
             | EvidenceKind::Dissent
+            | EvidenceKind::IncidentDiagnosis
     ) {
         return Err("Product Director review kind is not admissible".to_string());
     }
@@ -1079,6 +1097,7 @@ fn review_evidence(
         contradiction_ids: Vec::new(),
         decision_impact: admission.decision_impact,
         revisit_trigger: Some("revisit if the bounded product scope or source changes".to_string()),
+        decision_question: None,
     })
 }
 
@@ -1280,6 +1299,7 @@ pub async fn run_product_github_risk_spike(
                     contradiction_ids: Vec::new(),
                     decision_impact: true,
                     revisit_trigger: Some("re-run if GitHub endpoint behavior changes".to_string()),
+                    decision_question: None,
                 });
                 records.project_revision = records.project_revision.saturating_add(1);
                 order.status = ProductWorkOrderStatus::Completed;
@@ -1304,15 +1324,17 @@ pub async fn run_product_github_risk_spike(
     .await
 }
 
-/// Execute a bounded local feasibility check selected by the coordinator. It
-/// deliberately uses an existing deterministic Git command rather than
-/// treating model prose as experiment evidence.
+/// Execute the bounded deterministic validation protocol selected by Arena.
+/// Repository hygiene (`git diff --check`) is deliberately not evidence here;
+/// this path executes the project check that the experiment contract names.
 pub async fn run_product_feasibility_spike(
     db: Arc<Mutex<TranscriptStore>>,
     runtime: Arc<SessionRuntime>,
     work_order_id: String,
     repository: std::path::PathBuf,
+    contract: ExperimentContract,
 ) -> Result<ProductWorkOrder, String> {
+    contract.validate()?;
     if !repository.is_dir() {
         return Err("feasibility repository does not exist".to_string());
     }
@@ -1374,13 +1396,13 @@ pub async fn run_product_feasibility_spike(
             .await
             .map_err(db_error)?;
             let execution = crate::dsh_worker::run_contained_command(
-                std::path::Path::new("git"),
+                std::path::Path::new("cargo"),
                 &[
-                    std::ffi::OsString::from("diff"),
-                    std::ffi::OsString::from("--check"),
+                    std::ffi::OsString::from("check"),
+                    std::ffi::OsString::from("--locked"),
                 ],
                 &repository,
-                Duration::from_secs(60),
+                Duration::from_secs(180),
             )
             .await;
             let execution = match execution {
@@ -1415,8 +1437,8 @@ pub async fn run_product_feasibility_spike(
                 let evidence_id = format!("{}:feasibility", order.work_order_id);
                 records.evidence.push(EvidenceItem {
                     evidence_id: evidence_id.clone(),
-                    claim: "The accepted repository supports a bounded deterministic Git check without source mutation.".to_string(),
-                    source_reference: "git diff --check".to_string(),
+                    claim: "The accepted repository passes its bounded deterministic validation check without source mutation.".to_string(),
+                    source_reference: "cargo check --locked".to_string(),
                     captured_at: Utc::now().to_rfc3339(),
                     summary: "A real bounded feasibility command completed successfully.".to_string(),
                     provenance: EvidenceProvenance::RuntimeProven,
@@ -1425,9 +1447,9 @@ pub async fn run_product_feasibility_spike(
                     verification: Some(EvidenceVerification::IndependentlyVerified),
                     kind: Some(EvidenceKind::RiskExperiment),
                     source: Some(EvidenceSource {
-                        reference: "git diff --check".to_string(),
+                        reference: "cargo check --locked".to_string(),
                         url: None,
-                        title: Some("Bounded local feasibility check".to_string()),
+                        title: Some("Bounded local validation check".to_string()),
                         checked_at: Utc::now().to_rfc3339(),
                         version_or_scope: "current repository worktree".to_string(),
                     }),
@@ -1435,11 +1457,12 @@ pub async fn run_product_feasibility_spike(
                     contradiction_ids: Vec::new(),
                     decision_impact: true,
                     revisit_trigger: Some("re-run when repository tooling or candidate boundary changes".to_string()),
+                    decision_question: None,
                 });
                 records.project_revision = records.project_revision.saturating_add(1);
                 order.status = ProductWorkOrderStatus::Completed;
                 order.evidence_id = Some(evidence_id.clone());
-                order.result_ref = Some("git diff --check".to_string());
+                order.result_ref = Some("cargo check --locked".to_string());
                 order.updated_at = now();
                 persist_records_and_order(&mut store, &records, &order)
                     .map_err(AgentError::DatabaseError)?;
@@ -1593,7 +1616,10 @@ pub async fn adopt_product_architecture(
             .lock()
             .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
         let mut records = load_records(&store, &project_id).map_err(AgentError::DatabaseError)?;
-        if admission.proposal_a_evidence_id == admission.proposal_b_evidence_id {
+        if admission.competition_mode == ArchitectureCompetitionMode::CompetingProposals
+            && (admission.proposal_a_evidence_id.is_empty()
+                || admission.proposal_a_evidence_id == admission.proposal_b_evidence_id)
+        {
             return Err(AgentError::DatabaseError(
                 "architecture admission requires distinct proposal evidence".to_string(),
             ));
@@ -1605,31 +1631,41 @@ pub async fn adopt_product_architecture(
             EvidenceKind::ArchitectureProposal,
             &records,
         )?;
-        let proposal_b = completed_director_evidence(
-            &store,
-            &project_id,
-            &admission.proposal_b_evidence_id,
-            EvidenceKind::ArchitectureProposal,
-            &records,
-        )?;
-        if proposal_a.work_order_id == proposal_b.work_order_id {
-            return Err(AgentError::DatabaseError(
-                "architecture proposals must originate from separate Product Director work orders"
-                    .to_string(),
-            ));
+        let proposal_b = if admission.proposal_b_evidence_id.is_empty() {
+            None
+        } else {
+            Some(completed_director_evidence(
+                &store,
+                &project_id,
+                &admission.proposal_b_evidence_id,
+                EvidenceKind::ArchitectureProposal,
+                &records,
+            )?)
+        };
+        if let Some(proposal_b) = proposal_b.as_ref() {
+            if proposal_a.work_order_id == proposal_b.work_order_id {
+                return Err(AgentError::DatabaseError(
+                    "architecture proposals must originate from separate Product Director work orders"
+                        .to_string(),
+                ));
+            }
         }
         let proposal_a_order = store
             .get_product_work_order(&proposal_a.work_order_id)?
             .ok_or_else(|| {
                 AgentError::DatabaseError("architecture A work order disappeared".to_string())
             })?;
-        let proposal_b_order = store
-            .get_product_work_order(&proposal_b.work_order_id)?
-            .ok_or_else(|| {
+        let proposal_b_order = match proposal_b.as_ref() {
+            Some(proposal_b) => Some(store.get_product_work_order(&proposal_b.work_order_id)?.ok_or_else(|| {
                 AgentError::DatabaseError("architecture B work order disappeared".to_string())
-            })?;
+            })?),
+            None => None,
+        };
         if proposal_a_order.role != ProductWorkOrderRole::ArchitectA
-            || proposal_b_order.role != ProductWorkOrderRole::ArchitectB
+            || (admission.competition_mode == ArchitectureCompetitionMode::CompetingProposals
+                && proposal_b_order
+                    .as_ref()
+                    .is_none_or(|order| order.role != ProductWorkOrderRole::ArchitectB))
         {
             return Err(AgentError::DatabaseError(
                 "architecture proposals must use independent Architect A and Architect B roles"
@@ -1664,9 +1700,15 @@ pub async fn adopt_product_architecture(
             EvidenceKind::Dissent,
             &records,
         )?;
-        if admission.risk_experiment_evidence_ids.is_empty() {
+        if admission
+            .synthesis
+            .as_ref()
+            .is_some_and(|synthesis| synthesis.experiment_needed)
+            && admission.risk_experiment_evidence_ids.is_empty()
+        {
             return Err(AgentError::DatabaseError(
-                "architecture admission requires a risk experiment".to_string(),
+                "experiment-needed architecture synthesis requires current experiment evidence"
+                    .to_string(),
             ));
         }
         for evidence_id in &admission.risk_experiment_evidence_ids {
@@ -1719,6 +1761,7 @@ pub async fn adopt_product_architecture(
             unresolved_high_blocker_evidence_ids: admission
                 .unresolved_high_blocker_evidence_ids
                 .clone(),
+            competition_mode: admission.competition_mode.clone(),
             synthesis: admission.synthesis.clone(),
         };
         records.project_revision = records.project_revision.saturating_add(1);
@@ -1953,6 +1996,7 @@ pub async fn run_research_work_order(
                         contradiction_ids: Vec::new(),
                         decision_impact: true,
                         revisit_trigger: Some("recheck when repository metadata changes".to_string()),
+                        decision_question: Some(question),
                     };
                     product_os::submit_research_proposal(&mut records, proposal).map_err(AgentError::DatabaseError)?;
                     order.status = ProductWorkOrderStatus::Completed;
@@ -2140,6 +2184,7 @@ pub async fn run_web_discovery_work_order(
                                 contradiction_ids: Vec::new(),
                                 decision_impact: proposal.decision_impact,
                                 revisit_trigger: Some(proposal.revisit_trigger.trim().to_string()),
+                                decision_question: Some(order.question.clone().unwrap_or_default()),
                             },
                         )
                         .map_err(AgentError::DatabaseError)?;
@@ -3640,6 +3685,8 @@ mod tests {
                 red_team_evidence_id: red_team.evidence_id.expect("red-team evidence"),
                 dissent_evidence_id: dissent.evidence_id.expect("dissent evidence"),
                 unresolved_high_blocker_evidence_ids: Vec::new(),
+                competition_mode:
+                    crate::pipeline_contract::ArchitectureCompetitionMode::CompetingProposals,
                 packet_hash: Some("reopened-packet-1".to_string()),
                 synthesis: Some(crate::pipeline_contract::ArchitectureSynthesis {
                     packet_hash: "reopened-packet-1".to_string(),
@@ -3650,6 +3697,10 @@ mod tests {
                     )]),
                     risky_assumptions: vec!["source remains explicitly bounded".to_string()],
                     experiment_needed: false,
+                    experiment_contract: None,
+                    no_experiment_reason: Some(
+                        "bounded source adapter is already proven".to_string(),
+                    ),
                     reuse_decisions: vec![crate::pipeline_contract::ReuseProof {
                         capability: "official GitHub metadata retrieval".to_string(),
                         classification: "REUSE".to_string(),
@@ -4328,6 +4379,8 @@ mod tests {
                 red_team_evidence_id: red_team.evidence_id.expect("red-team evidence"),
                 dissent_evidence_id: dissent.evidence_id.expect("dissent evidence"),
                 unresolved_high_blocker_evidence_ids: Vec::new(),
+                competition_mode:
+                    crate::pipeline_contract::ArchitectureCompetitionMode::CompetingProposals,
                 packet_hash: Some("m06-packet-1".to_string()),
                 synthesis: Some(crate::pipeline_contract::ArchitectureSynthesis {
                     packet_hash: "m06-packet-1".to_string(),
@@ -4340,6 +4393,10 @@ mod tests {
                         "the bounded study slice remains sufficient".to_string(),
                     ],
                     experiment_needed: false,
+                    experiment_contract: None,
+                    no_experiment_reason: Some(
+                        "existing runtime boundary is established".to_string(),
+                    ),
                     reuse_decisions: vec![crate::pipeline_contract::ReuseProof {
                         capability: "bounded study slice runtime and verification".to_string(),
                         classification: "REUSE".to_string(),

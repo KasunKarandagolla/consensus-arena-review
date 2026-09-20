@@ -246,3 +246,9 @@ experiment returns to Decide, while Stop and Pivot are distinct owner
 commands. Non-PASS gates route to a typed bounded remediation and persist
 counters. Read/snapshot commands do not reconcile or mutate state;
 startup/resume invokes reconciliation explicitly.
+
+M09B route classification requires explicit existing-repository context for
+ExistingFeature and high-confidence incident predicates. Existing-feature
+intent and bounded incident repair do not ask the owner to re-authorize the
+same mandate. Verification selects all bounded decision-critical claims from a
+discovery result and only a representative claim when no claim is critical.

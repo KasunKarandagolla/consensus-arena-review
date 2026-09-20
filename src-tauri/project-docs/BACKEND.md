@@ -277,3 +277,9 @@ prevents overlapping exclusive role claims before the existing runtime
 admission. Architecture reviewers receive delivered proposal content through
 the manifest, not only proposal IDs. The current package gate requires a
 selected synthesis before Delivery can be reached.
+
+M09B source corrections make dissent packet-bound, preserve full typed proposal
+inputs, select decision-critical research claims for independent verification,
+and attach a concrete action to every gate remediation. New Build admissions
+use OpenCode; the historical DSH path is not a fallback for new Product OS
+runs.

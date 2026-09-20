@@ -8,6 +8,7 @@ use crate::product_os::ProductWorkOrderRole;
 use serde::{Deserialize, Serialize};
 
 pub const CONTEXT7_URL: &str = "https://mcp.context7.com/mcp";
+pub const PLAYWRIGHT_MCP_VERSION: &str = "0.0.82";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,7 +108,7 @@ impl ExecutionProfile {
             },
             Self::BrowserQa => ProfileSpec {
                 agent: "build",
-                allowed_tools: &["read", "glob", "grep", "list", "bash"],
+                allowed_tools: &["read", "glob", "grep", "list", "bash", "mcp_playwright"],
                 selected_skills: &[],
                 lsp: false,
                 context7: false,
@@ -163,6 +164,7 @@ impl ExecutionProfile {
             | ProductWorkOrderRole::RedTeamReviewer
             | ProductWorkOrderRole::DissentReviewer
             | ProductWorkOrderRole::FeasibilityReviewer => Self::SemanticNoTools,
+            ProductWorkOrderRole::BrowserQa => Self::BrowserQa,
         }
     }
 
@@ -220,6 +222,15 @@ impl ExecutionProfile {
                 "context7": {"type": "remote", "url": CONTEXT7_URL, "enabled": true}
             });
         }
+        if matches!(self, Self::BrowserQa) {
+            config["mcp"] = serde_json::json!({
+                "playwright": {
+                    "type": "local",
+                    "command": ["npx", "--yes", format!("@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}")],
+                    "enabled": true
+                }
+            });
+        }
         config
     }
 }
@@ -256,5 +267,16 @@ mod tests {
         assert_eq!(config["permission"]["acceptance"], "deny");
         assert_eq!(config["permission"]["skill"]["*"], "deny");
         assert_eq!(config["mcp"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn browser_profile_uses_pinned_playwright_mcp_without_authority() {
+        let config = ExecutionProfile::BrowserQa.authority_free_config();
+        assert_eq!(
+            config["mcp"]["playwright"]["command"][2],
+            format!("@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}")
+        );
+        assert_eq!(config["permission"]["apply"], "deny");
+        assert_eq!(config["permission"]["verify"], "deny");
     }
 }

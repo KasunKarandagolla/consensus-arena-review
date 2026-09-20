@@ -82,6 +82,7 @@ pub enum EvidenceKind {
     RiskExperiment,
     RedTeamReview,
     Dissent,
+    IncidentDiagnosis,
     General,
 }
 
@@ -139,6 +140,8 @@ pub struct EvidenceItem {
     pub decision_impact: bool,
     #[serde(default)]
     pub revisit_trigger: Option<String>,
+    #[serde(default)]
+    pub decision_question: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,6 +166,8 @@ pub struct ReviewerRestatement {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchitectureProof {
     pub proposal_count: u8,
+    #[serde(default)]
+    pub established_pattern: bool,
     pub hard_constraints_checked: bool,
     pub reuse_scan_complete: bool,
     pub risky_assumptions_tested: bool,
@@ -468,10 +473,15 @@ pub fn evaluate(input: &GateInput) -> GateDecision {
                 GateStatus::MissingEvidence,
                 "architecture competition record is missing",
             ),
-            Some(proof) if proof.proposal_count < 2 => decision(
+            Some(proof) if proof.proposal_count == 0 => decision(
                 input,
                 GateStatus::Blocked,
-                "architecture gate requires two materially different proposals",
+                "architecture gate requires a selected architecture record",
+            ),
+            Some(proof) if proof.proposal_count < 2 && !proof.established_pattern => decision(
+                input,
+                GateStatus::Blocked,
+                "architecture gate requires two proposals unless an established pattern is explicitly recorded",
             ),
             Some(proof)
                 if !proof.hard_constraints_checked
@@ -490,7 +500,7 @@ pub fn evaluate(input: &GateInput) -> GateDecision {
             Some(_) => decision(
                 input,
                 GateStatus::Pass,
-                "architecture competition and challenge evidence are complete",
+                "architecture selection and challenge evidence are complete",
             ),
         },
         GateId::BuildReadiness => {
@@ -589,6 +599,7 @@ mod tests {
                 contradiction_ids: Vec::new(),
                 decision_impact: false,
                 revisit_trigger: None,
+                decision_question: None,
             }],
             ambiguities: Vec::new(),
             next_irreversible_commitment: Some("commitment-1".to_string()),
@@ -715,6 +726,7 @@ mod tests {
         let mut input = base(GateId::Architecture);
         input.architecture = Some(ArchitectureProof {
             proposal_count: 1,
+            established_pattern: false,
             hard_constraints_checked: true,
             reuse_scan_complete: true,
             risky_assumptions_tested: true,

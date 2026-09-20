@@ -42,29 +42,71 @@ pub struct RoutePlan {
     pub omitted_stages: Vec<OmittedStage>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchitecturePlanningMode {
+    EstablishedPattern,
+    CompetingProposals,
+}
+
+/// Cheap, deterministic planning predicate. It is deliberately conservative:
+/// only explicit existing-repository, localized extension language may bypass
+/// proposal competition.
+pub fn architecture_planning_mode(route: ProductRoute, intent: &str) -> ArchitecturePlanningMode {
+    let lower = intent.to_ascii_lowercase();
+    if route == ProductRoute::ExistingFeature
+        && [
+            "csv export",
+            "straightforward",
+            "established",
+            "localized",
+            "existing utility",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        ArchitecturePlanningMode::EstablishedPattern
+    } else {
+        ArchitecturePlanningMode::CompetingProposals
+    }
+}
+
 pub fn select_route(intent: &str) -> ProductRoute {
     let lower = intent.to_ascii_lowercase();
+    let existing_context = [
+        "existing app",
+        "existing repo",
+        "existing repository",
+        "existing project",
+        "existing feature",
+        "current product",
+        "current app",
+        "current service",
+        "this repo",
+        "this repository",
+        "this codebase",
+        "this project",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
     if [
         "incident",
         "outage",
         "regression",
-        "production bug",
+        "crash",
+        "broken current app",
+        "broken current service",
+        "production failure",
         "service down",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
     {
         ProductRoute::Incident
-    } else if [
-        "existing feature",
-        "extend",
-        "modify",
-        "change",
-        "add to",
-        "fix",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    } else if existing_context
+        && ["existing feature", "add ", "modify", "extend", "implement"]
+            .iter()
+            .any(|marker| lower.contains(marker))
     {
         ProductRoute::ExistingFeature
     } else {
@@ -173,6 +215,9 @@ pub struct GateRemediation {
     pub attempt: u8,
     pub max_attempts: u8,
     pub reason: String,
+    /// The next concrete Arena-owned action. This is intentionally descriptive
+    /// rather than a workflow DSL; the coordinator remains the executor.
+    pub action: String,
 }
 
 pub fn route_gate_remediation(gate: GateId, status: GateStatus, attempt: u8) -> GateRemediation {
@@ -209,6 +254,33 @@ pub fn route_gate_remediation(gate: GateId, status: GateStatus, attempt: u8) -> 
         reason: format!(
             "{gate:?} returned {status:?}; remediation is bounded at {MAX_ATTEMPTS} attempts"
         ),
+        action: match outcome {
+            GateRemediationOutcome::NeedsResearch => {
+                "create targeted research for the missing decision claim".to_string()
+            }
+            GateRemediationOutcome::NeedsArchitectureRevision => {
+                "re-run only invalidated architecture decision elements".to_string()
+            }
+            GateRemediationOutcome::NeedsRepair => {
+                "repair the exact missing BuildReadiness predicate".to_string()
+            }
+            GateRemediationOutcome::NeedsExperiment => {
+                "create and execute the bounded ExperimentContract".to_string()
+            }
+            GateRemediationOutcome::NeedsOwnerDecision => {
+                "persist a typed owner question for the unresolved authority choice".to_string()
+            }
+            GateRemediationOutcome::ExternalBlock => {
+                "persist the exact missing external prerequisite".to_string()
+            }
+            GateRemediationOutcome::RecommendStop => {
+                "persist a stop recommendation for owner disposition".to_string()
+            }
+            GateRemediationOutcome::RecommendPivot => {
+                "persist a pivot recommendation for owner disposition".to_string()
+            }
+            GateRemediationOutcome::Satisfied => "no remediation required".to_string(),
+        },
     }
 }
 
@@ -237,6 +309,15 @@ impl ResolvedInputManifest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchitectureProposalInput {
     pub evidence_id: String,
+    /// The complete typed proposal is hashed into the immutable review packet.
+    pub proposal: String,
+    pub assumptions: Vec<String>,
+    pub reuse_choices: Vec<String>,
+    pub interfaces: Vec<String>,
+    pub risks: Vec<String>,
+    /// Kept as a compatibility alias for older persisted packets. New packets
+    /// set this to the same value as `proposal`.
+    #[serde(default)]
     pub content: String,
 }
 
@@ -245,7 +326,8 @@ pub struct ArchitectureReviewPacket {
     pub project_id: String,
     pub project_revision: u64,
     pub proposal_a: ArchitectureProposalInput,
-    pub proposal_b: ArchitectureProposalInput,
+    #[serde(default)]
+    pub proposal_b: Option<ArchitectureProposalInput>,
     pub packet_hash: String,
 }
 
@@ -258,8 +340,8 @@ impl ArchitectureReviewPacket {
     ) -> Result<Self, String> {
         if proposal_a.evidence_id.trim().is_empty()
             || proposal_b.evidence_id.trim().is_empty()
-            || proposal_a.content.trim().is_empty()
-            || proposal_b.content.trim().is_empty()
+            || (proposal_a.proposal.trim().is_empty() && proposal_a.content.trim().is_empty())
+            || (proposal_b.proposal.trim().is_empty() && proposal_b.content.trim().is_empty())
         {
             return Err("architecture review packet requires both proposal contents".to_string());
         }
@@ -270,7 +352,7 @@ impl ArchitectureReviewPacket {
             project_id.clone(),
             project_revision,
             &proposal_a,
-            &proposal_b,
+            &Some(proposal_b.clone()),
         ))
         .map_err(|error| format!("serialize architecture review packet: {error}"))?;
         let mut hasher = Sha256::new();
@@ -280,7 +362,36 @@ impl ArchitectureReviewPacket {
             project_id,
             project_revision,
             proposal_a,
-            proposal_b,
+            proposal_b: Some(proposal_b),
+            packet_hash,
+        })
+    }
+
+    pub fn resolve_established(
+        project_id: String,
+        project_revision: u64,
+        proposal_a: ArchitectureProposalInput,
+    ) -> Result<Self, String> {
+        if proposal_a.evidence_id.trim().is_empty()
+            || (proposal_a.proposal.trim().is_empty() && proposal_a.content.trim().is_empty())
+        {
+            return Err("established architecture packet requires proposal content".to_string());
+        }
+        let canonical = serde_json::to_vec(&(
+            project_id.clone(),
+            project_revision,
+            &proposal_a,
+            Option::<ArchitectureProposalInput>::None,
+        ))
+        .map_err(|error| format!("serialize established architecture packet: {error}"))?;
+        let mut hasher = Sha256::new();
+        hasher.update(canonical);
+        let packet_hash = format!("sha256:{:x}", hasher.finalize());
+        Ok(Self {
+            project_id,
+            project_revision,
+            proposal_a,
+            proposal_b: None,
             packet_hash,
         })
     }
@@ -296,14 +407,15 @@ impl ArchitectureReviewPacket {
     ) -> Result<ResolvedInputManifest, String> {
         let resolved_content = serde_json::to_string(self)
             .map_err(|error| format!("serialize resolved architecture packet: {error}"))?;
+        let mut required_inputs = vec![self.proposal_a.evidence_id.clone()];
+        if let Some(proposal) = &self.proposal_b {
+            required_inputs.push(proposal.evidence_id.clone());
+        }
         Ok(ResolvedInputManifest {
             project_id: self.project_id.clone(),
             project_revision,
             role: role.to_string(),
-            required_inputs: vec![
-                self.proposal_a.evidence_id.clone(),
-                self.proposal_b.evidence_id.clone(),
-            ],
+            required_inputs,
             resolved_content,
             packet_hash: Some(self.packet_hash.clone()),
         })
@@ -319,12 +431,83 @@ pub enum ArchitectureSelection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchitectureCompetitionMode {
+    CompetingProposals,
+    EstablishedPattern,
+}
+
+impl Default for ArchitectureCompetitionMode {
+    fn default() -> Self {
+        Self::CompetingProposals
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentDisposition {
+    Pass,
+    Fail,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExperimentContract {
+    pub experiment_id: String,
+    pub synthesis_identity: String,
+    pub assumption: String,
+    pub protocol: String,
+    pub executor: String,
+    pub expected_observation: String,
+    pub pass_condition: String,
+    pub fail_condition: String,
+    pub inconclusive_condition: String,
+    pub timeout_seconds: u64,
+    pub allowed_effects: Vec<String>,
+    pub protected_paths: Vec<String>,
+}
+
+impl ExperimentContract {
+    pub fn validate(&self) -> Result<(), String> {
+        for (value, field) in [
+            (&self.experiment_id, "experiment id"),
+            (&self.synthesis_identity, "synthesis identity"),
+            (&self.assumption, "assumption"),
+            (&self.protocol, "protocol"),
+            (&self.executor, "executor"),
+            (&self.expected_observation, "expected observation"),
+            (&self.pass_condition, "PASS condition"),
+            (&self.fail_condition, "FAIL condition"),
+            (&self.inconclusive_condition, "INCONCLUSIVE condition"),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("experiment contract requires {field}"));
+            }
+        }
+        if self.timeout_seconds == 0
+            || self.allowed_effects.is_empty()
+            || self.protected_paths.is_empty()
+        {
+            return Err(
+                "experiment contract requires bounded timeout, effects, and protected paths"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchitectureSynthesis {
     pub packet_hash: String,
     pub selection: ArchitectureSelection,
     pub reviewer_dispositions: BTreeMap<String, String>,
     pub risky_assumptions: Vec<String>,
     pub experiment_needed: bool,
+    #[serde(default)]
+    pub experiment_contract: Option<ExperimentContract>,
+    #[serde(default)]
+    pub no_experiment_reason: Option<String>,
     pub reuse_decisions: Vec<ReuseProof>,
     pub owner_tradeoff: Option<String>,
 }
@@ -338,6 +521,22 @@ impl ArchitectureSynthesis {
             return Err(
                 "architecture synthesis requires project-specific reuse decisions".to_string(),
             );
+        }
+        if self.experiment_needed {
+            self.experiment_contract
+                .as_ref()
+                .ok_or_else(|| {
+                    "experiment-needed synthesis requires an ExperimentContract".to_string()
+                })?
+                .validate()?;
+        } else if self
+            .no_experiment_reason
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            return Err("synthesis must record why no experiment is required".to_string());
         }
         for decision in &self.reuse_decisions {
             decision.validate()?;
@@ -462,6 +661,37 @@ mod tests {
     }
 
     #[test]
+    fn route_classifier_does_not_treat_greenfield_fix_language_as_existing() {
+        assert_eq!(
+            select_route("Build an AI product to fix invoice reconciliation"),
+            ProductRoute::NewProduct
+        );
+        assert_eq!(
+            select_route("Fix the crash in this existing app"),
+            ProductRoute::Incident
+        );
+        assert_eq!(
+            select_route("Add CSV export to this existing repo"),
+            ProductRoute::ExistingFeature
+        );
+    }
+
+    #[test]
+    fn architecture_competition_is_conditional() {
+        assert_eq!(
+            architecture_planning_mode(
+                ProductRoute::ExistingFeature,
+                "Add CSV export to this existing repo using the existing utility"
+            ),
+            ArchitecturePlanningMode::EstablishedPattern
+        );
+        assert_eq!(
+            architecture_planning_mode(ProductRoute::ExistingFeature, "add a new billing model"),
+            ArchitecturePlanningMode::CompetingProposals
+        );
+    }
+
+    #[test]
     fn validation_experiment_cannot_map_to_narrow_build() {
         assert_eq!(
             owner_decision_for_option(
@@ -511,10 +741,20 @@ mod tests {
             1,
             ArchitectureProposalInput {
                 evidence_id: "a".to_string(),
+                proposal: "proposal A".to_string(),
+                assumptions: Vec::new(),
+                reuse_choices: Vec::new(),
+                interfaces: Vec::new(),
+                risks: Vec::new(),
                 content: "proposal A".to_string(),
             },
             ArchitectureProposalInput {
                 evidence_id: "b".to_string(),
+                proposal: "proposal B".to_string(),
+                assumptions: Vec::new(),
+                reuse_choices: Vec::new(),
+                interfaces: Vec::new(),
+                risks: Vec::new(),
                 content: "proposal B".to_string(),
             },
         )
@@ -528,15 +768,82 @@ mod tests {
                 1,
                 ArchitectureProposalInput {
                     evidence_id: "a".to_string(),
+                    proposal: "proposal A".to_string(),
+                    assumptions: Vec::new(),
+                    reuse_choices: Vec::new(),
+                    interfaces: Vec::new(),
+                    risks: Vec::new(),
                     content: "proposal A".to_string()
                 },
                 ArchitectureProposalInput {
                     evidence_id: "b".to_string(),
+                    proposal: String::new(),
+                    assumptions: Vec::new(),
+                    reuse_choices: Vec::new(),
+                    interfaces: Vec::new(),
+                    risks: Vec::new(),
                     content: String::new()
                 },
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn packet_hash_covers_typed_proposal_details() {
+        let base = |assumptions: Vec<String>| ArchitectureProposalInput {
+            evidence_id: "a".to_string(),
+            proposal: "use the existing boundary".to_string(),
+            assumptions,
+            reuse_choices: vec!["reuse Delivery".to_string()],
+            interfaces: vec!["typed handoff".to_string()],
+            risks: vec!["stale candidate".to_string()],
+            content: "use the existing boundary".to_string(),
+        };
+        let packet_a = ArchitectureReviewPacket::resolve(
+            "project".to_string(),
+            1,
+            base(vec!["constraint one".to_string()]),
+            ArchitectureProposalInput {
+                evidence_id: "b".to_string(),
+                proposal: "build a bounded adapter".to_string(),
+                assumptions: vec!["adapter is isolated".to_string()],
+                reuse_choices: vec!["wrap source".to_string()],
+                interfaces: vec!["adapter API".to_string()],
+                risks: vec!["source changes".to_string()],
+                content: "build a bounded adapter".to_string(),
+            },
+        )
+        .expect("packet");
+        let packet_b = ArchitectureReviewPacket::resolve(
+            "project".to_string(),
+            1,
+            base(vec!["different constraint".to_string()]),
+            packet_a.proposal_b.clone().expect("competing packet B"),
+        )
+        .expect("packet");
+        assert_ne!(packet_a.packet_hash, packet_b.packet_hash);
+    }
+
+    #[test]
+    fn experiment_contract_requires_bounded_protocol() {
+        let mut contract = ExperimentContract {
+            experiment_id: "experiment-1".to_string(),
+            synthesis_identity: "synthesis-1".to_string(),
+            assumption: "the adapter compiles".to_string(),
+            protocol: "cargo check".to_string(),
+            executor: "Arena".to_string(),
+            expected_observation: "exit zero".to_string(),
+            pass_condition: "exit zero".to_string(),
+            fail_condition: "exit non-zero".to_string(),
+            inconclusive_condition: "timeout".to_string(),
+            timeout_seconds: 60,
+            allowed_effects: vec!["read-only".to_string()],
+            protected_paths: vec![".arena".to_string()],
+        };
+        assert!(contract.validate().is_ok());
+        contract.timeout_seconds = 0;
+        assert!(contract.validate().is_err());
     }
 
     #[test]
@@ -546,10 +853,20 @@ mod tests {
             1,
             ArchitectureProposalInput {
                 evidence_id: "a".to_string(),
+                proposal: "proposal A".to_string(),
+                assumptions: Vec::new(),
+                reuse_choices: Vec::new(),
+                interfaces: Vec::new(),
+                risks: Vec::new(),
                 content: "proposal A".to_string(),
             },
             ArchitectureProposalInput {
                 evidence_id: "b".to_string(),
+                proposal: "proposal B".to_string(),
+                assumptions: Vec::new(),
+                reuse_choices: Vec::new(),
+                interfaces: Vec::new(),
+                risks: Vec::new(),
                 content: "proposal B".to_string(),
             },
         )
@@ -560,6 +877,10 @@ mod tests {
             reviewer_dispositions: BTreeMap::new(),
             risky_assumptions: Vec::new(),
             experiment_needed: false,
+            experiment_contract: None,
+            no_experiment_reason: Some(
+                "no bounded risky assumption requires execution".to_string(),
+            ),
             reuse_decisions: Vec::new(),
             owner_tradeoff: None,
         };

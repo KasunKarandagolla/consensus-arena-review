@@ -46,6 +46,11 @@ pub enum CoordinatorStatus {
     Admitted,
     Running,
     WaitingForOwner,
+    Stopped,
+    Pivoted,
+    Blocked,
+    Reconciling,
+    Cancelling,
     Completed,
     Failed,
     Cancelled,
@@ -73,6 +78,8 @@ pub struct ProductCoordinatorRun {
     #[serde(default)]
     pub remediation_counts: BTreeMap<String, u8>,
     #[serde(default)]
+    pub remediation_question: Option<String>,
+    #[serde(default)]
     pub last_remediation: Option<GateRemediation>,
     pub research_work_order_ids: Vec<String>,
     pub verifier_work_order_ids: Vec<String>,
@@ -91,6 +98,8 @@ pub struct ProductCoordinatorRun {
     pub red_team_work_order_id: Option<String>,
     pub dissent_work_order_id: Option<String>,
     pub feasibility_work_order_id: Option<String>,
+    #[serde(default)]
+    pub pending_experiment: Option<pipeline_contract::ExperimentContract>,
     pub build_package_id: Option<String>,
     pub delivery_session_id: Option<String>,
     pub terminal_outcome: Option<String>,
@@ -178,6 +187,10 @@ struct SynthesisOutput {
     risky_assumptions: Vec<String>,
     #[serde(default)]
     experiment_needed: bool,
+    #[serde(default)]
+    experiment_contract: Option<pipeline_contract::ExperimentContract>,
+    #[serde(default)]
+    no_experiment_reason: Option<String>,
     #[serde(default)]
     reuse_decisions: Vec<pipeline_contract::ReuseProof>,
     #[serde(default)]
@@ -397,34 +410,40 @@ async fn run_research_wave(
         save_run(ctx, run).await?;
         return Ok(());
     }
-    let questions = [
-        (
-            ProductResearchCategory::UserProblem,
+    let targeted_question = run.remediation_question.take();
+    let questions = if let Some(question) = targeted_question {
+        vec![(
+            ProductResearchCategory::TechnicalCurrentFact,
             format!(
-                "What current public evidence describes the user problem in this founder idea? Identify scope, dates, uncertainty, and do not claim market validation: {}",
-                run.founder_idea
+                "Targeted remediation: independently resolve this missing or contradicted decision claim before continuing: {question}"
             ),
-        ),
-        (
-            ProductResearchCategory::CompetitorStatusQuo,
-            format!(
-                "What current alternatives or status-quo workflows relate to this founder idea? Identify bounded capabilities and source limits; do not claim market share: {}",
-                run.founder_idea
+        )]
+    } else {
+        vec![
+            (
+                ProductResearchCategory::UserProblem,
+                format!(
+                    "What current public evidence describes the user problem in this founder idea? Identify scope, dates, uncertainty, and do not claim market validation: {}",
+                    run.founder_idea
+                ),
             ),
-        ),
-        (
-            ProductResearchCategory::PriorArtReuse,
-            format!(
-                "What existing public tools or prior art could be reused for this founder idea? Identify technical scope and uncertainty: {}",
-                run.founder_idea
+            (
+                ProductResearchCategory::CompetitorStatusQuo,
+                format!(
+                    "What current alternatives or status-quo workflows relate to this founder idea? Identify bounded capabilities and source limits; do not claim market share: {}",
+                    run.founder_idea
+                ),
             ),
-        ),
-    ];
+            (
+                ProductResearchCategory::PriorArtReuse,
+                format!(
+                    "What existing public tools or prior art could be reused for this founder idea? Identify technical scope and uncertainty: {}",
+                    run.founder_idea
+                ),
+            ),
+        ]
+    };
     for (category, question) in questions {
-        let index = run.research_work_order_ids.len();
-        if index >= 3 {
-            break;
-        }
         let mut completed = None;
         for attempt in 0..2 {
             let order = product_os_runtime::create_web_discovery_work_order(
@@ -456,9 +475,35 @@ async fn run_research_wave(
         let completed = completed.ok_or_else(|| {
             "bounded research retry did not produce an admissible result".to_string()
         })?;
-        // A bounded research wave needs one independently checked claim per
-        // category, not an unbounded verifier fan-out for every proposal.
-        for evidence_id in completed.evidence_ids.into_iter().take(1) {
+        // Verify every decision-critical claim from this discovery result,
+        // with a small cap. If none is critical, preserve the bounded
+        // representative-claim fallback required by the research gate.
+        let current_evidence = product_os_runtime::snapshot(
+            ctx.db.clone(),
+            Arc::new(SessionRuntime::new()),
+            run.project_id.clone(),
+        )
+        .await?
+        .ok_or_else(|| "Product OS project disappeared during research verification".to_string())?;
+        let critical_ids = completed
+            .evidence_ids
+            .iter()
+            .filter(|evidence_id| {
+                current_evidence.records.evidence.iter().any(|item| {
+                    item.evidence_id == **evidence_id
+                        && item.current
+                        && item.kind == Some(EvidenceKind::ResearchClaim)
+                        && item.decision_impact
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let selected_ids: Vec<String> = if critical_ids.is_empty() {
+            completed.evidence_ids.iter().take(1).cloned().collect()
+        } else {
+            critical_ids.into_iter().take(4).collect()
+        };
+        for evidence_id in selected_ids {
             let verifier = product_os_runtime::create_web_fact_verifier_work_order(
                 ctx.db.clone(),
                 run.project_id.clone(),
@@ -574,7 +619,11 @@ async fn run_product_review(
         return Err("Product Director returned an unsupported outcome".to_string());
     }
     if matches!(outcome.as_str(), "stop" | "pivot") {
-        run.status = CoordinatorStatus::Completed;
+        run.status = if outcome == "stop" {
+            CoordinatorStatus::Stopped
+        } else {
+            CoordinatorStatus::Pivoted
+        };
         run.phase = CoordinatorPhase::Terminal;
         run.terminal_outcome = Some(outcome);
         run.updated_at = now();
@@ -583,7 +632,7 @@ async fn run_product_review(
     }
     let Some(scope) = output.scope else {
         if outcome == "validation_experiment" {
-            run.status = CoordinatorStatus::Completed;
+            run.status = CoordinatorStatus::Blocked;
             run.phase = CoordinatorPhase::Terminal;
             run.terminal_outcome = Some("validation_experiment".to_string());
             run.updated_at = now();
@@ -604,6 +653,7 @@ async fn run_product_review(
         acceptance_scenarios: list(&scope.acceptance_scenarios, "scope acceptance scenarios")?,
         reviewer_restatement: scope.reviewer_restatement,
     };
+    let experiment_expected = scope.acceptance_scenarios.join("; ");
     product_os_runtime::admit_product_scope_from_review(
         ctx.db.clone(),
         run.project_id.clone(),
@@ -611,6 +661,23 @@ async fn run_product_review(
         scope,
     )
     .await?;
+    if matches!(
+        run.route,
+        ProductRoute::ExistingFeature | ProductRoute::Incident
+    ) && outcome == "narrow_build"
+    {
+        // The selected route already carries explicit owner intent for a
+        // bounded change/repair. Do not ask the founder to authorize the same
+        // feature again; material scope expansion still creates a question.
+        product_os_runtime::adopt_narrow_build_direction(ctx.db.clone(), run.project_id.clone())
+            .await?;
+        run.status = CoordinatorStatus::Running;
+        run.phase = CoordinatorPhase::Architecture;
+        run.stage = PipelineStage::Decide;
+        run.updated_at = now();
+        save_run(ctx, run).await?;
+        return Ok(false);
+    }
     let default_question = if outcome == "validation_experiment" {
         "Should Arena run the explicitly bounded validation experiment before treating this as a broader product commitment?"
     } else {
@@ -677,6 +744,26 @@ async fn run_product_review(
     .await?;
     run.owner_ambiguity_id = Some(ambiguity_id);
     run.owner_question_id = Some(question_id);
+    if outcome == "validation_experiment" {
+        run.pending_experiment = Some(pipeline_contract::ExperimentContract {
+            experiment_id: format!("{}:validation-experiment", run.project_id),
+            synthesis_identity: format!(
+                "{}:product-review:{}",
+                run.project_id, snapshot.records.project_revision
+            ),
+            assumption: output.rationale.clone(),
+            protocol: "bounded validation slice with deterministic local acceptance check"
+                .to_string(),
+            executor: "Arena Product OS validation executor".to_string(),
+            expected_observation: experiment_expected,
+            pass_condition: "deterministic acceptance check passes".to_string(),
+            fail_condition: "deterministic acceptance check fails".to_string(),
+            inconclusive_condition: "timeout or missing observation".to_string(),
+            timeout_seconds: 120,
+            allowed_effects: vec!["candidate worktree only".to_string()],
+            protected_paths: vec![".arena/verification.json".to_string()],
+        });
+    }
     run.pending_owner_decision = Some(if outcome == "validation_experiment" {
         OwnerDecisionKind::AuthorizeValidationExperiment
     } else {
@@ -705,10 +792,16 @@ async fn run_architecture(
         records_brief(&snapshot.records),
         bounded_repo_intelligence(ctx, run, "architecture symbols and coupling").await
     );
-    let roles = [
-        (ProductWorkOrderRole::ArchitectA, "Architect A"),
-        (ProductWorkOrderRole::ArchitectB, "Architect B"),
-    ];
+    let planning_mode = pipeline_contract::architecture_planning_mode(run.route, &run.founder_idea);
+    let roles = match planning_mode {
+        pipeline_contract::ArchitecturePlanningMode::EstablishedPattern => {
+            vec![(ProductWorkOrderRole::ArchitectA, "Architect A")]
+        }
+        pipeline_contract::ArchitecturePlanningMode::CompetingProposals => vec![
+            (ProductWorkOrderRole::ArchitectA, "Architect A"),
+            (ProductWorkOrderRole::ArchitectB, "Architect B"),
+        ],
+    };
     let architect_prompt = |label: &str| {
         role_prompt(
             label,
@@ -759,6 +852,11 @@ async fn run_architecture(
         proposal_ids.push(proposal_id.clone());
         proposal_inputs.push(pipeline_contract::ArchitectureProposalInput {
             evidence_id: proposal_id,
+            proposal: proposal_content.clone(),
+            assumptions: output.assumptions,
+            reuse_choices: output.reuse_choices,
+            interfaces: output.interfaces,
+            risks: output.risks,
             content: proposal_content,
         });
     }
@@ -769,18 +867,30 @@ async fn run_architecture(
     )
     .await?
     .ok_or_else(|| "Product OS project disappeared before architecture packet".to_string())?;
-    let packet = pipeline_contract::ArchitectureReviewPacket::resolve(
-        run.project_id.clone(),
-        current_snapshot.records.project_revision,
-        proposal_inputs
-            .first()
-            .cloned()
-            .ok_or_else(|| "architecture A packet input missing".to_string())?,
-        proposal_inputs
-            .get(1)
-            .cloned()
-            .ok_or_else(|| "architecture B packet input missing".to_string())?,
-    )?;
+    let proposal_a = proposal_inputs
+        .first()
+        .cloned()
+        .ok_or_else(|| "architecture A packet input missing".to_string())?;
+    let packet = match planning_mode {
+        pipeline_contract::ArchitecturePlanningMode::EstablishedPattern => {
+            pipeline_contract::ArchitectureReviewPacket::resolve_established(
+                run.project_id.clone(),
+                current_snapshot.records.project_revision,
+                proposal_a,
+            )?
+        }
+        pipeline_contract::ArchitecturePlanningMode::CompetingProposals => {
+            pipeline_contract::ArchitectureReviewPacket::resolve(
+                run.project_id.clone(),
+                current_snapshot.records.project_revision,
+                proposal_a,
+                proposal_inputs
+                    .get(1)
+                    .cloned()
+                    .ok_or_else(|| "architecture B packet input missing".to_string())?,
+            )?
+        }
+    };
     run.architecture_evidence_ids = proposal_ids;
     save_run(ctx, run).await?;
 
@@ -897,18 +1007,24 @@ async fn run_architecture(
         ProductWorkOrderRole::DissentReviewer,
     )
     .await?;
-    let dissent_execution = product_os_runtime::run_product_role_work_order(
+    product_os_runtime::bind_input_manifest(
         ctx.db.clone(),
-        ctx.runtime.clone(),
+        dissent_order.work_order_id.clone(),
+        packet.manifest("Dissent Reviewer")?,
+    )
+    .await?;
+    let dissent_execution = run_scheduled_role(
+        ctx,
+        run,
         dissent_order.work_order_id,
         role_prompt(
             "Dissent reviewer",
-            &format!("{brief}\nPreserve the strongest rejected alternative and no-build argument after considering both architecture proposals. Return JSON: {{\"summary\":\"...\",\"findings\":[\"...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}"),
+            &format!("{brief}\nResolved ArchitectureReviewPacket (packet_hash={}): {packet_json}\nPreserve the strongest rejected alternative and no-build argument after considering both typed architecture proposals. Return JSON: {{\"summary\":\"...\",\"findings\":[\"...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}", packet.packet_hash),
         ),
     )
     .await?;
     let dissent_output: ReviewOutput = parse_json(&dissent_execution.output)?;
-    let dissent = admit_review(
+    let dissent = admit_packet_review(
         ctx,
         &run.project_id,
         dissent_execution.work_order,
@@ -918,28 +1034,14 @@ async fn run_architecture(
             "rejected alternative: {}; rationale: {}",
             dissent_output.rejected_alternative, dissent_output.rationale
         ),
+        packet.packet_hash.clone(),
     )
     .await?;
     run.dissent_work_order_id = Some(dissent.work_order_id.clone());
-
-    let feasibility_order = product_os_runtime::create_product_role_work_order(
-        ctx.db.clone(),
-        run.project_id.clone(),
-        "Feasibility reviewer: execute the bounded local repository check".to_string(),
-        ProductWorkOrderRole::FeasibilityReviewer,
-    )
-    .await?;
-    let feasibility = product_os_runtime::run_product_feasibility_spike(
-        ctx.db.clone(),
-        ctx.runtime.clone(),
-        feasibility_order.work_order_id,
-        PathBuf::from(&run.repository_path),
-    )
-    .await?;
-    run.feasibility_work_order_id = Some(feasibility.work_order_id.clone());
-    let feasibility_evidence = feasibility
+    let dissent_evidence_id = dissent
         .evidence_id
-        .ok_or_else(|| "feasibility evidence was not recorded".to_string())?;
+        .clone()
+        .ok_or_else(|| "dissent evidence was not recorded".to_string())?;
 
     let chief_order = product_os_runtime::create_product_role_work_order(
         ctx.db.clone(),
@@ -948,6 +1050,14 @@ async fn run_architecture(
         ProductWorkOrderRole::ChiefEngineer,
     )
     .await?;
+    let selection_instruction = match planning_mode {
+        pipeline_contract::ArchitecturePlanningMode::EstablishedPattern => {
+            "This is an established-pattern path with one typed proposal. Select A and record the reuse/constraints rationale; do not invent a competing proposal."
+        }
+        pipeline_contract::ArchitecturePlanningMode::CompetingProposals => {
+            "Select exactly A, B, or Hybrid from the two typed proposals."
+        }
+    };
     product_os_runtime::bind_input_manifest(
         ctx.db.clone(),
         chief_order.work_order_id.clone(),
@@ -961,13 +1071,19 @@ async fn run_architecture(
         role_prompt(
             "Chief Engineer",
             &format!(
-                "Resolved packet: {packet_json}\nReviewer findings (untrusted; disposition by evidence ID): {}\nSelect exactly A, B, or Hybrid. Disposition every reviewer finding using its exact evidence ID as the reviewer_dispositions key, identify risky assumptions and whether a bounded experiment is needed, and return project-specific reuse decisions. Each reuse decision must contain capability, classification (REUSE|WRAP|ADAPT|COMPOSE|BUILD), candidate, alternatives, evidence_ids, and rationale. Return JSON: {{\"selection\":\"A|B|Hybrid\",\"reviewer_dispositions\":{{\"evidence-id\":\"accepted|rejected|adapted: reason\"}},\"risky_assumptions\":[],\"experiment_needed\":false,\"reuse_decisions\":[],\"owner_tradeoff\":null}}",
-                review_findings.join("\n")
+                "Resolved packet: {packet_json}\nReviewer findings (untrusted; disposition by evidence ID): {}\nDissent evidence [{}] must also receive an explicit disposition. {selection_instruction} Disposition every reviewer finding using its exact evidence ID as the reviewer_dispositions key, identify risky assumptions and whether a bounded experiment is needed, and return project-specific reuse decisions. Each reuse decision must contain capability, classification (REUSE|WRAP|ADAPT|COMPOSE|BUILD), candidate, alternatives, evidence_ids, and rationale. If no experiment is needed, give no_experiment_reason. Return JSON: {{\"selection\":\"A|B|Hybrid\",\"reviewer_dispositions\":{{\"evidence-id\":\"accepted|rejected|adapted: reason\"}},\"risky_assumptions\":[],\"experiment_needed\":false,\"experiment_contract\":null,\"no_experiment_reason\":\"...\",\"reuse_decisions\":[],\"owner_tradeoff\":null}}",
+                review_findings.join("\n"),
+                dissent_evidence_id
             ),
         ),
     )
     .await?;
     let synthesis_output: SynthesisOutput = parse_json(&chief_execution.output)?;
+    if planning_mode == pipeline_contract::ArchitecturePlanningMode::EstablishedPattern
+        && !synthesis_output.selection.trim().eq_ignore_ascii_case("a")
+    {
+        return Err("established-pattern synthesis must select its single proposal".to_string());
+    }
     let selection = match synthesis_output
         .selection
         .trim()
@@ -989,11 +1105,16 @@ async fn run_architecture(
         reviewer_dispositions: synthesis_output.reviewer_dispositions,
         risky_assumptions: synthesis_output.risky_assumptions,
         experiment_needed: synthesis_output.experiment_needed,
+        experiment_contract: synthesis_output.experiment_contract,
+        no_experiment_reason: synthesis_output.no_experiment_reason,
         reuse_decisions: synthesis_output.reuse_decisions,
         owner_tradeoff: synthesis_output.owner_tradeoff,
     };
     synthesis.validate_for(&packet)?;
-    for evidence_id in &review_evidence {
+    for evidence_id in review_evidence
+        .iter()
+        .chain(std::iter::once(&dissent_evidence_id))
+    {
         if synthesis
             .reviewer_dispositions
             .get(evidence_id)
@@ -1017,6 +1138,36 @@ async fn run_architecture(
     run.architecture_work_order_ids
         .push(synthesis_admitted.work_order_id.clone());
 
+    let mut risk_experiment_evidence_ids = Vec::new();
+    if synthesis.experiment_needed {
+        let contract = synthesis
+            .experiment_contract
+            .as_ref()
+            .ok_or_else(|| "experiment-needed synthesis has no contract".to_string())?;
+        contract.validate()?;
+        let experiment_order = product_os_runtime::create_product_role_work_order(
+            ctx.db.clone(),
+            run.project_id.clone(),
+            format!("Execute ExperimentContract {}", contract.experiment_id),
+            ProductWorkOrderRole::FeasibilityReviewer,
+        )
+        .await?;
+        run.feasibility_work_order_id = Some(experiment_order.work_order_id.clone());
+        let result = product_os_runtime::run_product_feasibility_spike(
+            ctx.db.clone(),
+            ctx.runtime.clone(),
+            experiment_order.work_order_id,
+            PathBuf::from(&run.repository_path),
+            contract.clone(),
+        )
+        .await?;
+        risk_experiment_evidence_ids.push(
+            result
+                .evidence_id
+                .ok_or_else(|| "ExperimentContract produced no evidence".to_string())?,
+        );
+    }
+
     let reuse_order_id = run
         .reuse_work_order_id
         .clone()
@@ -1025,37 +1176,38 @@ async fn run_architecture(
         .first()
         .cloned()
         .ok_or_else(|| "reuse evidence was not retained".to_string())?;
-    let first_reuse = synthesis
-        .reuse_decisions
-        .first()
-        .ok_or_else(|| "Chief Engineer omitted project-specific reuse".to_string())?;
-    product_os_runtime::adopt_product_reuse_decision(
-        ctx.db.clone(),
-        run.project_id.clone(),
-        reuse_order_id,
-        first_reuse.capability.clone(),
-        match first_reuse.classification.to_ascii_lowercase().as_str() {
-            "reuse" => ReuseClassification::Reuse,
-            "wrap" => ReuseClassification::Wrap,
-            "adapt" => ReuseClassification::Adapt,
-            "compose" => ReuseClassification::Compose,
-            "build" => ReuseClassification::Build,
-            _ => {
-                return Err(
-                    "Chief Engineer returned an unsupported reuse classification".to_string(),
-                );
-            }
-        },
-        if first_reuse.evidence_ids.is_empty() {
-            vec![reuse_evidence_id.clone()]
-        } else {
-            first_reuse.evidence_ids.clone()
-        },
-        first_reuse.candidate.clone(),
-        first_reuse.alternatives.clone(),
-        first_reuse.rationale.clone(),
-    )
-    .await?;
+    if synthesis.reuse_decisions.is_empty() {
+        return Err("Chief Engineer omitted project-specific reuse".to_string());
+    }
+    for reuse in &synthesis.reuse_decisions {
+        product_os_runtime::adopt_product_reuse_decision(
+            ctx.db.clone(),
+            run.project_id.clone(),
+            reuse_order_id.clone(),
+            reuse.capability.clone(),
+            match reuse.classification.to_ascii_lowercase().as_str() {
+                "reuse" => ReuseClassification::Reuse,
+                "wrap" => ReuseClassification::Wrap,
+                "adapt" => ReuseClassification::Adapt,
+                "compose" => ReuseClassification::Compose,
+                "build" => ReuseClassification::Build,
+                _ => {
+                    return Err(
+                        "Chief Engineer returned an unsupported reuse classification".to_string(),
+                    );
+                }
+            },
+            if reuse.evidence_ids.is_empty() {
+                vec![reuse_evidence_id.clone()]
+            } else {
+                reuse.evidence_ids.clone()
+            },
+            reuse.candidate.clone(),
+            reuse.alternatives.clone(),
+            reuse.rationale.clone(),
+        )
+        .await?;
+    }
     let constraints = run
         .constraints_work_order_id
         .as_ref()
@@ -1072,9 +1224,7 @@ async fn run_architecture(
     let red_team_evidence = red_team_order
         .evidence_id
         .ok_or_else(|| "red-team evidence missing".to_string())?;
-    let dissent_evidence = dissent
-        .evidence_id
-        .ok_or_else(|| "dissent evidence missing".to_string())?;
+    let dissent_evidence = dissent_evidence_id;
     product_os_runtime::adopt_product_architecture(
         ctx.db.clone(),
         run.project_id.clone(),
@@ -1088,19 +1238,66 @@ async fn run_architecture(
                 .architecture_evidence_ids
                 .get(1)
                 .cloned()
-                .ok_or_else(|| "architecture B missing".to_string())?,
+                .unwrap_or_default(),
             reuse_review_evidence_id: reuse_evidence_id,
             constraints_review_evidence_id: constraints_evidence,
-            risk_experiment_evidence_ids: vec![feasibility_evidence],
+            risk_experiment_evidence_ids,
             red_team_evidence_id: red_team_evidence,
             dissent_evidence_id: dissent_evidence,
             unresolved_high_blocker_evidence_ids: Vec::new(),
             packet_hash: Some(packet.packet_hash),
+            competition_mode: match planning_mode {
+                pipeline_contract::ArchitecturePlanningMode::EstablishedPattern => {
+                    pipeline_contract::ArchitectureCompetitionMode::EstablishedPattern
+                }
+                pipeline_contract::ArchitecturePlanningMode::CompetingProposals => {
+                    pipeline_contract::ArchitectureCompetitionMode::CompetingProposals
+                }
+            },
             synthesis: Some(synthesis),
         },
     )
     .await?;
     Ok(())
+}
+
+async fn run_incident_diagnosis(
+    ctx: &CoordinatorContext,
+    run: &mut ProductCoordinatorRun,
+) -> Result<(), String> {
+    let order = product_os_runtime::create_product_role_work_order(
+        ctx.db.clone(),
+        run.project_id.clone(),
+        "Incident diagnosis: reproduce, rank hypotheses, and identify bounded repair evidence"
+            .to_string(),
+        ProductWorkOrderRole::ProductDirector,
+    )
+    .await?;
+    run.product_director_work_order_id = Some(order.work_order_id.clone());
+    save_run(ctx, run).await?;
+    let prompt = role_prompt(
+        "Incident diagnosis reviewer",
+        &format!(
+            "This is an existing-product incident. Do not perform market research or ask whether Arena should build the product. Produce bounded diagnosis evidence with expected versus actual behavior, relevant source/log observations, deterministic reproduction steps when possible, ranked hypotheses, and a repair boundary. Repository: {}. Incident brief: {}. Return JSON: {{\"summary\":\"...\",\"findings\":[\"expected: ...\",\"actual: ...\",\"reproduction: ...\",\"hypothesis: ...\",\"repair boundary: ...\"],\"rejected_alternative\":\"...\",\"rationale\":\"...\"}}",
+            run.repository_path, run.founder_idea
+        ),
+    );
+    let execution = run_scheduled_role(ctx, run, order.work_order_id, prompt).await?;
+    let output: ReviewOutput = parse_json(&execution.output)?;
+    let admitted = admit_review(
+        ctx,
+        &run.project_id,
+        execution.work_order,
+        EvidenceKind::IncidentDiagnosis,
+        text(&output.summary, "incident diagnosis summary")?,
+        output.findings.join(" | "),
+    )
+    .await?;
+    run.product_director_work_order_id = Some(admitted.work_order_id);
+    run.phase = CoordinatorPhase::ProductReview;
+    run.stage = PipelineStage::Decide;
+    run.updated_at = now();
+    save_run(ctx, run).await
 }
 
 async fn load_work_order(ctx: &CoordinatorContext, id: &str) -> Result<ProductWorkOrder, String> {
@@ -1125,6 +1322,8 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
         CoordinatorStatus::Completed
             | CoordinatorStatus::Failed
             | CoordinatorStatus::Cancelled
+            | CoordinatorStatus::Stopped
+            | CoordinatorStatus::Pivoted
             | CoordinatorStatus::WaitingForOwner
     ) {
         return Ok(());
@@ -1137,11 +1336,10 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
         run.stage = PipelineStage::ReproduceDiagnose;
         run.updated_at = now();
         save_run(&ctx, &run).await?;
-        // The incident route enters the explicit diagnosis stage before the
-        // existing Decide controller.  Reproduction tools are M09B scope.
-        run.phase = CoordinatorPhase::ProductReview;
-        run.stage = PipelineStage::Decide;
-        save_run(&ctx, &run).await?;
+        if let Err(error) = run_incident_diagnosis(&ctx, &mut run).await {
+            mark_failed(&ctx, &mut run, error).await;
+            return Ok(());
+        }
     }
     if run.phase == CoordinatorPhase::Research {
         run.stage = PipelineStage::Discover;
@@ -1157,7 +1355,17 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
     if run.phase == CoordinatorPhase::ProductReview {
         match run_product_review(&ctx, &mut run).await {
             Ok(true) => return Ok(()),
-            Ok(false) if run.status == CoordinatorStatus::Completed => return Ok(()),
+            Ok(false)
+                if matches!(
+                    run.status,
+                    CoordinatorStatus::Completed
+                        | CoordinatorStatus::Stopped
+                        | CoordinatorStatus::Pivoted
+                        | CoordinatorStatus::Blocked
+                ) =>
+            {
+                return Ok(());
+            }
             Ok(false) => {}
             Err(error) => {
                 mark_failed(&ctx, &mut run, error).await;
@@ -1217,6 +1425,7 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
             run.updated_at = now();
             match remediation.outcome {
                 pipeline_contract::GateRemediationOutcome::NeedsResearch => {
+                    run.remediation_question = Some(failed.reason.clone());
                     run.phase = CoordinatorPhase::Research;
                     run.stage = PipelineStage::Discover;
                     run.status = CoordinatorStatus::Running;
@@ -1234,20 +1443,107 @@ async fn run_to_terminal(ctx: CoordinatorContext, run_id: String) -> Result<(), 
                     return Ok(());
                 }
                 pipeline_contract::GateRemediationOutcome::NeedsRepair => {
+                    let repair = product_os_runtime::create_product_director_work_order(
+                        ctx.db.clone(),
+                        run.project_id.clone(),
+                        format!(
+                            "BuildReadiness predicate repair: resolve the exact missing package or acceptance capability described here: {}",
+                            failed.reason
+                        ),
+                    )
+                    .await?;
+                    run.product_director_work_order_id = Some(repair.work_order_id);
+                    run.status = CoordinatorStatus::Blocked;
                     run.phase = CoordinatorPhase::Package;
                     run.stage = PipelineStage::Decide;
-                    run.status = CoordinatorStatus::Running;
-                    run.execution_epoch = run.execution_epoch.saturating_add(1);
+                    run.terminal_outcome = Some("build_readiness_repair_queued".to_string());
                     save_run(&ctx, &run).await?;
-                    spawn(ctx, run_id);
                     return Ok(());
                 }
                 pipeline_contract::GateRemediationOutcome::NeedsExperiment => {
-                    run.status = CoordinatorStatus::Completed;
+                    let contract = pipeline_contract::ExperimentContract {
+                        experiment_id: format!(
+                            "{}:gate-experiment:{:?}",
+                            run.project_id, failed.gate_id
+                        ),
+                        synthesis_identity: format!("{}:gate:{:?}", run.project_id, failed.gate_id),
+                        assumption: failed.reason.clone(),
+                        protocol: "bounded project validation check".to_string(),
+                        executor: "Arena Product OS validation executor".to_string(),
+                        expected_observation:
+                            "cargo check --locked succeeds without source mutation".to_string(),
+                        pass_condition: "cargo check exits zero".to_string(),
+                        fail_condition: "cargo check exits non-zero".to_string(),
+                        inconclusive_condition: "timeout or cancelled process".to_string(),
+                        timeout_seconds: 180,
+                        allowed_effects: vec!["read-only candidate validation".to_string()],
+                        protected_paths: vec![".arena/verification.json".to_string()],
+                    };
+                    contract.validate()?;
+                    run.pending_experiment = Some(contract);
+                    let order = product_os_runtime::create_product_role_work_order(
+                        ctx.db.clone(),
+                        run.project_id.clone(),
+                        "Execute the bounded gate ExperimentContract".to_string(),
+                        ProductWorkOrderRole::FeasibilityReviewer,
+                    )
+                    .await?;
+                    run.feasibility_work_order_id = Some(order.work_order_id.clone());
+                    save_run(&ctx, &run).await?;
+                    match product_os_runtime::run_product_feasibility_spike(
+                        ctx.db.clone(),
+                        ctx.runtime.clone(),
+                        order.work_order_id,
+                        PathBuf::from(&run.repository_path),
+                        run.pending_experiment
+                            .clone()
+                            .ok_or_else(|| "gate experiment contract disappeared".to_string())?,
+                    )
+                    .await
+                    {
+                        Ok(completed) => {
+                            run.pending_experiment = None;
+                            if let Some(evidence_id) = completed.evidence_id {
+                                run.verified_evidence_ids.push(evidence_id);
+                            }
+                            run.status = CoordinatorStatus::Running;
+                            run.phase = CoordinatorPhase::ProductReview;
+                            run.stage = PipelineStage::Decide;
+                            run.terminal_outcome =
+                                Some("bounded_experiment_completed_return_to_decide".to_string());
+                        }
+                        Err(error) => {
+                            run.status = CoordinatorStatus::Blocked;
+                            run.error = Some(error.chars().take(240).collect());
+                        }
+                    }
+                    save_run(&ctx, &run).await?;
+                    if run.status == CoordinatorStatus::Running {
+                        spawn(ctx, run_id);
+                    }
+                    return Ok(());
+                }
+                pipeline_contract::GateRemediationOutcome::RecommendStop => {
+                    run.status = CoordinatorStatus::Blocked;
                     run.phase = CoordinatorPhase::ProductReview;
                     run.stage = PipelineStage::Decide;
-                    run.terminal_outcome =
-                        Some("gate_requires_bounded_experiment_return_to_decide".to_string());
+                    run.terminal_outcome = Some("recommend_stop".to_string());
+                    save_run(&ctx, &run).await?;
+                    return Ok(());
+                }
+                pipeline_contract::GateRemediationOutcome::RecommendPivot => {
+                    run.status = CoordinatorStatus::Blocked;
+                    run.phase = CoordinatorPhase::ProductReview;
+                    run.stage = PipelineStage::Decide;
+                    run.terminal_outcome = Some("recommend_pivot".to_string());
+                    save_run(&ctx, &run).await?;
+                    return Ok(());
+                }
+                pipeline_contract::GateRemediationOutcome::ExternalBlock => {
+                    run.status = CoordinatorStatus::Blocked;
+                    run.phase = CoordinatorPhase::ProductReview;
+                    run.stage = PipelineStage::Decide;
+                    run.terminal_outcome = Some("external_block".to_string());
                     save_run(&ctx, &run).await?;
                     return Ok(());
                 }
@@ -1400,6 +1696,7 @@ pub async fn start(
         status: CoordinatorStatus::Admitted,
         execution_epoch: 1,
         remediation_counts: BTreeMap::new(),
+        remediation_question: None,
         last_remediation: None,
         research_work_order_ids: Vec::new(),
         verifier_work_order_ids: Vec::new(),
@@ -1416,6 +1713,7 @@ pub async fn start(
         red_team_work_order_id: None,
         dissent_work_order_id: None,
         feasibility_work_order_id: None,
+        pending_experiment: None,
         build_package_id: None,
         delivery_session_id: None,
         terminal_outcome: None,
@@ -1505,6 +1803,11 @@ pub async fn answer_owner_question(
     ) {
         let mut terminal = run.clone();
         terminal.status = CoordinatorStatus::Completed;
+        terminal.status = match decision {
+            OwnerDecisionKind::StopRun => CoordinatorStatus::Stopped,
+            OwnerDecisionKind::PivotRun => CoordinatorStatus::Pivoted,
+            _ => CoordinatorStatus::Completed,
+        };
         terminal.phase = CoordinatorPhase::Terminal;
         terminal.stage = PipelineStage::Terminal;
         terminal.pending_owner_decision = None;
@@ -1519,15 +1822,58 @@ pub async fn answer_owner_question(
     }
     if decision == OwnerDecisionKind::AuthorizeValidationExperiment {
         let mut returned = run.clone();
-        returned.status = CoordinatorStatus::Completed;
+        let contract = returned
+            .pending_experiment
+            .clone()
+            .ok_or_else(|| "validation experiment contract is missing".to_string())?;
+        contract.validate()?;
+        let order = product_os_runtime::create_product_role_work_order(
+            ctx.db.clone(),
+            returned.project_id.clone(),
+            format!("Execute ExperimentContract {}", contract.experiment_id),
+            ProductWorkOrderRole::FeasibilityReviewer,
+        )
+        .await?;
+        returned.feasibility_work_order_id = Some(order.work_order_id.clone());
+        returned.status = CoordinatorStatus::Running;
         returned.phase = CoordinatorPhase::ProductReview;
         returned.stage = PipelineStage::Decide;
         returned.pending_owner_decision = None;
-        returned.terminal_outcome =
-            Some("validation_experiment_authorized_return_to_decide".to_string());
+        returned.terminal_outcome = Some("validation_experiment_authorized_running".to_string());
         returned.updated_at = now();
         save_run(&ctx, &returned).await?;
-        return Ok(returned);
+        match product_os_runtime::run_product_feasibility_spike(
+            ctx.db.clone(),
+            ctx.runtime.clone(),
+            order.work_order_id,
+            PathBuf::from(&returned.repository_path),
+            contract,
+        )
+        .await
+        {
+            Ok(completed) => {
+                returned.pending_experiment = None;
+                if let Some(evidence_id) = completed.evidence_id {
+                    returned.verified_evidence_ids.push(evidence_id);
+                }
+                returned.status = CoordinatorStatus::Running;
+                returned.phase = CoordinatorPhase::ProductReview;
+                returned.stage = PipelineStage::Decide;
+                returned.terminal_outcome =
+                    Some("validation_experiment_completed_return_to_decide".to_string());
+                returned.updated_at = now();
+                save_run(&ctx, &returned).await?;
+                spawn(ctx, returned.run_id.clone());
+                return Ok(returned);
+            }
+            Err(error) => {
+                returned.status = CoordinatorStatus::Blocked;
+                returned.error = Some(error.chars().take(240).collect());
+                returned.updated_at = now();
+                save_run(&ctx, &returned).await?;
+                return Ok(returned);
+            }
+        }
     }
     product_os_runtime::adopt_narrow_build_direction(ctx.db.clone(), run.project_id.clone())
         .await?;
@@ -1571,6 +1917,8 @@ pub async fn cancel(
             }
         }
     }
+    run.status = CoordinatorStatus::Cancelling;
+    save_run(&ctx, &run).await?;
     run.status = CoordinatorStatus::Cancelled;
     run.phase = CoordinatorPhase::Terminal;
     run.error = Some(reason.chars().take(240).collect());
@@ -1586,13 +1934,18 @@ pub async fn resume(
     let mut run = load_run(&ctx, &run_id).await?;
     if matches!(
         run.status,
-        CoordinatorStatus::Completed | CoordinatorStatus::Cancelled
+        CoordinatorStatus::Completed
+            | CoordinatorStatus::Stopped
+            | CoordinatorStatus::Pivoted
+            | CoordinatorStatus::Cancelled
     ) {
         return Ok(run);
     }
     if run.status == CoordinatorStatus::WaitingForOwner {
         return Ok(run);
     }
+    run.status = CoordinatorStatus::Reconciling;
+    save_run(&ctx, &run).await?;
     product_os_runtime::reconcile_after_restart(ctx.db.clone(), ctx.runtime.clone()).await?;
     run.status = CoordinatorStatus::Running;
     run.updated_at = now();
@@ -1655,6 +2008,7 @@ mod tests {
             status: CoordinatorStatus::Running,
             execution_epoch: 3,
             remediation_counts: BTreeMap::new(),
+            remediation_question: None,
             last_remediation: None,
             research_work_order_ids: vec!["research-1".to_string()],
             verifier_work_order_ids: vec!["verifier-1".to_string()],
@@ -1671,6 +2025,7 @@ mod tests {
             red_team_work_order_id: Some("red-team-1".to_string()),
             dissent_work_order_id: Some("dissent-1".to_string()),
             feasibility_work_order_id: Some("feasibility-1".to_string()),
+            pending_experiment: None,
             build_package_id: Some("package-1".to_string()),
             delivery_session_id: Some("delivery-1".to_string()),
             terminal_outcome: None,
