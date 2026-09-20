@@ -143,10 +143,10 @@ pub fn select_route_with_context(
             ]
             .iter()
             .any(|marker| lower.contains(marker)));
-    if incident_language {
-        ProductRoute::Incident
-    } else if explicit_greenfield_context && !explicit_existing_context {
+    if explicit_greenfield_context && !explicit_existing_context {
         ProductRoute::NewProduct
+    } else if incident_language {
+        ProductRoute::Incident
     } else if existing_context
         && [
             "existing feature",
@@ -873,6 +873,24 @@ mod tests {
         );
         assert_eq!(
             select_route_with_context("Fix the crash", true),
+            ProductRoute::Incident
+        );
+    }
+
+    #[test]
+    fn greenfield_incident_domain_language_does_not_become_incident_route() {
+        assert_eq!(
+            select_route_with_context(
+                "Build a new incident management app from scratch for small IT teams",
+                true,
+            ),
+            ProductRoute::NewProduct
+        );
+        assert_eq!(
+            select_route_with_context(
+                "Fix the incident in this existing app after the latest release",
+                true,
+            ),
             ProductRoute::Incident
         );
     }
