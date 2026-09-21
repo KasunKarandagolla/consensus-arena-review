@@ -1507,7 +1507,16 @@ async fn run_architecture(
         records_brief(&snapshot.records, run.route),
         bounded_repo_intelligence(ctx, run, "architecture symbols and coupling").await
     );
-    let planning_mode = pipeline_contract::architecture_planning_mode(run.route, &run.founder_idea);
+    let planning_context = format!(
+        "{}\nobjective: {}\nrisks: {}\ninterfaces: {}\nconstraints: {}",
+        run.founder_idea,
+        snapshot.records.objective,
+        snapshot.records.risks.join(" | "),
+        snapshot.records.interfaces.join(" | "),
+        snapshot.records.constraints.join(" | "),
+    );
+    let planning_mode =
+        pipeline_contract::architecture_planning_mode(run.route, &planning_context);
     let roles = match planning_mode {
         pipeline_contract::ArchitecturePlanningMode::EstablishedPattern => {
             vec![(ProductWorkOrderRole::ArchitectA, "Architect A")]
