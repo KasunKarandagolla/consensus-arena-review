@@ -129,6 +129,7 @@ pub struct ConsultationActivity {
     pub unknown_outcome: usize,
     pub blocked_or_recovery: usize,
     pub active_request_ids: Vec<String>,
+    pub recovery_request_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,6 +516,18 @@ pub fn build_functional_state(
         active_request_ids: consultations
             .iter()
             .filter(|order| !order.state.is_terminal())
+            .map(|order| order.request_id.clone())
+            .collect(),
+        recovery_request_ids: consultations
+            .iter()
+            .filter(|order| {
+                matches!(
+                    order.state,
+                    ConsultationTransactionState::UnknownOutcome
+                        | ConsultationTransactionState::OwnerRecovery
+                        | ConsultationTransactionState::Observing
+                )
+            })
             .map(|order| order.request_id.clone())
             .collect(),
     };
