@@ -638,6 +638,34 @@ async fn verify_campaign_evidence(
     Ok(())
 }
 
+async fn distinct_current_source_count(
+    ctx: &CoordinatorContext,
+    run: &ProductCoordinatorRun,
+    evidence_ids: &[String],
+) -> Result<usize, String> {
+    let snapshot = product_os_runtime::snapshot(
+        ctx.db.clone(),
+        ctx.runtime.clone(),
+        run.project_id.clone(),
+    )
+    .await?
+    .ok_or_else(|| "Product OS project disappeared while counting research sources".to_string())?;
+    let wanted = evidence_ids.iter().collect::<BTreeSet<_>>();
+    let distinct = snapshot
+        .records
+        .evidence
+        .iter()
+        .filter(|item| {
+            item.current
+                && wanted.contains(&item.evidence_id)
+                && item.kind == Some(EvidenceKind::ResearchClaim)
+                && !item.source_reference.trim().is_empty()
+        })
+        .map(|item| item.source_reference.trim().to_string())
+        .collect::<BTreeSet<_>>();
+    Ok(distinct.len())
+}
+
 fn pending_research_mandate(run: &ProductCoordinatorRun) -> bool {
     run.research_mandates.iter().any(|mandate| {
         matches!(
@@ -791,8 +819,10 @@ async fn run_dynamic_research_campaigns(
                 }
             }
 
+            let distinct_sources_before_tasks =
+                distinct_current_source_count(ctx, run, &mandate.evidence_ids).await?;
             if plan.complete
-                && mandate.evidence_ids.len() < usize::from(mandate.minimum_distinct_sources)
+                && distinct_sources_before_tasks < usize::from(mandate.minimum_distinct_sources)
             {
                 for channel in &mandate.channels {
                     if plan.tasks.len() >= crate::work_graph::MAX_DELEGATED_CHILDREN {
@@ -915,7 +945,13 @@ async fn run_dynamic_research_campaigns(
                         .unavailable_channels
                         .contains(channel)
                 });
-            let source_floor_met = run.research_mandates[mandate_index].evidence_ids.len()
+            let distinct_sources = distinct_current_source_count(
+                ctx,
+                run,
+                &run.research_mandates[mandate_index].evidence_ids,
+            )
+            .await?;
+            let source_floor_met = distinct_sources
                 >= usize::from(run.research_mandates[mandate_index].minimum_distinct_sources);
 
             if required_unavailable {
