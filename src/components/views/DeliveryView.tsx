@@ -17,11 +17,40 @@ interface CoordinatorRun {
   error?: string | null
 }
 
+interface ProductFunctionalState {
+  owner_phase: string
+  internal_stage: string
+  lifecycle: string
+  degraded_notices: string[]
+  research: {
+    owner_directives: number
+    mandates_total: number
+    active: number
+    satisfied: number
+    blocked_or_partial: number
+    unavailable_channels: string[]
+    mandatory_unavailable_channels: string[]
+  }
+  consultation: {
+    request_count: number
+    completed: number
+    unknown_outcome: number
+    blocked_or_recovery: number
+    active_request_ids: string[]
+    recovery_request_ids: string[]
+  }
+}
+
 export default function DeliveryView() {
   const state = useAppStore(s => s.deliveryState)
   const setState = useAppStore(s => s.setDeliveryState)
   const [product, setProduct] = useState<ProductAuthoritySnapshot | null>(null)
   const [coordinator, setCoordinator] = useState<CoordinatorRun | null>(null)
+  const [functional, setFunctional] = useState<ProductFunctionalState | null>(null)
+  const [guidance, setGuidance] = useState('')
+  const [consultQuestion, setConsultQuestion] = useState('')
+  const [consultProvider, setConsultProvider] = useState<'chatgpt' | 'qwen'>('chatgpt')
+  const [ownerActionBusy, setOwnerActionBusy] = useState(false)
   const coordinatorRunId = coordinator?.run_id
 
   useEffect(() => {
@@ -50,6 +79,17 @@ export default function DeliveryView() {
           if (parsed) setCoordinator(parsed)
         }
       } catch {}
+      if (coordinatorRunId) {
+        try {
+          const raw = await invoke<string>('get_product_functional_state', {
+            run_id: coordinatorRunId,
+          })
+          if (!disposed) {
+            const parsed = JSON.parse(raw) as ProductFunctionalState
+            setFunctional(parsed)
+          }
+        } catch {}
+      }
     }
     void load()
     const timer = window.setInterval(() => void load(), 2500)
@@ -119,6 +159,60 @@ export default function DeliveryView() {
     }
   }
 
+  async function injectGuidance() {
+    if (!coordinator || !guidance.trim() || ownerActionBusy) return
+    setOwnerActionBusy(true)
+    try {
+      const raw = await invoke<string>('inject_product_guidance', {
+        run_id: coordinator.run_id,
+        guidance: guidance.trim(),
+      })
+      setCoordinator(JSON.parse(raw) as CoordinatorRun)
+      setGuidance('')
+      useAppStore.getState().addToast('Guidance accepted. Arena is re-planning safely.', 5000)
+    } catch (error) {
+      useAppStore.getState().addToast(String(error), 7000)
+    } finally {
+      setOwnerActionBusy(false)
+    }
+  }
+
+  async function requestConsultation() {
+    if (!coordinator || !consultQuestion.trim() || ownerActionBusy) return
+    setOwnerActionBusy(true)
+    try {
+      const raw = await invoke<string>('request_product_consultation', {
+        run_id: coordinator.run_id,
+        provider: consultProvider,
+        question: consultQuestion.trim(),
+      })
+      setCoordinator(JSON.parse(raw) as CoordinatorRun)
+      setConsultQuestion('')
+      useAppStore.getState().addToast('Consultation completed or entered safe recovery state.', 6000)
+    } catch (error) {
+      useAppStore.getState().addToast(String(error), 7000)
+    } finally {
+      setOwnerActionBusy(false)
+    }
+  }
+
+  async function recoverConsultation(requestId: string, action: 'observe' | 'abandon') {
+    if (!coordinator || ownerActionBusy) return
+    setOwnerActionBusy(true)
+    try {
+      const raw = await invoke<string>('recover_product_consultation', {
+        run_id: coordinator.run_id,
+        request_id: requestId,
+        action,
+      })
+      setCoordinator(JSON.parse(raw) as CoordinatorRun)
+    } catch (error) {
+      useAppStore.getState().addToast(String(error), 7000)
+    } finally {
+      setOwnerActionBusy(false)
+    }
+  }
+
   return (
     <section className="view">
       <Topbar title={state?.objective?.slice(0, 48) || 'Build'} />
@@ -150,6 +244,20 @@ export default function DeliveryView() {
               <div style={{ color: 'var(--t2)', fontSize: 13 }}>
                 {coordinator.phase.replace(/_/g, ' ')} · {coordinator.status.replace(/_/g, ' ')}
               </div>
+              {functional && (
+                <div style={{ color: 'var(--t3)', fontSize: 12, marginTop: 4 }}>
+                  {functional.owner_phase} · {functional.internal_stage.replace(/_/g, ' ')} ·{' '}
+                  {functional.lifecycle.replace(/_/g, ' ')}
+                  {functional.research.mandates_total > 0
+                    ? ` · research ${functional.research.satisfied}/${functional.research.mandates_total}`
+                    : ''}
+                </div>
+              )}
+              {functional?.degraded_notices.map(notice => (
+                <div key={notice} className="form-error" role="status" style={{ marginTop: 8 }}>
+                  {notice}
+                </div>
+              ))}
               {coordinator.error && (
                 <div className="form-error" role="status">
                   {coordinator.error}
@@ -206,6 +314,104 @@ export default function DeliveryView() {
                 )}
             </div>
           )}
+
+          {coordinator &&
+            !['completed', 'stopped', 'pivoted', 'cancelled'].includes(coordinator.status) && (
+              <details className="fg">
+                <summary style={{ cursor: 'pointer', color: 'var(--t2)', fontSize: 13 }}>
+                  Owner controls
+                </summary>
+                <div style={{ marginTop: 12, display: 'grid', gap: 12 }}>
+                  <div>
+                    <label className="fl" htmlFor="arena-guidance">
+                      Change direction or add a constraint
+                    </label>
+                    <textarea
+                      id="arena-guidance"
+                      value={guidance}
+                      onChange={event => setGuidance(event.target.value)}
+                      placeholder="Example: Research YouTube and GitHub first before deciding."
+                      rows={3}
+                      maxLength={8000}
+                      style={{ width: '100%', resize: 'vertical' }}
+                    />
+                    <button
+                      className="sv-btn"
+                      disabled={ownerActionBusy || !guidance.trim()}
+                      onClick={() => void injectGuidance()}
+                      style={{ marginTop: 8 }}
+                    >
+                      Update Arena
+                    </button>
+                  </div>
+
+                  <div>
+                    <label className="fl" htmlFor="arena-consult-question">
+                      Optional frontier consultation
+                    </label>
+                    <div style={{ color: 'var(--t3)', fontSize: 12, marginBottom: 6 }}>
+                      Advisory only. It cannot mark gates PASS, Verify a candidate, or Apply.
+                    </div>
+                    <select
+                      value={consultProvider}
+                      onChange={event =>
+                        setConsultProvider(event.target.value === 'qwen' ? 'qwen' : 'chatgpt')
+                      }
+                      disabled={ownerActionBusy}
+                      style={{ marginBottom: 8 }}
+                    >
+                      <option value="chatgpt">ChatGPT</option>
+                      <option value="qwen">Qwen</option>
+                    </select>
+                    <textarea
+                      id="arena-consult-question"
+                      value={consultQuestion}
+                      onChange={event => setConsultQuestion(event.target.value)}
+                      placeholder="Ask for an independent opinion on a consequential unresolved decision."
+                      rows={3}
+                      maxLength={8000}
+                      style={{ width: '100%', resize: 'vertical' }}
+                    />
+                    <button
+                      className="sv-btn"
+                      disabled={ownerActionBusy || !consultQuestion.trim()}
+                      onClick={() => void requestConsultation()}
+                      style={{ marginTop: 8 }}
+                    >
+                      Consult
+                    </button>
+                  </div>
+
+                  {!!functional?.consultation.recovery_request_ids.length && (
+                    <div className="form-error" role="status">
+                      A consultation may have been submitted before Arena lost certainty. Automatic
+                      resend is disabled.
+                      {functional.consultation.recovery_request_ids.map(requestId => (
+                        <div
+                          key={requestId}
+                          style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}
+                        >
+                          <button
+                            className="sv-btn"
+                            disabled={ownerActionBusy}
+                            onClick={() => void recoverConsultation(requestId, 'observe')}
+                          >
+                            Observe existing conversation
+                          </button>
+                          <button
+                            className="sv-btn"
+                            disabled={ownerActionBusy}
+                            onClick={() => void recoverConsultation(requestId, 'abandon')}
+                          >
+                            Abandon unresolved consultation
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </details>
+            )}
 
           {state && <FounderJourney phase={state.phase} />}
 
