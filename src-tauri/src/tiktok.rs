@@ -51,6 +51,11 @@ impl TiktokOperation {
 pub struct TiktokRequest {
     pub operation: TiktokOperation,
     pub query: String,
+    /// Secondary positional identity used by operations such as replies
+    /// (comment ID). Kept explicit so Arena does not hide multi-argument
+    /// commands inside an opaque query string.
+    #[serde(default)]
+    pub secondary: Option<String>,
     pub max_results: usize,
     pub timeout_seconds: u64,
 }
@@ -66,6 +71,20 @@ impl TiktokRequest {
             || self.query.chars().any(char::is_control)
         {
             return Err("TikTok query is empty, oversized, or contains control text".to_string());
+        }
+        if let Some(secondary) = self.secondary.as_deref() {
+            if secondary.trim().is_empty()
+                || secondary.len() > MAX_QUERY_BYTES
+                || secondary.chars().any(char::is_control)
+            {
+                return Err("TikTok secondary identity is invalid or oversized".to_string());
+            }
+        }
+        if self.operation == TiktokOperation::Replies && self.secondary.is_none() {
+            return Err("TikTok replies requires a comment ID".to_string());
+        }
+        if self.operation != TiktokOperation::Replies && self.secondary.is_some() {
+            return Err("TikTok secondary identity is only valid for replies".to_string());
         }
         if self.max_results == 0 || self.max_results > MAX_RESULTS {
             return Err("TikTok result count is outside the bounded range".to_string());
@@ -126,8 +145,29 @@ pub async fn runtime_status(cwd: &Path) -> Result<bool, String> {
 pub async fn run(cwd: &Path, request: TiktokRequest) -> Result<TiktokResult, String> {
     request.validate()?;
     let mut args = vec![OsString::from(request.operation.as_str())];
-    if !request.query.trim().is_empty() {
-        args.push(OsString::from(request.query.clone()));
+    match request.operation {
+        TiktokOperation::Discover => {
+            if request.query.trim().is_empty() {
+                args.push(OsString::from("--trending"));
+            } else {
+                args.push(OsString::from("--seed-search"));
+                args.push(OsString::from(request.query.clone()));
+            }
+        }
+        TiktokOperation::Replies => {
+            args.push(OsString::from(request.query.clone()));
+            args.push(OsString::from(
+                request
+                    .secondary
+                    .as_deref()
+                    .ok_or_else(|| "TikTok replies comment ID disappeared".to_string())?,
+            ));
+        }
+        _ => {
+            if !request.query.trim().is_empty() {
+                args.push(OsString::from(request.query.clone()));
+            }
+        }
     }
     args.extend([
         OsString::from("--output"),
@@ -175,6 +215,14 @@ pub async fn run(cwd: &Path, request: TiktokRequest) -> Result<TiktokResult, Str
     } else {
         Vec::new()
     };
+    let status = if status == TiktokResultStatus::Success && records.is_empty() {
+        // Exit 3 is the CLI's explicit valid-empty contract. Exit 0 with no
+        // parseable records is therefore malformed/unsupported output, not an
+        // evidence-bearing success.
+        TiktokResultStatus::Failed
+    } else {
+        status
+    };
     Ok(TiktokResult {
         status,
         exit_code: output.exit_code,
@@ -198,14 +246,12 @@ fn parse_records(raw: &str, operation: TiktokOperation) -> Vec<TiktokEvidenceRec
                 .get("id")
                 .or_else(|| value.get("video_id"))
                 .or_else(|| value.get("aweme_id"))
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    value
-                        .get("id")
-                        .and_then(Value::as_i64)
-                        .map(|_| "numeric-id")
-                })?
-                .to_string();
+                .and_then(|id| {
+                    id.as_str()
+                        .map(ToString::to_string)
+                        .or_else(|| id.as_i64().map(|number| number.to_string()))
+                        .or_else(|| id.as_u64().map(|number| number.to_string()))
+                })?;
             Some(TiktokEvidenceRecord {
                 identity,
                 source_url: value
@@ -250,6 +296,7 @@ mod tests {
             TiktokRequest {
                 operation: TiktokOperation::Search,
                 query: "arena".to_string(),
+                secondary: None,
                 max_results: 3,
                 timeout_seconds: 20,
             }
@@ -260,6 +307,7 @@ mod tests {
             TiktokRequest {
                 operation: TiktokOperation::Search,
                 query: "arena".to_string(),
+                secondary: None,
                 max_results: 21,
                 timeout_seconds: 20,
             }
@@ -274,6 +322,7 @@ mod tests {
             TiktokRequest {
                 operation: TiktokOperation::Trending,
                 query: String::new(),
+                secondary: None,
                 max_results: 3,
                 timeout_seconds: 20,
             }
@@ -284,12 +333,59 @@ mod tests {
             TiktokRequest {
                 operation: TiktokOperation::Search,
                 query: String::new(),
+                secondary: None,
                 max_results: 3,
                 timeout_seconds: 20,
             }
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn replies_requires_comment_id_and_discover_maps_to_a_bounded_seed() {
+        assert!(
+            TiktokRequest {
+                operation: TiktokOperation::Replies,
+                query: "https://www.tiktok.com/@a/video/v1".to_string(),
+                secondary: None,
+                max_results: 3,
+                timeout_seconds: 20,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TiktokRequest {
+                operation: TiktokOperation::Replies,
+                query: "https://www.tiktok.com/@a/video/v1".to_string(),
+                secondary: Some("comment-1".to_string()),
+                max_results: 3,
+                timeout_seconds: 20,
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            TiktokRequest {
+                operation: TiktokOperation::Discover,
+                query: "tauri agents".to_string(),
+                secondary: None,
+                max_results: 3,
+                timeout_seconds: 20,
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn numeric_record_identity_is_preserved() {
+        let records = parse_records(
+            r#"{"id":7106594312292453675,"web_url":"https://www.tiktok.com/@a/video/7106594312292453675"}"#,
+            TiktokOperation::Video,
+        );
+        assert_eq!(records[0].identity, "7106594312292453675");
     }
 
     #[test]
