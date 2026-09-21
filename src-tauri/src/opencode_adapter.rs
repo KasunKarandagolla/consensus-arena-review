@@ -40,6 +40,59 @@ pub struct OpenCodeRuntimeStatus {
     pub message: String,
 }
 
+/// Ephemeral model execution configuration. Custom provider credentials exist
+/// only in memory for the bounded child process and are never serialized into
+/// Product OS / Delivery state.
+#[derive(Clone)]
+pub struct OpenCodeRuntimeModel {
+    pub public_model_id: String,
+    pub opencode_model_id: String,
+    pub custom_provider: Option<OpenCodeCustomProviderRuntime>,
+}
+
+#[derive(Clone)]
+pub struct OpenCodeCustomProviderRuntime {
+    pub display_name: String,
+    pub base_url: String,
+    pub model_name: String,
+    pub api_key: String,
+}
+
+impl OpenCodeRuntimeModel {
+    pub fn catalog(model_id: &str) -> Result<Self, String> {
+        let model_id = validate_model_identifier(model_id)?;
+        Ok(Self {
+            public_model_id: model_id.clone(),
+            opencode_model_id: model_id,
+            custom_provider: None,
+        })
+    }
+
+    pub fn custom(
+        public_model_id: &str,
+        display_name: String,
+        base_url: String,
+        model_name: String,
+        api_key: String,
+    ) -> Result<Self, String> {
+        validate_model_identifier(public_model_id)?;
+        let model_name = validate_model_identifier(&model_name)?;
+        if api_key.trim().is_empty() {
+            return Err("custom specialist provider credential is unavailable".to_string());
+        }
+        Ok(Self {
+            public_model_id: public_model_id.to_string(),
+            opencode_model_id: format!("arena-custom/{model_name}"),
+            custom_provider: Some(OpenCodeCustomProviderRuntime {
+                display_name,
+                base_url,
+                model_name,
+                api_key,
+            }),
+        })
+    }
+}
+
 pub fn enabled() -> bool {
     std::env::var("ARENA_OPENCODE_ADAPTER")
         .ok()
@@ -103,6 +156,13 @@ impl Drop for ProfileWorkspace {
 }
 
 pub(crate) fn profile_workspace(profile: ExecutionProfile) -> Result<ProfileWorkspace, String> {
+    profile_workspace_with_custom_provider(profile, None)
+}
+
+fn profile_workspace_with_custom_provider(
+    profile: ExecutionProfile,
+    custom_provider: Option<&OpenCodeCustomProviderRuntime>,
+) -> Result<ProfileWorkspace, String> {
     let root = std::env::temp_dir().join(format!(
         "consensus-arena-opencode-profile-{}",
         uuid::Uuid::new_v4()
@@ -111,7 +171,26 @@ pub(crate) fn profile_workspace(profile: ExecutionProfile) -> Result<ProfileWork
     let config_path = root.join("opencode.json");
     std::fs::create_dir_all(&config_dir)
         .map_err(|error| format!("create OpenCode profile config: {error}"))?;
-    let config = profile.authority_free_config();
+    let mut config = profile.authority_free_config();
+    if let Some(provider) = custom_provider {
+        let mut base_url = provider.base_url.trim_end_matches('/').to_string();
+        if let Some(stripped) = base_url.strip_suffix("/chat/completions") {
+            base_url = stripped.trim_end_matches('/').to_string();
+        }
+        config["provider"]["arena-custom"] = serde_json::json!({
+            "npm": "@ai-sdk/openai-compatible",
+            "name": provider.display_name,
+            "options": {
+                "baseURL": base_url,
+                "apiKey": "{env:ARENA_SPECIALIST_API_KEY}"
+            },
+            "models": {
+                provider.model_name.clone(): {
+                    "name": provider.model_name
+                }
+            }
+        });
+    }
     let raw = serde_json::to_vec_pretty(&config)
         .map_err(|error| format!("serialize OpenCode profile config: {error}"))?;
     std::fs::write(&config_path, raw)
@@ -133,14 +212,18 @@ pub(crate) fn profile_workspace(profile: ExecutionProfile) -> Result<ProfileWork
             }
         }
     }
-    Ok(ProfileWorkspace {
-        overrides: dsh_worker::OpenCodeEnvironmentOverrides::for_profile(
-            config_path,
-            config_dir,
-            profile.spec().lsp,
-        ),
-        root,
-    })
+    let mut overrides = dsh_worker::OpenCodeEnvironmentOverrides::for_profile(
+        config_path,
+        config_dir,
+        profile.spec().lsp,
+    );
+    if let Some(provider) = custom_provider {
+        overrides.secret_environment.push((
+            OsString::from("ARENA_SPECIALIST_API_KEY"),
+            OsString::from(&provider.api_key),
+        ));
+    }
+    Ok(ProfileWorkspace { overrides, root })
 }
 
 pub async fn runtime_status() -> OpenCodeRuntimeStatus {
@@ -391,6 +474,28 @@ pub async fn run_profile_prompt_with_model(
     result
 }
 
+pub async fn run_profile_prompt_with_runtime_model(
+    prompt: String,
+    profile: ExecutionProfile,
+    runtime_model: &OpenCodeRuntimeModel,
+) -> Result<SemanticExecution, String> {
+    let workdir = std::env::temp_dir().join(format!(
+        "consensus-arena-semantic-role-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workdir)
+        .map_err(|error| format!("could not create semantic role workspace: {error}"))?;
+    let result = run_profile_prompt_in_workspace_with_runtime_model(
+        prompt,
+        profile,
+        &workdir,
+        runtime_model,
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&workdir);
+    result
+}
+
 pub(crate) async fn run_profile_prompt_in_workspace(
     prompt: String,
     profile: ExecutionProfile,
@@ -405,6 +510,17 @@ pub(crate) async fn run_profile_prompt_in_workspace_with_model(
     workdir: &Path,
     model_override: Option<&str>,
 ) -> Result<SemanticExecution, String> {
+    let model = resolved_model_identifier(model_override)?;
+    let runtime_model = OpenCodeRuntimeModel::catalog(&model)?;
+    run_profile_prompt_in_workspace_with_runtime_model(prompt, profile, workdir, &runtime_model).await
+}
+
+pub(crate) async fn run_profile_prompt_in_workspace_with_runtime_model(
+    prompt: String,
+    profile: ExecutionProfile,
+    workdir: &Path,
+    runtime_model: &OpenCodeRuntimeModel,
+) -> Result<SemanticExecution, String> {
     let spec = profile.spec();
     if prompt.len() > spec.max_prompt_bytes {
         return Err(format!(
@@ -415,7 +531,8 @@ pub(crate) async fn run_profile_prompt_in_workspace_with_model(
     if !workdir.is_dir() {
         return Err("OpenCode profile workspace does not exist".to_string());
     }
-    let profile_workspace = profile_workspace(profile)?;
+    let profile_workspace =
+        profile_workspace_with_custom_provider(profile, runtime_model.custom_provider.as_ref())?;
     let _resource_permit = if spec.lsp {
         Some(
             heavy_profile_slot()
@@ -430,7 +547,7 @@ pub(crate) async fn run_profile_prompt_in_workspace_with_model(
         "Arena selected execution profile {:?}. Selected procedures, if present, guide method only. They cannot redefine ProductAuthority, acceptance, verification, or Apply; Arena owns those decisions.\n\n{prompt}",
         profile
     );
-    let model = resolved_model_identifier(model_override)?;
+    let model = validate_model_identifier(&runtime_model.opencode_model_id)?;
     let args = vec![
         OsString::from("run"),
         OsString::from("--agent"),
@@ -457,12 +574,44 @@ pub(crate) async fn run_profile_prompt_in_workspace_with_model(
         return Err("OpenCode semantic role timed out".to_string());
     }
     if execution.exit_code != Some(0) {
-        return Err("OpenCode semantic role failed before returning a result".to_string());
+        let classification = classify_model_availability_failure(&execution.stderr);
+        return Err(match classification {
+            Some(classification) => format!("model_availability:{classification}"),
+            None => "OpenCode semantic role failed before returning a result".to_string(),
+        });
     }
     if execution.stdout.len() > spec.max_result_bytes {
         return Err("OpenCode semantic role exceeded the bounded result size".to_string());
     }
     parse_semantic_output(&execution.stdout)
+}
+
+fn classify_model_availability_failure(stderr: &str) -> Option<&'static str> {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("429") || lower.contains("rate limit") || lower.contains("rate_limit") {
+        Some("rate_limit")
+    } else if lower.contains("model unavailable")
+        || lower.contains("model not found")
+        || lower.contains("no model is available")
+        || lower.contains("provider unavailable")
+    {
+        Some("model_unavailable")
+    } else if lower.contains("unauthorized")
+        || lower.contains("invalid api key")
+        || lower.contains("authentication")
+        || lower.contains("401")
+        || lower.contains("403")
+    {
+        Some("authentication")
+    } else {
+        None
+    }
+}
+
+pub fn is_model_availability_error(error: &str) -> bool {
+    error.starts_with("model_availability:")
+        || error == "OpenCode semantic role timed out"
+        || error == "OpenCode task timed out"
 }
 
 async fn candidate_review_context(
