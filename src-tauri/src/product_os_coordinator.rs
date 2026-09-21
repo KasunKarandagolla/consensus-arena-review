@@ -3047,6 +3047,13 @@ pub async fn inject_owner_guidance(
 
     // Publish newer owner authority before touching the live task. Every stale
     // coordinator write from the old epoch is rejected by save_run().
+    if crate::work_graph::guidance_supersedes_prior_research(&guidance) {
+        for prior in &mut run.research_mandates {
+            if prior.status != crate::work_graph::ResearchMandateStatus::Satisfied {
+                prior.status = crate::work_graph::ResearchMandateStatus::Superseded;
+            }
+        }
+    }
     run.owner_directives.push(directive.clone());
     if let Some(mandate) = mandate.clone() {
         run.research_mandates.push(mandate);
