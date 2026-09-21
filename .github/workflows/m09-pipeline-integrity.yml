@@ -1,0 +1,82 @@
+name: M09 Pipeline Integrity
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - chatgpt/arena-m09cd-rebuild
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m09-pipeline-integrity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-integrity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact recovery branch
+        uses: actions/checkout@v4
+
+      - name: Install Tauri Linux prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y             libwebkit2gtk-4.1-dev             build-essential             curl             wget             file             libxdo-dev             libssl-dev             libayatana-appindicator3-dev             librsvg2-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Rust format
+        id: rustfmt
+        continue-on-error: true
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Rust tests
+        id: rusttests
+        continue-on-error: true
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast
+
+      - name: Rust check
+        id: rustcheck
+        continue-on-error: true
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Diff hygiene
+        id: diffcheck
+        continue-on-error: true
+        run: git diff --check
+
+      - name: Integrity gate
+        if: always()
+        env:
+          RUSTFMT: ${{ steps.rustfmt.outcome }}
+          RUSTTESTS: ${{ steps.rusttests.outcome }}
+          RUSTCHECK: ${{ steps.rustcheck.outcome }}
+          DIFFCHECK: ${{ steps.diffcheck.outcome }}
+        run: |
+          printf 'rustfmt=%s\nrusttests=%s\nrustcheck=%s\ndiffcheck=%s\n' \
+            "$RUSTFMT" "$RUSTTESTS" "$RUSTCHECK" "$DIFFCHECK"
+          test "$RUSTFMT" = success
+          test "$RUSTTESTS" = success
+          test "$RUSTCHECK" = success
+          test "$DIFFCHECK" = success

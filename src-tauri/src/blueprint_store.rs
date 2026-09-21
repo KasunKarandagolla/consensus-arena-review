@@ -18,19 +18,19 @@ pub enum SectionStatus {
 impl SectionStatus {
     fn as_str(&self) -> &'static str {
         match self {
-            SectionStatus::Draft       => "draft",
-            SectionStatus::Agreed      => "agreed",
+            SectionStatus::Draft => "draft",
+            SectionStatus::Agreed => "agreed",
             SectionStatus::Negotiation => "negotiation",
-            SectionStatus::Disputed    => "disputed",
+            SectionStatus::Disputed => "disputed",
         }
     }
 
     fn from_str(s: &str) -> Self {
         match s {
-            "agreed"      => SectionStatus::Agreed,
+            "agreed" => SectionStatus::Agreed,
             "negotiation" => SectionStatus::Negotiation,
-            "disputed"    => SectionStatus::Disputed,
-            _             => SectionStatus::Draft,
+            "disputed" => SectionStatus::Disputed,
+            _ => SectionStatus::Draft,
         }
     }
 }
@@ -130,9 +130,7 @@ impl BlueprintStore {
                     row.get::<_, Option<u32>>(5)?,
                 ))
             })
-            .map_err(|e| {
-                AgentError::DatabaseError(format!("Failed to query sections: {}", e))
-            })?;
+            .map_err(|e| AgentError::DatabaseError(format!("Failed to query sections: {}", e)))?;
 
         let mut sections = Vec::new();
         for row in rows {

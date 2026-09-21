@@ -1,0 +1,60 @@
+command_name,defined_line,registered,return_type,serde_json_wrapped,frontend_caller,frontend_parses_json,unwrap_present,notes
+start_session,131,True,unknown,False,src/components/views/SetupView.tsx,NO,False,
+pause_session,426,True,unknown,False,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+resume_session,437,True,unknown,False,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+abort_session,448,True,unknown,False,src/components/shared/InputBar.tsx,NO,False,
+user_input,485,True,(), String,False,src/components/shared/InputBar.tsx,NO,False,
+provide_user_answer,496,True,unknown,False,src/components/overlays/AskUserPopup.tsx,NO,False,
+save_agent_brain_config,519,True,unknown,False,src/components/views/SetupView.tsx,NO,False,
+setup_agent_sent,593,True,unknown,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+captcha_resolved,603,True,unknown,True,src/components/overlays/CaptchaOverlay.tsx,NO,False,
+retry_setup_agent,619,True,unknown,True,src/components/views/PrimingView.tsx,NO,False,
+confirm_setup_agent,667,True,unknown,True,src/components/views/PrimingView.tsx,NO,False,
+provide_manual_model_response,706,True,unknown,True,src/components/views/ActiveView.tsx,NO,False,
+rate_limit_decision,741,True,unknown,True,src/components/overlays/RateLimitOverlay.tsx,NO,False,
+get_agent_brain_config,759,True,String, String,True,src/components/views/SetupView.tsx;src/panels/SettingsPanel.tsx,YES,False,
+save_secondary_brain_config,773,True,unknown,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+get_secondary_brain_config,820,True,unknown,True,src/panels/SettingsPanel.tsx,YES,False,
+save_fallback_brain_config,843,True,unknown,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+get_fallback_brain_config,895,True,unknown,True,src/panels/SettingsPanel.tsx,YES,False,
+get_custom_participants,911,True,unknown,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+get_participants,930,True,String, String,True,src/panels/SettingsPanel.tsx,YES,False,
+save_custom_participants,989,True,unknown,True,src/panels/SettingsPanel.tsx,NO,False,
+save_prompt_template,1007,True,unknown,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+get_prompt_template,1029,True,unknown,True,src/panels/SettingsPanel.tsx,YES,False,plain_string_exception
+get_maintenance_mode,1052,True,String, String,True,src/panels/SettingsPanel.tsx,YES,False,
+set_maintenance_mode,1064,True,unknown,True,src/panels/SettingsPanel.tsx,YES,False,
+get_diagnostic_snapshot,1118,True,unknown,True,src/panels/SettingsPanel.tsx,YES,False,
+get_browser_timeline,1238,True,String, String,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+get_browser_reliability_report,1247,True,String, String,True,NO_CALLER_FOUND,N/A,False,plain_string_exception;NO_FRONTEND_CALLER
+export_browser_diagnostics,1259,True,String, String,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+run_single_model_diagnostic,1342,True,unknown,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+get_transcript,1421,True,String, String,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+get_session_list,1450,True,String, String,True,src/components/layout/Sidebar.tsx,YES,False,
+export_blueprint,1482,True,unknown,True,src/components/layout/Sidebar.tsx;src/components/views/ActiveView.tsx,MIXED,False,plain_string_exception
+get_agent_health,1546,True,String, String,True,src/components/layout/Sidebar.tsx;src/components/views/SetupView.tsx;src/panels/SettingsPanel.tsx,YES,False,
+delete_session,1571,True,unknown,True,src/components/layout/Sidebar.tsx,YES,False,
+rename_session,1638,True,unknown,True,src/components/layout/Sidebar.tsx,YES,False,
+get_session_details,1678,True,unknown,True,src/components/layout/Sidebar.tsx;src/panels/SettingsPanel.tsx,YES,False,
+get_recovery_state,1733,True,String, String,True,src/App.tsx,YES,False,
+recover_session,1762,True,unknown,False,src/components/layout/Sidebar.tsx,YES,False,
+launch_connected_account,1801,True,unknown,False,src/panels/SettingsPanel.tsx,NO,False,
+get_brain_status,2053,True,String, String,True,src/App.tsx,YES,False,
+get_project_memory,2061,True,unknown,True,src/panels/MemoryPanel.tsx,YES,False,
+get_global_memory,2078,True,String, String,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+clear_project_memory,2092,True,unknown,True,src/panels/MemoryPanel.tsx,NO,False,
+get_open_questions,2108,True,unknown,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+get_model_strengths,2125,True,unknown,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+save_project_config,2142,True,unknown,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+get_project_config,2159,True,unknown,True,src/panels/SettingsPanel.tsx,YES,False,
+get_memory_health,2175,True,String, String,True,src/panels/MemoryPanel.tsx,YES,False,
+repair_memory_index,2189,True,(), String,True,src/panels/MemoryPanel.tsx,YES,False,
+get_patterns,2202,True,unknown,True,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+export_memory,2219,True,unknown,True,src/panels/MemoryPanel.tsx,NO,False,
+restore_memory,2235,True,unknown,True,src/panels/MemoryPanel.tsx,NO,False,
+get_hackathon_config,2279,True,unknown,True,src/components/hackathon/HackathonMiniWindow.tsx;src/components/views/SetupView.tsx,YES,False,
+save_hackathon_config,2293,True,unknown,True,src/components/hackathon/HackathonMiniWindow.tsx;src/components/views/SetupView.tsx,YES,False,
+get_hackathon_run_state,2332,True,unknown,True,src/components/hackathon/HackathonMiniWindow.tsx;src/hooks/useIpcListeners.ts,YES,False,
+cancel_hackathon_run,2346,True,unknown,False,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER
+send_hackathon_invitations,2357,True,unknown,False,src/components/hackathon/HackathonMiniWindow.tsx,YES,False,
+run_hackathon,2659,True,unknown,False,NO_CALLER_FOUND,N/A,False,;NO_FRONTEND_CALLER

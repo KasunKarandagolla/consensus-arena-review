@@ -1,0 +1,207 @@
+name: Windows build and test qualification
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/arena-dev-temp
+
+permissions:
+  contents: read
+
+jobs:
+  windows-dsh-prerequisite:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Record DSH qualification host identity
+        shell: pwsh
+        run: |
+          Get-ComputerInfo -Property WindowsProductName,WindowsVersion,OsBuildNumber | Format-List
+          git --version
+
+      - name: Clean install and run Arena DSH prerequisite probe without credentials
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = 'input validation'
+          $result = 'BLOCK'
+          $reason = 'qualification did not complete'
+          $runtimeRoot = Join-Path $env:GITHUB_WORKSPACE 'src-tauri/project-docs/audits/dsh-runtime-reproducibility'
+          $expectedManifestHash = '2a227dd10076bfe86a0a453ee9b6da163087210e6f9e354f484906ecb13a4baa'
+          $expectedLockHash = '563f454a9e732e1090be474dfde3261fc479b648fa295ad0809f88056f712582'
+          $expectedDsh = '0.1.5-rc.1'
+          $expectedHarness = '3.8.3'
+          $nodeVersion = ''
+          $npmVersion = ''
+          $manifestHash = ''
+          $lockHash = ''
+          $installedHarnessVersion = ''
+          $reportedDshVersion = ''
+          try {
+            $nodeVersion = (& node --version | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $nodeVersion -ne 'v22.22.2') {
+              throw "Expected Node v22.22.2; found '$nodeVersion'."
+            }
+            $npmVersion = (& npm --version | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $npmVersion -ne '10.9.7') {
+              throw "Expected npm 10.9.7; found '$npmVersion'."
+            }
+
+            $manifestPath = Join-Path $runtimeRoot 'package.json'
+            $lockPath = Join-Path $runtimeRoot 'package-lock.json'
+            $manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $lockHash = (Get-FileHash -LiteralPath $lockPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($manifestHash -ne $expectedManifestHash -or $lockHash -ne $expectedLockHash) {
+              throw "Pinned DSH qualification manifest/lock hash mismatch (manifest=$manifestHash lock=$lockHash)."
+            }
+
+            if (Test-Path Env:ARENA_DSH_API_KEY) {
+              Remove-Item Env:ARENA_DSH_API_KEY
+            }
+            $stage = 'clean locked install'
+            Push-Location $runtimeRoot
+            try {
+              & npm ci --no-audit --no-fund --engine-strict
+              if ($LASTEXITCODE -ne 0) {
+                throw "npm ci exited with code $LASTEXITCODE."
+              }
+            }
+            finally {
+              Pop-Location
+            }
+
+            $installedDshPath = Join-Path $runtimeRoot 'node_modules/@deepseek-ai/dsh/package.json'
+            $installedDsh = (Get-Content -Raw -LiteralPath $installedDshPath | ConvertFrom-Json).version
+            if ($installedDsh -ne $expectedDsh) {
+              throw "Expected top-level @deepseek-ai/dsh $expectedDsh; found '$installedDsh'."
+            }
+            $installedHarnessPath = Join-Path $runtimeRoot 'node_modules/@mstar-harness/dsh/package.json'
+            $installedHarness = (Get-Content -Raw -LiteralPath $installedHarnessPath | ConvertFrom-Json).version
+            $installedHarnessVersion = $installedHarness
+            if ($installedHarness -ne $expectedHarness) {
+              throw "Expected @mstar-harness/dsh $expectedHarness; found '$installedHarness'."
+            }
+
+            $dshCommand = Join-Path $runtimeRoot 'node_modules/.bin/dsh.cmd'
+            if (-not (Test-Path -LiteralPath $dshCommand -PathType Leaf)) {
+              throw "npm did not create the Windows DSH launcher at '$dshCommand'."
+            }
+            $env:ARENA_DSH_HOME = Join-Path $env:RUNNER_TEMP 'arena-dsh-qualification-home'
+            New-Item -ItemType Directory -Path $env:ARENA_DSH_HOME -Force | Out-Null
+            $stage = 'exact DSH executable version'
+            $versionLines = & $dshCommand --version 2>&1
+            $versionExit = $LASTEXITCODE
+            $versionText = ($versionLines | Out-String).Trim()
+            $reportedDshVersion = $versionText
+            Write-Host "dsh --version: $versionText"
+            if ($versionExit -ne 0 -or $versionText -notmatch '(?<![A-Za-z0-9])0\.1\.5-rc\.1(?![A-Za-z0-9])') {
+              throw "Expected dsh --version to report exactly $expectedDsh; exit=$versionExit output='$versionText'."
+            }
+
+            $stage = 'Arena five-second headless prerequisite probe'
+            $env:ARENA_DSH_EXECUTABLE = $dshCommand
+            $env:ARENA_DSH_API_KEY = ''
+            & cargo test --manifest-path src-tauri/Cargo.toml dsh_worker::tests::installed_windows_dsh_passes_arena_prerequisite_probe -- --ignored --exact --nocapture
+            if ($LASTEXITCODE -ne 0) {
+              throw "Arena prerequisite test exited with code $LASTEXITCODE."
+            }
+            $result = 'PASS'
+            $reason = 'The locked Windows DSH install passed Arena version and five-second headless prerequisite checks without a provider credential.'
+          }
+          catch {
+            $reason = "${stage}: $($_.Exception.Message)"
+            Write-Host "DSH_WINDOWS_RESULT=BLOCK"
+            Write-Host "DSH_WINDOWS_REASON=$reason"
+          }
+          finally {
+            $summary = @(
+              '## Windows DSH prerequisite qualification',
+              "- Result: **$result**",
+              "- Stage: $stage",
+              "- Node: $nodeVersion",
+              "- npm: $npmVersion",
+              "- DSH CLI version: $reportedDshVersion",
+              "- Harness version: $installedHarnessVersion",
+              "- Manifest SHA256: $manifestHash",
+              "- Lock SHA256: $lockHash",
+              "- Provider credential supplied: no",
+              "- Detail: $reason"
+            ) -join "`n"
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $summary
+            Write-Host "DSH_WINDOWS_RESULT=$result"
+            Write-Host "DSH_WINDOWS_REASON=$reason"
+          }
+          if ($result -ne 'PASS') {
+            exit 1
+          }
+
+  windows-build-test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+
+      - name: Set up Python for production verifier process tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up stable Rust and rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Record non-secret toolchain identity
+        shell: pwsh
+        run: |
+          Get-ComputerInfo -Property WindowsProductName,WindowsVersion,OsBuildNumber | Format-List
+          node --version
+          npm --version
+          python --version
+          rustc --version
+          cargo --version
+          git --version
+
+      - name: Install locked frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Run Rust test suite
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast
+
+      - name: Check Windows Rust application
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Build unsigned Windows NSIS package
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Retain unsigned installer as qualification artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-nsis-${{ github.sha }}
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14

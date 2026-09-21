@@ -1,6 +1,7 @@
 /// <reference types="vite/client" />
 import { useEffect } from 'react'
 import { safeInvoke as invoke } from '@/lib/tauri'
+import { loadParticipants } from '@/lib/agents'
 import { useIpcListeners } from '@/hooks/useIpcListeners'
 import { useAppStore } from '@/stores/useAppStore'
 import Sidebar from '@/components/layout/Sidebar'
@@ -8,16 +9,18 @@ import EmptyView from '@/components/views/EmptyView'
 import SetupView from '@/components/views/SetupView'
 import PrimingView from '@/components/views/PrimingView'
 import ActiveView from '@/components/views/ActiveView'
+import DeliveryView from '@/components/views/DeliveryView'
 import AskUserPopup from '@/components/overlays/AskUserPopup'
 import CaptchaOverlay from '@/components/overlays/CaptchaOverlay'
 import RateLimitOverlay from '@/components/overlays/RateLimitOverlay'
 import Toast from '@/components/shared/Toast'
 import DebugPanel from '@/components/shared/DebugPanel'
+import HackathonMiniWindow from '@/components/hackathon/HackathonMiniWindow'
 
 export default function App() {
   useIpcListeners()
 
-  const { sessionStatus, askUserPending, captchaPending, setRecoveryState } = useAppStore()
+  const { sessionStatus, askUserPending, captchaPending, setRecoveryState, activeMode } = useAppStore()
 
   // Batch D: the runtime <style> injection (INJECTED_STYLES) that used to
   // live here has been removed. All those keyframes/classes now live in
@@ -27,14 +30,35 @@ export default function App() {
   // `className="ca-xxx"` / `animation: 'ca-xxx ...'` reference is
   // unaffected since the class/keyframe names are identical.
 
-  // Check for recoverable session on startup
+  // Check for recoverable session on startup + load the unified participant
+  // registry (built-ins + persisted custom) so every participant consumer and
+  // name resolution is populated for the whole session.
   useEffect(() => {
+    void loadParticipants()
+    invoke<string>('get_delivery_recovery_state')
+      .then((raw) => {
+        if (!raw || raw === 'null') return
+        const delivery = JSON.parse(raw) as import('@/stores/useAppStore').DeliveryState | null
+        if (delivery) {
+          useAppStore.getState().setDeliveryState(delivery)
+          useAppStore.getState().setActiveMode('delivery')
+        }
+      })
+      .catch(() => {})
     invoke<string>('get_recovery_state')
       .then((raw) => {
         const state = JSON.parse(raw) as { available: boolean; session_id: string }
         if (state.available) setRecoveryState(state)
       })
       .catch(console.error)
+    invoke<string>('get_brain_status')
+      .then((raw) => {
+        try {
+          const status = JSON.parse(raw) as { kind: string; model: string }
+          useAppStore.getState().setActiveBrain({ kind: status.kind as import('@/stores/useAppStore').ActiveBrainKind, model: status.model })
+        } catch {}
+      })
+      .catch(() => {})
   }, [setRecoveryState])
 
   const isActive =
@@ -48,16 +72,18 @@ export default function App() {
       <Sidebar />
 
       <main className="main-shell">
-        {sessionStatus === 'idle' && <EmptyView />}
+        {activeMode === 'delivery' && <DeliveryView />}
+        {activeMode === 'consult' && sessionStatus === 'idle' && <EmptyView />}
         {sessionStatus === 'setup' && <SetupView />}
         {(sessionStatus === 'priming' || sessionStatus === 'requirements') && <PrimingView />}
-        {isActive && <ActiveView />}
+        {activeMode === 'consult' && isActive && <ActiveView />}
       </main>
 
       {/* Overlays — always mounted, conditionally visible */}
       {askUserPending && <AskUserPopup />}
       {captchaPending && <CaptchaOverlay />}
       <RateLimitOverlay />
+      <HackathonMiniWindow />
       <Toast />
 
       {import.meta.env.DEV && <DebugPanel />}

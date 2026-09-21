@@ -306,6 +306,13 @@ impl MemoryStore {
         source_agent: &str,
         source_type: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || contains_credential_like_text(category)
+            || contains_credential_like_text(content)
+            || skill_name.is_some_and(contains_credential_like_text)
+        {
+            return Ok(());
+        }
         self.conn
             .execute(
                 "INSERT INTO session_memory
@@ -369,6 +376,16 @@ impl MemoryStore {
         source_agent: &str,
         source_type: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || contains_credential_like_text(category)
+            || contains_credential_like_text(content)
+            || trigger_desc.is_some_and(contains_credential_like_text)
+            || skill_name.is_some_and(contains_credential_like_text)
+            || contains_credential_like_text(source_agent)
+            || contains_credential_like_text(source_type)
+        {
+            return Ok(());
+        }
         let now = chrono::Utc::now().timestamp();
         self.conn
             .execute(
@@ -426,6 +443,9 @@ impl MemoryStore {
         project_brief: &str,
         content: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief) || contains_credential_like_text(content) {
+            return Ok(());
+        }
         let content = safe_prefix(content, 2_000);
         let project_brief = project_brief.to_string();
         self.with_transaction(|tx| {
@@ -592,6 +612,9 @@ impl MemoryStore {
         question: &str,
         raised_iteration: u32,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief) || contains_credential_like_text(question) {
+            return Ok(());
+        }
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO open_questions
@@ -618,6 +641,9 @@ impl MemoryStore {
         question_prefix: &str,
         resolution: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(resolution) {
+            return Ok(());
+        }
         self.conn
             .execute(
                 "UPDATE open_questions
@@ -660,6 +686,13 @@ impl MemoryStore {
         adopted: bool,
         session_id: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || contains_credential_like_text(model_id)
+            || contains_credential_like_text(topic)
+            || contains_credential_like_text(session_id)
+        {
+            return Ok(());
+        }
         self.conn
             .execute(
                 "INSERT INTO model_reliability
@@ -725,6 +758,13 @@ impl MemoryStore {
         pattern_action: &str,
         pattern_outcome: &str,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || contains_credential_like_text(pattern_condition)
+            || contains_credential_like_text(pattern_action)
+            || contains_credential_like_text(pattern_outcome)
+        {
+            return Ok(());
+        }
         let now = chrono::Utc::now().timestamp();
         self.conn
             .execute(
@@ -809,6 +849,14 @@ impl MemoryStore {
         models_consulted: &[String],
         iterations_since_last_section: u32,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || contains_credential_like_text(section_title)
+            || models_consulted
+                .iter()
+                .any(|model| contains_credential_like_text(model))
+        {
+            return Ok(());
+        }
         let topic = detect_topic(section_title).to_string();
         let models_joined = models_consulted.join(", ");
         let title_lower = section_title.to_lowercase();
@@ -885,6 +933,24 @@ impl MemoryStore {
         sections_finalized: u32,
         total_iterations: u32,
     ) -> Result<(), AgentError> {
+        if contains_credential_like_text(project_brief)
+            || summary
+                .investigated
+                .iter()
+                .chain(&summary.completed)
+                .chain(&summary.learned)
+                .chain(&summary.next_steps)
+                .any(|item| contains_credential_like_text(item))
+            || open_questions.iter().any(|question| {
+                contains_credential_like_text(&question.question)
+                    || question
+                        .resolution
+                        .as_deref()
+                        .is_some_and(contains_credential_like_text)
+            })
+        {
+            return Ok(());
+        }
         let project_brief = project_brief.to_string();
         self.with_transaction(|tx| {
             let now = chrono::Utc::now().timestamp();
@@ -1203,6 +1269,77 @@ pub fn safe_prefix(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// Conservative filter for owner-provided values before they enter durable
+/// product memory. Credential-like content is omitted rather than guessed at.
+pub fn contains_credential_like_text(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if [
+        "api_key",
+        "apikey",
+        "api key",
+        "password",
+        "passphrase",
+        "secret",
+        "bearer ",
+        "access token",
+        "refresh token",
+        "private key",
+        "credential",
+        "token=",
+        "authorization",
+        "nvapi-",
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "xoxb-",
+        "eyj",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    value.split_whitespace().any(|token| {
+        let compact = token
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            .collect::<String>();
+        let has_letters = compact
+            .chars()
+            .any(|character| character.is_ascii_alphabetic());
+        let has_digits = compact.chars().any(|character| character.is_ascii_digit());
+        compact.len() >= 24 && ((has_letters && has_digits) || compact.len() >= 32)
+    })
+}
+
+#[cfg(test)]
+mod credential_text_tests {
+    use super::contains_credential_like_text;
+
+    #[test]
+    fn detects_common_credential_markers_and_long_bare_tokens() {
+        for value in [
+            "API key: synthetic-value",
+            "Bearer synthetic-value",
+            "nvapi-synthetic-value",
+            "ghp_synthetic-value",
+            "syntheticcredentialtokenvalue123456",
+            "Use abcdefgh12345678901234567890 for staging",
+        ] {
+            assert!(contains_credential_like_text(value), "missed {value}");
+        }
+        assert!(!contains_credential_like_text(
+            "Choose the first-run setup page"
+        ));
+        assert!(!contains_credential_like_text(
+            "Use the encrypted system vault"
+        ));
+        assert!(!contains_credential_like_text(
+            "Keep the long term product setting"
+        ));
+    }
+}
+
 pub fn normalize_question_key(question: &str) -> String {
     question
         .to_lowercase()
@@ -1353,6 +1490,12 @@ fn upsert_transaction_project_memory(
     content: &str,
     now: i64,
 ) -> Result<(), AgentError> {
+    if contains_credential_like_text(project_brief)
+        || contains_credential_like_text(category)
+        || contains_credential_like_text(content)
+    {
+        return Ok(());
+    }
     tx.execute(
         "INSERT INTO project_memory
          (id, project_brief, category, content, importance, hard_pinned,
@@ -1469,6 +1612,235 @@ mod tests {
         assert_eq!(journal_mode, "wal");
         assert!(user_version >= MEMORY_SCHEMA_VERSION);
         eprintln!("memory smoke database: {}", path.display());
+        Ok(())
+    }
+
+    #[test]
+    fn full_ask_user_question_resolves_its_normalized_open_question_key() -> Result<(), AgentError>
+    {
+        let path = std::env::temp_dir().join(format!(
+            "consensus-arena-memory-question-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let mut store = MemoryStore::new(&path.to_string_lossy())?;
+        let session_id = "memory-question-resolution";
+        let project = "memory question resolution";
+        let question = "Which of these launch options should we use for the first setup flow?";
+
+        store.add_open_question(session_id, project, question, 1)?;
+        store.resolve_question(session_id, question, "Use the first setup option")?;
+
+        assert!(store.get_open_questions(project)?.is_empty());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        Ok(())
+    }
+
+    #[test]
+    fn open_question_storage_skips_credential_like_briefs_questions_and_resolutions()
+    -> Result<(), AgentError> {
+        let mut store = MemoryStore::new_empty();
+        let sensitive_brief = "project abcdefgh12345678901234567890 staging";
+        let sensitive_question = "Use abcdefgh12345678901234567890 for staging?";
+        store.add_open_question("session", sensitive_brief, "Which release target?", 1)?;
+        store.add_open_question("session", "safe project", sensitive_question, 1)?;
+        store.add_open_question("session", "safe project", "Which release target?", 1)?;
+        store.resolve_question(
+            "session",
+            "Which release target?",
+            "Set abcdefgh12345678901234567890",
+        )?;
+
+        assert!(store.get_open_questions(sensitive_brief)?.is_empty());
+        let questions = store.get_open_questions("safe project")?;
+        assert_eq!(questions.len(), 1);
+        assert!(!questions[0].resolved);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase1_runtime_round_trip_and_repair() -> Result<(), AgentError> {
+        let root = std::env::temp_dir().join(format!(
+            "consensus-arena-phase1-memory-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root)
+            .map_err(|error| AgentError::DatabaseError(error.to_string()))?;
+        let source_path = root.join("memory.db");
+        let export_path = root.join("export.db");
+        let restored_path = root.join("restored.db");
+        let source_text = source_path.to_string_lossy().into_owned();
+        let export_text = export_path.to_string_lossy().into_owned();
+        let restored_text = restored_path.to_string_lossy().into_owned();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(MemoryStore::new(&source_text)?));
+
+        let project = "memory runtime qualification";
+        let session = "session-runtime-1";
+        let shared_for_write = shared.clone();
+        crate::db_helpers::run_blocking(move || {
+            let mut memory = shared_for_write
+                .lock()
+                .map_err(|_| AgentError::DatabaseError("memory test lock poisoned".to_string()))?;
+            memory.add_session_fact(
+                session,
+                project,
+                "learned",
+                "SQLite FTS preserves product continuity",
+                None,
+                "leader",
+                "confirmed",
+            )?;
+            memory.save_project_config(project, "Arena owns product truth")?;
+            memory.add_project_memory_with_source(
+                project,
+                "decision",
+                "Use SQLite FTS for product memory search",
+                Some("runtime test"),
+                None,
+                "owner",
+                "confirmed",
+            )?;
+            memory.add_project_memory_with_source(
+                project,
+                "decision",
+                "Use SQLite FTS for product memory search",
+                None,
+                None,
+                "owner",
+                "confirmed",
+            )?;
+            memory.add_project_memory_with_source(
+                project,
+                "decision",
+                "Use SQLite FTS for product memory search",
+                None,
+                None,
+                "owner",
+                "confirmed",
+            )?;
+            memory.add_open_question(session, project, "Which search index should we use?", 1)?;
+            memory.record_model_response(project, "muse", "database", true, session)?;
+            memory.record_model_response(project, "muse", "database", false, session)?;
+            memory.add_pattern(
+                project,
+                "FTS query",
+                "search project memory",
+                "found decision",
+            )?;
+            memory.add_pattern(
+                project,
+                "FTS query",
+                "search project memory",
+                "found decision",
+            )?;
+            memory.write_session_completion_memory(
+                session,
+                project,
+                &SessionSummaryData {
+                    investigated: vec!["SQLite".to_string()],
+                    completed: vec!["memory runtime".to_string()],
+                    learned: vec!["Search is product continuity".to_string()],
+                    next_steps: vec!["Run native UI qualification".to_string()],
+                },
+                &[],
+                3,
+                4,
+            )?;
+            Ok(())
+        })
+        .await?;
+
+        let shared_for_read = shared.clone();
+        let export_for_read = export_text.clone();
+        let snapshot = crate::db_helpers::run_blocking(move || {
+            let mut memory = shared_for_read
+                .lock()
+                .map_err(|_| AgentError::DatabaseError("memory test lock poisoned".to_string()))?;
+            let session_facts = memory.get_session_facts(session)?;
+            let project_memory = memory.get_project_memory(project)?;
+            let search = memory.search_project_memory(project, "SQLite", 5)?;
+            let questions = memory.get_open_questions(project)?;
+            let strengths = memory.get_model_strengths(project)?;
+            let patterns = memory.get_patterns(project)?;
+            let global = memory.get_global_memory()?;
+            let context = memory.build_memory_context(session, project, Some("database"), None)?;
+            memory.export_to(&export_for_read)?;
+            Ok::<_, AgentError>((
+                session_facts,
+                project_memory,
+                search,
+                questions,
+                strengths,
+                patterns,
+                global,
+                context,
+            ))
+        })
+        .await?;
+        assert_eq!(snapshot.0.len(), 1);
+        assert_eq!(
+            snapshot.1.len(),
+            6,
+            "config, decision, and completion facts should persist"
+        );
+        assert!(
+            snapshot
+                .2
+                .iter()
+                .any(|entry| entry.category == "decision" && entry.content.contains("SQLite FTS")),
+            "FTS should find the decision"
+        );
+        assert_eq!(snapshot.3.len(), 1);
+        assert_eq!(snapshot.4[0].label, "moderate");
+        assert_eq!(snapshot.5[0].confidence, 2);
+        assert_eq!(snapshot.6.len(), 1);
+        assert!(snapshot.7.contains("Arena owns product truth"));
+
+        let reopened = MemoryStore::new(&source_text)?;
+        assert_eq!(reopened.get_session_facts(session)?.len(), 1);
+        assert_eq!(
+            reopened.get_project_config(project)?,
+            "Arena owns product truth"
+        );
+        assert!(reopened.check_health().is_healthy);
+
+        let mut restored = MemoryStore::new(&restored_text)?;
+        restored.restore_from(&export_text)?;
+        assert_eq!(
+            restored.get_project_config(project)?,
+            "Arena owns product truth"
+        );
+        assert!(restored.check_health().is_healthy);
+
+        let mut repair = MemoryStore::new(&root.join("repair.db").to_string_lossy())?;
+        repair.add_project_memory(project, "decision", "repairable FTS row", None, None)?;
+        repair
+            .conn
+            .execute("DELETE FROM project_memory_fts", [])
+            .map_err(database_error)?;
+        assert!(
+            repair
+                .search_project_memory(project, "repairable", 5)?
+                .is_empty(),
+            "corrupted FTS index should stop returning the deleted row"
+        );
+        repair.repair_fts_index()?;
+        assert!(
+            !repair
+                .search_project_memory(project, "repairable", 5)?
+                .is_empty(),
+            "FTS repair should restore search results"
+        );
+        assert!(repair.check_health().is_healthy);
+
+        drop(repair);
+        drop(restored);
+        drop(reopened);
+        drop(shared);
+        std::fs::remove_dir_all(root)
+            .map_err(|error| AgentError::DatabaseError(error.to_string()))?;
         Ok(())
     }
 }

@@ -1,19 +1,1176 @@
 use std::collections::HashSet;
+use std::io::Read;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::agent_brain::AgentBrain;
 use crate::browser_backend::{
-    NavEvent, create_windows, get_agent_config, navigate_agent_window, record_nav_event,
-    record_setup_completion,
+    NavEvent, SetupControlKey, create_windows, ensure_nav_window, get_agent_config,
+    navigate_agent_window, record_setup_completion_if_current, resolve_participant,
 };
 use crate::context_manager::ContextManager;
 use crate::errors::AgentError;
 use crate::orchestrator::{AppState, OrchestratorStatus, SessionConfig, SessionType};
 use crate::session_runner::{run_debate, run_setup};
+use crate::settings_store::CustomParticipant;
 use serde::Serialize;
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
+
+pub(crate) fn redact_saved_credentials(text: &str, secrets: &[String]) -> String {
+    credential_scan_literals(secrets)
+        .iter()
+        .fold(text.to_string(), |safe, secret| {
+            crate::dsh_worker::redact_secret(&safe, secret)
+        })
+}
+
+fn prepare_delivery_objective(objective: &str, secrets: &[String]) -> String {
+    redact_saved_credentials(objective, secrets)
+}
+
+fn credential_scan_literals(secrets: &[String]) -> Vec<String> {
+    let mut literals = Vec::new();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        literals.push(secret.clone());
+        if let Ok(encoded) = serde_json::to_string(secret) {
+            if encoded.len() >= 2 {
+                let encoded_contents = encoded[1..encoded.len() - 1].to_string();
+                if !encoded_contents.is_empty() {
+                    literals.push(encoded_contents);
+                }
+            }
+        }
+    }
+    literals.sort();
+    literals.dedup();
+    literals
+}
+
+pub(crate) fn configured_credentials(
+    store: &crate::settings_store::SettingsStore,
+) -> Result<Vec<String>, String> {
+    let mut secrets = Vec::new();
+    for key in ["brain_api_key", "brain_fallback_api_key", "brain2_api_key"] {
+        if let Some(secret) = store
+            .get(key)
+            .map_err(|_| crate::credentials::secure_storage_help().to_string())?
+            .filter(|secret| !secret.is_empty())
+        {
+            secrets.push(secret);
+        }
+    }
+    let config = store
+        .get_hackathon_config()
+        .map_err(|_| crate::credentials::secure_storage_help().to_string())?;
+    secrets.extend(
+        config
+            .models
+            .into_iter()
+            .map(|model| model.api_key)
+            .filter(|secret| !secret.is_empty()),
+    );
+    secrets.sort();
+    secrets.dedup();
+    Ok(secrets)
+}
+
+async fn product_os_safe_text(value: String, state: &AppState) -> Result<String, String> {
+    let (secrets, storage_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !storage_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    Ok(redact_saved_credentials(&value, &secrets))
+}
+
+async fn diagnostic_credentials(state: &AppState) -> Result<Vec<String>, String> {
+    let store = state.settings_store.lock().await;
+    if !store.credential_storage_available() || store.credential_migration_pending() {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    configured_credentials(&store)
+}
+
+const MAX_CREDENTIAL_SCAN_BYTES: u64 = 512 * 1024 * 1024;
+
+fn file_contains_credentials(path: &std::path::Path, secrets: &[String]) -> Result<bool, String> {
+    let literals = credential_scan_literals(secrets);
+    let secrets = literals
+        .iter()
+        .map(|secret| secret.as_bytes())
+        .collect::<Vec<_>>();
+    if secrets.is_empty() {
+        return Ok(false);
+    }
+    let metadata = std::fs::metadata(path)
+        .map_err(|_| "could not inspect export for credentials".to_string())?;
+    if metadata.len() > MAX_CREDENTIAL_SCAN_BYTES {
+        return Err("export exceeds the credential scan size limit".to_string());
+    }
+    if secrets.iter().any(|secret| secret.len() > 16 * 1024) {
+        return Err("configured credential exceeds the export scan limit".to_string());
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|_| "could not read export for credential scan".to_string())?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut overlap = vec![Vec::new(); secrets.len()];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| "could not read export for credential scan".to_string())?;
+        if read == 0 {
+            return Ok(false);
+        }
+        for (index, secret) in secrets.iter().enumerate() {
+            let mut window = std::mem::take(&mut overlap[index]);
+            window.extend_from_slice(&buffer[..read]);
+            if window
+                .windows(secret.len())
+                .any(|candidate| candidate == *secret)
+            {
+                return Ok(true);
+            }
+            let keep = secret.len().saturating_sub(1).min(window.len());
+            overlap[index].extend_from_slice(&window[window.len() - keep..]);
+        }
+    }
+}
+
+pub(crate) fn directory_contains_credentials(
+    root: &std::path::Path,
+    secrets: &[String],
+) -> Result<bool, String> {
+    let literals = credential_scan_literals(secrets);
+    let mut stack = vec![root.to_path_buf()];
+    let mut count = 0usize;
+    let mut scanned_bytes = 0u64;
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .map_err(|_| "could not inspect export files for credentials".to_string())?
+        {
+            count = count.saturating_add(1);
+            if count > 20_000 {
+                return Err("export exceeds the credential scan file limit".to_string());
+            }
+            let entry =
+                entry.map_err(|_| "could not inspect export files for credentials".to_string())?;
+            let file_name = entry.file_name();
+            if file_name == ".git" {
+                continue;
+            }
+            let path_text = file_name.to_string_lossy();
+            if literals.iter().any(|secret| path_text.contains(secret)) {
+                return Ok(true);
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|_| "could not inspect export files for credentials".to_string())?;
+            if file_type.is_symlink() {
+                let path = entry.path().to_string_lossy().into_owned();
+                if literals.iter().any(|secret| path.contains(secret)) {
+                    return Ok(true);
+                }
+            } else if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                let metadata = entry
+                    .metadata()
+                    .map_err(|_| "could not inspect export files for credentials".to_string())?;
+                scanned_bytes = scanned_bytes.saturating_add(metadata.len());
+                if scanned_bytes > MAX_CREDENTIAL_SCAN_BYTES {
+                    return Err("export exceeds the credential scan size limit".to_string());
+                }
+                if file_contains_credentials(&entry.path(), secrets)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+struct ExportDirectoryGuard {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+
+struct ExportFileGuard {
+    path: std::path::PathBuf,
+    keep: bool,
+}
+
+impl Drop for ExportFileGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to remove temporary export file"
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ExportDirectoryGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            if let Err(error) = std::fs::remove_dir_all(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = %error,
+                        "failed to remove temporary diagnostic export"
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl ExportFileGuard {
+    fn remove_now(&mut self) -> std::io::Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {
+                self.keep = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.keep = true;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl ExportDirectoryGuard {
+    fn remove_now(&mut self) -> std::io::Result<()> {
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => {
+                self.keep = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.keep = true;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+async fn git_command(
+    repo: &std::path::Path,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    crate::git_runtime::output(repo, args).await
+}
+
+async fn read_delivery_state(
+    state: &AppState,
+) -> Result<Option<crate::delivery::DeliveryState>, String> {
+    let db = state.transcript_store.clone();
+    let raw = crate::db_helpers::run_blocking(move || {
+        let store = db.lock().map_err(|_| {
+            crate::errors::AgentError::DatabaseError(
+                "delivery transcript lock poisoned".to_string(),
+            )
+        })?;
+        store.get_latest_delivery_state()
+    })
+    .await
+    .map_err(|error| format!("read delivery state: {error}"))?;
+    let raw = raw.or_else(|| std::fs::read_to_string(&state.delivery_state_path).ok());
+    raw.map(|value| {
+        serde_json::from_str(&value).map_err(|error| format!("invalid delivery state: {error}"))
+    })
+    .transpose()
+}
+
+async fn launch_delivery(
+    state: &AppState,
+    app: &AppHandle,
+    value: crate::delivery::DeliveryState,
+    resume: bool,
+) -> Result<(), String> {
+    let id = value.session_id.clone();
+    let permit = if resume {
+        state.session_runtime.try_acquire_resume(id)?
+    } else {
+        state.session_runtime.try_acquire_start(id)?
+    };
+    launch_delivery_with_permit(state, app, value, permit)
+}
+
+fn launch_delivery_with_permit(
+    state: &AppState,
+    app: &AppHandle,
+    value: crate::delivery::DeliveryState,
+    permit: crate::session_runtime::SessionStartPermit,
+) -> Result<(), String> {
+    let owner = permit.owner();
+    let handle = tokio::spawn(crate::delivery::run(
+        state.session_runtime.clone(),
+        app.clone(),
+        value,
+        state.delivery_state_path.clone(),
+        owner,
+        state.delivery_state.clone(),
+        state.transcript_store.clone(),
+        state.ask_user_tx.clone(),
+        state.settings_store.clone(),
+    ));
+    let (activate_tx, _activate_rx) = tokio::sync::oneshot::channel();
+    permit.commit(handle, activate_tx)
+}
+
+async fn rollback_delivery_admission(
+    state: &AppState,
+    repo: &std::path::Path,
+    worktree: &std::path::Path,
+    branch: &str,
+    session_id: &str,
+    branch_preexisted: bool,
+    worktree_created: bool,
+    session_attempted: bool,
+    previous_state_file: Option<&[u8]>,
+    previous_state_slot: Option<crate::delivery::DeliveryState>,
+) {
+    if worktree_created {
+        let args = vec![
+            "worktree".into(),
+            "remove".into(),
+            "--force".into(),
+            worktree.as_os_str().to_os_string(),
+        ];
+        let _ = crate::git_runtime::output_owned(repo, &args).await;
+    }
+    if !branch_preexisted {
+        let _ = git_command(repo, &["branch", "-D", branch]).await;
+    }
+    if session_attempted {
+        let db = state.transcript_store.clone();
+        let session_id = session_id.to_string();
+        let _ = crate::db_helpers::run_blocking(move || {
+            let mut store = db.lock().map_err(|_| {
+                crate::errors::AgentError::DatabaseError(
+                    "delivery transcript lock poisoned during rollback".to_string(),
+                )
+            })?;
+            store.delete_delivery_state(&session_id)?;
+            let _ = store.delete_session(&session_id);
+            Ok::<(), crate::errors::AgentError>(())
+        })
+        .await;
+    }
+    match previous_state_file {
+        Some(contents) => {
+            let _ = std::fs::write(&state.delivery_state_path, contents);
+        }
+        None => {
+            let _ = std::fs::remove_file(&state.delivery_state_path);
+        }
+    }
+    *state.delivery_state.lock().await = previous_state_slot;
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn start_delivery(
+    objective: String,
+    repo_path: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let mut objective = objective.trim().to_string();
+    if objective.is_empty() {
+        return Err("Build objective is required".to_string());
+    }
+    let repo = std::path::PathBuf::from(repo_path.trim());
+    if !repo.is_dir() {
+        return Err("Project folder does not exist".to_string());
+    }
+    let repo = repo
+        .canonicalize()
+        .map_err(|error| format!("resolve project folder: {error}"))?;
+    let top = git_command(&repo, &["rev-parse", "--show-toplevel"]).await?;
+    if !top.status.success() {
+        return Err("Project folder must be a Git repository".to_string());
+    }
+    let git_root = std::path::PathBuf::from(String::from_utf8_lossy(&top.stdout).trim());
+    if git_root.canonicalize().ok().as_ref() != Some(&repo) {
+        return Err("Choose the repository root, not a subdirectory".to_string());
+    }
+    let base = crate::delivery::validate_clean_base(&repo).await?;
+    let use_opencode = crate::opencode_adapter::enabled();
+    if !use_opencode {
+        return Err(
+            "OpenCode is the only active V1 Delivery runtime; the legacy DSH fallback is not admitted"
+                .to_string(),
+        );
+    }
+    let opencode = crate::opencode_adapter::runtime_status().await;
+    if !opencode.compatible {
+        return Err(opencode.message);
+    }
+    let (saved_secrets, credentials_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !credentials_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    objective = prepare_delivery_objective(&objective, &saved_secrets);
+    let previous_state_file = match std::fs::read(&state.delivery_state_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("read existing delivery state: {error}")),
+    };
+    let previous_state_slot = state.delivery_state.lock().await.clone();
+    let id = Uuid::new_v4().to_string();
+    let short = id.chars().take(8).collect::<String>();
+    let branch = format!("arena-delivery/{short}");
+    let branch_ref = format!("refs/heads/{branch}");
+    let branch_preexisted = git_command(&repo, &["show-ref", "--verify", &branch_ref])
+        .await
+        .map(|output| output.status.success())?;
+    // Reserve the single runtime owner before creating any worktree, session
+    // row, or persisted delivery state. Concurrent Build clicks must not
+    // leave an orphaned candidate after one launch loses admission.
+    let permit = state
+        .session_runtime
+        .try_acquire_start(id.clone())
+        .map_err(|error| error.to_string())?;
+    let data_dir = state
+        .delivery_state_path
+        .parent()
+        .ok_or_else(|| "invalid Arena data directory".to_string())?;
+    let worktree = data_dir.join("delivery-worktrees").join(&id);
+    if worktree.exists() {
+        return Err("delivery worktree path already exists".to_string());
+    }
+    if let Err(error) = std::fs::create_dir_all(
+        worktree
+            .parent()
+            .ok_or_else(|| "invalid worktree directory".to_string())?,
+    ) {
+        return Err(format!("create delivery worktree directory: {error}"));
+    }
+    match crate::delivery::create_candidate_worktree(&repo, &worktree, &branch, &base).await {
+        Ok(()) => {}
+        Err(error) => {
+            let partially_created = worktree.exists();
+            rollback_delivery_admission(
+                state.inner(),
+                &repo,
+                &worktree,
+                &branch,
+                &id,
+                branch_preexisted,
+                partially_created,
+                false,
+                previous_state_file.as_deref(),
+                previous_state_slot.clone(),
+            )
+            .await;
+            return Err(error);
+        }
+    }
+    let worktree_created = true;
+    let id_for_db = id.clone();
+    let config = SessionConfig {
+        session_id: id.clone(),
+        project_brief: objective.clone(),
+        session_type: SessionType::Delivery,
+        agent_ids: Vec::new(),
+        leader_agent_id: String::new(),
+    };
+    let db = state.transcript_store.clone();
+    let session_result = crate::db_helpers::run_blocking(move || {
+        let mut store = db.lock().map_err(|_| {
+            crate::errors::AgentError::DatabaseError(
+                "delivery transcript lock poisoned".to_string(),
+            )
+        })?;
+        store.create_session(&config)
+    })
+    .await;
+    if let Err(error) = session_result {
+        rollback_delivery_admission(
+            state.inner(),
+            &repo,
+            &worktree,
+            &branch,
+            &id,
+            branch_preexisted,
+            worktree_created,
+            true,
+            previous_state_file.as_deref(),
+            previous_state_slot.clone(),
+        )
+        .await;
+        return Err(format!("create delivery session: {error}"));
+    }
+    let now = chrono::Utc::now().timestamp();
+    let mut value = crate::delivery::DeliveryState {
+        schema_version: crate::delivery::DELIVERY_SCHEMA_VERSION,
+        session_id: id_for_db.clone(),
+        objective: objective.clone(),
+        source_workspace: repo.to_string_lossy().into(),
+        worktree_path: worktree.to_string_lossy().into(),
+        branch_name: branch.clone(),
+        base_commit: base,
+        phase: crate::delivery::DeliveryPhase::Preparing,
+        contract: Some(crate::delivery::DeliveryContract {
+            revision: 1,
+            objective,
+            acceptance_criteria: Vec::new(),
+            constraints: vec!["No deployment or external infrastructure changes".to_string()],
+            worker_brief: "Acceptance tests are frozen before implementation".to_string(),
+        }),
+        user_answers: Vec::new(),
+        protected_files: Vec::new(),
+        protected_hashes: Vec::new(),
+        verification_commands: Vec::new(),
+        acceptance_commit: None,
+        attempt: 0,
+        pending_question: None,
+        waiting_phase: None,
+        candidate_commit: None,
+        last_worker_summary: None,
+        last_verification: None,
+        runtime: if use_opencode {
+            crate::delivery::DeliveryRuntime::OpenCode
+        } else {
+            crate::delivery::DeliveryRuntime::Dsh
+        },
+        work_order: None,
+        evidence: Vec::new(),
+        semantic_reviews: Vec::new(),
+        authority_records: None,
+        build_package: None,
+        created_at: now,
+        updated_at: now,
+        message: "Preparing project…".to_string(),
+    };
+    if let Err(error) = crate::delivery::persist_state(
+        &state.delivery_state_path,
+        &state.delivery_state,
+        &state.transcript_store,
+        &mut value,
+    )
+    .await
+    {
+        rollback_delivery_admission(
+            state.inner(),
+            &repo,
+            &worktree,
+            &branch,
+            &id,
+            branch_preexisted,
+            worktree_created,
+            true,
+            previous_state_file.as_deref(),
+            previous_state_slot.clone(),
+        )
+        .await;
+        return Err(error);
+    }
+    let owner = permit.owner();
+    if let Err(error) = launch_delivery_with_permit(state.inner(), &app, value, permit) {
+        // A stop racing the final handoff owns cleanup and will persist the
+        // cancelled state. If the permit became stale without that owner,
+        // clean up the new admission artifacts here.
+        if state.session_runtime.current_owner().as_ref() != Some(&owner) {
+            rollback_delivery_admission(
+                state.inner(),
+                &repo,
+                &worktree,
+                &branch,
+                &id,
+                branch_preexisted,
+                worktree_created,
+                true,
+                previous_state_file.as_deref(),
+                previous_state_slot,
+            )
+            .await;
+        }
+        return Err(error);
+    }
+    Ok(id_for_db)
+}
+
+#[tauri::command]
+pub async fn get_delivery_state(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    serde_json::to_string(&read_delivery_state(state.inner()).await?)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn create_product_research_work_order(
+    project_id: String,
+    question: String,
+    source_url: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let question = product_os_safe_text(question, state.inner()).await?;
+    let source_url = product_os_safe_text(source_url, state.inner()).await?;
+    let order = crate::product_os_runtime::create_research_work_order(
+        state.transcript_store.clone(),
+        project_id,
+        question,
+        source_url,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_product_research_work_order(
+    work_order_id: String,
+    source_url: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let source_url = product_os_safe_text(source_url, state.inner()).await?;
+    let order = crate::product_os_runtime::run_research_work_order(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        work_order_id,
+        source_url,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn create_product_web_research_work_order(
+    project_id: String,
+    question: String,
+    category: crate::product_os::ProductResearchCategory,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let question = product_os_safe_text(question, state.inner()).await?;
+    let order = crate::product_os_runtime::create_web_discovery_work_order(
+        state.transcript_store.clone(),
+        project_id,
+        question,
+        category,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_product_web_research_work_order(
+    work_order_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let order = crate::product_os_runtime::run_web_discovery_work_order(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        work_order_id,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn create_product_fact_verifier_work_order(
+    project_id: String,
+    evidence_id: String,
+    source_url: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let evidence_id = product_os_safe_text(evidence_id, state.inner()).await?;
+    let source_url = product_os_safe_text(source_url, state.inner()).await?;
+    let order = crate::product_os_runtime::create_fact_verifier_work_order(
+        state.transcript_store.clone(),
+        project_id,
+        evidence_id,
+        source_url,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_product_fact_verifier_work_order(
+    work_order_id: String,
+    source_url: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let source_url = product_os_safe_text(source_url, state.inner()).await?;
+    let order = crate::product_os_runtime::run_fact_verifier_work_order(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        work_order_id,
+        source_url,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn create_product_web_fact_verifier_work_order(
+    project_id: String,
+    evidence_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let evidence_id = product_os_safe_text(evidence_id, state.inner()).await?;
+    let order = crate::product_os_runtime::create_web_fact_verifier_work_order(
+        state.transcript_store.clone(),
+        project_id,
+        evidence_id,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_product_web_fact_verifier_work_order(
+    work_order_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let order = crate::product_os_runtime::run_web_fact_verifier_work_order(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        work_order_id,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn cancel_product_work_order(
+    work_order_id: String,
+    reason: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let reason = product_os_safe_text(reason, state.inner()).await?;
+    let order = crate::product_os_runtime::cancel_product_work_order(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        work_order_id,
+        reason,
+    )
+    .await?;
+    serde_json::to_string(&order).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_product_os_snapshot(
+    project_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let snapshot = crate::product_os_runtime::snapshot(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+        project_id,
+    )
+    .await?;
+    serde_json::to_string(&snapshot).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_latest_product_os_snapshot(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let snapshot = crate::product_os_runtime::latest_snapshot(
+        state.transcript_store.clone(),
+        state.session_runtime.clone(),
+    )
+    .await?;
+    serde_json::to_string(&snapshot).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn admit_product_ambiguity(
+    project_id: String,
+    work_order_id: String,
+    ambiguity_id: String,
+    question_id: String,
+    question: String,
+    affected_commitment: String,
+    severity: crate::evidence_gates::AmbiguitySeverity,
+    evidence_ids: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let ambiguity_id = product_os_safe_text(ambiguity_id, state.inner()).await?;
+    let question_id = product_os_safe_text(question_id, state.inner()).await?;
+    let question = product_os_safe_text(question, state.inner()).await?;
+    let affected_commitment = product_os_safe_text(affected_commitment, state.inner()).await?;
+    let ambiguity = crate::product_os_runtime::admit_ambiguity(
+        state.transcript_store.clone(),
+        project_id,
+        work_order_id,
+        ambiguity_id,
+        question_id,
+        question,
+        affected_commitment,
+        severity,
+        evidence_ids,
+    )
+    .await?;
+    serde_json::to_string(&ambiguity).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn provide_product_owner_decision(
+    project_id: String,
+    ambiguity_id: String,
+    question_id: String,
+    selected_option: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let project_id = product_os_safe_text(project_id, state.inner()).await?;
+    let ambiguity_id = product_os_safe_text(ambiguity_id, state.inner()).await?;
+    let question_id = product_os_safe_text(question_id, state.inner()).await?;
+    let selected_option = product_os_safe_text(selected_option, state.inner()).await?;
+    let records = crate::product_os_runtime::adopt_owner_decision(
+        state.transcript_store.clone(),
+        project_id,
+        ambiguity_id,
+        question_id,
+        selected_option,
+    )
+    .await?;
+    serde_json::to_string(&records).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_dsh_prerequisite() -> Result<String, String> {
+    if crate::opencode_adapter::enabled() {
+        serde_json::to_string(&crate::opencode_adapter::runtime_status().await)
+    } else {
+        serde_json::to_string(&crate::dsh_worker::check_prerequisite().await)
+    }
+    .map_err(|error| error.to_string())
+}
+
+fn product_coordinator_context(
+    state: &AppState,
+    app: Option<AppHandle>,
+) -> crate::product_os_coordinator::CoordinatorContext {
+    crate::product_os_coordinator::CoordinatorContext {
+        db: state.transcript_store.clone(),
+        runtime: state.session_runtime.clone(),
+        coordinator_lock: state.product_coordinator_lock.clone(),
+        delivery_state_path: state.delivery_state_path.clone(),
+        delivery_slot: state.delivery_state.clone(),
+        settings: state.settings_store.clone(),
+        memory: state.memory_store.clone(),
+        ask_user_tx: state.ask_user_tx.clone(),
+        app,
+        role_scheduler: Arc::new(crate::pipeline_contract::ResourceScheduler::default()),
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn start_product_project(
+    founder_idea: String,
+    repo_path: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let founder_idea = product_os_safe_text(founder_idea, state.inner()).await?;
+    let repo_path = product_os_safe_text(repo_path, state.inner()).await?;
+    let run = crate::product_os_coordinator::start(
+        product_coordinator_context(state.inner(), Some(app)),
+        founder_idea,
+        repo_path,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_product_coordinator_status(
+    run_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let run_id = match run_id {
+        Some(value) => Some(product_os_safe_text(value, state.inner()).await?),
+        None => None,
+    };
+    let status = crate::product_os_coordinator::status(
+        &product_coordinator_context(state.inner(), None),
+        run_id,
+    )
+    .await?;
+    serde_json::to_string(&status).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn answer_product_question(
+    run_id: String,
+    selected_option: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let selected_option = product_os_safe_text(selected_option, state.inner()).await?;
+    let run = crate::product_os_coordinator::answer_owner_question(
+        product_coordinator_context(state.inner(), Some(app)),
+        run_id,
+        selected_option,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_product_functional_state(
+    run_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let view =
+        crate::functional_contract::load_functional_state(state.transcript_store.clone(), run_id)
+            .await?;
+    serde_json::to_string(&view).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn inject_product_guidance(
+    run_id: String,
+    guidance: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let guidance = product_os_safe_text(guidance, state.inner()).await?;
+    let run = crate::product_os_coordinator::inject_owner_guidance(
+        product_coordinator_context(state.inner(), Some(app)),
+        run_id,
+        guidance,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn request_product_consultation(
+    run_id: String,
+    provider: String,
+    question: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let provider = product_os_safe_text(provider, state.inner()).await?;
+    let question = product_os_safe_text(question, state.inner()).await?;
+    let provider = match provider.trim().to_ascii_lowercase().as_str() {
+        "chatgpt" | "chat_gpt" => crate::consultation_broker::ConsultationProvider::ChatGpt,
+        "qwen" => crate::consultation_broker::ConsultationProvider::Qwen,
+        _ => return Err("M09C consultation currently supports only ChatGPT and Qwen".to_string()),
+    };
+    let run = crate::product_os_coordinator::request_consultation(
+        product_coordinator_context(state.inner(), Some(app)),
+        run_id,
+        provider,
+        question,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn recover_product_consultation(
+    run_id: String,
+    request_id: String,
+    action: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let request_id = product_os_safe_text(request_id, state.inner()).await?;
+    let action = product_os_safe_text(action, state.inner()).await?;
+    let run = crate::product_os_coordinator::recover_consultation(
+        product_coordinator_context(state.inner(), Some(app)),
+        run_id,
+        request_id,
+        action,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn cancel_product_project(
+    run_id: String,
+    reason: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let reason = product_os_safe_text(reason, state.inner()).await?;
+    let run = crate::product_os_coordinator::cancel(
+        product_coordinator_context(state.inner(), None),
+        run_id,
+        reason,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn resume_product_project(
+    run_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let run_id = product_os_safe_text(run_id, state.inner()).await?;
+    let run = crate::product_os_coordinator::resume(
+        product_coordinator_context(state.inner(), Some(app)),
+        run_id,
+    )
+    .await?;
+    serde_json::to_string(&run).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_delivery_recovery_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    get_delivery_state(state).await
+}
+
+#[tauri::command]
+pub async fn resume_delivery(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let mut value = read_delivery_state(state.inner())
+        .await?
+        .ok_or_else(|| "No delivery state to resume".to_string())?;
+    if matches!(
+        value.phase,
+        crate::delivery::DeliveryPhase::Verified
+            | crate::delivery::DeliveryPhase::Applied
+            | crate::delivery::DeliveryPhase::Cancelled
+    ) {
+        return Ok(());
+    }
+    if value.phase == crate::delivery::DeliveryPhase::Preparing
+        || value.phase == crate::delivery::DeliveryPhase::AuthoringAcceptance
+    {
+        crate::delivery::reset_for_recovery(&value, false).await?;
+    }
+    if matches!(
+        value.phase,
+        crate::delivery::DeliveryPhase::Implementing
+            | crate::delivery::DeliveryPhase::Repairing
+            | crate::delivery::DeliveryPhase::Failed
+    ) {
+        let retry_verification = value
+            .last_verification
+            .as_ref()
+            .is_some_and(|receipt| receipt.verdict == "inconclusive");
+        crate::delivery::reset_for_recovery(&value, true).await?;
+        value.phase = if retry_verification {
+            crate::delivery::DeliveryPhase::Verifying
+        } else if value.acceptance_commit.is_some() {
+            crate::delivery::DeliveryPhase::Repairing
+        } else {
+            crate::delivery::DeliveryPhase::AuthoringAcceptance
+        };
+    }
+    launch_delivery(state.inner(), &app, value, true).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn abort_delivery(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let value = read_delivery_state(state.inner())
+        .await?
+        .ok_or_else(|| "No delivery state to abort".to_string())?;
+    if value.session_id != session_id {
+        return Err("The requested delivery is not the current delivery".to_string());
+    }
+    let owner = state.session_runtime.current_owner();
+    if let Some(owner) = owner {
+        if owner.session_id != session_id {
+            return Err("Another session owns the active runtime".to_string());
+        }
+        if let Some(guard) = state.session_runtime.stop_owner(&owner).await? {
+            *state.ask_user_tx.lock().await = None;
+            let mut cancelled = value;
+            cancelled.phase = crate::delivery::DeliveryPhase::Cancelled;
+            if cancelled.runtime == crate::delivery::DeliveryRuntime::OpenCode {
+                if let Some(work_order) = cancelled.work_order.as_mut() {
+                    crate::opencode_adapter::cancel(work_order);
+                }
+            }
+            crate::delivery::persist_state(
+                &state.delivery_state_path,
+                &state.delivery_state,
+                &state.transcript_store,
+                &mut cancelled,
+            )
+            .await?;
+            crate::delivery::emit(&app, &cancelled).await;
+            guard.finish();
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn apply_delivery(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let mut value = read_delivery_state(state.inner())
+        .await?
+        .ok_or_else(|| "No delivery state".to_string())?;
+    if value.session_id != session_id {
+        return Err("The requested delivery is not the current delivery".to_string());
+    }
+    if value.phase == crate::delivery::DeliveryPhase::Verified {
+        crate::delivery::apply_verified_candidate(&mut value).await?;
+        crate::delivery::persist_state(
+            &state.delivery_state_path,
+            &state.delivery_state,
+            &state.transcript_store,
+            &mut value,
+        )
+        .await?;
+        crate::delivery::emit(&app, &value).await;
+    } else if value.phase != crate::delivery::DeliveryPhase::Applied {
+        return Err("Only a Verified delivery can be applied".to_string());
+    }
+    // If Safe Apply already succeeded but Product OS correlation failed or
+    // Arena crashed immediately afterward, this call is reconciliation-only:
+    // it never repeats the Git fast-forward.
+    let _ = crate::product_os_coordinator::mark_delivery_applied(
+        &product_coordinator_context(state.inner(), Some(app)),
+        value.session_id.clone(),
+    )
+    .await?;
+    Ok(())
+}
 
 fn redact_diagnostic_text(value: &str) -> String {
     let mut redact_next = false;
@@ -59,6 +1216,22 @@ fn settings_command_error(stage: &str, error: impl std::fmt::Display) -> String 
     message
 }
 
+async fn require_maintenance_enabled(state: &tauri::State<'_, AppState>) -> Result<(), String> {
+    let enabled = state
+        .settings_store
+        .lock()
+        .await
+        .get_maintenance_mode()
+        .map_err(|e| settings_command_error("Failed to read maintenance mode", e))?;
+    if !enabled {
+        return Err(
+            "Diagnostic capture disabled — enable Maintenance mode to collect diagnostics."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_brain_fields(base_url: &str, model: &str) -> Result<(), String> {
     let base_url = base_url.trim();
     if base_url.is_empty() {
@@ -76,7 +1249,16 @@ fn validate_brain_fields(base_url: &str, model: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_session_agents(agent_ids: &[String], leader_agent_id: &str) -> Result<(), String> {
+/// P1: session participants are validated against the MERGED registry (the
+/// seven built-ins plus any persisted custom participants). Built-in ids are
+/// authoritative; a custom entry colliding with a built-in id would be
+/// re-validated at save time, so here the merged resolver simply returns the
+/// built-in.
+fn validate_session_agents(
+    agent_ids: &[String],
+    leader_agent_id: &str,
+    custom: &[CustomParticipant],
+) -> Result<(), String> {
     if agent_ids.len() < 2 {
         return Err("Select at least two participants.".to_string());
     }
@@ -86,7 +1268,7 @@ fn validate_session_agents(agent_ids: &[String], leader_agent_id: &str) -> Resul
         if !seen.insert(agent_id.clone()) {
             return Err(format!("Duplicate participant selected: {agent_id}"));
         }
-        if get_agent_config(agent_id).is_none() {
+        if resolve_participant(agent_id, custom).is_none() {
             return Err(format!("Unknown participant selected: {agent_id}"));
         }
     }
@@ -111,16 +1293,21 @@ pub async fn start_session(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    validate_session_agents(&agent_ids, &leader_agent_id)?;
-
-    // IMP-3: Concurrency guard — prevent two sessions from running simultaneously.
-    // compare_exchange(false → true): if already true, return error immediately.
-    state
-        .session_active
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .map_err(|_| {
-            "A session is already active. Use Stop to end it before starting a new one.".to_string()
-        })?;
+    let (custom, saved_secrets, credentials_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            store
+                .get_custom_participants()
+                .map_err(|e| settings_command_error("Failed to read custom participants", e))?,
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !credentials_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    let project_brief = redact_saved_credentials(&project_brief, &saved_secrets);
+    validate_session_agents(&agent_ids, &leader_agent_id, &custom)?;
 
     let stype = match session_type.as_str() {
         "architecture" => SessionType::Architecture,
@@ -137,6 +1324,14 @@ pub async fn start_session(
         agent_ids: agent_ids.clone(),
         leader_agent_id: leader_agent_id.clone(),
     };
+    // SessionRuntime ownership: acquire STARTING permit before any fallible setup.
+    // The permit's Drop provides owner-checked rollback if we return before handoff.
+    let start_permit = state
+        .session_runtime
+        .try_acquire_start(config.session_id.clone())
+        .map_err(|e| e.to_string())?;
+    let start_owner = start_permit.owner();
+
     let setup_order = config.setup_order();
     let setup_generation = state
         .setup_generation
@@ -163,19 +1358,17 @@ pub async fn start_session(
             .set("session_complete", "false")
             .map_err(|e| e.to_string())?;
     }
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
     // IMP-10: Reset brain fail counter for the new session.
     state.brain_fail_count.store(0, Ordering::SeqCst);
 
     // Task 10 (HIGH-7): reset per-agent token counts at the session boundary.
-    // Previously these accumulated across the entire app process lifetime —
-    // a session starting now must not inherit counts from whatever ran before
-    // it. token_budget stays a plain in-memory tokio::sync::Mutex (no rusqlite
-    // involved), so this is a direct lock + call, not a db_helpers call.
     {
         let mut tb = state.token_budget.lock().await;
         tb.reset_all();
     }
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
     // Update orchestrator
     {
@@ -190,14 +1383,9 @@ pub async fn start_session(
         let mut ctx = state.context_manager.lock().await;
         *ctx = ContextManager::new(project_brief, stype);
     }
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
     // Create transcript session.
-    //
-    // Task 9 (HIGH-5/HIGH-6): transcript_store is now Arc<std::sync::Mutex<_>>
-    // (see orchestrator.rs) instead of Arc<tokio::sync::Mutex<_>>, so this
-    // synchronous rusqlite write runs inside db_helpers::run_blocking — off
-    // the async runtime thread, with retry/backoff on transient failure —
-    // instead of directly on it via `.lock().await`.
     {
         let store = state.transcript_store.clone();
         let cfg = config.clone();
@@ -210,13 +1398,15 @@ pub async fn start_session(
         .await
         .map_err(|e| e.to_string())?;
     }
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
-    // Build a fresh std::sync::mpsc channel and create windows.
-    let (std_nav_tx, std_nav_rx) = std::sync::mpsc::sync_channel::<NavEvent>(256);
-    let browser_diagnostics = {
+    // Attach this session to the process-lifetime navigation ingress. Named
+    // WebViews keep their original callback sender and can be reused without
+    // destroying authenticated browser state.
+    let tokio_rx = {
         let mut browser = state.browser_state.lock().await;
-        let new_browser = crate::browser_backend::BrowserState::new(std_nav_tx.clone());
-        *browser = new_browser;
+        browser.reset_for_session();
+        let nav_rx = browser.attach_nav_receiver();
         if let Err(error) = create_windows(
             &app,
             &mut browser,
@@ -225,28 +1415,17 @@ pub async fn start_session(
             &config.session_id,
             setup_generation,
             &setup_order,
+            &custom,
         ) {
-            state.session_active.store(false, Ordering::SeqCst);
             {
                 let mut orch = state.orchestrator.lock().await;
                 orch.status = OrchestratorStatus::Ended;
             }
             return Err(error.to_string());
         }
-        browser.diagnostics.clone()
+        nav_rx
     };
-
-    // Bridge std::sync::mpsc → tokio::sync::mpsc for async session runner.
-    let (tokio_tx, tokio_rx) = tokio::sync::mpsc::channel::<NavEvent>(256);
-    let bridge_app = app.clone();
-    std::thread::spawn(move || {
-        while let Ok(event) = std_nav_rx.recv() {
-            record_nav_event(&bridge_app, &browser_diagnostics, &event);
-            if tokio_tx.blocking_send(event).is_err() {
-                break;
-            }
-        }
-    });
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
     app.emit(
         "session-status",
@@ -260,6 +1439,7 @@ pub async fn start_session(
         }),
     )
     .map_err(|e| e.to_string())?;
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
 
     // Clone all Arc fields so the spawned task owns them.
     let config_clone = config.clone();
@@ -276,15 +1456,35 @@ pub async fn start_session(
     let ab_clone = state.agent_brain.clone();
     let aut_clone = state.ask_user_tx.clone();
     let ab2_clone = state.agent_brain_2.clone();
-    // IMP-3 / IMP-5 / IMP-10: new fields
-    let sa_clone = state.session_active.clone();
+    // SessionRuntime ownership handles concurrency; former session_active/resuming removed
+    let rt_clone = state.session_runtime.clone();
     let mh_clone = state.model_health.clone();
     let bfc_clone = state.brain_fail_count.clone();
     let mem_clone = state.memory_store.clone();
     let memory_health = state.last_memory_health.clone();
     let setup_generation_clone = state.setup_generation.clone();
+    let active_brain_clone = state.active_brain.clone();
+    // Hackathon
+    let hk_run_clone = state.hackathon_run.clone();
+    let hk_run_id_clone = state.hackathon_run_id.clone();
+    let hk_cancel_clone = state.hackathon_cancel.clone();
+    let pause_req_clone = state.pause_requested.clone();
+    let checkpoint_clone = state.checkpoint.clone();
+    let delivery_clone = state.delivery_state.clone();
+    let delivery_path_clone = state.delivery_state_path.clone();
+    let product_coordinator_lock_clone = state.product_coordinator_lock.clone();
 
-    tokio::spawn(async move {
+    start_permit.ensure_admitted().map_err(|e| e.to_string())?;
+    let (activate_tx, activate_rx) = tokio::sync::oneshot::channel::<()>();
+    let owner_for_task = start_owner.clone();
+    // Session 03D: this session's setup generation travels into the task by
+    // value, so the failed-setup consumer always compares controls against
+    // its own immutable expectation — never live mutable state.
+    let task_setup_generation = setup_generation;
+    let handle = tokio::spawn(async move {
+        if activate_rx.await.is_err() {
+            return;
+        }
         let state_ref = AppState {
             orchestrator: orch_clone.clone(),
             transcript_store: ts_clone,
@@ -297,19 +1497,28 @@ pub async fn start_session(
             agent_brain: ab_clone,
             ask_user_tx: aut_clone,
             agent_brain_2: ab2_clone,
-            session_active: sa_clone.clone(),
+            session_runtime: rt_clone.clone(),
             model_health: mh_clone,
             brain_fail_count: bfc_clone,
             memory_store: mem_clone,
             last_memory_health: memory_health,
             setup_generation: setup_generation_clone,
+            active_brain: active_brain_clone,
+            hackathon_run: hk_run_clone,
+            hackathon_run_id: hk_run_id_clone,
+            hackathon_cancel: hk_cancel_clone,
+            pause_requested: pause_req_clone,
+            checkpoint: checkpoint_clone,
+            delivery_state: delivery_clone,
+            delivery_state_path: delivery_path_clone,
+            product_coordinator_lock: product_coordinator_lock_clone,
         };
 
         let mut nav_rx = tokio_rx;
 
         // Browser readiness is not a terminal session failure. Keep the
         // windows/session/generation alive and wait for a focused retry.
-        loop {
+        'setup_loop: loop {
             match run_setup(&config_clone, &state_ref, &app_clone, &mut nav_rx).await {
                 Ok(()) => break,
                 Err(e) => {
@@ -317,43 +1526,156 @@ pub async fn start_session(
                         let browser = state_ref.browser_state.lock().await;
                         browser.diagnostics.mark_setup_failed_recoverable()
                     };
-                    let message = format!("Complete login/loading/security check in the model window, then retry setup. {}", e);
-                    app_clone.emit("boss-message", json!({ "text": message, "message_type": "status" })).ok();
-                    app_clone.emit("setup-agent-failed", json!({
-                        "agent_id": agent_id,
-                        "recoverable": true
-                    })).ok();
-                    match nav_rx.recv().await {
-                        Some(NavEvent::ResumeRequested(_)) => continue,
-                        Some(NavEvent::SetupManualConfirmed(agent_id)) => {
-                            app_clone.emit("setup-agent-complete", json!({
+                    let message = format!(
+                        "Complete login/loading/security check in the model window, then retry setup. {}",
+                        e
+                    );
+                    app_clone
+                        .emit(
+                            "boss-message",
+                            json!({ "text": message, "message_type": "status" }),
+                        )
+                        .ok();
+                    app_clone
+                        .emit(
+                            "setup-agent-failed",
+                            json!({
                                 "agent_id": agent_id,
-                                "conversation_url": ""
-                            })).ok();
-                            continue;
+                                "recoverable": true
+                            }),
+                        )
+                        .ok();
+                    // Session 03D: the expected control key is immutable task
+                    // state (session/run/setup/agent). Only an
+                    // identity-bearing control matching all four dimensions
+                    // authorizes retry or completion. Unscoped
+                    // `ResumeRequested` wakeups and stale cross-session
+                    // controls keep this inner wait looping on recv.
+                    'retry_wait: loop {
+                        match nav_rx.recv().await {
+                            Some(event) => {
+                                let expected_key =
+                                    agent_id.as_ref().map(|failed| SetupControlKey {
+                                        session_id: config_clone.session_id.clone(),
+                                        run_generation: owner_for_task.run_generation,
+                                        setup_generation: task_setup_generation,
+                                        agent_id: failed.clone(),
+                                    });
+                                match crate::session_runner::classify_setup_retry_signal(
+                                    expected_key.as_ref(),
+                                    &event,
+                                ) {
+                                    crate::session_runner::SetupRetrySignal::Retry => {
+                                        continue 'setup_loop;
+                                    }
+                                    crate::session_runner::SetupRetrySignal::ManualConfirmed => {
+                                        if let NavEvent::SetupManualConfirmed(key) = &event {
+                                            // Authoritative completion lives
+                                            // here at the exact-current
+                                            // consumer — never in the command
+                                            // producer or the diagnostics
+                                            // mirror.
+                                            let applied = {
+                                                let browser = state_ref.browser_state.lock().await;
+                                                crate::browser_backend::record_setup_completion_if_current(
+                                                    &browser.diagnostics,
+                                                    key,
+                                                    "user_confirmed_manual",
+                                                )
+                                            };
+                                            if applied {
+                                                app_clone
+                                                    .emit(
+                                                        "setup-agent-complete",
+                                                        json!({
+                                                            "agent_id": key.agent_id,
+                                                            "conversation_url": ""
+                                                        }),
+                                                    )
+                                                    .ok();
+                                            }
+                                        }
+                                        continue 'setup_loop;
+                                    }
+                                    crate::session_runner::SetupRetrySignal::Abort => {
+                                        // Owner-checked terminal cleanup: only the live owner may mutate status/runtime.
+                                        let is_owner = state_ref
+                                            .session_runtime
+                                            .current_owner()
+                                            .map(|o| o == owner_for_task)
+                                            .unwrap_or(false);
+                                        if is_owner {
+                                            let mut orch = orch_clone.lock().await;
+                                            orch.status = OrchestratorStatus::Ended;
+                                            app_clone
+                                                .emit(
+                                                    "session-status",
+                                                    json!({ "status": "ended" }),
+                                                )
+                                                .ok();
+                                            state_ref
+                                                .session_runtime
+                                                .mark_completed(&owner_for_task);
+                                        }
+                                        return;
+                                    }
+                                    crate::session_runner::SetupRetrySignal::Ignore => {
+                                        // Stale/unrelated signal while waiting for
+                                        // an explicit retry: record and keep
+                                        // waiting on recv. No setup re-entry.
+                                        let browser = state_ref.browser_state.lock().await;
+                                        crate::browser_backend::record_setup_stale_signal(
+                                            &browser.diagnostics,
+                                            agent_id.as_deref().unwrap_or("setup"),
+                                            &event,
+                                        );
+                                        continue 'retry_wait;
+                                    }
+                                }
+                            }
+                            None => {
+                                // Owner-checked terminal cleanup: only the live owner may mutate status/runtime.
+                                let is_owner = state_ref
+                                    .session_runtime
+                                    .current_owner()
+                                    .map(|o| o == owner_for_task)
+                                    .unwrap_or(false);
+                                if is_owner {
+                                    let mut orch = orch_clone.lock().await;
+                                    orch.status = OrchestratorStatus::Ended;
+                                    app_clone
+                                        .emit("session-status", json!({ "status": "ended" }))
+                                        .ok();
+                                    state_ref.session_runtime.mark_completed(&owner_for_task);
+                                }
+                                return;
+                            }
                         }
-                        Some(NavEvent::SessionAborted) | None => {
-                            let mut orch = orch_clone.lock().await;
-                            orch.status = OrchestratorStatus::Ended;
-                            app_clone.emit("session-status", json!({ "status": "ended" })).ok();
-                            sa_clone.store(false, Ordering::SeqCst);
-                            return;
-                        }
-                        Some(_) => continue,
                     }
                 }
             }
         }
 
-        // Transition to running
+        // Transition to running (owner-checked: only if still live owner)
         {
-            let mut orch = state_ref.orchestrator.lock().await;
-            orch.status = OrchestratorStatus::Running;
+            let is_owner = state_ref
+                .session_runtime
+                .current_owner()
+                .map(|o| o == owner_for_task)
+                .unwrap_or(false);
+            if is_owner {
+                let mut orch = state_ref.orchestrator.lock().await;
+                orch.status = OrchestratorStatus::Running;
+            }
         }
 
-        // IMP-3: sa_clone stays accessible after state_ref is moved into run_debate.
-        // Debate / autonomous loop phase
-        if let Err(e) = run_debate(config_clone, state_ref, app_clone.clone(), nav_rx).await {
+        // Debate / autonomous loop phase — preserve runtime owner for terminal checks
+        let runtime_for_terminal = state_ref.session_runtime.clone();
+        let orch_for_terminal = orch_clone.clone();
+        let owner_for_terminal = owner_for_task.clone();
+        let debate_result =
+            run_debate(config_clone.clone(), state_ref, app_clone.clone(), nav_rx).await;
+        if let Err(e) = &debate_result {
             app_clone
                 .emit(
                     "boss-message",
@@ -363,20 +1685,41 @@ pub async fn start_session(
                     }),
                 )
                 .ok();
-            {
-                let mut orch = orch_clone.lock().await;
+            // Owner-checked: only live owner may set orchestrator to Ended
+            let is_owner = runtime_for_terminal
+                .current_owner()
+                .map(|o| o == owner_for_terminal)
+                .unwrap_or(false);
+            if is_owner {
+                let mut orch = orch_for_terminal.lock().await;
                 orch.status = OrchestratorStatus::Ended;
+                app_clone
+                    .emit("session-status", json!({ "status": "ended" }))
+                    .ok();
             }
-            app_clone
-                .emit("session-status", json!({ "status": "ended" }))
-                .ok();
         }
 
-        // IMP-3: reset flag in ALL remaining exit paths — exit paths 2 and 3.
-        // run_debate either completed successfully (Ok) or errored (Err);
-        // either way the session loop is over.
-        sa_clone.store(false, Ordering::SeqCst);
+        // Owner-checked terminal cleanup: only live owner may mark Finished.
+        // If paused, keep runtime active so resume can continue; do not mark completed.
+        {
+            let orch = orch_for_terminal.lock().await;
+            if orch.status != OrchestratorStatus::Paused {
+                let is_owner = runtime_for_terminal
+                    .current_owner()
+                    .map(|o| o == owner_for_terminal)
+                    .unwrap_or(false);
+                if is_owner {
+                    runtime_for_terminal.mark_completed(&owner_for_terminal);
+                }
+            }
+        }
     });
+    // Handoff ownership to SessionRuntime with task handle and activation gate.
+    // This must be owner-checked: if Stop won the race during STARTING, handoff is rejected and task aborted.
+    // Return Err so the Tauri command reports failure instead of success.
+    if let Err(e) = start_permit.commit(handle, activate_tx) {
+        return Err(e);
+    }
 
     Ok(())
 }
@@ -386,21 +1729,334 @@ pub async fn pause_session(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    let mut orch = state.orchestrator.lock().await;
-    orch.status = OrchestratorStatus::Paused;
-    app.emit("session-status", json!({ "status": "paused" }))
-        .map_err(|e| e.to_string())
+    // Graceful pause requested — backend owns transition to Paused after checkpoint.
+    state.pause_requested.store(true, Ordering::SeqCst);
+    // Keep orchestrator status as Running until checkpoint persisted; response_router will transition to Paused.
+    // Emit intermediate status so frontend can show "Pausing..."
+    let _ = app.emit(
+        "session-status",
+        json!({ "status": "paused", "reason": "pause_requested" }),
+    );
+    Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn resume_session(
+    session_id: Option<String>,
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    let mut orch = state.orchestrator.lock().await;
-    orch.status = OrchestratorStatus::Running;
-    app.emit("session-status", json!({ "status": "running" }))
-        .map_err(|e| e.to_string())
+    // Determine target session_id: explicit param wins, else current orchestrator session
+    let target_sid = if let Some(s) = session_id {
+        let trimmed = s.trim().to_string();
+        if !trimmed.is_empty() {
+            trimmed
+        } else {
+            let orch = state.orchestrator.lock().await;
+            orch.current_session
+                .as_ref()
+                .map(|c| c.session_id.clone())
+                .unwrap_or_default()
+        }
+    } else {
+        let orch = state.orchestrator.lock().await;
+        orch.current_session
+            .as_ref()
+            .map(|c| c.session_id.clone())
+            .unwrap_or_default()
+    };
+    if target_sid.is_empty() {
+        return Err("No session to resume — open a paused session first".to_string());
+    }
+    let cp_key = crate::checkpoint::SessionCheckpoint::key_for(&target_sid);
+    let cp_json = {
+        let store = state.settings_store.lock().await;
+        store
+            .get(&cp_key)
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default()
+    };
+    if cp_json.is_empty() {
+        return Err("No checkpoint found for this session".to_string());
+    }
+    let cp: crate::checkpoint::SessionCheckpoint =
+        serde_json::from_str(&cp_json).map_err(|e| format!("Checkpoint parse failed: {}", e))?;
+    if let Err(e) = cp.validate() {
+        return Err(format!("Checkpoint invalid: {}", e));
+    }
+    if cp.session_id != target_sid {
+        return Err("Checkpoint does not belong to this session".to_string());
+    }
+    if !cp.paused {
+        return Err("Session is not paused".to_string());
+    }
+    // In-process case: a live task owns the runtime — require exact Paused -> Running transition
+    if state.session_runtime.is_active() {
+        let _live_owner = state
+            .session_runtime
+            .resume_paused_session(&target_sid)
+            .map_err(|e| e.to_string())?;
+        {
+            let mut orch = state.orchestrator.lock().await;
+            orch.status = OrchestratorStatus::Running;
+        }
+        state.pause_requested.store(false, Ordering::SeqCst);
+        app.emit(
+            "session-status",
+            json!({ "status": "running", "session_id": cp.session_id.clone(), "resume_from": format!("{:?}", cp.next_step) }),
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = app.emit(
+            "session-checkpoint",
+            json!({ "checkpoint_id": cp.session_id, "phase": "resumed", "next_step": format!("{:?}", cp.next_step) }),
+        );
+        return Ok(());
+    }
+    // Restart case: no live owner — acquire fresh runtime ownership with new generation.
+    if cp.agent_ids.is_empty() {
+        return Err("Checkpoint missing session config — cannot reconstruct after restart (old checkpoint version)".to_string());
+    }
+    // Acquire resume ownership before any fallible window creation.
+    let resume_permit = state
+        .session_runtime
+        .try_acquire_resume(target_sid.clone())
+        .map_err(|e| e.to_string())?;
+    let resume_owner = resume_permit.owner();
+    // Reconstruct SessionConfig from checkpoint
+    let stype = match cp.session_type.as_str() {
+        "Architecture" => crate::orchestrator::SessionType::Architecture,
+        "Mvp" => crate::orchestrator::SessionType::Mvp,
+        "Api" => crate::orchestrator::SessionType::Api,
+        "Security" => crate::orchestrator::SessionType::Security,
+        _ => crate::orchestrator::SessionType::Custom,
+    };
+    let config = crate::orchestrator::SessionConfig {
+        session_id: cp.session_id.clone(),
+        project_brief: cp.project_brief.clone(),
+        session_type: stype.clone(),
+        agent_ids: cp.agent_ids.clone(),
+        leader_agent_id: cp.leader_id.clone(),
+    };
+    let setup_order = config.setup_order();
+    let setup_generation = state
+        .setup_generation
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    // Custom participants for window creation
+    let custom = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .unwrap_or_default();
+    // Validate agent_ids still known
+    for aid in &config.agent_ids {
+        if crate::browser_backend::resolve_participant(aid, &custom).is_none() {
+            return Err(format!(
+                "Cannot resume — participant {} no longer configured",
+                aid
+            ));
+        }
+    }
+    resume_permit.ensure_admitted().map_err(|e| e.to_string())?;
+    // Reattach the resumed session to the same process-lifetime ingress and
+    // reuse healthy named WebViews. Session-only routing state is reset.
+    let tokio_rx = {
+        let mut browser = state.browser_state.lock().await;
+        browser.reset_for_session();
+        let nav_rx = browser.attach_nav_receiver();
+        if let Err(e) = crate::browser_backend::create_windows(
+            &app,
+            &mut browser,
+            &config.agent_ids,
+            &config.leader_agent_id,
+            &config.session_id,
+            setup_generation,
+            &setup_order,
+            &custom,
+        ) {
+            return Err(format!("Failed to recreate windows for resume: {}", e));
+        }
+        nav_rx
+    };
+    resume_permit.ensure_admitted().map_err(|e| e.to_string())?;
+    // Restore AppState fields
+    {
+        let mut orch = state.orchestrator.lock().await;
+        orch.current_session = Some(config.clone());
+        orch.status = OrchestratorStatus::Running;
+        orch.current_iteration = cp.turn_number;
+    }
+    {
+        let mut ctx = state.context_manager.lock().await;
+        *ctx = crate::context_manager::ContextManager::new(cp.project_brief.clone(), stype);
+        for msg in &cp.pending_user_messages {
+            ctx.set_pending_user_input_for_session(msg.clone(), cp.session_id.clone());
+        }
+    }
+    resume_permit.ensure_admitted().map_err(|e| e.to_string())?;
+    state.pause_requested.store(false, Ordering::SeqCst);
+    // Persist that we are resuming (keep checkpoint for audit, not deleted)
+    {
+        let mut cached = state.checkpoint.lock().await;
+        *cached = Some(cp.clone());
+    }
+    app.emit(
+        "session-status",
+        json!({
+            "status": "running",
+            "session_id": cp.session_id,
+            "setup_generation": setup_generation,
+            "selected_leader_id": cp.leader_id,
+            "selected_agent_ids": cp.agent_ids,
+            "setup_order": setup_order,
+            "resume_from": format!("{:?}", cp.next_step)
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = app.emit(
+        "session-checkpoint",
+        json!({ "checkpoint_id": cp.session_id, "phase": "resumed", "next_step": format!("{:?}", cp.next_step) }),
+    );
+    resume_permit.ensure_admitted().map_err(|e| e.to_string())?;
+    resume_permit.ensure_admitted().map_err(|e| e.to_string())?;
+    let (activate_tx, activate_rx) = tokio::sync::oneshot::channel::<()>();
+    // Clone Arcs for spawned task
+    let config_clone = config.clone();
+    let app_clone = app.clone();
+    let orch_clone = state.orchestrator.clone();
+    let ts_clone = state.transcript_store.clone();
+    let tb_clone = state.token_budget.clone();
+    let sv_clone = state.session_vault.clone();
+    let bs_clone = state.browser_state.clone();
+    let ctx_clone = state.context_manager.clone();
+    let bp_clone = state.blueprint_store.clone();
+    let ss_clone = state.settings_store.clone();
+    let ab_clone = state.agent_brain.clone();
+    let aut_clone = state.ask_user_tx.clone();
+    let ab2_clone = state.agent_brain_2.clone();
+    let rt_clone = state.session_runtime.clone();
+    let mh_clone = state.model_health.clone();
+    let bfc_clone = state.brain_fail_count.clone();
+    let mem_clone = state.memory_store.clone();
+    let memory_health = state.last_memory_health.clone();
+    let setup_gen_clone = state.setup_generation.clone();
+    let active_brain_clone = state.active_brain.clone();
+    let hk_run_clone = state.hackathon_run.clone();
+    let hk_run_id_clone = state.hackathon_run_id.clone();
+    let hk_cancel_clone = state.hackathon_cancel.clone();
+    let pause_req_clone = state.pause_requested.clone();
+    let checkpoint_clone = state.checkpoint.clone();
+    let delivery_clone = state.delivery_state.clone();
+    let delivery_path_clone = state.delivery_state_path.clone();
+    let product_coordinator_lock_clone = state.product_coordinator_lock.clone();
+    // Spawn resumed loop — skip setup, go directly to debate loop (gated)
+    let handle = tokio::spawn(async move {
+        if activate_rx.await.is_err() {
+            return;
+        }
+        let state_ref = crate::orchestrator::AppState {
+            orchestrator: orch_clone.clone(),
+            transcript_store: ts_clone,
+            token_budget: tb_clone,
+            session_vault: sv_clone,
+            browser_state: bs_clone,
+            context_manager: ctx_clone,
+            blueprint_store: bp_clone,
+            settings_store: ss_clone,
+            agent_brain: ab_clone,
+            ask_user_tx: aut_clone,
+            agent_brain_2: ab2_clone,
+            session_runtime: rt_clone.clone(),
+            model_health: mh_clone,
+            brain_fail_count: bfc_clone,
+            memory_store: mem_clone,
+            last_memory_health: memory_health,
+            setup_generation: setup_gen_clone,
+            active_brain: active_brain_clone,
+            hackathon_run: hk_run_clone,
+            hackathon_run_id: hk_run_id_clone,
+            hackathon_cancel: hk_cancel_clone,
+            pause_requested: pause_req_clone,
+            checkpoint: checkpoint_clone,
+            delivery_state: delivery_clone,
+            delivery_state_path: delivery_path_clone,
+            product_coordinator_lock: product_coordinator_lock_clone,
+        };
+        let runtime_for_terminal = state_ref.session_runtime.clone();
+        let owner_for_terminal = resume_owner.clone();
+        let orch_for_terminal = orch_clone.clone();
+        let mut nav_rx = tokio_rx;
+        // Clone brain out of lock before loop (DEF-001)
+        let brain = {
+            let guard = state_ref.agent_brain.lock().await;
+            guard.clone()
+        };
+        // If no brain configured, we cannot run loop — emit error and pause again
+        if brain.is_none() {
+            let _ = app_clone.emit(
+                "boss-message",
+                serde_json::json!({"text":"Cannot resume — agent brain not configured","message_type":"status"}),
+            );
+            let is_owner = runtime_for_terminal
+                .current_owner()
+                .map(|o| o == owner_for_terminal)
+                .unwrap_or(false);
+            if is_owner {
+                let mut orch = orch_clone.lock().await;
+                orch.status = OrchestratorStatus::Paused;
+                let _ = app_clone.emit(
+                    "session-status",
+                    serde_json::json!({"status":"paused","session_id": config_clone.session_id}),
+                );
+                runtime_for_terminal.mark_completed(&owner_for_terminal);
+            }
+            return;
+        }
+        if let Err(e) = crate::response_router::run_agent_loop(
+            &config_clone,
+            &brain.unwrap(),
+            &state_ref,
+            &app_clone,
+            &mut nav_rx,
+        )
+        .await
+        {
+            let _ = app_clone.emit("boss-message", serde_json::json!({"text": format!("Resumed debate error: {}", e),"message_type":"status"}));
+            let is_owner = runtime_for_terminal
+                .current_owner()
+                .map(|o| o == owner_for_terminal)
+                .unwrap_or(false);
+            if is_owner {
+                let mut orch = orch_clone.lock().await;
+                if orch.status != OrchestratorStatus::Paused {
+                    orch.status = OrchestratorStatus::Ended;
+                    let _ = app_clone.emit(
+                        "session-status",
+                        serde_json::json!({"status":"ended","session_id": config_clone.session_id}),
+                    );
+                }
+            }
+        }
+        // Terminal cleanup: only live owner may mark completed
+        {
+            let orch = orch_for_terminal.lock().await;
+            if orch.status != OrchestratorStatus::Paused {
+                let is_owner = runtime_for_terminal
+                    .current_owner()
+                    .map(|o| o == owner_for_terminal)
+                    .unwrap_or(false);
+                if is_owner {
+                    runtime_for_terminal.mark_completed(&owner_for_terminal);
+                }
+            }
+        }
+    });
+    if let Err(e) = resume_permit.commit(handle, activate_tx) {
+        tracing::warn!("[RUNTIME] resume handoff rejected: {}", e);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -408,46 +2064,325 @@ pub async fn abort_session(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    // IMP-3: Reset session_active so a new session can be started.
-    state.session_active.store(false, Ordering::SeqCst);
+    // Capture current exact owner before mutating shared state
+    let Some(expected) = state.session_runtime.current_owner() else {
+        return Ok(());
+    };
+
+    // SessionRuntime stop_owner: abort owned task, await proof, keep Stopping until final cleanup
+    let rt = state.session_runtime.clone();
+    let stop_guard_opt = rt.stop_owner(&expected).await.map_err(|e| e.to_string())?;
+    let Some(stop_guard) = stop_guard_opt else {
+        // Stale owner already gone
+        return Ok(());
+    };
+    // Exact owned task now dead; runtime still Stopping(expected) — admission still reserved
+
+    // Cooperative cancellation flags for that owner/current run (no async lock held across stop await for these atomics)
+    state.hackathon_cancel.store(true, Ordering::SeqCst);
+    {
+        let run = state.hackathon_run.lock().await;
+        if let Some(r) = run.as_ref() {
+            r.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
 
     {
         let mut ask = state.ask_user_tx.lock().await;
         *ask = None;
     }
 
-    {
-        let browser = state.browser_state.lock().await;
-        let _ = browser.nav_tx.try_send(NavEvent::SessionAborted);
-    }
-
+    // Perform final cleanup ONLY for expected owner while admission still reserved
+    state.pause_requested.store(false, Ordering::SeqCst);
     {
         let mut orch = state.orchestrator.lock().await;
-        orch.status = OrchestratorStatus::Ended;
+        if orch
+            .current_session
+            .as_ref()
+            .map(|c| c.session_id == expected.session_id)
+            .unwrap_or(false)
+        {
+            orch.status = OrchestratorStatus::Ended;
+        } else if orch.current_session.is_none() {
+            orch.status = OrchestratorStatus::Ended;
+        }
     }
+    let _ = app.emit(
+        "session-status",
+        json!({ "status": "ended", "session_id": expected.session_id.clone() }),
+    );
 
-    app.emit("session-status", json!({ "status": "ended" }))
-        .map_err(|e| e.to_string())
+    // Now and only now release to Idle / new admission
+    stop_guard.finish();
+
+    Ok(())
 }
 
-// ── User interaction ──────────────────────────────────────────────────────────
+// ── User interaction + Checkpoint ─────────────────────────────────────────
 
 #[tauri::command]
 pub async fn user_input(text: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if !state.session_runtime.is_active() {
+        return Err("No active session — start a session before sending context".to_string());
+    }
+    let session_id_check = {
+        let orch = state.orchestrator.lock().await;
+        orch.current_session
+            .as_ref()
+            .map(|c| c.session_id.clone())
+            .unwrap_or_default()
+    };
+    if session_id_check.is_empty() {
+        return Err("No active session".to_string());
+    }
     let mut ctx = state.context_manager.lock().await;
-    ctx.set_pending_user_input(text);
+    ctx.set_pending_user_input_for_session(text, session_id_check.clone());
     Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn request_pause(
+    session_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let sid = if let Some(s) = session_id {
+        if !s.trim().is_empty() {
+            s.trim().to_string()
+        } else {
+            {
+                let orch = state.orchestrator.lock().await;
+                orch.current_session
+                    .as_ref()
+                    .map(|c| c.session_id.clone())
+                    .unwrap_or_default()
+            }
+        }
+    } else {
+        {
+            let orch = state.orchestrator.lock().await;
+            orch.current_session
+                .as_ref()
+                .map(|c| c.session_id.clone())
+                .unwrap_or_default()
+        }
+    };
+    if sid.is_empty() {
+        return Err("No active session to pause".to_string());
+    }
+    state.pause_requested.store(true, Ordering::SeqCst);
+    // Build checkpoint at safe boundary: include session config for post-restart reconstruction
+    let (leader_id, pending, agent_ids, project_brief, session_type) = {
+        let orch = state.orchestrator.lock().await;
+        let cfg = orch.current_session.clone();
+        let lid = cfg
+            .as_ref()
+            .map(|c| c.leader_agent_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let aids = cfg
+            .as_ref()
+            .map(|c| c.agent_ids.clone())
+            .unwrap_or_default();
+        let pbrief = cfg
+            .as_ref()
+            .map(|c| c.project_brief.clone())
+            .unwrap_or_default();
+        let stype = cfg
+            .as_ref()
+            .map(|c| format!("{:?}", c.session_type))
+            .unwrap_or_default();
+        let pending = {
+            let ctx = state.context_manager.lock().await;
+            ctx.pending_user_input
+                .clone()
+                .map(|s| vec![s])
+                .unwrap_or_default()
+        };
+        let pbrief2 = if pbrief.is_empty() {
+            let ctx = state.context_manager.lock().await;
+            ctx.project_brief.clone()
+        } else {
+            pbrief
+        };
+        (lid, pending, aids, pbrief2, stype)
+    };
+    let (hackathon_run_id, hackathon_task_brief) = {
+        let run = state.hackathon_run.lock().await;
+        if let Some(r) = run.as_ref() {
+            (Some(r.run_id.clone()), Some(r.task_brief.clone()))
+        } else {
+            let id = state.hackathon_run_id.lock().await.clone();
+            (id, None)
+        }
+    };
+    let cp = crate::checkpoint::SessionCheckpoint {
+        checkpoint_version: crate::checkpoint::CHECKPOINT_VERSION,
+        session_id: sid.clone(),
+        run_id: format!("run-{}", &sid[..sid.len().min(8)]),
+        turn_number: {
+            let orch = state.orchestrator.lock().await;
+            orch.current_iteration
+        },
+        phase: "leader_decision".to_string(),
+        leader_id: leader_id.clone(),
+        target_participant: None,
+        next_step: crate::checkpoint::CheckpointNextStep::LeaderDecision,
+        pending_user_messages: pending,
+        pause_requested: true,
+        paused: true,
+        pause_reason: crate::checkpoint::PauseReason::UserRequested,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        agent_ids,
+        project_brief,
+        session_type,
+        hackathon_run_id,
+        hackathon_task_brief,
+        last_leader_response: None,
+    };
+    cp.validate()
+        .map_err(|e| format!("Checkpoint invalid: {}", e))?;
+    let key = crate::checkpoint::SessionCheckpoint::key_for(&sid);
+    let json = serde_json::to_string(&cp).map_err(|e| e.to_string())?;
+    {
+        let mut store = state.settings_store.lock().await;
+        store
+            .set(&key, &json)
+            .map_err(|e| settings_command_error("Failed to persist checkpoint", e))?;
+    }
+    {
+        let mut cached = state.checkpoint.lock().await;
+        *cached = Some(cp.clone());
+    }
+    {
+        let mut orch = state.orchestrator.lock().await;
+        orch.status = OrchestratorStatus::Paused;
+    }
+    let _ = app.emit(
+        "session-status",
+        json!({ "status": "paused", "session_id": sid, "checkpoint_id": sid }),
+    );
+    let _ = app.emit("session-checkpoint", json!({ "checkpoint_id": sid, "phase": "paused", "session_id": sid, "next_step": "leader_decision" }));
+    Ok(json)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_session_checkpoint(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let trimmed = session_id.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("session_id is required".to_string());
+    }
+    let key = crate::checkpoint::SessionCheckpoint::key_for(&trimmed);
+    let val = {
+        let store = state.settings_store.lock().await;
+        store
+            .get(&key)
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default()
+    };
+    if val.is_empty() {
+        return Ok("null".to_string());
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&val).map_err(|e| format!("Checkpoint parse failed: {}", e))?;
+    if let Some(v) = parsed.get("checkpoint_version") {
+        if v.as_u64() != Some(crate::checkpoint::CHECKPOINT_VERSION as u64) {
+            return Err(format!("Unsupported checkpoint version {}", v));
+        }
+    }
+    Ok(val)
 }
 
 /// D-041: Deliver the user's answer from the AskUser popup to the suspended
 /// run_agent_loop.  Uses take() to atomically remove the sender and prevent
 /// any possibility of a double-send (RISK-ASKCHANNEL resolved).
 /// Returns Err if no question is currently pending.
+fn record_delivery_decision(
+    memory: &mut crate::memory_store::MemoryStore,
+    project_brief: &str,
+    session_id: &str,
+    question: &str,
+    answer: &str,
+    secrets: &[String],
+) -> Result<(), AgentError> {
+    let question = question.trim();
+    let answer = answer.trim();
+    if question.is_empty()
+        || answer.is_empty()
+        || answer.eq_ignore_ascii_case("cancelled")
+        || crate::memory_store::contains_credential_like_text(project_brief)
+        || crate::memory_store::contains_credential_like_text(question)
+        || crate::memory_store::contains_credential_like_text(answer)
+        || secrets.iter().any(|secret| {
+            !secret.is_empty()
+                && (project_brief.contains(secret.as_str())
+                    || question.contains(secret.as_str())
+                    || answer.contains(secret.as_str()))
+        })
+    {
+        return Ok(());
+    }
+    let question = question.chars().take(1_000).collect::<String>();
+    let answer = answer.chars().take(1_000).collect::<String>();
+    let content = format!("Owner decision: {question}\nAnswer: {answer}");
+    let provenance = format!("Delivery session {session_id}");
+    memory.add_project_memory_with_source(
+        project_brief,
+        "decision",
+        &content,
+        Some(&provenance),
+        None,
+        "owner",
+        "user",
+    )
+}
+
 #[tauri::command]
 pub async fn provide_user_answer(
     answer: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let (configured, secure_storage_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store),
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    let (secrets, secure_storage_ready) = match (configured, secure_storage_ready) {
+        (Ok(secrets), true) => (secrets, true),
+        _ => (Vec::new(), false),
+    };
+    let answer_contains_saved_secret = !secure_storage_ready
+        || secrets
+            .iter()
+            .any(|secret| !secret.is_empty() && answer.contains(secret));
+    let safe_answer = if secure_storage_ready {
+        redact_saved_credentials(&answer, &secrets)
+    } else {
+        "Cancelled".to_string()
+    };
+    let delivery_decision = {
+        let delivery = state.delivery_state.lock().await;
+        delivery.as_ref().and_then(|delivery| {
+            (delivery.phase == crate::delivery::DeliveryPhase::WaitingForUser
+                && state
+                    .session_runtime
+                    .is_active_session(&delivery.session_id))
+            .then(|| {
+                delivery.pending_question.as_ref().map(|question| {
+                    (
+                        delivery.objective.clone(),
+                        delivery.session_id.clone(),
+                        question.text.clone(),
+                    )
+                })
+            })
+            .flatten()
+        })
+    };
     // take() atomically removes the sender and clears the Option.
     let tx = {
         let mut lock = state.ask_user_tx.lock().await;
@@ -455,9 +2390,41 @@ pub async fn provide_user_answer(
     }; // lock drops here
 
     match tx {
-        Some(sender) => sender
-            .send(answer)
-            .map_err(|_| "Answer channel dropped — session may have ended".to_string()),
+        Some(sender) => {
+            sender
+                .send(safe_answer.clone())
+                .map_err(|_| "Answer channel dropped — session may have ended".to_string())?;
+            if !secure_storage_ready {
+                tracing::warn!(
+                    "AskUser response was converted to cancellation because saved credentials could not be checked"
+                );
+            }
+            if let Some((project_brief, session_id, question)) = delivery_decision
+                && !answer_contains_saved_secret
+            {
+                let memory_store = state.memory_store.clone();
+                let answer_to_adopt = safe_answer.clone();
+                let decision_secrets = secrets.clone();
+                if let Err(error) = crate::db_helpers::run_blocking(move || {
+                    let mut memory = memory_store.lock().map_err(|_| {
+                        AgentError::DatabaseError("memory store lock poisoned".to_string())
+                    })?;
+                    record_delivery_decision(
+                        &mut memory,
+                        &project_brief,
+                        &session_id,
+                        &question,
+                        &answer_to_adopt,
+                        &decision_secrets,
+                    )
+                })
+                .await
+                {
+                    tracing::warn!("[MEMORY] Delivery decision adoption failed: {error}");
+                }
+            }
+            Ok(())
+        }
         None => Err("No pending ask_user question".to_string()),
     }
 }
@@ -474,6 +2441,17 @@ pub async fn save_agent_brain_config(
     system_prompt: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let api_key = if api_key.trim().is_empty() {
+        state
+            .settings_store
+            .lock()
+            .await
+            .get("brain_api_key")
+            .map_err(|e| settings_command_error("Failed to read saved Agent Brain credential", e))?
+            .unwrap_or_default()
+    } else {
+        api_key
+    };
     validate_brain_fields(&base_url, &model)
         .map_err(|e| settings_command_error("Agent brain validation failed", e))?;
 
@@ -515,17 +2493,24 @@ pub async fn save_agent_brain_config(
     // STEP C: Persist primary config to DB.
     {
         let mut store = state.settings_store.lock().await;
+        let config = crate::settings_store::AgentBrainConfig {
+            api_key: api_key.clone(),
+            base_url: base_url.clone(),
+            model: model.clone(),
+            system_prompt: system_prompt.clone(),
+            leader_priming_prompt: store
+                .get("prompt_leader_priming")
+                .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?
+                .unwrap_or_default(),
+            participant_priming_prompt: store
+                .get("prompt_participant_priming")
+                .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?
+                .unwrap_or_default(),
+            credential_storage_available: store.credential_storage_available(),
+            credential_migration_pending: store.credential_migration_pending(),
+        };
         store
-            .set("brain_api_key", &api_key)
-            .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
-        store
-            .set("brain_base_url", &base_url)
-            .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
-        store
-            .set("brain_model", &model)
-            .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
-        store
-            .set("brain_system_prompt", &system_prompt)
+            .save_agent_brain_config(&config)
             .map_err(|e| settings_command_error("Failed to save agent brain settings", e))?;
     } // lock drops here
 
@@ -555,83 +2540,202 @@ pub async fn captcha_resolved(
     agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    // Sequential snapshots only — never nest orchestrator/browser/runtime
+    // locks.
+    let (phase_is_setup, orchestrator_session_id, is_member) = {
+        let orchestrator = state.orchestrator.lock().await;
+        (
+            orchestrator.status == OrchestratorStatus::Setup,
+            orchestrator
+                .current_session
+                .as_ref()
+                .map(|config| config.session_id.clone()),
+            orchestrator
+                .current_session
+                .as_ref()
+                .is_some_and(|config| config.agent_ids.iter().any(|id| id == &agent_id)),
+        )
+    };
+    let owner = state.session_runtime.current_owner();
+    let (nav_tx, lifecycle, admission) = {
+        let browser = state.browser_state.lock().await;
+        let (diagnostics_session_id, diagnostics_setup_generation) =
+            browser.diagnostics.setup_identity_snapshot();
+        let admission = crate::session_runner::SetupRetryAdmission {
+            requested_agent: agent_id.clone(),
+            expected_unfinished_agent: browser.diagnostics.expected_unfinished_agent(),
+            setup_completed: browser.diagnostics.setup_completed(&agent_id),
+            session_active: owner.is_some(),
+            phase_is_setup,
+            is_member,
+            owner,
+            orchestrator_session_id,
+            diagnostics_session_id: Some(diagnostics_session_id),
+            diagnostics_setup_generation: Some(diagnostics_setup_generation),
+        };
+        (browser.nav_tx.clone(), browser.lifecycle.clone(), admission)
+    };
+    nav_tx
+        .try_send(NavEvent::ResumeRequested(agent_id.clone()))
+        .map_err(|e| format!("Could not resume after captcha: {e}"))?;
+    // Session 03: a completed verification is only a wakeup for lifecycle
+    // reevaluation. It never manufactures Ready; current-generation composer
+    // evidence must still create the lease.
+    lifecycle.request_recheck();
+    // Session 03D: preserve the product behavior where a CAPTCHA Resume can
+    // rerun an already-failed setup — but only as a separate identity-bearing
+    // retry intent, emitted solely when the exact current setup identity is
+    // provable. Otherwise the wakeup above is the whole effect. Best-effort:
+    // a full ingress here must not fail the wakeup contract.
+    if let crate::session_runner::SetupRetryIntent::Resume { key } =
+        crate::session_runner::decide_setup_retry_intent(&admission)
+    {
+        if let Err(error) = nav_tx.try_send(NavEvent::SetupRetryRequested(key)) {
+            tracing::warn!("[SETUP] Could not queue identity retry after captcha: {error}");
+        }
+    }
     let mut browser = state.browser_state.lock().await;
-    browser.captcha_resolved.insert(agent_id.clone());
-    browser
-        .nav_tx
-        .try_send(NavEvent::ResumeRequested(agent_id))
-        .map_err(|e| format!("Could not resume browser readiness wait: {e}"))?;
+    browser.captcha_resolved.insert(agent_id);
     Ok(())
 }
 
-/// Re-focus and re-probe the agent currently blocked in Phase 1 setup without
+/// Signal a retry for the agent currently blocked in Phase 1 setup without
 /// creating a new session or changing setup_order/setup_generation.
+///
+/// Session 03C ownership: this command validates and signals retry intent
+/// only — it never navigates. `run_setup` remains the sole setup-navigation
+/// owner, so one explicit retry leads to exactly one setup-loop navigation.
+///
+/// Session 03D identity: the emitted `SetupRetryRequested` carries the exact
+/// current setup-control key (session/run/setup/agent) proven against live
+/// state. A delayed event can never authorize a newer session. Emitting the
+/// signal never manufactures Ready.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn retry_setup_agent(
     agent_id: String,
     state: tauri::State<'_, AppState>,
-    app: AppHandle,
+    _app: AppHandle,
 ) -> Result<(), String> {
-    let config = {
+    let (config, phase_is_setup) = {
         let orchestrator = state.orchestrator.lock().await;
-        orchestrator.current_session.clone()
-    }.ok_or_else(|| "No setup session is active".to_string())?;
-    if !config.agent_ids.iter().any(|id| id == &agent_id) {
-        return Err("Agent is not part of the active setup".to_string());
-    }
-    let agent = get_agent_config(&agent_id).ok_or_else(|| "Unknown setup agent".to_string())?;
-    let (window, diagnostics, window_kind, nav_tx) = {
-        let browser = state.browser_state.lock().await;
-        let is_leader = agent_id == config.leader_agent_id;
-        let window = browser.select_window(is_leader)
-            .ok_or_else(|| "Model window is not available".to_string())?;
-        (window, browser.diagnostics.clone(), if is_leader { "leader" } else { "nav" }, browser.nav_tx.clone())
+        (
+            orchestrator.current_session.clone(),
+            orchestrator.status == OrchestratorStatus::Setup,
+        )
     };
-    navigate_agent_window(&app, &diagnostics, &window, &agent_id, window_kind, agent.base_url)
-        .map_err(|error| error.to_string())?;
-    nav_tx.try_send(NavEvent::ResumeRequested(agent_id))
-        .map_err(|error| format!("Could not request setup retry: {error}"))?;
-    Ok(())
+    let owner = state.session_runtime.current_owner();
+    let config = config.ok_or_else(|| "No setup session is active".to_string())?;
+    // P2: resolve through the MERGED registry so a persisted custom participant
+    // can be retried. Unknown ids keep the same rejection as before. Kept as a
+    // validation step only — the resolved record navigates nothing here.
+    let custom = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .unwrap_or_default();
+    resolve_participant(&agent_id, &custom).ok_or_else(|| "Unknown setup agent".to_string())?;
+    let (nav_tx, admission) = {
+        let browser = state.browser_state.lock().await;
+        let (diagnostics_session_id, diagnostics_setup_generation) =
+            browser.diagnostics.setup_identity_snapshot();
+        (
+            browser.nav_tx.clone(),
+            crate::session_runner::SetupRetryAdmission {
+                requested_agent: agent_id.clone(),
+                expected_unfinished_agent: browser.diagnostics.expected_unfinished_agent(),
+                setup_completed: browser.diagnostics.setup_completed(&agent_id),
+                session_active: owner.is_some(),
+                phase_is_setup,
+                is_member: config.agent_ids.iter().any(|id| id == &agent_id),
+                owner,
+                orchestrator_session_id: Some(config.session_id.clone()),
+                diagnostics_session_id: Some(diagnostics_session_id),
+                diagnostics_setup_generation: Some(diagnostics_setup_generation),
+            },
+        )
+    };
+    match crate::session_runner::decide_setup_retry_intent(&admission) {
+        crate::session_runner::SetupRetryIntent::Resume { key } => nav_tx
+            .try_send(NavEvent::SetupRetryRequested(key))
+            .map_err(|e| format!("Could not request setup retry: {e}")),
+        crate::session_runner::SetupRetryIntent::Rejected { reason } => Err(match reason {
+            "no_active_session" | "no_owner" => "No active setup session".to_string(),
+            "not_in_setup" => "Setup retry is only available during setup".to_string(),
+            "unknown_agent" => "Agent is not part of the active setup".to_string(),
+            "already_completed" => "Setup agent is already completed".to_string(),
+            "session_mismatch" | "diagnostics_mismatch" => {
+                "Setup session identity changed; retry is no longer valid".to_string()
+            }
+            _ => "Only the current unfinished setup agent can be retried".to_string(),
+        }),
+    }
 }
 
 /// User-confirmed recovery path for a prompt that was visibly sent or answered
 /// but whose browser event was missed. This advances only the currently
 /// expected setup agent; it neither clicks Send nor manufactures a browser
 /// send/response signal.
+///
+/// Session 03D identity: the producer only enqueues an identity-bearing
+/// `SetupManualConfirmed(key)` proven against live state. It must NOT record
+/// setup completion itself — the process-lifetime diagnostics object would let
+/// a stale producer retain completion authority across owner/session
+/// replacement. The live setup consumer records completion after exact key
+/// acceptance.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn confirm_setup_agent(
     agent_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if !state.session_active.load(Ordering::SeqCst) {
-        return Err("No active setup session".to_string());
-    }
-    let setup_order = {
+    let (setup_order, owner, phase_is_setup, session_id) = {
         let orchestrator = state.orchestrator.lock().await;
         let config = orchestrator
             .current_session
             .as_ref()
             .ok_or_else(|| "No setup session is active".to_string())?;
-        if orchestrator.status != OrchestratorStatus::Setup {
-            return Err("Manual confirmation is only available during setup".to_string());
-        }
-        config.setup_order()
+        (
+            config.setup_order(),
+            state.session_runtime.current_owner(),
+            orchestrator.status == OrchestratorStatus::Setup,
+            Some(config.session_id.clone()),
+        )
     };
-    if !setup_order.iter().any(|id| id == &agent_id) {
-        return Err("Agent is not part of the active setup order".to_string());
-    }
-    let (diagnostics, nav_tx) = {
+    let (nav_tx, admission) = {
         let browser = state.browser_state.lock().await;
-        if !browser.diagnostics.is_expected_unfinished(&agent_id) {
-            return Err("Only the current unfinished setup agent can be confirmed".to_string());
-        }
-        (browser.diagnostics.clone(), browser.nav_tx.clone())
+        let (diagnostics_session_id, diagnostics_setup_generation) =
+            browser.diagnostics.setup_identity_snapshot();
+        (
+            browser.nav_tx.clone(),
+            crate::session_runner::SetupRetryAdmission {
+                requested_agent: agent_id.clone(),
+                expected_unfinished_agent: browser.diagnostics.expected_unfinished_agent(),
+                setup_completed: browser.diagnostics.setup_completed(&agent_id),
+                session_active: owner.is_some(),
+                phase_is_setup,
+                is_member: setup_order.iter().any(|id| id == &agent_id),
+                owner,
+                orchestrator_session_id: session_id,
+                diagnostics_session_id: Some(diagnostics_session_id),
+                diagnostics_setup_generation: Some(diagnostics_setup_generation),
+            },
+        )
     };
-    record_setup_completion(&diagnostics, &agent_id, "user_confirmed_manual");
-    nav_tx
-        .try_send(NavEvent::SetupManualConfirmed(agent_id))
-        .map_err(|error| format!("Could not deliver manual setup confirmation: {error}"))?;
-    Ok(())
+    match crate::session_runner::decide_setup_retry_intent(&admission) {
+        crate::session_runner::SetupRetryIntent::Resume { key } => nav_tx
+            .try_send(NavEvent::SetupManualConfirmed(key))
+            .map_err(|e| format!("Could not confirm setup agent: {e}")),
+        crate::session_runner::SetupRetryIntent::Rejected { reason } => Err(match reason {
+            "no_active_session" | "no_owner" => "No active setup session".to_string(),
+            "not_in_setup" => "Manual confirmation is only available during setup".to_string(),
+            "unknown_agent" => "Agent is not part of the active setup order".to_string(),
+            "already_completed" => "Setup agent is already completed".to_string(),
+            "session_mismatch" | "diagnostics_mismatch" => {
+                "Setup session identity changed; confirmation is no longer valid".to_string()
+            }
+            _ => "Only the current unfinished setup agent can be confirmed".to_string(),
+        }),
+    }
 }
 
 /// User-confirmed active-turn recovery. The response is accepted only for the
@@ -644,7 +2748,7 @@ pub async fn provide_manual_model_response(
     response: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if !state.session_active.load(Ordering::SeqCst) {
+    if !state.session_runtime.is_active() {
         return Err("No active session".to_string());
     }
     if response.trim().is_empty() {
@@ -656,20 +2760,33 @@ pub async fn provide_manual_model_response(
             return Err("Manual response is only available while a session is running".to_string());
         }
     }
-    let nav_tx = {
+    let (nav_tx, context) = {
         let browser = state.browser_state.lock().await;
-        if browser.active_turn.as_ref() != Some(&(agent_id.clone(), turn_number)) {
+        let Some(ctx) = browser.active_operation.clone() else {
+            return Err("This model and turn are not currently awaiting a response".to_string());
+        };
+        if ctx.agent_id != agent_id || ctx.turn != turn_number {
             return Err("This model and turn are not currently awaiting a response".to_string());
         }
-        browser.nav_tx.clone()
+        // Validate SessionOwner exactly matches operation's session+ generation
+        if let Some(owner) = state.session_runtime.current_owner() {
+            if owner.session_id != ctx.session_id || owner.run_generation != ctx.run_generation {
+                return Err("Active operation does not belong to current session owner".to_string());
+            }
+        } else {
+            return Err("No active session owner".to_string());
+        }
+        (browser.nav_tx.clone(), ctx)
     };
     nav_tx
         .try_send(NavEvent::ManualResponse {
+            operation_id: context.operation_id.clone(),
             agent_id,
             turn: turn_number,
             response,
         })
-        .map_err(|error| format!("Could not deliver manual model response: {error}"))
+        .map_err(|e| format!("Could not deliver manual response: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -712,6 +2829,17 @@ pub async fn save_secondary_brain_config(
     system_prompt: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let api_key = if api_key.trim().is_empty() {
+        state
+            .settings_store
+            .lock()
+            .await
+            .get("brain2_api_key")
+            .map_err(|e| settings_command_error("Failed to read saved secondary credential", e))?
+            .unwrap_or_default()
+    } else {
+        api_key
+    };
     validate_brain_fields(&base_url, &model)
         .map_err(|e| settings_command_error("Secondary brain validation failed", e))?;
 
@@ -727,17 +2855,16 @@ pub async fn save_secondary_brain_config(
     // STEP B: Persist.
     {
         let mut store = state.settings_store.lock().await;
+        let config = crate::settings_store::SecondaryBrainConfig {
+            api_key: api_key.clone(),
+            base_url: base_url.clone(),
+            model: model.clone(),
+            system_prompt: system_prompt.clone(),
+            credential_storage_available: store.credential_storage_available(),
+            credential_migration_pending: store.credential_migration_pending(),
+        };
         store
-            .set("brain2_api_key", &api_key)
-            .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
-        store
-            .set("brain2_base_url", &base_url)
-            .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
-        store
-            .set("brain2_model", &model)
-            .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
-        store
-            .set("brain2_system_prompt", &system_prompt)
+            .save_secondary_brain_config(&config)
             .map_err(|e| settings_command_error("Failed to save secondary brain settings", e))?;
     }
 
@@ -783,6 +2910,17 @@ pub async fn save_fallback_brain_config(
 ) -> Result<(), String> {
     let clears_fallback =
         api_key.trim().is_empty() && base_url.trim().is_empty() && model.trim().is_empty();
+    let api_key = if api_key.trim().is_empty() && !clears_fallback {
+        state
+            .settings_store
+            .lock()
+            .await
+            .get("brain_fallback_api_key")
+            .map_err(|e| settings_command_error("Failed to read saved fallback credential", e))?
+            .unwrap_or_default()
+    } else {
+        api_key
+    };
     if !clears_fallback {
         validate_brain_fields(&base_url, &model)
             .map_err(|e| settings_command_error("Fallback brain validation failed", e))?;
@@ -798,6 +2936,8 @@ pub async fn save_fallback_brain_config(
         api_key: api_key.clone(),
         base_url: base_url.clone(),
         model: model.clone(),
+        credential_storage_available: true,
+        credential_migration_pending: false,
     };
 
     // STEP A: Persist.
@@ -840,6 +2980,156 @@ pub async fn get_fallback_brain_config(
     serde_json::to_string(&config).map_err(|e| e.to_string())
 }
 
+/// Remove one saved Agent Brain credential from the operating system store.
+/// The kind is a closed product enum so renderer input cannot choose arbitrary
+/// credential-store accounts.
+#[tauri::command]
+pub async fn clear_brain_credential(
+    kind: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let account = match kind.as_str() {
+        "primary" => "brain_api_key",
+        "fallback" => "brain_fallback_api_key",
+        "secondary" => "brain2_api_key",
+        _ => return Err("Unknown Agent Brain credential".to_string()),
+    };
+    state
+        .settings_store
+        .lock()
+        .await
+        .clear_credential(account)
+        .map_err(|e| settings_command_error("Could not remove saved API key", e))?;
+
+    match kind.as_str() {
+        "primary" => *state.agent_brain.lock().await = None,
+        "secondary" => *state.agent_brain_2.lock().await = None,
+        "fallback" => {
+            let mut brain = state.agent_brain.lock().await;
+            if let Some(existing) = brain.take() {
+                *brain = Some(existing.without_fallback());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_credential_storage_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let store = state.settings_store.lock().await;
+    serde_json::to_string(&json!({
+        "available": store.credential_storage_available(),
+        "migration_pending": store.credential_migration_pending(),
+        "message": if !store.credential_storage_available() {
+            "Secure credential storage is unavailable. Unlock the system keyring or Credential Manager, then retry. Existing saved credentials have been kept."
+        } else if store.credential_migration_pending() {
+            "An older saved API key still needs to move into secure storage. Retry after the system keyring is available."
+        } else {
+            "API keys are stored in the system credential store."
+        }
+    }))
+    .map_err(|e| e.to_string())
+}
+
+/// P1: return the persisted custom participants as a JSON array string.
+/// Follows the IPC.json-string convention (callers JSON.parse the result).
+#[tauri::command]
+pub async fn get_custom_participants(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let participants = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .map_err(|e| settings_command_error("Failed to read custom participants", e))?;
+    serde_json::to_string(&participants).map_err(|e| e.to_string())
+}
+
+/// P3: return the UNIFIED participant registry (the seven immutable built-ins
+/// in frozen order followed by persisted custom participants) as a JSON array
+/// string, each entry tagged with `is_custom`. This is the single logical
+/// participant list the frontend iterates for participant/leader selection,
+/// connected accounts, sidebar model dots, and name resolution. Returns a
+/// JSON string per the project's convention (callers JSON.parse the result).
+#[tauri::command]
+pub async fn get_participants(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let custom = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .map_err(|e| settings_command_error("Failed to read custom participants", e))?;
+    serde_json::to_string(&crate::browser_backend::merged_participants(&custom))
+        .map_err(|e| e.to_string())
+}
+
+/// P1: validate a single proposed custom participant. Built-in ids are
+/// reserved; ids must be unique and URLs must be absolute HTTP(S).
+fn validate_custom_participant(
+    index: usize,
+    participant: &CustomParticipant,
+    reserved: &HashSet<String>,
+) -> Result<(), String> {
+    let label = format!("Custom participant {}", index + 1);
+    let id = participant.agent_id.trim();
+    if id.is_empty() || id.chars().any(|c| c.is_whitespace()) {
+        return Err(settings_command_error(
+            &label,
+            "agent_id is required and must not contain whitespace",
+        ));
+    }
+    let name = participant.display_name.trim();
+    if name.is_empty() {
+        return Err(settings_command_error(&label, "display_name is required"));
+    }
+    let base_url = participant.base_url.trim();
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|e| settings_command_error(&label, format!("base_url is invalid: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(settings_command_error(
+            &label,
+            "base_url must be an absolute http:// or https:// URL",
+        ));
+    }
+    // Built-in ids are always reserved; a custom save can never shadow or
+    // redefine one (e.g. agent_id "deepseek" is refused at save time).
+    if get_agent_config(id).is_some() {
+        return Err(settings_command_error(
+            &label,
+            format!("agent_id '{id}' is reserved — it collides with a built-in participant"),
+        ));
+    }
+    if reserved.contains(id) {
+        return Err(settings_command_error(
+            &label,
+            format!("agent_id '{id}' is duplicated within the custom participant list"),
+        ));
+    }
+    Ok(())
+}
+
+/// P1: persist the custom-participant list. Passing an empty list clears all
+/// custom participants. Built-in ids may never be overridden.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_custom_participants(
+    participants: Vec<CustomParticipant>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let mut reserved: HashSet<String> = HashSet::new();
+    for (index, participant) in participants.iter().enumerate() {
+        validate_custom_participant(index, participant, &reserved)?;
+        reserved.insert(participant.agent_id.trim().to_string());
+    }
+
+    let mut store = state.settings_store.lock().await;
+    store
+        .save_custom_participants(&participants)
+        .map_err(|e| settings_command_error("Failed to save custom participants", e))?;
+    Ok(())
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn save_prompt_template(
     template_name: String,
@@ -878,9 +3168,35 @@ pub async fn get_prompt_template(
         .settings_store
         .lock()
         .await
-        .get(key)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default())
+        .get_prompt_template_with_default(key)
+        .map_err(|e| e.to_string())?)
+}
+
+// ── Maintenance mode (Diagnostics gate) ─────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_maintenance_mode(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let enabled = state
+        .settings_store
+        .lock()
+        .await
+        .get_maintenance_mode()
+        .map_err(|e| e.to_string())?;
+    // Return JSON boolean string per IPC convention (callers JSON.parse it)
+    serde_json::to_string(&enabled).map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_maintenance_mode(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .settings_store
+        .lock()
+        .await
+        .set_maintenance_mode(enabled)
+        .map_err(|e| settings_command_error("Failed to save maintenance mode", e))
 }
 
 // ── Data retrieval ────────────────────────────────────────────────────────────
@@ -900,16 +3216,39 @@ struct DiagnosticSnapshot {
     leader_window_exists: bool,
     nav_window_exists: bool,
     browser_diagnostics: Vec<crate::browser_backend::BrowserDiagnosticRecord>,
+    browser_console_error_count: usize,
+    browser_console_warning_count: usize,
+    browser_console_last_error_at: Option<String>,
+    // Harness extensions (spec 15)
+    browser_timeline: Vec<crate::browser_harness::BrowserEvent>,
+    browser_timeline_dropped: std::collections::HashMap<String, usize>,
+    browser_timeline_count: usize,
+    // Cross-platform forensics extensions (§4-9, §14)
+    navigation_intents: Vec<crate::browser_harness::NavigationIntent>,
+    lifecycle_events: Vec<crate::browser_harness::PageLifecycleEvent>,
+    safe_dom_snapshots: Vec<crate::browser_harness::SafeDomForensics>,
+    action_records: Vec<crate::browser_harness::ActionRecord>,
+    // Recent failures + auth hints
+    recent_failures: Vec<serde_json::Value>,
+    // W1-D: minimal Windows WebView2 environment
+    webview_version: Option<String>,
+    os: String,
+    arch: String,
+    tauri_version: String,
     command_timestamp: String,
 }
 
-/// Secret-free runtime snapshot for diagnosing configuration and persistence
-/// failures. Configuration values are reduced to booleans before serialization.
+/// Runtime snapshot for diagnosing configuration and persistence failures.
+/// Configuration values are reduced to booleans, and saved credential literals
+/// are redacted from retained browser evidence before it is returned.
 #[tauri::command]
 pub async fn get_diagnostic_snapshot(
     state: tauri::State<'_, AppState>,
     app: AppHandle,
 ) -> Result<String, String> {
+    require_maintenance_enabled(&state).await?;
+    let secrets = diagnostic_credentials(&state).await?;
+
     let app_data_dir = app
         .path()
         .app_data_dir()
@@ -946,18 +3285,98 @@ pub async fn get_diagnostic_snapshot(
     .await
     .map_err(|e| settings_command_error("Failed to read memory health", e))?;
 
-    let browser_diagnostics = {
+    let (
+        browser_diagnostics,
+        browser_timeline,
+        browser_timeline_dropped,
+        browser_timeline_count,
+        navigation_intents,
+        lifecycle_events,
+        safe_dom_snapshots,
+        action_records,
+        recent_failures,
+    ) = {
         let browser = state.browser_state.lock().await;
-        browser.diagnostics.snapshot()
+        let diag = browser.diagnostics.snapshot();
+        let tl = browser.diagnostics.timeline.all_events_sorted();
+        let mut dropped: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for r in &diag {
+            let d = browser.diagnostics.timeline.events_dropped(&r.agent_id);
+            if d > 0 {
+                dropped.insert(r.agent_id.clone(), d);
+            }
+        }
+        let count = browser.diagnostics.timeline.total_events();
+        let nav_intents = browser
+            .diagnostics
+            .navigation_intents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .flat_map(|d| d.iter().cloned())
+            .collect::<Vec<_>>();
+        let lifecycle = browser
+            .diagnostics
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .flat_map(|d| d.iter().cloned())
+            .collect::<Vec<_>>();
+        let dom = browser
+            .diagnostics
+            .safe_dom_snapshots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .flat_map(|d| d.iter().cloned())
+            .collect::<Vec<_>>();
+        let actions = browser
+            .diagnostics
+            .action_records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .flat_map(|d| d.iter().cloned())
+            .collect::<Vec<_>>();
+        let recent_failures = tl.iter().filter(|e| e.event_type.contains("failed") || e.event_type.contains("error") || e.event_type.contains("blocked") || e.event_type.contains("missing")).take(20).map(|e| serde_json::json!({ "timestamp": e.timestamp, "agent_id": e.agent_id, "event_type": e.event_type, "operation_id": e.operation_id, "url": e.url })).collect::<Vec<_>>();
+        (
+            diag,
+            tl,
+            dropped,
+            count,
+            nav_intents,
+            lifecycle,
+            dom,
+            actions,
+            recent_failures,
+        )
     };
+    // Top-level console summary derived from per-agent vectors.
+    let browser_console_error_count = browser_diagnostics
+        .iter()
+        .map(|r| r.browser_console_error_count as usize)
+        .sum();
+    let browser_console_warning_count = browser_diagnostics
+        .iter()
+        .map(|r| r.browser_console_warning_count as usize)
+        .sum();
+    let browser_console_last_error_at = browser_diagnostics
+        .iter()
+        .filter_map(|r| r.browser_console_last_error_at.clone())
+        .max();
 
+    // W1-D: WebView version via Tauri/Wry (no new dep). On Windows this is
+    // the Edge WebView2 runtime version; on Linux it is WebKitGTK version.
+    let webview_version = tauri::webview_version().ok();
     let snapshot = DiagnosticSnapshot {
         app_data_dir: app_data_dir.to_string_lossy().into_owned(),
         settings_db_exists: app_data_dir.join("settings.db").is_file(),
         memory_db_exists: app_data_dir.join("memory.db").is_file(),
         transcript_db_exists: app_data_dir.join("transcript.db").is_file(),
         blueprint_db_exists: app_data_dir.join("blueprint.db").is_file(),
-        session_active: state.session_active.load(Ordering::SeqCst),
+        session_active: state.session_runtime.is_active(),
         primary_agent_brain_configured: primary_configured,
         fallback_brain_settings_present: fallback_present,
         secondary_brain_configured: secondary_configured,
@@ -969,11 +3388,554 @@ pub async fn get_diagnostic_snapshot(
             .get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL)
             .is_some(),
         browser_diagnostics,
+        browser_console_error_count,
+        browser_console_warning_count,
+        browser_console_last_error_at,
+        browser_timeline,
+        browser_timeline_dropped,
+        browser_timeline_count,
+        navigation_intents,
+        lifecycle_events,
+        safe_dom_snapshots,
+        action_records,
+        recent_failures,
+        webview_version,
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        tauri_version: env!("CARGO_PKG_VERSION").to_string(),
         command_timestamp: chrono::Utc::now().to_rfc3339(),
     };
 
-    serde_json::to_string(&snapshot)
-        .map_err(|e| settings_command_error("Failed to serialize diagnostic snapshot", e))
+    let serialized = serde_json::to_string(&snapshot)
+        .map_err(|e| settings_command_error("Failed to serialize diagnostic snapshot", e))?;
+    Ok(redact_saved_credentials(&serialized, &secrets))
+}
+
+/// Compact human/AI-facing diagnostic artifact. Saved credential literals
+/// are redacted before return. This is plain Markdown; callers must not JSON.parse it.
+#[tauri::command]
+pub async fn get_diagnostic_brief(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    // Gate before any database or retained-diagnostics collection.
+    require_maintenance_enabled(&state).await?;
+    build_diagnostic_brief(&state, &app).await
+}
+
+async fn build_diagnostic_brief(state: &AppState, app: &AppHandle) -> Result<String, String> {
+    let secrets = diagnostic_credentials(state).await?;
+    let app_data_dir = app.path().app_data_dir().map_err(|error| {
+        settings_command_error("Failed to resolve diagnostic storage location", error)
+    })?;
+    let (primary_configured, fallback_present, secondary_configured) = {
+        let store = state.settings_store.lock().await;
+        let primary = store
+            .get_agent_brain_config()
+            .map_err(|e| settings_command_error("Failed to read diagnostic settings", e))?;
+        let fallback = store
+            .get_fallback_brain_config()
+            .map_err(|e| settings_command_error("Failed to read diagnostic settings", e))?;
+        let secondary = store
+            .get_secondary_brain_config()
+            .map_err(|e| settings_command_error("Failed to read diagnostic settings", e))?;
+        (
+            !primary.base_url.trim().is_empty() && !primary.model.trim().is_empty(),
+            !fallback.api_key.trim().is_empty()
+                && !fallback.base_url.trim().is_empty()
+                && !fallback.model.trim().is_empty(),
+            !secondary.base_url.trim().is_empty() && !secondary.model.trim().is_empty(),
+        )
+    };
+    let memory_store = state.memory_store.clone();
+    let memory_health = crate::db_helpers::run_blocking(move || {
+        let memory = memory_store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("memory store lock poisoned".to_string()))?;
+        Ok(memory.check_health())
+    })
+    .await
+    .map_err(|e| settings_command_error("Failed to read memory health", e))?;
+
+    let leader_exists = app
+        .get_webview_window(crate::browser_backend::LEADER_WINDOW_LABEL)
+        .is_some();
+    let nav_exists = app
+        .get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL)
+        .is_some();
+    // The nav window is the active shared model surface when present; fall
+    // back to leader without creating either window for diagnostics.
+    let active_model_window = app
+        .get_webview_window(crate::browser_backend::NAV_WINDOW_LABEL)
+        .map(|window| (window, crate::browser_backend::NAV_WINDOW_LABEL.to_string()))
+        .or_else(|| {
+            app.get_webview_window(crate::browser_backend::LEADER_WINDOW_LABEL)
+                .map(|window| {
+                    (
+                        window,
+                        crate::browser_backend::LEADER_WINDOW_LABEL.to_string(),
+                    )
+                })
+        });
+    let storage =
+        crate::browser_backend::collect_model_webview_storage_diagnostics(active_model_window)
+            .await;
+    let diagnostic_bool = |value: Option<bool>| match value {
+        Some(value) => value.to_string(),
+        None => "unknown".to_string(),
+    };
+    let diagnostic_cookies = |cookies: &crate::browser_backend::CookieDiagnosticSummary| {
+        if cookies.available {
+            format!(
+                "count: {}\nnames: [{}]\nany_secure: {}\nany_http_only: {}",
+                cookies.count,
+                cookies.names.join(", "),
+                diagnostic_bool(cookies.any_secure),
+                diagnostic_bool(cookies.any_http_only),
+            )
+        } else {
+            "count: unknown\nnames: unknown\nany_secure: unknown\nany_http_only: unknown"
+                .to_string()
+        }
+    };
+    let mut writer = crate::browser_harness::DiagnosticBriefWriter::new();
+    writer.push("# Consensus Arena Diagnostic Brief\n\n");
+    writer.push(&format!(
+        "timestamp: {}\nos_arch: {}/{}\napp_version: {}\napp_data_dir: {}\nwebview_engine: {}\nsession_active: {}\nleader_registry_window: {}\nnav_registry_window: {}\n",
+        chrono::Utc::now().to_rfc3339(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        env!("CARGO_PKG_VERSION"),
+        app_data_dir.display(),
+        tauri::webview_version().unwrap_or_else(|_| "unavailable".to_string()),
+        state.session_runtime.is_active(),
+        leader_exists,
+        nav_exists,
+    ));
+    writer.push(&format!(
+        "\n## Active model WebView storage\n\nactive_model_window: {}\nwebview_ephemeral: {}\nwebkit_itp_enabled: {}\ncookie_policy: {}\nclaude_cookie_{}\ncloudflare_cookie_{}\n",
+        storage.window_label.as_deref().unwrap_or("none"),
+        diagnostic_bool(storage.webview_ephemeral),
+        diagnostic_bool(storage.webkit_itp_enabled),
+        storage.cookie_policy.as_deref().unwrap_or("unknown"),
+        diagnostic_cookies(&storage.claude).replace('\n', "\nclaude_cookie_"),
+        diagnostic_cookies(&storage.cloudflare).replace('\n', "\ncloudflare_cookie_"),
+    ));
+
+    let (retention, timeline_retained, timeline_selected, dropped) = {
+        let browser = state.browser_state.lock().await;
+        let leader_cached = browser.leader_window.is_some();
+        let nav_cached = browser.nav_window.is_some();
+        writer.push(&format!(
+            "leader_cached_handle: {}\nnav_cached_handle: {}\nbrain_configured: primary={}, fallback={}, secondary={}\nmemory_health: healthy={}, warnings={}, issues={}\n",
+            leader_cached,
+            nav_cached,
+            primary_configured,
+            fallback_present,
+            secondary_configured,
+            memory_health.is_healthy,
+            memory_health.warnings.len(),
+            memory_health.issues.len(),
+        ));
+        if leader_exists != leader_cached || nav_exists != nav_cached {
+            writer.push("flags: registry/cache mismatch\n");
+        }
+        let mut dropped = Vec::new();
+        let mut agents = browser.diagnostics.timeline.agent_ids();
+        agents.sort();
+        for agent in agents {
+            dropped.push((
+                agent.clone(),
+                browser.diagnostics.timeline.events_dropped(&agent),
+            ));
+        }
+        let retention = browser.diagnostics.append_diagnostic_brief(&mut writer);
+        let (retained, selected) = browser
+            .diagnostics
+            .timeline
+            .append_diagnostic_brief_events(&mut writer);
+        (retention, retained, selected, dropped)
+    };
+    writer.push("\n## Evidence accounting\n\n");
+    writer.push(&format!(
+        "raw_timeline_retained: {}\nevents_included_in_brief: {}\nevents_omitted: {}\nlifecycle_retained: {}\nnavigation_intent_retained: {}\naction_retained: {}\ndom_snapshot_retained: {}\n",
+        timeline_retained,
+        timeline_selected,
+        timeline_retained.saturating_sub(timeline_selected),
+        retention.lifecycle,
+        retention.navigation_intents,
+        retention.actions,
+        retention.dom_snapshots,
+    ));
+    if dropped.is_empty() {
+        writer.push("per_agent_dropped_events: none\n");
+    } else {
+        for (agent, count) in dropped {
+            writer.push(&format!("dropped_events.{}: {}\n", agent, count));
+        }
+    }
+    Ok(redact_saved_credentials(&writer.finish(), &secrets))
+}
+
+/// Harness: return chronological timeline events as JSON string (spec 3-15)
+#[tauri::command]
+pub async fn get_browser_timeline(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    require_maintenance_enabled(&state).await?;
+    let browser = state.browser_state.lock().await;
+    let events = browser.diagnostics.timeline.all_events_sorted();
+    serde_json::to_string(&events).map_err(|e| e.to_string())
+}
+
+/// Harness: human-readable reliability report markdown (spec 16)
+#[tauri::command]
+pub async fn get_browser_reliability_report(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    require_maintenance_enabled(&state).await?;
+    let (timeline, diagnostics) = {
+        let browser = state.browser_state.lock().await;
+        (
+            browser.diagnostics.timeline.clone(),
+            browser.diagnostics.snapshot(),
+        )
+    };
+    let md = crate::browser_harness::generate_reliability_report_markdown(&timeline, &diagnostics);
+    Ok(md)
+}
+
+/// Harness: export bundle (spec 18) – writes BROWSER_RELIABILITY_REPORT.md + JSON files to app_data_dir/exports
+#[tauri::command]
+pub async fn export_browser_diagnostics(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    require_maintenance_enabled(&state).await?;
+    let (secrets, secure_storage_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !secure_storage_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let export_dir = app_data_dir.join(format!(
+        "diagnostics_export_{}_{}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+        &Uuid::new_v4().simple().to_string()[..8]
+    ));
+    crate::diagnostics_retention::prune_diagnostic_exports(
+        &app_data_dir,
+        crate::diagnostics_retention::MAX_DIAGNOSTIC_EXPORTS - 1,
+    )
+    .map_err(|error| {
+        settings_command_error("Could not apply diagnostic export retention", error)
+    })?;
+    std::fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
+    let mut export_guard = ExportDirectoryGuard {
+        path: export_dir.clone(),
+        keep: false,
+    };
+    let export_result = async {
+        let brief_path = export_dir.join("DIAGNOSTIC_BRIEF.md");
+        let brief = build_diagnostic_brief(&state, &app).await?;
+        std::fs::write(&brief_path, brief).map_err(|e| e.to_string())?;
+        let (timeline, diagnostics, browser_diagnostics) = {
+            let browser = state.browser_state.lock().await;
+            (
+                browser.diagnostics.timeline.all_events_sorted(),
+                browser.diagnostics.snapshot(),
+                browser.diagnostics.snapshot(),
+            )
+        };
+        // events.json
+        let events_path = export_dir.join("events.json");
+        std::fs::write(
+            &events_path,
+            serde_json::to_string_pretty(&timeline).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // browser-diagnostics.json
+        let diag_path = export_dir.join("browser-diagnostics.json");
+        std::fs::write(
+            &diag_path,
+            serde_json::to_string_pretty(&browser_diagnostics).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // navigation-history.json
+        let nav: Vec<_> = browser_diagnostics
+            .iter()
+            .flat_map(|r| r.navigation_diagnostics.clone())
+            .collect();
+        let nav_path = export_dir.join("navigation-history.json");
+        std::fs::write(
+            &nav_path,
+            serde_json::to_string_pretty(&nav).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // console-errors.json
+        let console: Vec<_> = browser_diagnostics
+            .iter()
+            .flat_map(|r| r.console_diagnostics.clone())
+            .collect();
+        let console_path = export_dir.join("console-errors.json");
+        std::fs::write(
+            &console_path,
+            serde_json::to_string_pretty(&console).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // Cross-platform forensics: lifecycle, dom, actions, intents
+        let (lifecycle, dom_snapshots, actions, intents, full_snapshot) = {
+            let browser = state.browser_state.lock().await;
+            let lc = browser
+                .diagnostics
+                .lifecycle_events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .flat_map(|d| d.iter().cloned())
+                .collect::<Vec<_>>();
+            let dom = browser
+                .diagnostics
+                .safe_dom_snapshots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .flat_map(|d| d.iter().cloned())
+                .collect::<Vec<_>>();
+            let acts = browser
+                .diagnostics
+                .action_records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .flat_map(|d| d.iter().cloned())
+                .collect::<Vec<_>>();
+            let intents = browser
+                .diagnostics
+                .navigation_intents
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .flat_map(|d| d.iter().cloned())
+                .collect::<Vec<_>>();
+            // Full diagnostic snapshot for forensic file
+            let diag = browser.diagnostics.snapshot();
+            let tl = browser.diagnostics.timeline.all_events_sorted();
+            let snapshot = serde_json::json!({
+                "browser_diagnostics": diag,
+                "timeline": tl,
+                "lifecycle_events": lc.clone(),
+                "safe_dom_snapshots": dom.clone(),
+                "action_records": acts.clone(),
+                "navigation_intents": intents.clone(),
+            });
+            (lc, dom, acts, intents, snapshot)
+        };
+        let lifecycle_path = export_dir.join("lifecycle-events.json");
+        std::fs::write(
+            &lifecycle_path,
+            serde_json::to_string_pretty(&lifecycle).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let dom_path = export_dir.join("safe-dom-snapshots.json");
+        std::fs::write(
+            &dom_path,
+            serde_json::to_string_pretty(&dom_snapshots).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let actions_path = export_dir.join("action-records.json");
+        std::fs::write(
+            &actions_path,
+            serde_json::to_string_pretty(&actions).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let intents_path = export_dir.join("navigation-intents.json");
+        std::fs::write(
+            &intents_path,
+            serde_json::to_string_pretty(&intents).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let snapshot_path = export_dir.join("diagnostic-snapshot.json");
+        std::fs::write(
+            &snapshot_path,
+            serde_json::to_string_pretty(&full_snapshot).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // BROWSER_RELIABILITY_REPORT.md
+        let timeline_obj = {
+            let browser = state.browser_state.lock().await;
+            browser.diagnostics.timeline.clone()
+        };
+        let report = crate::browser_harness::generate_reliability_report_markdown(
+            &timeline_obj,
+            &diagnostics,
+        );
+        let report_path = export_dir.join("BROWSER_RELIABILITY_REPORT.md");
+        std::fs::write(&report_path, &report).map_err(|e| e.to_string())?;
+        match directory_contains_credentials(&export_dir, &secrets) {
+            Ok(false) => {}
+            scan_result => {
+                return Err(match scan_result {
+                    Ok(true) => "Diagnostic export contained a saved model credential.".to_string(),
+                    Err(_) => "Diagnostic export could not be checked for saved model credentials."
+                        .to_string(),
+                    Ok(false) => "Diagnostic export produced an unexpected credential scan result."
+                        .to_string(),
+                });
+            }
+        }
+        let result = serde_json::json!({
+            "export_dir": export_dir.to_string_lossy(),
+            "diagnostic_brief": brief_path.to_string_lossy(),
+            "report": report_path.to_string_lossy(),
+            "events": events_path.to_string_lossy(),
+            "browser_diagnostics": diag_path.to_string_lossy(),
+            "navigation_history": nav_path.to_string_lossy(),
+            "console_errors": console_path.to_string_lossy(),
+            "lifecycle_events": lifecycle_path.to_string_lossy(),
+            "safe_dom_snapshots": dom_path.to_string_lossy(),
+            "action_records": actions_path.to_string_lossy(),
+            "navigation_intents": intents_path.to_string_lossy(),
+            "diagnostic_snapshot": snapshot_path.to_string_lossy(),
+        });
+        let serialized = serde_json::to_string(&result).map_err(|e| e.to_string())?;
+        Ok(serialized)
+    }
+    .await;
+    match export_result {
+        Ok(serialized) => {
+            export_guard.keep = true;
+            Ok(serialized)
+        }
+        Err(export_error) => {
+            let export_error = redact_saved_credentials(&export_error, &secrets);
+            match export_guard.remove_now() {
+                Ok(()) => Err(export_error),
+                Err(cleanup_error) => Err(redact_saved_credentials(
+                    &format!(
+                        "{export_error}; cleanup could not be confirmed, so a partial diagnostic export may remain at {}: {cleanup_error}",
+                        export_guard.path.display()
+                    ),
+                    &secrets,
+                )),
+            }
+        }
+    }
+}
+
+/// Dev-only single-model diagnostic (spec 19) – probe one agent without full arena loop
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_single_model_diagnostic(
+    agent_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    require_maintenance_enabled(&state).await?;
+    if state.session_runtime.is_active() {
+        return Err(
+            "Cannot run single-model diagnostic while a session is active. Stop the session first."
+                .to_string(),
+        );
+    }
+    let custom = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .map_err(|e| e.to_string())?;
+    let participant = crate::browser_backend::resolve_participant(&agent_id, &custom)
+        .ok_or_else(|| format!("Unknown participant: {agent_id}"))?;
+    let window = {
+        let mut browser = state.browser_state.lock().await;
+        // This externally initiated diagnostic shares the same registry-
+        // authoritative lifecycle rule as Connected Accounts.
+        crate::browser_backend::ensure_nav_window(&app, &mut browser).map_err(|e| e.to_string())?
+    };
+    let diagnostics = {
+        let browser = state.browser_state.lock().await;
+        browser.diagnostics.clone()
+    };
+    let lifecycle = {
+        let browser = state.browser_state.lock().await;
+        browser.lifecycle.clone()
+    };
+    let generation = diagnostics.setup_generation();
+    let op = crate::browser_harness::operation_id_diagnostic_single(&agent_id, generation);
+    diagnostics.set_operation(&agent_id, &op, "diagnostic");
+    diagnostics.emit_harness_event(
+        &agent_id,
+        crate::browser_harness::EventType::Unknown,
+        "diagnostic",
+        &op,
+        &participant.base_url,
+        serde_json::json!({ "single_model": true, "window": "available" }),
+    );
+
+    // Navigate
+    crate::browser_backend::navigate_agent_window(
+        &app,
+        &diagnostics,
+        &lifecycle,
+        &window,
+        &agent_id,
+        "nav",
+        &participant.base_url,
+        &participant.base_url,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Wait briefly for readiness probe (non-blocking, harness captures regardless)
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(15);
+    let probe_snapshot = loop {
+        if start.elapsed() > timeout {
+            break serde_json::json!({ "timed_out": true, "elapsed_ms": start.elapsed().as_millis() });
+        }
+        // Check diagnostics for composer detection
+        let diag = diagnostics
+            .snapshot()
+            .into_iter()
+            .find(|r| r.agent_id == agent_id);
+        if let Some(r) = diag {
+            if r.input_found || r.send_button_found || r.last_ready_at.is_some() {
+                break serde_json::json!({
+                    "input_found": r.input_found,
+                    "send_button_found": r.send_button_found,
+                    "composer_candidate_count": r.composer_candidate_count,
+                    "input_candidate_count": r.input_candidate_count,
+                    "send_button_candidate_count": r.send_button_candidate_count,
+                    "page_state_hint": r.page_state_hint,
+                    "page_health_hint": r.page_health_hint,
+                    "last_navigation_url": r.last_navigation_url,
+                    "elapsed_ms": start.elapsed().as_millis()
+                });
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    };
+
+    diagnostics.emit_harness_event(
+        &agent_id,
+        crate::browser_harness::EventType::DomSnapshot,
+        "diagnostic",
+        &op,
+        &participant.base_url,
+        probe_snapshot.clone(),
+    );
+
+    let result = serde_json::json!({
+        "agent_id": agent_id,
+        "display_name": participant.display_name,
+        "base_url": participant.base_url,
+        "operation_id": op,
+        "probe": probe_snapshot,
+        "timeline_dropped": diagnostics.timeline.events_dropped(&agent_id),
+        "note": "Diagnostic probe is dev-only and does not run the full arena loop; check timeline for detailed events"
+    });
+    Ok(serde_json::to_string(&result).map_err(|e| e.to_string())?)
 }
 
 #[tauri::command]
@@ -1068,7 +4030,7 @@ pub async fn export_blueprint(
     let store = state.blueprint_store.clone();
     let sid = resolved_session_id.clone();
     let fmt = format.clone();
-    let content = crate::db_helpers::run_blocking(move || {
+    let mut content = crate::db_helpers::run_blocking(move || {
         let guard = store
             .lock()
             .map_err(|_| AgentError::DatabaseError("blueprint store lock poisoned".to_string()))?;
@@ -1080,6 +4042,18 @@ pub async fn export_blueprint(
     })
     .await
     .map_err(|e| e.to_string())?;
+
+    let (export_secrets, secure_storage_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !secure_storage_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    content = redact_saved_credentials(&content, &export_secrets);
 
     let ext = if format == "markdown" { "md" } else { "txt" };
     let id_prefix_len = resolved_session_id.len().min(8);
@@ -1131,7 +4105,7 @@ pub async fn delete_session(
     session_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if state.session_active.load(Ordering::SeqCst) {
+    if state.session_runtime.is_active() {
         let orch = state.orchestrator.lock().await;
         if let Some(current) = orch.current_session.as_ref() {
             if current.session_id == session_id {
@@ -1288,6 +4262,57 @@ pub async fn get_session_details(
 /// The frontend calls this on startup to decide whether to offer recovery.
 ///
 /// Returns JSON: { "available": bool, "session_id": string }
+// ── Recent session loading: explicit session_id variants ─────────────────────
+// LOOP 1: Fix recent-session click that previously only setSelectedSessionId without
+// loading transcript/blueprint. These commands accept an explicit session_id
+// so Sidebar can load any past session, not just the active one. Stale
+// protection is handled frontend via loadSeq guard and backend via session_id
+// matching; no unwrap/expect, no secrets in payloads.
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_session_transcript(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let trimmed = session_id.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("session_id is required".to_string());
+    }
+    let store = state.transcript_store.clone();
+    let sid = trimmed.clone();
+    let records = crate::db_helpers::run_blocking(move || {
+        let guard = store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        guard.get_transcript(&sid)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    serde_json::to_string(&records).map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_blueprint_sections(
+    session_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let trimmed = session_id.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("session_id is required".to_string());
+    }
+    let store = state.blueprint_store.clone();
+    let sid = trimmed.clone();
+    let sections = crate::db_helpers::run_blocking(move || {
+        let guard = store
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("blueprint store lock poisoned".to_string()))?;
+        guard.get_sections(&sid)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    serde_json::to_string(&sections).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn get_recovery_state(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let store = state.settings_store.lock().await;
@@ -1352,6 +4377,335 @@ pub async fn recover_session(
     }
 
     Ok(())
+}
+
+// ── Launch Connected Account (reuses 2-WebView, no third window) ───────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectedAccountOutcome {
+    ComposerReady,
+    LoginRequired,
+    EmptyShell,
+}
+
+fn connected_account_outcome(
+    event: &NavEvent,
+    expected_agent_id: &str,
+) -> Option<ConnectedAccountOutcome> {
+    match event {
+        NavEvent::Ready(agent_id) if agent_id == expected_agent_id => {
+            Some(ConnectedAccountOutcome::ComposerReady)
+        }
+        NavEvent::SendProbe {
+            agent_id,
+            page_state_hint: Some(hint),
+            ..
+        } if agent_id == expected_agent_id => match hint.as_str() {
+            "possible_login_required" => Some(ConnectedAccountOutcome::LoginRequired),
+            "empty_shell_or_hydration_stuck" => Some(ConnectedAccountOutcome::EmptyShell),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+async fn wait_for_connected_account_readiness<F>(
+    expected_agent_id: &str,
+    display_name: &str,
+    diagnostics: &crate::browser_backend::BrowserDiagnostics,
+    nav_rx: &mut crate::browser_backend::AsyncNavReceiver<NavEvent>,
+    mut emit_challenge: F,
+) -> Result<ConnectedAccountOutcome, String>
+where
+    F: FnMut(),
+{
+    let mut verification_ui_emitted = false;
+    loop {
+        match nav_rx.recv().await {
+            Some(event) => {
+                if let Some(outcome) = connected_account_outcome(&event, expected_agent_id) {
+                    return Ok(outcome);
+                }
+                match event {
+                    // A challenge is a non-terminal state. The user may
+                    // complete it in the existing page; do not reload,
+                    // navigate, reinject, release ownership, or turn a
+                    // resume request into fake composer readiness.
+                    NavEvent::ChallengeDetected(id, _) if id == expected_agent_id => {
+                        if !verification_ui_emitted {
+                            emit_challenge();
+                            verification_ui_emitted = true;
+                        }
+                    }
+                    NavEvent::ResumeRequested(id) if id == expected_agent_id => {}
+                    NavEvent::Error(id) if id == expected_agent_id => {
+                        return Err(format!(
+                            "Page did not become ready: {}",
+                            diagnostics.readiness_timeout_message(&id, display_name)
+                        ));
+                    }
+                    NavEvent::UnshowableUrl(id, _url) if id == expected_agent_id => {
+                        return Err(format!("{} navigated to an unshowable page", display_name));
+                    }
+                    NavEvent::SessionAborted => return Err("Session aborted".to_string()),
+                    _ => {}
+                }
+            }
+            None => return Err("Navigation channel closed".to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+fn announces_connected_account_ready(outcome: ConnectedAccountOutcome) -> bool {
+    outcome == ConnectedAccountOutcome::ComposerReady
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn launch_connected_account(
+    agent_id: String,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if state.session_runtime.is_active() {
+        return Err(
+            "Cannot launch a model window while a session is active. Stop the session first."
+                .to_string(),
+        );
+    }
+    let custom = state
+        .settings_store
+        .lock()
+        .await
+        .get_custom_participants()
+        .map_err(|e| format!("Failed to read custom participants: {e}"))?;
+    let participant = resolve_participant(&agent_id, &custom)
+        .ok_or_else(|| format!("Unknown participant: {agent_id}"))?;
+
+    // The named Tauri registry is authoritative. Do this before consulting the
+    // Connected Accounts lease: a manually destroyed arena-nav can otherwise
+    // leave a stale cached handle and 20–120 second lease that blocks its one
+    // legitimate replacement.
+    let window = {
+        let mut browser = state.browser_state.lock().await;
+        ensure_nav_window(&app, &mut browser)
+            .map_err(|e| format!("Failed to create model window: {e}"))?
+    };
+
+    // R1.3: shared-window busy guard — prevents rapid successive launches
+    // from yanking the same WebView between models while navigation is still
+    // in flight. Uses the existing BrowserState lock so frontend and backend
+    // stay synchronized; not a frontend-only flag.
+    {
+        let mut browser = state.browser_state.lock().await;
+        if let Some(until) = browser.connected_account_busy_until {
+            if std::time::Instant::now() < until {
+                return Err(
+                    "A model window launch is already in progress. Wait about 30s and try again."
+                        .to_string(),
+                );
+            }
+        }
+        browser.connected_account_busy_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+    }
+
+    // Attach this command to the process-lifetime ingress. The sender captured
+    // by the shared WebView never changes, so a healthy authenticated window
+    // does not need to be destroyed merely to receive navigation signals.
+    let (diagnostics, lifecycle, mut tokio_rx) = {
+        let mut browser = state.browser_state.lock().await;
+        let nav_rx = browser.attach_nav_receiver();
+        (
+            browser.diagnostics.clone(),
+            browser.lifecycle.clone(),
+            nav_rx,
+        )
+    };
+
+    // A healthy same-agent/same-origin composer is already the desired account
+    // page. Focus it without another browsing transition. Any ownership,
+    // origin, blocker, or readiness mismatch still performs normal navigation.
+    let current_url = window.url().ok().map(|url| url.to_string());
+    let reuse_existing = current_url.as_deref().is_some_and(|url| {
+        diagnostics.can_reuse_connected_page(
+            &agent_id,
+            crate::browser_backend::NAV_WINDOW_LABEL,
+            url,
+            &participant.base_url,
+        )
+    });
+    let nav_result = if reuse_existing {
+        tracing::info!(
+            "[LAUNCH] reusing healthy connected account page for {} without navigation",
+            agent_id
+        );
+        Ok(())
+    } else {
+        navigate_agent_window(
+            &app,
+            &diagnostics,
+            &lifecycle,
+            &window,
+            &agent_id,
+            "nav",
+            &participant.base_url,
+            &participant.base_url,
+        )
+        .map_err(|e| e.to_string())
+    };
+
+    // Keep busy guard through the page-load tail so a second immediate click
+    // at 11s does not steal the window while the first navigation is still
+    // hydrating. Doubled readiness (90s/100s) means the tail must cover the
+    // full WebKitGTK composer mount; 20s tail (total 30s) is the minimum, but
+    // the readiness wait below holds the async function for up to 100s, so the
+    // guard is extended to 100s+20s to prevent yank during slow load.
+    {
+        let mut browser = state.browser_state.lock().await;
+        if nav_result.is_ok() {
+            browser.connected_account_busy_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(100 + 20));
+        } else {
+            browser.connected_account_busy_until = None;
+        }
+    }
+    nav_result?;
+
+    // Wait for page readiness (composer detected) with the doubled timeout
+    // (100s). This mirrors Priming's `wait_for_setup_ready` but without
+    // requiring priming prompt injection — it only ensures the page actually
+    // loaded and the generic composer was found, so the user does not see a
+    // blank window. The outcome distinguishes a usable composer from login,
+    // challenge, and empty-shell states so only genuine composer evidence is
+    // announced as ready. The window stays visible for every non-fatal state.
+    let wait_outcome = if reuse_existing {
+        Ok(Ok(ConnectedAccountOutcome::ComposerReady))
+    } else {
+        let timeout =
+            std::time::Duration::from_secs(crate::browser_backend::READINESS_WAIT_TIMEOUT_SECS);
+        let agent_id_wait = agent_id.clone();
+        let display_name_wait = participant.display_name.clone();
+        let diagnostics_wait = diagnostics.clone();
+        let app_wait = app.clone();
+        tokio::time::timeout(timeout, async move {
+            wait_for_connected_account_readiness(
+                &agent_id_wait,
+                &display_name_wait,
+                &diagnostics_wait,
+                &mut tokio_rx,
+                || {
+                    let _ = app_wait.emit(
+                        "captcha-detected",
+                        serde_json::json!({ "agent_id": agent_id_wait }),
+                    );
+                },
+            )
+            .await
+        })
+        .await
+    };
+
+    // Show/focus regardless of wait outcome — the page may be showing a login
+    // screen even if readiness hasn't fired yet. P5: surface failures.
+    if let Err(e) = window.show() {
+        tracing::warn!("[LAUNCH] show nav window failed for {}: {}", agent_id, e);
+    }
+    if let Err(e) = window.set_focus() {
+        tracing::warn!("[LAUNCH] focus nav window failed for {}: {}", agent_id, e);
+    }
+
+    match wait_outcome {
+        Ok(Ok(ConnectedAccountOutcome::ComposerReady)) => {
+            // Ready — clear extended guard to base tail and notify.
+            {
+                let mut browser = state.browser_state.lock().await;
+                browser.connected_account_busy_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+            }
+            let _ = app.emit(
+                "boss-message",
+                serde_json::json!({
+                    "text": format!(
+                        "{} is ready — window showing {}.",
+                        participant.display_name, participant.base_url
+                    ),
+                    "message_type": "status"
+                }),
+            );
+        }
+        Ok(Ok(ConnectedAccountOutcome::LoginRequired)) => {
+            let mut browser = state.browser_state.lock().await;
+            browser.connected_account_busy_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+            drop(browser);
+            let _ = app.emit(
+                "boss-message",
+                serde_json::json!({
+                    "text": format!("{} is showing a login page at {}. Please log in in the window.", participant.display_name, participant.base_url),
+                    "message_type": "status"
+                }),
+            );
+        }
+        Ok(Ok(ConnectedAccountOutcome::EmptyShell)) => {
+            let mut browser = state.browser_state.lock().await;
+            browser.connected_account_busy_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+            drop(browser);
+            let _ = app.emit(
+                "boss-message",
+                serde_json::json!({
+                    "text": format!("{} loaded, but its application UI did not render or hydrate. The window remains open for inspection; Arena will not reload it automatically. Check Settings → Diagnostics.", participant.display_name),
+                    "message_type": "status"
+                }),
+            );
+        }
+        Ok(Err(msg)) => {
+            // Non-fatal readiness error (e.g., timeout with page_state_hint) —
+            // window is still visible; surface diagnostics but don't fail the
+            // command so user can still interact (login, retry).
+            tracing::warn!(
+                "[LAUNCH] readiness wait for {} ended with a recoverable failure",
+                agent_id
+            );
+            let _ = app.emit(
+                "boss-message",
+                serde_json::json!({
+                    "text": format!("{} window loading — {} Complete any login if prompted. Diagnostics: {}", participant.display_name, participant.base_url, msg),
+                    "message_type": "status"
+                }),
+            );
+        }
+        Err(_) => {
+            // Timeout (100s) — page still loading. Keep window visible and
+            // tell user to check diagnostics / retry. Not a hard error.
+            tracing::warn!(
+                "[LAUNCH] readiness timeout for {} after {}s",
+                agent_id,
+                crate::browser_backend::READINESS_WAIT_TIMEOUT_SECS
+            );
+            let hint = diagnostics
+                .page_state_hint_for(&agent_id)
+                .unwrap_or_else(|| "still_loading".to_string());
+            let _ = app.emit(
+                "boss-message",
+                serde_json::json!({
+                    "text": format!(
+                        "{} is still loading ({}). Window remains open — complete any login there if prompted, or retry in 30s. Hint: {}",
+                        participant.display_name, participant.base_url, hint
+                    ),
+                    "message_type": "status"
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_brain_status(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let status = state.active_brain.lock().await.clone();
+    serde_json::to_string(&status).map_err(|e| e.to_string())
 }
 
 // ── Phase 1 memory ───────────────────────────────────────────────────────────
@@ -1519,15 +4873,74 @@ pub async fn export_memory(
     state: tauri::State<'_, AppState>,
     destination_path: String,
 ) -> Result<(), String> {
+    let (secrets, secure_storage_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !secure_storage_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
     let memory_store = state.memory_store.clone();
-    crate::db_helpers::run_blocking(move || {
+    let export_path = std::path::PathBuf::from(destination_path.clone());
+    let scan_secrets = secrets.clone();
+    let result = crate::db_helpers::run_blocking(move || {
+        let parent = export_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let name = export_path
+            .file_name()
+            .ok_or_else(|| {
+                AgentError::DatabaseError("memory export destination has no file name".to_string())
+            })?
+            .to_string_lossy();
+        let staging_path = parent.join(format!(".{name}.arena-export-{}.tmp", Uuid::new_v4()));
+        let mut staging_guard = ExportFileGuard {
+            path: staging_path.clone(),
+            keep: false,
+        };
         let memory = memory_store
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        memory.export_to(&destination_path)
+        let export_result = (|| {
+            memory.export_to(&staging_path.to_string_lossy())?;
+            match file_contains_credentials(&staging_path, &scan_secrets) {
+                Ok(false) => {
+                    std::fs::rename(&staging_path, &export_path).map_err(|error| {
+                        AgentError::DatabaseError(format!(
+                            "could not publish verified memory export: {error}"
+                        ))
+                    })?;
+                    Ok(())
+                }
+                Ok(true) => Err(AgentError::DatabaseError(
+                    "memory export contained a saved model credential".to_string(),
+                )),
+                Err(error) => Err(AgentError::DatabaseError(format!(
+                    "memory export could not be checked for saved model credentials: {error}"
+                ))),
+            }
+        })();
+        match export_result {
+            Ok(()) => {
+                staging_guard.keep = true;
+                Ok(())
+            }
+            Err(export_error) => match staging_guard.remove_now() {
+                Ok(()) => Err(export_error),
+                Err(cleanup_error) => Err(AgentError::DatabaseError(format!(
+                    "{export_error}; cleanup could not be confirmed, so a temporary memory export may remain at {}: {cleanup_error}",
+                    staging_guard.path.display()
+                ))),
+            },
+        }
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    result.map_err(|error| redact_saved_credentials(&error, &secrets))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1536,10 +4949,24 @@ pub async fn restore_memory(
     app: AppHandle,
     source_path: String,
 ) -> Result<(), String> {
-    if state.session_active.load(Ordering::SeqCst) {
+    if state.session_runtime.is_active() {
         return Err(
             "Cannot restore memory while a session is active. Stop the session first.".to_string(),
         );
+    }
+
+    let (secrets, secure_storage_ready) = {
+        let store = state.settings_store.lock().await;
+        (
+            configured_credentials(&store)?,
+            store.credential_storage_available() && !store.credential_migration_pending(),
+        )
+    };
+    if !secure_storage_ready {
+        return Err(crate::credentials::secure_storage_help().to_string());
+    }
+    if file_contains_credentials(std::path::Path::new(&source_path), &secrets)? {
+        return Err("Memory backup contains a saved model credential. Review the backup before restoring it.".to_string());
     }
 
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -1547,8 +4974,9 @@ pub async fn restore_memory(
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
     let pre_restore_path = backup_dir.join(format!("pre_restore_{timestamp}.db"));
     let memory_store = state.memory_store.clone();
+    let scan_secrets = secrets.clone();
 
-    crate::db_helpers::run_blocking(move || {
+    let result = crate::db_helpers::run_blocking(move || {
         std::fs::create_dir_all(&backup_dir).map_err(|e| {
             AgentError::DatabaseError(format!("could not create memory backup directory: {e}"))
         })?;
@@ -1556,8 +4984,51 @@ pub async fn restore_memory(
         let mut memory = memory_store
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        memory.export_to(&pre_restore_path)?;
-        memory.restore_from(&source_path)?;
+        let mut backup_guard = ExportFileGuard {
+            path: std::path::PathBuf::from(&pre_restore_path),
+            keep: false,
+        };
+        if let Err(export_error) = memory.export_to(&pre_restore_path) {
+            return match backup_guard.remove_now() {
+                Ok(()) => Err(export_error),
+                Err(cleanup_error) => Err(AgentError::DatabaseError(format!(
+                    "{export_error}; cleanup could not be confirmed, so a partial pre-restore backup may remain at {}: {cleanup_error}",
+                    backup_guard.path.display()
+                ))),
+            };
+        }
+        match file_contains_credentials(std::path::Path::new(&pre_restore_path), &scan_secrets) {
+            Ok(false) => backup_guard.keep = true,
+            Ok(true) => {
+                let error = AgentError::DatabaseError(
+                    "pre-restore backup contained a saved model credential".to_string(),
+                );
+                return match backup_guard.remove_now() {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(AgentError::DatabaseError(format!(
+                        "{error}; cleanup could not be confirmed, so a credential-bearing pre-restore backup may remain at {}: {cleanup_error}",
+                        backup_guard.path.display()
+                    ))),
+                };
+            }
+            Err(scan_error) => {
+                let error = AgentError::DatabaseError(format!(
+                    "pre-restore backup could not be checked for saved model credentials: {scan_error}"
+                ));
+                return match backup_guard.remove_now() {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(AgentError::DatabaseError(format!(
+                        "{error}; cleanup could not be confirmed, so an unchecked pre-restore backup may remain at {}: {cleanup_error}",
+                        backup_guard.path.display()
+                    ))),
+                };
+            }
+        }
+        if let Err(error) = memory.restore_from(&source_path) {
+            return Err(AgentError::DatabaseError(format!(
+                "memory restore failed: {error}. Pre-restore backup saved at {pre_restore_path}"
+            )));
+        }
         let health = memory.check_health();
         if !health.is_healthy {
             return Err(AgentError::DatabaseError(format!(
@@ -1569,5 +5040,1221 @@ pub async fn restore_memory(
         Ok(())
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    result.map_err(|error| redact_saved_credentials(&error, &secrets))
+}
+
+// ── Hackathon Mode ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_hackathon_config(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let config = state
+        .settings_store
+        .lock()
+        .await
+        .get_hackathon_config()
+        .map_err(|e| settings_command_error("Failed to read hackathon config", e))?;
+    let safe = config.to_safe();
+    serde_json::to_string(&safe).map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_hackathon_config(
+    mut config: crate::hackathon::HackathonConfig,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // Preserve existing api_keys when frontend sends empty string (since frontend never receives keys back).
+    // Frontend's safe config omits keys; on round-trip, empty means "keep previous".
+    {
+        let store = state.settings_store.lock().await;
+        let existing = store
+            .get_hackathon_config()
+            .map_err(|e| settings_command_error("Failed to read existing hackathon config", e))?;
+        let existing_map: std::collections::HashMap<String, String> = existing
+            .models
+            .into_iter()
+            .map(|m| (m.id, m.api_key))
+            .collect();
+        for m in &mut config.models {
+            if m.api_key.trim().is_empty() {
+                if let Some(prev) = existing_map.get(&m.id) {
+                    if !prev.trim().is_empty() {
+                        m.api_key = prev.clone();
+                    }
+                }
+            }
+        }
+    }
+    config
+        .validate()
+        .map_err(|e| settings_command_error("Hackathon config validation failed", e))?;
+    {
+        let mut store = state.settings_store.lock().await;
+        store
+            .save_hackathon_config(&config)
+            .map_err(|e| settings_command_error("Failed to save hackathon config", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_hackathon_run_state(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let run = state.hackathon_run.lock().await;
+    match run.as_ref() {
+        Some(r) => {
+            let safe = r.to_safe();
+            serde_json::to_string(&safe).map_err(|e| e.to_string())
+        }
+        None => Ok("null".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn cancel_hackathon_run(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.hackathon_cancel.store(true, Ordering::SeqCst);
+    // Also clear run_id after short delay? Keep run for display.
+    Ok(())
+}
+
+/// Send parallel health-check invitations to all models in selected groups.
+/// Returns run_id as JSON string. Emits hackathon-invitation-update per model and hackathon-group-status per group.
+#[tauri::command]
+pub async fn send_hackathon_invitations(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    // Prevent duplicate active runs
+    {
+        let existing = state.hackathon_run.lock().await;
+        if let Some(r) = existing.as_ref() {
+            // If previous run is still pending/running and not cancelled, reject
+            let has_running = r
+                .groups
+                .iter()
+                .any(|g| g.status == crate::hackathon::GroupRunStatus::Running);
+            if has_running && !r.cancelled.load(Ordering::SeqCst) {
+                return Err(
+                    "A hackathon invitation/run is already in progress. Cancel it first."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let config = state
+        .settings_store
+        .lock()
+        .await
+        .get_hackathon_config()
+        .map_err(|e| settings_command_error("Failed to read hackathon config", e))?;
+
+    if config.groups.is_empty() || config.models.is_empty() {
+        return Err("No hackathon groups or models configured".to_string());
+    }
+
+    let selected_groups: Vec<_> = config
+        .groups
+        .iter()
+        .filter(|g| g.selected)
+        .cloned()
+        .collect();
+    if selected_groups.is_empty() {
+        return Err("No groups selected for invitation".to_string());
+    }
+
+    // Build GroupRunState list for selected groups
+    let run_id = Uuid::new_v4().to_string();
+    let mut groups: Vec<crate::hackathon::GroupRunState> = Vec::new();
+    let mut model_creds: std::collections::HashMap<String, (String, String, String)> =
+        std::collections::HashMap::new();
+    for m in &config.models {
+        model_creds.insert(
+            m.id.clone(),
+            (m.base_url.clone(), m.api_key.clone(), m.model_name.clone()),
+        );
+    }
+    let task_brief = {
+        // Use context_manager project_brief if available, else generic
+        let ctx = state.context_manager.lock().await;
+        if !ctx.project_brief.trim().is_empty() {
+            ctx.project_brief.clone()
+        } else {
+            // Fallback: use orchestrator current_session brief if any
+            let orch = state.orchestrator.lock().await;
+            orch.current_session
+                .as_ref()
+                .map(|c| c.project_brief.clone())
+                .unwrap_or_else(|| "Hackathon task".to_string())
+        }
+    };
+
+    for g in selected_groups {
+        let participants: Vec<crate::hackathon::ParticipantRunState> = g
+            .model_ids
+            .iter()
+            .filter_map(|mid| {
+                config.models.iter().find(|m| &m.id == mid).map(|m| {
+                    crate::hackathon::ParticipantRunState {
+                        model_id: m.id.clone(),
+                        model_name: m.model_name.clone(),
+                        base_url: m.base_url.clone(),
+                        group_id: g.id.clone(),
+                        status: crate::hackathon::ParticipantRunStatus::Pending,
+                        consultation_count: 0,
+                        last_error: None,
+                    }
+                })
+            })
+            .collect();
+        groups.push(crate::hackathon::GroupRunState {
+            group_id: g.id.clone(),
+            group_name: g.name.clone(),
+            model_ids_ordered: g.model_ids.clone(),
+            participants,
+            leader_id: None,
+            history: Vec::new(),
+            status: crate::hackathon::GroupRunStatus::Pending,
+            final_output: None,
+            consultation_counts: std::collections::HashMap::new(),
+        });
+    }
+
+    let max_questions = config.max_questions_per_teammate;
+    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let run_state = crate::hackathon::HackathonRunState {
+        run_id: run_id.clone(),
+        task_brief: task_brief.clone(),
+        max_questions,
+        groups: groups.clone(),
+        cancelled: cancel_flag.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    // Store run state and run_id
+    {
+        let mut r = state.hackathon_run.lock().await;
+        *r = Some(run_state);
+    }
+    {
+        let mut id = state.hackathon_run_id.lock().await;
+        *id = Some(run_id.clone());
+    }
+    state.hackathon_cancel.store(false, Ordering::SeqCst);
+
+    // Emit run started
+    let _ = app.emit(
+        "hackathon-run-started",
+        json!({
+            "run_id": run_id,
+            "task_brief": task_brief,
+            "group_ids": groups.iter().map(|g| &g.group_id).collect::<Vec<_>>(),
+            "max_questions": max_questions,
+        }),
+    );
+
+    // Clone state arcs for tasks
+    let hackathon_run_clone = state.hackathon_run.clone();
+    let app_clone = app.clone();
+    let run_id_clone = run_id.clone();
+
+    // Fan-out invitations concurrently
+    tokio::spawn(async move {
+        let mut join_set = tokio::task::JoinSet::new();
+
+        // Snapshot participants for tasks
+        let mut tasks_info: Vec<(String, String, String, String, String, String)> = Vec::new(); // group_id, model_id, base_url, api_key, model_name, run_id
+        for group in &groups {
+            for p in &group.participants {
+                if let Some((base_url, api_key, model_name)) = model_creds.get(&p.model_id) {
+                    tasks_info.push((
+                        group.group_id.clone(),
+                        p.model_id.clone(),
+                        base_url.clone(),
+                        api_key.clone(),
+                        model_name.clone(),
+                        run_id_clone.clone(),
+                    ));
+                }
+            }
+        }
+
+        for (group_id, model_id, base_url, api_key, model_name, run_id_task) in tasks_info {
+            let app_task = app_clone.clone();
+            let run_clone = hackathon_run_clone.clone();
+            let run_id_task_clone = run_id_task.clone();
+            join_set.spawn(async move {
+                let prompt = crate::hackathon::build_invitation_prompt();
+                let messages = vec![crate::hackathon::HackathonMessage {
+                    role: "user".to_string(),
+                    content: prompt,
+                }];
+                let result = crate::hackathon::call_hackathon_model(
+                    &base_url,
+                    &api_key,
+                    &model_name,
+                    &messages,
+                    crate::hackathon::HACKATHON_INVITE_TIMEOUT_SECS,
+                )
+                .await;
+
+                let (status_str, error_opt) = match &result {
+                    Ok(_) => ("confirmed", None),
+                    Err(e) => ("failed", Some(e.clone())),
+                };
+
+                // Update run state under lock — clone, modify, drop lock before emit
+                let should_emit = {
+                    let mut run_lock = run_clone.lock().await;
+                    if let Some(run) = run_lock.as_mut() {
+                        // Stale run check
+                        if run.run_id != run_id_task_clone {
+                            return;
+                        }
+                        for group in &mut run.groups {
+                            if group.group_id == group_id {
+                                for p in &mut group.participants {
+                                    if p.model_id == model_id {
+                                        p.status = if status_str == "confirmed" {
+                                            crate::hackathon::ParticipantRunStatus::Confirmed
+                                        } else {
+                                            crate::hackathon::ParticipantRunStatus::Failed
+                                        };
+                                        p.last_error = error_opt.clone();
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    true
+                };
+
+                if should_emit {
+                    let _ = app_task.emit(
+                        "hackathon-invitation-update",
+                        json!({
+                            "run_id": run_id_task,
+                            "group_id": group_id,
+                            "model_id": model_id,
+                            "status": status_str,
+                            "error": error_opt,
+                        }),
+                    );
+                }
+            });
+        }
+
+        // Wait for all invitations
+        while let Some(res) = join_set.join_next().await {
+            if let Err(e) = res {
+                tracing::warn!("[HACKATHON] invitation task join error: {}", e);
+            }
+        }
+
+        // After all, compute group status and emit group-status, handle zero-responders locking
+        let final_groups: Vec<(String, String)> = {
+            // group_id, status
+            let mut run_lock = hackathon_run_clone.lock().await;
+            if let Some(run) = run_lock.as_mut() {
+                if run.run_id != run_id_clone {
+                    return;
+                }
+                let mut out = Vec::new();
+                for group in &mut run.groups {
+                    let live_count = group
+                        .participants
+                        .iter()
+                        .filter(|p| p.status == crate::hackathon::ParticipantRunStatus::Confirmed)
+                        .count();
+                    if live_count == 0 {
+                        group.status = crate::hackathon::GroupRunStatus::Locked;
+                    } else {
+                        // Sort participants so responders float top preserving order
+                        // Build status map
+                        let mut status_map = std::collections::HashMap::new();
+                        for p in &group.participants {
+                            status_map.insert(p.model_id.clone(), p.status.clone());
+                        }
+                        let sorted_ids = crate::hackathon::sort_by_responder_status(
+                            &group.model_ids_ordered,
+                            &status_map,
+                        );
+                        group.model_ids_ordered = sorted_ids.clone();
+                        // Also reorder participants vec to match sorted order for UI consistency
+                        let mut sorted_parts = Vec::new();
+                        for id in &sorted_ids {
+                            if let Some(p) = group
+                                .participants
+                                .iter()
+                                .find(|pp| &pp.model_id == id)
+                                .cloned()
+                            {
+                                sorted_parts.push(p);
+                            }
+                        }
+                        group.participants = sorted_parts;
+                        // Select leader = first confirmed
+                        let live_set: std::collections::HashSet<String> = group
+                            .participants
+                            .iter()
+                            .filter(|p| {
+                                p.status == crate::hackathon::ParticipantRunStatus::Confirmed
+                            })
+                            .map(|p| p.model_id.clone())
+                            .collect();
+                        group.leader_id =
+                            crate::hackathon::select_leader(&group.model_ids_ordered, &live_set);
+                        group.status = crate::hackathon::GroupRunStatus::Pending;
+                    }
+                    let status_str = match group.status {
+                        crate::hackathon::GroupRunStatus::Locked => "locked",
+                        crate::hackathon::GroupRunStatus::Pending => "pending",
+                        _ => "pending",
+                    };
+                    out.push((group.group_id.clone(), status_str.to_string()));
+                }
+                out
+            } else {
+                Vec::new()
+            }
+        };
+
+        for (group_id, status) in final_groups {
+            let _ = app_clone.emit(
+                "hackathon-group-status",
+                json!({
+                    "run_id": run_id_clone,
+                    "group_id": group_id,
+                    "status": status,
+                }),
+            );
+        }
+
+        // Also update hackathon_run_id cleanup? Keep it.
+        let _ = app_clone.emit(
+            "hackathon-invitations-complete",
+            json!({
+                "run_id": run_id_clone,
+            }),
+        );
+    });
+
+    serde_json::to_string(&json!({ "run_id": run_id })).map_err(|e| e.to_string())
+}
+
+/// Run full hackathon execution for all selected groups concurrently.
+/// Uses task_brief verbatim for every group. Groups execute via run_single_group concurrently.
+/// Returns combined report as JSON string.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_hackathon(
+    task_brief: String,
+    selected_participant_ids: Option<Vec<String>>,
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    if task_brief.trim().is_empty() {
+        return Err("Task brief cannot be empty".to_string());
+    }
+
+    // Must have an existing run state from invitations, or create one if groups exist but no prior invitations
+    let (run_id, max_questions, config_groups) = {
+        let run_lock = state.hackathon_run.lock().await;
+        if let Some(run) = run_lock.as_ref() {
+            // If cancelled, reject
+            if run.cancelled.load(Ordering::SeqCst) {
+                return Err(
+                    "Previous hackathon run was cancelled — send invitations again".to_string(),
+                );
+            }
+            // If groups exist but some are still Pending without confirmed status, we need confirmed participants
+            let has_confirmed = run.groups.iter().any(|g| {
+                g.participants
+                    .iter()
+                    .any(|p| p.status == crate::hackathon::ParticipantRunStatus::Confirmed)
+            });
+            if !has_confirmed {
+                return Err(
+                    "No confirmed participants — send invitations and wait for responders"
+                        .to_string(),
+                );
+            }
+            (run.run_id.clone(), run.max_questions, run.groups.clone())
+        } else {
+            // No prior run — try to build from config's selected groups with live=Pending (allow execution without invitation phase)
+            let config = state
+                .settings_store
+                .lock()
+                .await
+                .get_hackathon_config()
+                .map_err(|e| settings_command_error("Failed to read hackathon config", e))?;
+            let selected: Vec<_> = config
+                .groups
+                .iter()
+                .filter(|g| g.selected)
+                .cloned()
+                .collect();
+            if selected.is_empty() {
+                return Err("No hackathon run found — send invitations first".to_string());
+            }
+            let new_run_id = Uuid::new_v4().to_string();
+            let mut groups = Vec::new();
+            for g in selected {
+                let participants: Vec<crate::hackathon::ParticipantRunState> = g
+                    .model_ids
+                    .iter()
+                    .filter_map(|mid| {
+                        config.models.iter().find(|m| &m.id == mid).map(|m| {
+                            crate::hackathon::ParticipantRunState {
+                                model_id: m.id.clone(),
+                                model_name: m.model_name.clone(),
+                                base_url: m.base_url.clone(),
+                                group_id: g.id.clone(),
+                                status: crate::hackathon::ParticipantRunStatus::Pending,
+                                consultation_count: 0,
+                                last_error: None,
+                            }
+                        })
+                    })
+                    .collect();
+                groups.push(crate::hackathon::GroupRunState {
+                    group_id: g.id.clone(),
+                    group_name: g.name.clone(),
+                    model_ids_ordered: g.model_ids.clone(),
+                    participants,
+                    leader_id: None,
+                    history: Vec::new(),
+                    status: crate::hackathon::GroupRunStatus::Pending,
+                    final_output: None,
+                    consultation_counts: std::collections::HashMap::new(),
+                });
+            }
+            // Create run state now; need to store it
+            // We cannot store inside this read lock — will do after drop
+            (new_run_id, config.max_questions_per_teammate, groups)
+        }
+    };
+
+    // If we created a new run_id above because no prior run existed, store it
+    {
+        let mut run_lock = state.hackathon_run.lock().await;
+        if run_lock.is_none() {
+            // Build new run_state from config_groups
+            // We already have run_id/max_questions/config_groups
+            // Need to reconstruct task_brief? Use passed task_brief
+            let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let new_state = crate::hackathon::HackathonRunState {
+                run_id: run_id.clone(),
+                task_brief: task_brief.clone(),
+                max_questions,
+                groups: config_groups.clone(),
+                cancelled: cancel_flag,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            *run_lock = Some(new_state);
+            let mut id_lock = state.hackathon_run_id.lock().await;
+            *id_lock = Some(run_id.clone());
+            state.hackathon_cancel.store(false, Ordering::SeqCst);
+        } else {
+            // Update task_brief for existing run for this execution
+            if let Some(run) = run_lock.as_mut() {
+                run.task_brief = task_brief.clone();
+                run.cancelled.store(false, Ordering::SeqCst);
+            }
+            state.hackathon_cancel.store(false, Ordering::SeqCst);
+        }
+    }
+
+    // Build credentials map from config
+    let config = state
+        .settings_store
+        .lock()
+        .await
+        .get_hackathon_config()
+        .map_err(|e| settings_command_error("Failed to read hackathon config", e))?;
+    let mut model_creds: std::collections::HashMap<String, (String, String, String)> =
+        std::collections::HashMap::new();
+    for m in &config.models {
+        model_creds.insert(
+            m.id.clone(),
+            (m.base_url.clone(), m.api_key.clone(), m.model_name.clone()),
+        );
+    }
+
+    // Server-trusted participant selection: if caller supplied selected ids, validate strictly.
+    // Rejects: unknown model, non-selected group, non-confirmed/failed/pending, deleted, stale run, cross-group.
+    if let Some(selected) = &selected_participant_ids {
+        let run_lock = state.hackathon_run.lock().await;
+        let run = run_lock
+            .as_ref()
+            .ok_or_else(|| "No hackathon run to validate selection against".to_string())?;
+        let current_run_id = run.run_id.clone();
+        // Build lookup: model_id -> (group_id, status)
+        let mut id_to_group: std::collections::HashMap<
+            String,
+            (String, crate::hackathon::ParticipantRunStatus),
+        > = std::collections::HashMap::new();
+        for g in &run.groups {
+            for p in &g.participants {
+                id_to_group.insert(p.model_id.clone(), (g.group_id.clone(), p.status.clone()));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for mid in selected {
+            if !seen.insert(mid.clone()) {
+                return Err(format!("Duplicate selected participant: {}", mid));
+            }
+            let (group_id, status) = id_to_group
+                .get(mid)
+                .ok_or_else(|| {
+                    format!(
+                        "Selected model {} not in current run (deleted or unknown)",
+                        mid
+                    )
+                })?
+                .clone();
+            if status != crate::hackathon::ParticipantRunStatus::Confirmed {
+                return Err(format!(
+                    "Selected model {} is not a confirmed responder (status {:?}) — cannot participate",
+                    mid, status
+                ));
+            }
+            // Ensure its group is still selected in persisted config
+            let cfg = config_groups.iter().find(|g| &g.group_id == &group_id);
+            if cfg.is_none() {
+                return Err(format!(
+                    "Selected model {} belongs to group {} not in current run",
+                    mid, group_id
+                ));
+            }
+            // Stale run check is implicit via run_id match above; caller must have fresh run.
+            let _ = current_run_id.clone();
+        }
+        // Apply selection: filter each group's participants to only selected confirmed ones; zero-selected groups become Locked (inactive)
+        {
+            let mut run_mut = state.hackathon_run.lock().await;
+            if let Some(r) = run_mut.as_mut() {
+                let sel_set: std::collections::HashSet<String> = selected.iter().cloned().collect();
+                for g in &mut r.groups {
+                    let is_selected_group =
+                        config_groups.iter().any(|cg| cg.group_id == g.group_id);
+                    if !is_selected_group || g.status == crate::hackathon::GroupRunStatus::Locked {
+                        continue;
+                    }
+                    // Retain only selected confirmed participants as Confirmed; others marked as Failed? Actually keep but mark not selected as Failed for execution exclusion
+                    // Instead we filter model_ids_ordered to selected only, and keep participants but execution will check live_set = Confirmed only
+                    // So we keep participants but mark non-selected Confirmed as still Confirmed? We need to downgrade non-selected to not live.
+                    // Easiest: keep status but filter live_set later via selected set. So we store selection as separate filtered view:
+                    // For now, mark non-selected confirmed as Pending so they become non-live.
+                    for p in &mut g.participants {
+                        if p.status == crate::hackathon::ParticipantRunStatus::Confirmed
+                            && !sel_set.contains(&p.model_id)
+                        {
+                            p.status = crate::hackathon::ParticipantRunStatus::Failed;
+                            p.last_error = Some("Deselected by user before Go".to_string());
+                        }
+                    }
+                    // Re-sort and recompute leader after deselection
+                    let live_set: std::collections::HashSet<String> = g
+                        .participants
+                        .iter()
+                        .filter(|p| p.status == crate::hackathon::ParticipantRunStatus::Confirmed)
+                        .map(|p| p.model_id.clone())
+                        .collect();
+                    if live_set.is_empty() {
+                        g.status = crate::hackathon::GroupRunStatus::Locked;
+                        g.leader_id = None;
+                    } else {
+                        g.leader_id =
+                            crate::hackathon::select_leader(&g.model_ids_ordered, &live_set);
+                        // Keep status Pending to be executable
+                        if g.status != crate::hackathon::GroupRunStatus::Locked {
+                            g.status = crate::hackathon::GroupRunStatus::Pending;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Snapshot groups for execution (clone)
+    let groups_snapshot: Vec<crate::hackathon::GroupRunState> = {
+        let run_lock = state.hackathon_run.lock().await;
+        run_lock
+            .as_ref()
+            .map(|r| r.groups.clone())
+            .unwrap_or_default()
+    };
+
+    // Filter to only groups that are not Locked and have at least one live participant
+    let executable_groups: Vec<crate::hackathon::GroupRunState> = groups_snapshot
+        .into_iter()
+        .filter(|g| g.status != crate::hackathon::GroupRunStatus::Locked)
+        .filter(|g| {
+            g.participants
+                .iter()
+                .any(|p| p.status == crate::hackathon::ParticipantRunStatus::Confirmed)
+        })
+        .collect();
+
+    if executable_groups.is_empty() {
+        return Err(
+            "No executable groups — all are locked or have zero selected live members".to_string(),
+        );
+    }
+
+    let run_id_clone = run_id.clone();
+    let app_clone = app.clone();
+    let _ = app_clone.emit(
+        "hackathon-run-started",
+        json!({
+            "run_id": run_id_clone,
+            "task_brief": task_brief,
+            "group_count": executable_groups.len(),
+        }),
+    );
+
+    // Prepare shared cancel flag from AppState
+    let cancel_flag = {
+        let run_lock = state.hackathon_run.lock().await;
+        run_lock
+            .as_ref()
+            .map(|r| r.cancelled.clone())
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    };
+    // Also respect global hackathon_cancel
+    let global_cancel = state.hackathon_cancel.clone();
+
+    // Concurrent execution via JoinSet
+    let mut join_set = tokio::task::JoinSet::new();
+    for group in executable_groups {
+        let task_brief_clone = task_brief.clone();
+        let max_q = max_questions;
+        let creds = model_creds.clone();
+        let run_id_task = run_id.clone();
+        let cancel_clone = cancel_flag.clone();
+        let global_cancel_clone = global_cancel.clone();
+        let app_task = app_clone.clone();
+        join_set.spawn(async move {
+            // Combine cancel flags
+            let combined_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // We'll check both flags inside run_single_group via closure that checks either
+            // For simplicity, make run_single_group check cancel_clone; we also spawn a watcher
+            let watcher_cancel = combined_cancel.clone();
+            let c1 = cancel_clone.clone();
+            let c2 = global_cancel_clone.clone();
+            tokio::spawn(async move {
+                loop {
+                    if c1.load(Ordering::SeqCst) || c2.load(Ordering::SeqCst) {
+                        watcher_cancel.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            });
+
+            let result = crate::hackathon::run_single_group(
+                group,
+                task_brief_clone,
+                max_q,
+                creds,
+                run_id_task.clone(),
+                combined_cancel,
+            )
+            .await;
+            let _ = app_task.emit(
+                "hackathon-group-output",
+                json!({
+                    "run_id": run_id_task,
+                    "group_id": result.group_id,
+                    "group_name": result.group_name,
+                    "status": result.status,
+                    "final_output": result.final_output,
+                }),
+            );
+            result
+        });
+    }
+
+    let mut completed_groups: Vec<crate::hackathon::GroupRunState> = Vec::new();
+    while let Some(res) = join_set.join_next().await {
+        match res {
+            Ok(group) => completed_groups.push(group),
+            Err(e) => {
+                tracing::warn!("[HACKATHON] group task join error: {}", e);
+            }
+        }
+    }
+
+    // Check for stale run: if current active run_id differs, discard
+    {
+        let active_id = state
+            .hackathon_run_id
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_default();
+        if active_id != run_id {
+            return Err("Hackathon run was superseded by a newer run".to_string());
+        }
+    }
+
+    // Respect cancellation
+    if cancel_flag.load(Ordering::SeqCst) || global_cancel.load(Ordering::SeqCst) {
+        return Err("Hackathon run was cancelled".to_string());
+    }
+
+    // Include locked groups for report from stored run
+    {
+        let mut run_lock = state.hackathon_run.lock().await;
+        if let Some(run) = run_lock.as_mut() {
+            if run.run_id == run_id {
+                // Update stored groups with completed results
+                for completed in &completed_groups {
+                    if let Some(stored) = run
+                        .groups
+                        .iter_mut()
+                        .find(|g| g.group_id == completed.group_id)
+                    {
+                        *stored = completed.clone();
+                    }
+                }
+                // For report, use stored groups (includes locked)
+                completed_groups = run.groups.clone();
+            }
+        }
+    }
+
+    let report = crate::hackathon::format_report(&completed_groups, &run_id);
+
+    // Emit complete event — NEVER include api keys
+    let _ = app.emit(
+        "hackathon-complete",
+        json!({
+            "run_id": run_id,
+            "report": report,
+            "group_count": completed_groups.len(),
+        }),
+    );
+
+    // Optionally inject into leader context if session is running — store for report-up later
+    // For now just return report; caller (frontend or session_runner) can inject into context_manager
+
+    serde_json::to_string(&json!({ "run_id": run_id, "report": report })).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings_store::CustomParticipant;
+
+    #[test]
+    fn credential_enumeration_fails_closed_on_malformed_hackathon_settings() {
+        let path = std::env::temp_dir().join(format!(
+            "arena-configured-credentials-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let mut store = crate::settings_store::SettingsStore::new_with_credential_store(
+            path.to_str().expect("temp path is utf8"),
+            std::sync::Arc::new(crate::credentials::MemoryCredentialStore::default()),
+        )
+        .expect("open isolated settings store");
+        store
+            .set("hackathon_config", "{")
+            .expect("seed malformed Hackathon metadata");
+
+        assert!(configured_credentials(&store).is_err());
+        assert!(!store.credential_storage_available());
+        assert!(store.credential_migration_pending());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn diagnostic_text_redacts_exact_saved_credentials() {
+        let secret = "synthetic-diagnostic-secret-7d3c";
+        let diagnostic = format!("browser last_error: provider returned {secret}");
+        let safe = redact_saved_credentials(&diagnostic, &[secret.to_string()]);
+        assert!(!safe.contains(secret));
+        assert!(safe.contains("[REDACTED]"));
+
+        let unusual_secret = "quoted\"\\line\nbreak";
+        let encoded = serde_json::to_string(&serde_json::json!({
+            "evidence": format!("provider returned {unusual_secret}")
+        }))
+        .expect("serialize diagnostic evidence");
+        let safe_encoded = redact_saved_credentials(&encoded, &[unusual_secret.to_string()]);
+        let variants = credential_scan_literals(&[unusual_secret.to_string()]);
+        assert!(
+            !variants
+                .iter()
+                .any(|literal| safe_encoded.contains(literal))
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "arena-escaped-secret-scan-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, &encoded).expect("write encoded evidence");
+        assert!(
+            file_contains_credentials(&path, &[unusual_secret.to_string()])
+                .expect("scan encoded evidence")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn opencode_objective_redacts_configured_secret_before_worker_invocation() {
+        let path = std::env::temp_dir().join(format!(
+            "arena-opencode-objective-redaction-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let mut store = crate::settings_store::SettingsStore::new_with_credential_store(
+            path.to_str().expect("temp path is utf8"),
+            std::sync::Arc::new(crate::credentials::MemoryCredentialStore::default()),
+        )
+        .expect("open isolated settings store");
+        let secret = format!("arena-runtime-secret-{}", uuid::Uuid::new_v4());
+        store
+            .set("brain_api_key", &secret)
+            .expect("store synthetic credential securely");
+        let saved = configured_credentials(&store).expect("enumerate configured credentials");
+        let objective = format!("Update the candidate using this incidental text: {secret}");
+        let prepared = prepare_delivery_objective(&objective, &saved);
+
+        assert!(!prepared.contains(&secret));
+        assert!(prepared.contains("[REDACTED]"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn export_credential_scanner_catches_binary_data_across_chunk_boundary() {
+        let path = std::env::temp_dir().join(format!(
+            "arena-export-secret-scan-{}.bin",
+            std::process::id()
+        ));
+        let secret = "synthetic-export-secret-boundary-91f3".to_string();
+        let mut bytes = vec![0xa5; 64 * 1024 - 7];
+        bytes.extend_from_slice(secret.as_bytes());
+        std::fs::write(&path, bytes).expect("write synthetic export");
+        assert!(file_contains_credentials(&path, &[secret.clone()]).expect("scan export"));
+        std::fs::write(&path, b"safe export bytes").expect("replace synthetic export");
+        assert!(!file_contains_credentials(&path, &[secret]).expect("scan safe export"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delivery_owner_answers_are_adopted_as_product_decisions_but_secrets_are_skipped() {
+        let mut memory = crate::memory_store::MemoryStore::new_empty();
+        record_delivery_decision(
+            &mut memory,
+            "Arena delivery project",
+            "delivery-123",
+            "Which launch target should the settings page use?",
+            "Use the first-run setup page.",
+            &[],
+        )
+        .expect("persist delivery decision");
+        record_delivery_decision(
+            &mut memory,
+            "Arena delivery project",
+            "delivery-124",
+            "Which API key should we use?",
+            "synthetic-secret-that-must-not-enter-memory",
+            &["synthetic-secret-that-must-not-enter-memory".to_string()],
+        )
+        .expect("skip credential decision without failing");
+        record_delivery_decision(
+            &mut memory,
+            "Delivery objective contains abcdefgh12345678901234567890 for staging",
+            "delivery-125",
+            "Which launch target should the settings page use?",
+            "Use the first-run setup page.",
+            &[],
+        )
+        .expect("skip credential-bearing project identity without failing");
+        assert!(
+            memory
+                .get_project_memory(
+                    "Delivery objective contains abcdefgh12345678901234567890 for staging"
+                )
+                .expect("check sensitive project identity")
+                .is_empty()
+        );
+
+        let entries = memory
+            .get_project_memory("Arena delivery project")
+            .expect("read adopted project decisions");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].category, "decision");
+        assert!(entries[0].content.contains("Use the first-run setup page."));
+        assert_eq!(entries[0].source_agent, "owner");
+        assert_eq!(entries[0].source_type, "user");
+        assert!(
+            !entries[0]
+                .content
+                .contains("synthetic-secret-that-must-not-enter-memory")
+        );
+    }
+
+    fn participant(agent_id: &str, name: &str, url: &str) -> CustomParticipant {
+        CustomParticipant {
+            agent_id: agent_id.to_string(),
+            display_name: name.to_string(),
+            base_url: url.to_string(),
+        }
+    }
+
+    // P1: a custom participant may never reserve a built-in id.
+    #[test]
+    fn custom_save_rejects_builtin_id_collision() {
+        let mut reserved = HashSet::new();
+        let err = validate_custom_participant(
+            0,
+            &participant("deepseek", "Spoof", "https://spoof.example.com"),
+            &reserved,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("reserved"),
+            "expected a reserved-id error, got: {err}"
+        );
+        reserved.insert("deepseek".to_string());
+    }
+
+    // P1: duplicate ids within the same custom list are rejected.
+    #[test]
+    fn custom_save_rejects_duplicate_ids() {
+        let mut reserved = HashSet::new();
+        reserved.insert("acme".to_string());
+        let err = validate_custom_participant(
+            1,
+            &participant("acme", "Acme", "https://acme.example.com"),
+            &reserved,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("duplicated"),
+            "expected a duplicate-id error, got: {err}"
+        );
+    }
+
+    // P1: a valid absolute-URL custom id passes validation.
+    #[test]
+    fn custom_save_accepts_valid_participant() {
+        let reserved = HashSet::new();
+        let result = validate_custom_participant(
+            0,
+            &participant("acme", "Acme Bot", "https://acme.example.com"),
+            &reserved,
+        );
+        assert!(result.is_ok(), "valid participant rejected: {result:?}");
+    }
+
+    // P1: session validation consumes the MERGED registry (built-in + custom).
+    #[test]
+    fn session_validation_accepts_merged_custom_participant() {
+        let custom = vec![participant("acme", "Acme Bot", "https://acme.example.com")];
+        let ids = vec!["chatgpt".to_string(), "acme".to_string()];
+        let result = validate_session_agents(&ids, "chatgpt", &custom);
+        assert!(result.is_ok(), "merged validation failed: {result:?}");
+    }
+
+    // P1: session validation still rejects a truly unknown id.
+    #[test]
+    fn session_validation_rejects_unknown_participant() {
+        let custom: Vec<CustomParticipant> = vec![];
+        let ids = vec!["chatgpt".to_string(), "does-not-exist".to_string()];
+        let result = validate_session_agents(&ids, "chatgpt", &custom);
+        assert!(result.is_err(), "unknown participant should be rejected");
+    }
+
+    fn connected_send_probe(agent_id: &str, page_state_hint: &str) -> NavEvent {
+        NavEvent::SendProbe {
+            agent_id: agent_id.to_string(),
+            input_found: false,
+            send_button_found: false,
+            user_submit_seen: false,
+            message_count_seen: None,
+            sent_signal_emitted: false,
+            readiness_probe_count: Some(1),
+            input_candidate_count: Some(0),
+            composer_candidate_count: Some(0),
+            send_button_candidate_count: Some(0),
+            readiness_timeout_ms: Some(crate::browser_backend::READINESS_TIMEOUT_MS),
+            page_state_hint: Some(page_state_hint.to_string()),
+            page_health_hint: None,
+        }
+    }
+
+    #[test]
+    fn connected_account_outcomes_preserve_ready_semantics() {
+        assert_eq!(
+            connected_account_outcome(&NavEvent::Ready("chatgpt".to_string()), "chatgpt"),
+            Some(ConnectedAccountOutcome::ComposerReady)
+        );
+        assert_eq!(
+            connected_account_outcome(
+                &connected_send_probe("chatgpt", "possible_login_required"),
+                "chatgpt"
+            ),
+            Some(ConnectedAccountOutcome::LoginRequired)
+        );
+        assert_eq!(
+            connected_account_outcome(
+                &NavEvent::ChallengeDetected("chatgpt".to_string(), "captcha".to_string()),
+                "chatgpt"
+            ),
+            None,
+            "a challenge must not be classified as a terminal outcome"
+        );
+        assert_eq!(
+            connected_account_outcome(
+                &connected_send_probe("chatgpt", "empty_shell_or_hydration_stuck"),
+                "chatgpt"
+            ),
+            Some(ConnectedAccountOutcome::EmptyShell)
+        );
+
+        assert!(announces_connected_account_ready(
+            ConnectedAccountOutcome::ComposerReady
+        ));
+        for outcome in [
+            ConnectedAccountOutcome::LoginRequired,
+            ConnectedAccountOutcome::EmptyShell,
+        ] {
+            assert!(
+                !announces_connected_account_ready(outcome),
+                "only ComposerReady may announce ready"
+            );
+        }
+    }
+
+    fn readiness_waiter(
+        rx: crate::browser_backend::AsyncNavReceiver<NavEvent>,
+    ) -> tokio::task::JoinHandle<(Result<ConnectedAccountOutcome, String>, usize)> {
+        tokio::spawn(async move {
+            let diagnostics = crate::browser_backend::BrowserDiagnostics::new();
+            let mut rx = rx;
+            let mut challenge_emits = 0usize;
+            let result = wait_for_connected_account_readiness(
+                "claude",
+                "Claude",
+                &diagnostics,
+                &mut rx,
+                || challenge_emits += 1,
+            )
+            .await;
+            (result, challenge_emits)
+        })
+    }
+
+    #[tokio::test]
+    async fn connected_account_challenge_resume_stays_waiting() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut handle = readiness_waiter(rx);
+        tx.send(NavEvent::ChallengeDetected(
+            "claude".to_string(),
+            "captcha".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(NavEvent::ResumeRequested("claude".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut handle)
+                .await
+                .is_err()
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn connected_account_repeated_challenge_stays_waiting_and_emits_once() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut handle = readiness_waiter(rx);
+        for indicator in ["captcha", "still-captcha"] {
+            tx.send(NavEvent::ChallengeDetected(
+                "claude".to_string(),
+                indicator.to_string(),
+            ))
+            .await
+            .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut handle)
+                .await
+                .is_err()
+        );
+        tx.send(NavEvent::Ready("claude".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.await.unwrap(),
+            (Ok(ConnectedAccountOutcome::ComposerReady), 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_account_resume_then_ready_succeeds_and_wrong_agent_ready_is_ignored() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut handle = readiness_waiter(rx);
+        tx.send(NavEvent::ChallengeDetected(
+            "claude".to_string(),
+            "captcha".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(NavEvent::ResumeRequested("claude".to_string()))
+            .await
+            .unwrap();
+        tx.send(NavEvent::Ready("other".to_string())).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut handle)
+                .await
+                .is_err()
+        );
+        tx.send(NavEvent::Ready("claude".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.await.unwrap(),
+            (Ok(ConnectedAccountOutcome::ComposerReady), 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_account_challenge_then_error_fails() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let handle = readiness_waiter(rx);
+        tx.send(NavEvent::ChallengeDetected(
+            "claude".to_string(),
+            "captcha".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(NavEvent::Error("claude".to_string()))
+            .await
+            .unwrap();
+        assert!(handle.await.unwrap().0.is_err());
+    }
+
+    #[tokio::test]
+    async fn connected_account_challenge_then_unshowable_fails() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let handle = readiness_waiter(rx);
+        tx.send(NavEvent::ChallengeDetected(
+            "claude".to_string(),
+            "captcha".to_string(),
+        ))
+        .await
+        .unwrap();
+        tx.send(NavEvent::UnshowableUrl(
+            "claude".to_string(),
+            "intent://blocked".to_string(),
+        ))
+        .await
+        .unwrap();
+        assert!(handle.await.unwrap().0.is_err());
+    }
 }

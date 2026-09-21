@@ -1,5 +1,12 @@
 import { create } from 'zustand'
 
+export interface Participant {
+  agent_id: string
+  display_name: string
+  base_url: string
+  is_custom: boolean
+}
+
 export interface BlueprintSection {
   id: string
   title: string
@@ -40,9 +47,92 @@ export interface ToastMessage {
   duration?: number
 }
 
+export type ActiveBrainKind = 'primary' | 'fallback' | 'secondary' | 'unavailable' | 'unknown'
+
+export interface ActiveBrainStatus {
+  kind: ActiveBrainKind
+  model: string
+}
+export type DeliveryPhase = 'preparing'|'authoring_acceptance'|'waiting_for_user'|'acceptance_ready'|'implementing'|'verifying'|'repairing'|'verified'|'applied'|'cancelled'|'failed'
+export interface DeliveryEvidence { evidence_id:string; kind:string; summary:string; result_ref:string }
+export interface DeliveryWorkOrder { work_order_id:string; project_id:string; root_session_id?:string|null; candidate_id:string; candidate_revision:number; authority_version:string; task_state:string; evidence_ref?:string|null; result_ref?:string|null; cancellation_state?:string|null; verification_id?:string|null; verification_status?:string|null; error?:string|null; build_package_id?:string|null; build_package_revision?:number|null; build_package_fingerprint?:string|null }
+export interface DeliveryState { session_id:string; phase:DeliveryPhase; status_text?:string; message?:string; attempt:number; objective:string; verification_summary?:string|null; candidate_commit?:string|null; branch_name?:string; runtime?:'dsh'|'open_code'; work_order?:DeliveryWorkOrder|null; evidence?:DeliveryEvidence[]; semantic_review_count?:number; build_package_id?:string|null; build_package_ready?:boolean; contract?:{revision:number;acceptance_criteria:{id:string;description:string}[]}; last_verification?:unknown }
+export interface ProductEvidence { evidence_id:string; claim:string; summary:string; verification?:string|null; source?:{reference:string;title?:string|null;checked_at:string;version_or_scope:string}|null; }
+export interface ProductWorkOrder { work_order_id:string; project_id:string; session_id:string; runtime_session_id?:string|null; role:string; status:string; project_revision:number; research_mode?:'known_source'|'web_discovery'|null; research_category?:'user_problem'|'competitor_status_quo'|'prior_art_reuse'|'technical_current_fact'|null; evidence_id?:string|null; evidence_ids?:string[]; result_ref?:string|null; cancellation_reason?:string|null; }
+export interface ProductAuthoritySnapshot { records:{project_id:string; project_revision:number; evidence:ProductEvidence[]; ambiguities:{ambiguity_id:string;question:string;status:string;resolver:string;owner_decision_id?:string|null}[]}; work_orders:ProductWorkOrder[]; research_gate?:{status:string;reason:string}|null }
+
+// ── Hackathon types (frontend-safe) ────────────────────────────────────────────
+
+export interface HackathonModelSafe {
+  id: string
+  model_name: string
+  base_url: string
+  group_id: string
+}
+
+export interface HackathonGroupSafe {
+  id: string
+  name: string
+  model_ids: string[]
+  selected: boolean
+}
+
+export interface HackathonConfigSafe {
+  groups: HackathonGroupSafe[]
+  models: HackathonModelSafe[]
+  max_questions_per_teammate: number | null
+  enabled: boolean
+}
+
+export interface HackathonParticipantRunSafe {
+  model_id: string
+  model_name: string
+  base_url: string
+  group_id: string
+  status: 'pending' | 'confirmed' | 'failed'
+  consultation_count: number
+}
+
+export interface HackathonGroupRunSafe {
+  group_id: string
+  group_name: string
+  model_ids_ordered: string[]
+  participants: HackathonParticipantRunSafe[]
+  leader_id: string | null
+  history_len: number
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'locked'
+  final_output: string | null
+}
+
+export interface HackathonRunSafe {
+  run_id: string
+  task_brief: string
+  max_questions_per_teammate: number | null
+  groups: HackathonGroupRunSafe[]
+  cancelled: boolean
+}
+
 export interface AppStore {
+  activeMode: 'consult' | 'delivery'
+  deliveryState: DeliveryState | null
+  // P3: unified participant registry (built-ins + persisted custom)
+  participants: Participant[]
+  setParticipants: (participants: Participant[]) => void
+
+  // Hackathon
+  hackathonConfig: HackathonConfigSafe | null
+  hackathonRun: HackathonRunSafe | null
+  hackathonOpen: boolean
+  setHackathonConfig: (config: HackathonConfigSafe | null) => void
+  setHackathonRun: (run: HackathonRunSafe | null) => void
+  setHackathonOpen: (open: boolean) => void
+
   // Session state
   sessionStatus: 'idle' | 'setup' | 'priming' | 'requirements' | 'running' | 'paused' | 'complete' | 'ended'
+  // Draft vs active session (§10-12): New Session draft must not block Settings/Connected Accounts.
+  // `isDraftSession` true means Setup screen is showing but `start_session` has not yet succeeded.
+  // Backend `session_active` remains false in this state; Settings remains accessible.
+  isDraftSession: boolean
   setupProgress: string[]
   selectedSessionId: string | null
   recoveryState: RecoveryState | null
@@ -52,6 +142,7 @@ export interface AppStore {
   setupFailedAgentId: string | null
   activeAgentId: string | null
   activeTurnNumber: number | null
+  activeBrain: ActiveBrainStatus
 
   // Blueprint
   blueprintSections: BlueprintSection[]
@@ -80,6 +171,9 @@ export interface AppStore {
 
   // Actions
   setSessionStatus: (status: AppStore['sessionStatus']) => void
+  setActiveMode: (mode: AppStore['activeMode']) => void
+  setDeliveryState: (state: DeliveryState | null) => void
+  setIsDraftSession: (isDraft: boolean) => void
   addSetupProgress: (agentId: string) => void
   clearSetupProgress: () => void
   setSelectedSessionId: (id: string | null) => void
@@ -90,6 +184,7 @@ export interface AppStore {
   setSetupFailedAgentId: (id: string | null) => void
   setActiveAgentId: (id: string | null) => void
   setActiveTurn: (agentId: string | null, turnNumber: number | null) => void
+  setActiveBrain: (status: ActiveBrainStatus) => void
 
   clearSessionState: () => void
 
@@ -116,7 +211,21 @@ export interface AppStore {
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
+  participants: [
+    { agent_id: 'chatgpt', display_name: 'ChatGPT', base_url: 'https://chatgpt.com', is_custom: false },
+    { agent_id: 'claude', display_name: 'Claude', base_url: 'https://claude.ai', is_custom: false },
+    { agent_id: 'gemini', display_name: 'Gemini', base_url: 'https://gemini.google.com', is_custom: false },
+    { agent_id: 'deepseek', display_name: 'DeepSeek', base_url: 'https://chat.deepseek.com', is_custom: false },
+    { agent_id: 'qwen', display_name: 'Qwen', base_url: 'https://chat.qwen.ai', is_custom: false },
+    { agent_id: 'glm', display_name: 'GLM', base_url: 'https://chat.z.ai/', is_custom: false },
+    { agent_id: 'kimi', display_name: 'Kimi', base_url: 'https://kimi.ai/', is_custom: false },
+  ],
+  setParticipants: (participants) => set({ participants }),
+
   sessionStatus: 'idle',
+  activeMode: 'consult',
+  deliveryState: null,
+  isDraftSession: false,
   setupProgress: [],
   selectedSessionId: null,
   recoveryState: null,
@@ -126,6 +235,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setupFailedAgentId: null,
   activeAgentId: null,
   activeTurnNumber: null,
+  activeBrain: { kind: 'unknown', model: '' },
   blueprintSections: [],
   liveStatusText: '',
   liveStatusExpanded: false,
@@ -137,8 +247,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
   agentBrainConfig: null,
   settingsOpen: false,
   sidebarCollapsed: false,
+  hackathonConfig: null,
+  hackathonRun: null,
+  hackathonOpen: false,
 
   setSessionStatus: (status) => set({ sessionStatus: status }),
+  setActiveMode: (activeMode) => set({ activeMode }),
+  setDeliveryState: (deliveryState) => set({ deliveryState }),
+  setIsDraftSession: (isDraft) => set({ isDraftSession: isDraft }),
   addSetupProgress: (agentId) => set((s) => ({
     setupProgress: s.setupProgress.includes(agentId)
       ? s.setupProgress
@@ -153,6 +269,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setSetupFailedAgentId: (id) => set({ setupFailedAgentId: id }),
   setActiveAgentId: (id) => set({ activeAgentId: id }),
   setActiveTurn: (agentId, turnNumber) => set({ activeAgentId: agentId, activeTurnNumber: turnNumber }),
+  setActiveBrain: (status) => set({ activeBrain: status }),
 
   clearSessionState: () => set({
     blueprintSections: [],
@@ -167,6 +284,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
     setupFailedAgentId: null,
     activeAgentId: null,
     activeTurnNumber: null,
+    activeBrain: { kind: 'unknown', model: '' },
+    isDraftSession: false,
   }),
 
   upsertBlueprintSection: (section) => set((s) => {
@@ -203,4 +322,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setAgentBrainConfig: (config) => set({ agentBrainConfig: config }),
   setSettingsOpen: (open) => set({ settingsOpen: open }),
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
+  setHackathonConfig: (config) => set({ hackathonConfig: config }),
+  setHackathonRun: (run) => set({ hackathonRun: run }),
+  setHackathonOpen: (open) => set({ hackathonOpen: open }),
 }))

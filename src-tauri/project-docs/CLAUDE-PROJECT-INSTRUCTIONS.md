@@ -309,7 +309,7 @@ Tailwind utility classes directly on JSX elements.
 | deepseek | DeepSeek | https://chat.deepseek.com | textarea |
 | qwen | Qwen | https://chat.qwen.ai | textarea |
 | glm | GLM | https://chat.z.ai/ | textarea (#chat-input, #send-message-button) |
-| kimi | Kimi | https://www.kimi.com/ | Lexical contenteditable (execCommand injection) |
+| kimi | Kimi | https://kimi.ai/ | Lexical contenteditable (execCommand injection) |
 
 All 7 fully implemented — none pending.
 

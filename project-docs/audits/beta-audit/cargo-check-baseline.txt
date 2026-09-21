@@ -1,0 +1,672 @@
+warning: unused import: `Error as SqliteError`
+ --> src/blueprint_store.rs:2:28
+  |
+2 | use rusqlite::{Connection, Error as SqliteError};
+  |                            ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `BoundingRect` and `SafeElement`
+ --> src/browser_backend.rs:2:39
+  |
+2 | ...t, BoundingRect, BrowserEvent, BrowserTimeline, EventType, NavigationIntent, PageLifecycleEvent, SafeDomForensics, SafeElement,
+  |       ^^^^^^^^^^^^                                                                                                    ^^^^^^^^^^^
+
+warning: unreachable pattern
+   --> src/session_runner.rs:876:13
+    |
+876 |             (Some(_), _) => unreachable!(),
+    |             ^^^^^^^^^^^^ no value can reach this
+    |
+note: multiple earlier patterns match some of the same values
+   --> src/session_runner.rs:876:13
+    |
+873 | ...   (Some(SetupCompletionProof::SendDetected(reason)), _) => record_setup_completion(&diagnostics, agent_id, &reason),
+    |       ----------------------------------------------------- matches some of the same values
+874 | ...   (Some(SetupCompletionProof::ResponseAfterInjection), _) => record_setup_completion(&diagnostics, agent_id, "response_after_in...
+    |       ------------------------------------------------------- matches some of the same values
+875 | ...   (Some(SetupCompletionProof::UserConfirmedManual), _) => record_setup_completion(&diagnostics, agent_id, "user_confirmed_manua...
+    |       ---------------------------------------------------- matches some of the same values
+876 | ...   (Some(_), _) => unreachable!(),
+    |       ^^^^^^^^^^^^ collectively making this unreachable
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `window_label`
+    --> src/browser_backend.rs:1465:48
+     |
+1465 |     if let NavEvent::PageLifecycle { agent_id, window_label, event_type, url, title } = event {
+     |                                                ^^^^^^^^^^^^ help: try ignoring the field: `window_label: _`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `ActionType` is never used
+ --> src/agentic_manager.rs:4:10
+  |
+4 | pub enum ActionType {
+  |          ^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `PendingAction` is never constructed
+  --> src/agentic_manager.rs:12:12
+   |
+12 | pub struct PendingAction {
+   |            ^^^^^^^^^^^^^
+
+warning: struct `AgenticManager` is never constructed
+  --> src/agentic_manager.rs:18:12
+   |
+18 | pub struct AgenticManager {
+   |            ^^^^^^^^^^^^^^
+
+warning: associated items `new`, `request_action`, `approve_action`, and `reject_action` are never used
+  --> src/agentic_manager.rs:24:12
+   |
+23 | impl AgenticManager {
+   | ------------------- associated items in this implementation
+24 |     pub fn new(workspace_dir: String) -> Self {
+   |            ^^^
+...
+31 |     pub fn request_action(&mut self, action: ActionType, requested_by: String, reason: String) -> Result<(), AgentError> {
+   |            ^^^^^^^^^^^^^^
+...
+49 |     pub fn approve_action(&mut self, index: usize) -> Result<(), AgentError> {
+   |            ^^^^^^^^^^^^^^
+...
+58 |     pub fn reject_action(&mut self, index: usize) -> Result<(), AgentError> {
+   |            ^^^^^^^^^^^^^
+
+warning: method `decide` is never used
+   --> src/agent_brain.rs:158:18
+    |
+102 | impl AgentBrain {
+    | --------------- method in this implementation
+...
+158 |     pub async fn decide(
+    |                  ^^^^^^
+
+warning: enum `ConsoleCategory` is never used
+  --> src/browser_backend.rs:32:10
+   |
+32 | pub enum ConsoleCategory {
+   |          ^^^^^^^^^^^^^^^
+
+warning: enum `ConsoleSeverity` is never used
+  --> src/browser_backend.rs:48:10
+   |
+48 | pub enum ConsoleSeverity {
+   |          ^^^^^^^^^^^^^^^
+
+warning: fields `window_label`, `timestamp`, `setup_generation`, and `phase` are never read
+   --> src/browser_backend.rs:170:9
+    |
+168 | pub struct PendingArenaNavigation {
+    |            ---------------------- fields in this struct
+169 |     pub agent_id: String,
+170 |     pub window_label: String,
+    |         ^^^^^^^^^^^^
+171 |     pub requested_url: String,
+172 |     pub timestamp: String,
+    |         ^^^^^^^^^
+173 |     pub instant: std::time::Instant,
+174 |     pub setup_generation: u32,
+    |         ^^^^^^^^^^^^^^^^
+175 |     pub phase: String,
+    |         ^^^^^
+    |
+    = note: `PendingArenaNavigation` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: methods `clear_operation`, `is_active`, `consume_pending_arena_navigation`, `can_recover_navigation`, and `reset_setup_navigation_recovery` are never used
+   --> src/browser_backend.rs:323:12
+    |
+195 | impl BrowserDiagnostics {
+    | ----------------------- methods in this implementation
+...
+323 |     pub fn clear_operation(&self, agent_id: &str) {
+    |            ^^^^^^^^^^^^^^^
+...
+639 |     pub fn is_active(&self, window_label: &str, agent_id: &str) -> bool {
+    |            ^^^^^^^^^
+...
+805 |     fn consume_pending_arena_navigation(&self, window_label: &str) -> Option<PendingArenaNavigation> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+915 |     pub fn can_recover_navigation(&self, agent_id: &str) -> bool {
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+...
+924 |     pub fn reset_setup_navigation_recovery(&self, agent_id: &str) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_display_name` is never used
+    --> src/browser_backend.rs:2319:8
+     |
+2319 | pub fn resolve_display_name(
+     |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: field `window_label` is never read
+    --> src/browser_backend.rs:2409:9
+     |
+2407 |     SafeDomForensics {
+     |     ---------------- field in this variant
+2408 |         agent_id: String,
+2409 |         window_label: String,
+     |         ^^^^^^^^^^^^
+     |
+     = note: `NavEvent` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `window_label` is never read
+    --> src/browser_backend.rs:2414:9
+     |
+2412 |     ActionEvent {
+     |     ----------- field in this variant
+2413 |         agent_id: String,
+2414 |         window_label: String,
+     |         ^^^^^^^^^^^^
+     |
+     = note: `NavEvent` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `inject_to_agent` is never used
+    --> src/browser_backend.rs:2811:14
+     |
+2811 | pub async fn inject_to_agent(
+     |              ^^^^^^^^^^^^^^^
+
+warning: function `monitor_existing_response` is never used
+    --> src/browser_backend.rs:5992:8
+     |
+5992 | pub fn monitor_existing_response(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `HarnessPhase` is never used
+  --> src/browser_harness.rs:19:10
+   |
+19 | pub enum HarnessPhase {
+   |          ^^^^^^^^^^^^
+
+warning: associated items `as_str` and `from_str` are never used
+  --> src/browser_harness.rs:46:12
+   |
+45 | impl HarnessPhase {
+   | ----------------- associated items in this implementation
+46 |     pub fn as_str(&self) -> &'static str {
+   |            ^^^^^^
+...
+73 |     pub fn from_str(s: &str) -> Self {
+   |            ^^^^^^^^
+
+warning: associated function `from_str` is never used
+   --> src/browser_harness.rs:332:12
+    |
+254 | impl EventType {
+    | -------------- associated function in this implementation
+...
+332 |     pub fn from_str(s: &str) -> Self {
+    |            ^^^^^^^^
+
+warning: function `sanitize_url` is never used
+   --> src/browser_harness.rs:666:8
+    |
+666 | pub fn sanitize_url(value: &str) -> String {
+    |        ^^^^^^^^^^^^
+
+warning: function `operation_id_login` is never used
+   --> src/browser_harness.rs:675:8
+    |
+675 | pub fn operation_id_login(agent_id: &str, generation: u32) -> String {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `operation_id_submit` is never used
+   --> src/browser_harness.rs:684:8
+    |
+684 | pub fn operation_id_submit(agent_id: &str, generation: u32, turn: u32) -> String {
+    |        ^^^^^^^^^^^^^^^^^^^
+
+warning: method `events_for` is never used
+   --> src/browser_harness.rs:820:12
+    |
+785 | impl BrowserTimeline {
+    | -------------------- method in this implementation
+...
+820 |     pub fn events_for(&self, agent_id: &str) -> Vec<BrowserEvent> {
+    |            ^^^^^^^^^^
+
+warning: struct `AgentReportView` is never constructed
+   --> src/browser_harness.rs:905:12
+    |
+905 | pub struct AgentReportView<'a> {
+    |            ^^^^^^^^^^^^^^^
+
+warning: constant `MAX_BUTTON_LABELS` is never used
+    --> src/browser_harness.rs:1021:11
+     |
+1021 | pub const MAX_BUTTON_LABELS: usize = 10;
+     |           ^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_LABEL_LENGTH` is never used
+    --> src/browser_harness.rs:1022:11
+     |
+1022 | pub const MAX_LABEL_LENGTH: usize = 50;
+     |           ^^^^^^^^^^^^^^^^
+
+warning: struct `ActionResult` is never constructed
+    --> src/browser_harness.rs:1117:12
+     |
+1117 | pub struct ActionResult {
+     |            ^^^^^^^^^^^^
+
+warning: enum `FailureClassification` is never used
+    --> src/browser_harness.rs:1131:10
+     |
+1131 | pub enum FailureClassification {
+     |          ^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `as_str` is never used
+    --> src/browser_harness.rs:1164:12
+     |
+1163 | impl FailureClassification {
+     | -------------------------- method in this implementation
+1164 |     pub fn as_str(&self) -> &'static str {
+     |            ^^^^^^
+
+warning: function `sanitize_button_label` is never used
+    --> src/browser_harness.rs:1203:8
+     |
+1203 | pub fn sanitize_button_label(raw: &str) -> String {
+     |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `classify_failure_from_timeline` is never used
+    --> src/browser_harness.rs:1212:8
+     |
+1212 | pub fn classify_failure_from_timeline(events: &[BrowserEvent]) -> FailureClassification {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `empty_safe_dom_forensics` is never used
+    --> src/browser_harness.rs:1244:8
+     |
+1244 | pub fn empty_safe_dom_forensics(operation_id: &str, url: &str) -> SafeDomForensics {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `Capability` is never used
+ --> src/capability_registry.rs:4:10
+  |
+4 | pub enum Capability {
+  |          ^^^^^^^^^^
+
+warning: struct `CapabilityRegistry` is never constructed
+  --> src/capability_registry.rs:18:12
+   |
+18 | pub struct CapabilityRegistry {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `register`, and `get_capable_models` are never used
+  --> src/capability_registry.rs:23:12
+   |
+22 | impl CapabilityRegistry {
+   | ----------------------- associated items in this implementation
+23 |     pub fn new() -> Self {
+   |            ^^^
+...
+29 |     pub fn register(&mut self, model_name: String, capabilities: Vec<Capability>) {
+   |            ^^^^^^^^
+...
+33 |     pub fn get_capable_models(&self, required: &[Capability]) -> Vec<String> {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: fields `history`, `requirements_charter`, and `session_type` are never read
+  --> src/context_manager.rs:32:9
+   |
+31 | pub struct ContextManager {
+   |            -------------- fields in this struct
+32 |     pub history: Vec<TurnRecord>,
+   |         ^^^^^^^
+33 |     pub project_brief: String,
+34 |     pub requirements_charter: Option<String>,
+   |         ^^^^^^^^^^^^^^^^^^^^
+35 |     pub session_type: SessionType,
+   |         ^^^^^^^^^^^^
+
+warning: multiple methods are never used
+   --> src/context_manager.rs:50:12
+    |
+ 39 | impl ContextManager {
+    | ------------------- methods in this implementation
+...
+ 50 |     pub fn build_prompt_for_agent(&self, agent_id: &str, role: &str, current_question: &str) -> String {
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+...
+ 78 |     fn get_history_for_prompt(&self) -> Vec<&TurnRecord> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+...
+ 88 |     pub fn add_turn(&mut self, record: TurnRecord) {
+    |            ^^^^^^^^
+...
+ 92 |     pub fn set_requirements_charter(&mut self, charter: String) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+100 |     pub fn take_pending_user_input(&mut self) -> Option<String> {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^
+...
+104 |     pub fn detect_consensus_signal(&self, response: &str) -> ConsensusSignal {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^
+...
+120 |     pub fn is_consensus_reached(&self, agent_ids: &[String]) -> bool {
+    |            ^^^^^^^^^^^^^^^^^^^^
+...
+138 |     pub fn is_improvement_velocity_low(&self) -> bool {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variants `ContextLimitReached` and `SessionExpired` are never constructed
+  --> src/errors.rs:19:5
+   |
+14 | pub enum AgentError {
+   |          ---------- variants in this enum
+...
+19 |     ContextLimitReached(String),
+   |     ^^^^^^^^^^^^^^^^^^^
+20 |     SessionExpired(String),
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `AgentError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `created_at` is never read
+   --> src/hackathon.rs:268:9
+    |
+262 | pub struct HackathonRunState {
+    |            ----------------- field in this struct
+...
+268 |     pub created_at: String,
+    |         ^^^^^^^^^^
+    |
+    = note: `HackathonRunState` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: struct `HackathonChatMessage` is never constructed
+   --> src/hackathon.rs:547:8
+    |
+547 | struct HackathonChatMessage {
+    |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `MemoryEntry` is never constructed
+  --> src/memory_store.rs:11:12
+   |
+11 | pub struct MemoryEntry {
+   |            ^^^^^^^^^^^
+
+warning: methods `get_session_facts`, `add_project_memory`, and `add_pattern` are never used
+   --> src/memory_store.rs:331:12
+    |
+118 | impl MemoryStore {
+    | ---------------- methods in this implementation
+...
+331 |     pub fn get_session_facts(&self, session_id: &str) -> Result<Vec<MemoryEntry>, AgentError> {
+    |            ^^^^^^^^^^^^^^^^^
+...
+405 |     pub fn add_project_memory(
+    |            ^^^^^^^^^^^^^^^^^^
+...
+721 |     pub fn add_pattern(
+    |            ^^^^^^^^^^^
+
+warning: function `memory_entry_from_row` is never used
+    --> src/memory_store.rs:1281:4
+     |
+1281 | fn memory_entry_from_row(row: &Row<'_>) -> rusqlite::Result<MemoryEntry> {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: variants `Preparing`, `Requirements`, and `Complete` are never constructed
+  --> src/orchestrator.rs:24:5
+   |
+22 | pub enum OrchestratorStatus {
+   |          ------------------ variants in this enum
+23 |     Idle,
+24 |     Preparing,
+   |     ^^^^^^^^^
+25 |     Setup,
+26 |     Requirements,
+   |     ^^^^^^^^^^^^
+...
+29 |     Complete,
+   |     ^^^^^^^^
+   |
+   = note: `OrchestratorStatus` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: struct `FingerprintProfile` is never constructed
+ --> src/persona_manager.rs:7:12
+  |
+7 | pub struct FingerprintProfile {
+  |            ^^^^^^^^^^^^^^^^^^
+
+warning: struct `Persona` is never constructed
+  --> src/persona_manager.rs:22:12
+   |
+22 | pub struct Persona {
+   |            ^^^^^^^
+
+warning: function `generate_fingerprint` is never used
+  --> src/persona_manager.rs:39:8
+   |
+39 | pub fn generate_fingerprint(persona_id: &str) -> FingerprintProfile {
+   |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProxyManager` is never constructed
+ --> src/proxy_manager.rs:5:12
+  |
+5 | pub struct ProxyManager;
+  |            ^^^^^^^^^^^^
+
+warning: associated items `new` and `fetch_through_proxy` are never used
+  --> src/proxy_manager.rs:8:12
+   |
+ 7 | impl ProxyManager {
+   | ----------------- associated items in this implementation
+ 8 |     pub fn new() -> Self {
+   |            ^^^
+...
+12 |     pub fn fetch_through_proxy(&self, url: &str) -> Result<String, AgentError> {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `AgentHealth` is never constructed
+ --> src/resource_monitor.rs:4:12
+  |
+4 | pub struct AgentHealth {
+  |            ^^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> src/resource_monitor.rs:11:12
+   |
+10 | impl AgentHealth {
+   | ---------------- associated function in this implementation
+11 |     pub fn new(failure_ratio: f64, captcha_ratio: f64) -> Self {
+   |            ^^^
+
+warning: struct `ResourceMonitor` is never constructed
+  --> src/resource_monitor.rs:21:12
+   |
+21 | pub struct ResourceMonitor {
+   |            ^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `check_memory`, `check_heartbeat`, and `reset_heartbeat` are never used
+  --> src/resource_monitor.rs:26:12
+   |
+25 | impl ResourceMonitor {
+   | -------------------- associated items in this implementation
+26 |     pub fn new() -> Self {
+   |            ^^^
+...
+32 |     pub fn check_memory(&self, current_mb: u64) -> MemoryAction {
+   |            ^^^^^^^^^^^^
+...
+44 |     pub fn check_heartbeat(&self) -> bool {
+   |            ^^^^^^^^^^^^^^^
+...
+50 |     pub fn reset_heartbeat(&mut self) {
+   |            ^^^^^^^^^^^^^^^
+
+warning: enum `MemoryAction` is never used
+  --> src/resource_monitor.rs:55:10
+   |
+55 | pub enum MemoryAction {
+   |          ^^^^^^^^^^^^
+
+warning: struct `OneNonce` is never constructed
+  --> src/session_vault.rs:12:8
+   |
+12 | struct OneNonce([u8; NONCE_LEN]);
+   |        ^^^^^^^^
+
+warning: field `key_bytes` is never read
+  --> src/session_vault.rs:22:5
+   |
+20 | pub struct SessionVault {
+   |            ------------ field in this struct
+21 |     conn: Connection,
+22 |     key_bytes: [u8; 32],
+   |     ^^^^^^^^^
+
+warning: associated items `open`, `get_conversation_url`, `save_cookies`, `load_cookies`, `encrypt`, and `decrypt` are never used
+   --> src/session_vault.rs:34:12
+    |
+ 25 | impl SessionVault {
+    | ----------------- associated items in this implementation
+...
+ 34 |     pub fn open(db_path: &str) -> Result<Self, AgentError> {
+    |            ^^^^
+...
+ 86 |     pub fn get_conversation_url(
+    |            ^^^^^^^^^^^^^^^^^^^^
+...
+117 |     pub fn save_cookies(&self, agent_id: &str, data: &[u8]) -> Result<(), AgentError> {
+    |            ^^^^^^^^^^^^
+...
+128 |     pub fn load_cookies(&self, agent_id: &str) -> Result<Option<Vec<u8>>, AgentError> {
+    |            ^^^^^^^^^^^^
+...
+141 |     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, AgentError> {
+    |        ^^^^^^^
+...
+162 |     fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, AgentError> {
+    |        ^^^^^^^
+
+warning: methods `save_agent_brain_config` and `save_secondary_brain_config` are never used
+   --> src/settings_store.rs:109:12
+    |
+ 39 | impl SettingsStore {
+    | ------------------ methods in this implementation
+...
+109 |     pub fn save_agent_brain_config(&mut self, config: &AgentBrainConfig) -> Result<(), AgentError> {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^
+...
+167 |     pub fn save_secondary_brain_config(
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `SignalState` is never used
+ --> src/signals.rs:2:10
+  |
+2 | pub enum SignalState {
+  |          ^^^^^^^^^^^
+
+warning: struct `TurnSignals` is never constructed
+ --> src/signals.rs:9:12
+  |
+9 | pub struct TurnSignals {
+  |            ^^^^^^^^^^^
+
+warning: associated items `new`, `weighted_sum`, and `is_complete` are never used
+  --> src/signals.rs:17:12
+   |
+16 | impl TurnSignals {
+   | ---------------- associated items in this implementation
+17 |     pub fn new() -> Self {
+   |            ^^^
+...
+26 |     pub fn weighted_sum(&self) -> f64 {
+   |            ^^^^^^^^^^^^
+...
+43 |     pub fn is_complete(&self) -> bool {
+   |            ^^^^^^^^^^^
+
+warning: struct `CompletionReport` is never constructed
+  --> src/signals.rs:49:12
+   |
+49 | pub struct CompletionReport {
+   |            ^^^^^^^^^^^^^^^^
+
+warning: associated function `from_signals` is never used
+  --> src/signals.rs:56:12
+   |
+55 | impl CompletionReport {
+   | --------------------- associated function in this implementation
+56 |     pub fn from_signals(signals: &TurnSignals) -> Self {
+   |            ^^^^^^^^^^^^
+
+warning: multiple methods are never used
+  --> src/token_budget.rs:14:12
+   |
+ 7 | impl TokenBudget {
+   | ---------------- methods in this implementation
+...
+14 |     pub fn record_tokens(&mut self, agent_id: &str, count: u32) {
+   |            ^^^^^^^^^^^^^
+...
+19 |     pub fn get_tokens(&self, agent_id: &str) -> u32 {
+   |            ^^^^^^^^^^
+...
+23 |     pub fn get_percentage(&self, agent_id: &str, limit: u32) -> f32 {
+   |            ^^^^^^^^^^^^^^
+...
+30 |     pub fn should_compress(&self, agent_id: &str, limit: u32) -> bool {
+   |            ^^^^^^^^^^^^^^^
+...
+34 |     pub fn should_migrate(&self, agent_id: &str, limit: u32) -> bool {
+   |            ^^^^^^^^^^^^^^
+...
+38 |     pub fn reset(&mut self, agent_id: &str) {
+   |            ^^^^^
+...
+56 |     pub fn all_tokens(&self) -> &HashMap<String, u32> {
+   |            ^^^^^^^^^^
+
+warning: associated items `new`, `record_turn`, and `update_session_status` are never used
+   --> src/transcript_store.rs:21:12
+    |
+ 20 | impl TranscriptStore {
+    | -------------------- associated items in this implementation
+ 21 |     pub fn new() -> Self {
+    |            ^^^
+...
+ 77 |     pub fn record_turn(&mut self, session_id: &str, record: &TurnRecord) -> Result<(), AgentError> {
+    |            ^^^^^^^^^^^
+...
+100 |     pub fn update_session_status(&mut self, session_id: &str, status: &str) -> Result<(), AgentError> {
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `TurnManager` is never constructed
+ --> src/turn_manager.rs:1:12
+  |
+1 | pub struct TurnManager {
+  |            ^^^^^^^^^^^
+
+warning: associated items `new`, `next_agent`, `advance_iteration`, `current_iteration`, `is_leader`, and `ordered_agents` are never used
+  --> src/turn_manager.rs:9:12
+   |
+ 8 | impl TurnManager {
+   | ---------------- associated items in this implementation
+ 9 |     pub fn new(agent_ids: Vec<String>, leader_id: String) -> Self {
+   |            ^^^
+...
+20 |     pub fn next_agent(&mut self) -> Option<String> {
+   |            ^^^^^^^^^^
+...
+30 |     pub fn advance_iteration(&mut self) {
+   |            ^^^^^^^^^^^^^^^^^
+...
+35 |     pub fn current_iteration(&self) -> u32 {
+   |            ^^^^^^^^^^^^^^^^^
+...
+39 |     pub fn is_leader(&self, agent_id: &str) -> bool {
+   |            ^^^^^^^^^
+...
+43 |     fn ordered_agents(&self) -> Vec<String> {
+   |        ^^^^^^^^^^^^^^
+
+warning: `consensus-arena` (bin "consensus-arena") generated 69 warnings (run `cargo fix --bin "consensus-arena" -p consensus-arena` to apply 3 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.19s

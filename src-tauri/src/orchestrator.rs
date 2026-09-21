@@ -1,17 +1,18 @@
+use crate::agent_brain::AgentBrain;
 use crate::blueprint_store::BlueprintStore;
 use crate::browser_backend::BrowserState;
 use crate::context_manager::ContextManager;
-use crate::agent_brain::AgentBrain;
+use crate::memory_store::{MemoryHealth, MemoryStore};
+use crate::session_runtime::SessionRuntime;
 use crate::session_vault::SessionVault;
+use crate::settings_store::SettingsStore;
 use crate::token_budget::TokenBudget;
 use crate::transcript_store::TranscriptStore;
-use crate::settings_store::SettingsStore;
-use crate::memory_store::{MemoryHealth, MemoryStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::path::PathBuf;
 use tokio::sync::Mutex;
 
 pub use crate::context_manager::SessionType;
@@ -88,10 +89,43 @@ impl Orchestrator {
     }
 }
 
+// ── Active Brain Status (for Topbar "Powered by..." indicator) ─────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveBrainKind {
+    Primary,
+    Fallback,
+    Secondary,
+    Unavailable,
+    Unknown,
+}
+
+impl Default for ActiveBrainKind {
+    fn default() -> Self {
+        ActiveBrainKind::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveBrainStatus {
+    pub kind: ActiveBrainKind,
+    pub model: String,
+}
+
+impl Default for ActiveBrainStatus {
+    fn default() -> Self {
+        Self {
+            kind: ActiveBrainKind::Unknown,
+            model: String::new(),
+        }
+    }
+}
+
 // ── AppState ──────────────────────────────────────────────────────────────────
 
 pub struct AppState {
-    pub orchestrator:     Arc<Mutex<Orchestrator>>,
+    pub orchestrator: Arc<Mutex<Orchestrator>>,
     /// Task 9 (HIGH-5/HIGH-6): switched from `tokio::sync::Mutex` to
     /// `std::sync::Mutex`. All call sites now go through
     /// `db_helpers::run_blocking`, which locks + calls + unlocks entirely
@@ -101,32 +135,31 @@ pub struct AppState {
     /// async runtime thread — exactly the bug being fixed. `std::sync::Mutex`
     /// makes that mistake a compile error instead (no `.await` on its lock).
     pub transcript_store: Arc<std::sync::Mutex<TranscriptStore>>,
-    pub token_budget:     Arc<Mutex<TokenBudget>>,
+    pub token_budget: Arc<Mutex<TokenBudget>>,
     /// Task 9: same rationale as transcript_store.
-    pub session_vault:    Arc<std::sync::Mutex<SessionVault>>,
-    pub browser_state:    Arc<Mutex<BrowserState>>,
-    pub context_manager:  Arc<Mutex<ContextManager>>,
+    pub session_vault: Arc<std::sync::Mutex<SessionVault>>,
+    pub browser_state: Arc<Mutex<BrowserState>>,
+    pub context_manager: Arc<Mutex<ContextManager>>,
     /// Task 9: same rationale as transcript_store.
-    pub blueprint_store:  Arc<std::sync::Mutex<BlueprintStore>>,
+    pub blueprint_store: Arc<std::sync::Mutex<BlueprintStore>>,
     /// Deliberately NOT part of the Task 9 conversion — out of that task's
     /// scope (see triage-fix-plan.md TASK 9 file list: blueprint_store.rs,
     /// transcript_store.rs, session_vault.rs only). settings_store.rs reads
     /// are tiny single-key lookups on the hot path of nearly every command;
     /// converting it is a separate, larger pass left for later.
-    pub settings_store:   Arc<Mutex<SettingsStore>>,
-    pub agent_brain:      Arc<Mutex<Option<AgentBrain>>>,
+    pub settings_store: Arc<Mutex<SettingsStore>>,
+    pub agent_brain: Arc<Mutex<Option<AgentBrain>>>,
     /// D-041: oneshot sender through which provide_user_answer delivers the
     /// user's answer to the suspended run_agent_loop.  Set when AskUser fires,
     /// cleared via take() after use.  RISK-ASKCHANNEL: resolved.
-    pub ask_user_tx:      Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    pub ask_user_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     /// D-039: optional secondary (alternative) orchestration brain.
-    pub agent_brain_2:    Arc<Mutex<Option<AgentBrain>>>,
-    /// IMP-3: concurrency guard — only one session loop may run at a time.
-    /// compare_exchange(false → true) in start_session; store(false) in every
-    /// exit path of the spawned task and in abort_session.
-    pub session_active:   Arc<AtomicBool>,
+    pub agent_brain_2: Arc<Mutex<Option<AgentBrain>>>,
+    /// SessionRuntime is the single concurrency/task ownership authority (reliability).
+    /// Replaces the former `session_active` + `resuming` atomics as independent authorities.
+    pub session_runtime: Arc<SessionRuntime>,
     /// IMP-5: per-agent health map updated on every Route/RouteCompare cycle.
-    pub model_health:     Arc<Mutex<HashMap<String, ModelHealth>>>,
+    pub model_health: Arc<Mutex<HashMap<String, ModelHealth>>>,
     /// IMP-10: consecutive decide() failure counter.  Increments when the full
     /// decide() call (primary + D-038 fallback) fails.  Resets on success.
     /// Once >= 3, run_agent_loop switches permanently to agent_brain_2.
@@ -134,6 +167,21 @@ pub struct AppState {
     pub memory_store: Arc<std::sync::Mutex<MemoryStore>>,
     pub last_memory_health: MemoryHealth,
     pub setup_generation: Arc<AtomicU32>,
+    pub active_brain: Arc<Mutex<ActiveBrainStatus>>,
+    /// Hackathon Mode: active run state (transient, not persisted).
+    /// None when no invitation/run is active.
+    pub hackathon_run: Arc<Mutex<Option<crate::hackathon::HackathonRunState>>>,
+    /// Hackathon Mode: active run_id for staleness checks.
+    pub hackathon_run_id: Arc<Mutex<Option<String>>>,
+    /// Hackathon Mode: cancellation flag for the active run.
+    pub hackathon_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Graceful pause: user requested pause, validated at safe checkpoint boundaries.
+    pub pause_requested: Arc<AtomicBool>,
+    /// Last persisted checkpoint (mirrors settings_store key checkpoint:<session_id>, cached).
+    pub checkpoint: Arc<Mutex<Option<crate::checkpoint::SessionCheckpoint>>>,
+    pub delivery_state: Arc<Mutex<Option<crate::delivery::DeliveryState>>>,
+    pub delivery_state_path: PathBuf,
+    pub product_coordinator_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -149,10 +197,11 @@ impl AppState {
     /// Task 9: transcript_store, blueprint_store, and session_vault are
     /// wrapped in `std::sync::Mutex` (see field docs above) instead of
     /// `tokio::sync::Mutex`.
-    pub fn new(data_dir: &str) -> Self {
-        let settings_db_path   = format!("{}/settings.db", data_dir);
-        let blueprint_db_path  = format!("{}/blueprint.db", data_dir);
+    pub fn new(data_dir: &str, app: &tauri::AppHandle) -> Self {
+        let settings_db_path = format!("{}/settings.db", data_dir);
+        let blueprint_db_path = format!("{}/blueprint.db", data_dir);
         let transcript_db_path = format!("{}/transcript.db", data_dir);
+        let session_vault_db_path = format!("{}/session_vault.db", data_dir);
         let memory_db_path = PathBuf::from(data_dir).join("memory.db");
 
         let memory_store = MemoryStore::new(memory_db_path.to_string_lossy().as_ref())
@@ -162,47 +211,49 @@ impl AppState {
             });
         let last_memory_health = memory_store.check_health();
 
-        let (nav_tx, _nav_rx) =
-            std::sync::mpsc::sync_channel::<crate::browser_backend::NavEvent>(256);
-
         AppState {
             orchestrator: Arc::new(Mutex::new(Orchestrator::new())),
             transcript_store: Arc::new(std::sync::Mutex::new(
-                TranscriptStore::open(&transcript_db_path)
-                    .expect("transcript store init failed"),
+                TranscriptStore::open(&transcript_db_path).expect("transcript store init failed"),
             )),
-            token_budget:     Arc::new(Mutex::new(TokenBudget::new())),
-            // NOTE: SessionVault::new() is in-memory, exactly as before this
-            // batch. Task 9 only changes the *lock type* (tokio::Mutex →
-            // std::sync::Mutex) so its rusqlite calls can run inside
-            // spawn_blocking — it does not change SessionVault's storage
-            // backend. SessionVault's own in-memory-vs-file-backed status
-            // was never flagged in the triage audit and is out of scope for
-            // this batch; flagging it separately rather than silently
-            // "fixing" an unrequested behaviour change.
-            session_vault: Arc::new(std::sync::Mutex::new(SessionVault::new())),
-            browser_state:    Arc::new(Mutex::new(BrowserState::new(nav_tx))),
-            context_manager:  Arc::new(Mutex::new(ContextManager::new(
+            token_budget: Arc::new(Mutex::new(TokenBudget::new())),
+            session_vault: Arc::new(std::sync::Mutex::new(
+                SessionVault::open(&session_vault_db_path).unwrap_or_else(|error| {
+                    eprintln!(
+                        "[VAULT] file-backed init failed ({error}); using transient fallback"
+                    );
+                    SessionVault::new()
+                }),
+            )),
+            browser_state: Arc::new(Mutex::new(BrowserState::new_live(app))),
+            context_manager: Arc::new(Mutex::new(ContextManager::new(
                 String::new(),
                 SessionType::Custom,
             ))),
             blueprint_store: Arc::new(std::sync::Mutex::new(
-                BlueprintStore::new(&blueprint_db_path)
-                    .expect("blueprint store init failed"),
+                BlueprintStore::new(&blueprint_db_path).expect("blueprint store init failed"),
             )),
             settings_store: Arc::new(Mutex::new(
-                SettingsStore::new(&settings_db_path)
-                    .expect("settings store init failed"),
+                SettingsStore::new(&settings_db_path).expect("settings store init failed"),
             )),
-            agent_brain:      Arc::new(Mutex::new(None)),
-            ask_user_tx:      Arc::new(Mutex::new(None)),
-            agent_brain_2:    Arc::new(Mutex::new(None)),
-            session_active:   Arc::new(AtomicBool::new(false)),
-            model_health:     Arc::new(Mutex::new(HashMap::new())),
+            agent_brain: Arc::new(Mutex::new(None)),
+            ask_user_tx: Arc::new(Mutex::new(None)),
+            agent_brain_2: Arc::new(Mutex::new(None)),
+            session_runtime: Arc::new(SessionRuntime::new()),
+            model_health: Arc::new(Mutex::new(HashMap::new())),
             brain_fail_count: Arc::new(AtomicU32::new(0)),
             memory_store: Arc::new(std::sync::Mutex::new(memory_store)),
             last_memory_health,
             setup_generation: Arc::new(AtomicU32::new(0)),
+            active_brain: Arc::new(Mutex::new(ActiveBrainStatus::default())),
+            hackathon_run: Arc::new(Mutex::new(None)),
+            hackathon_run_id: Arc::new(Mutex::new(None)),
+            hackathon_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pause_requested: Arc::new(AtomicBool::new(false)),
+            checkpoint: Arc::new(Mutex::new(None)),
+            delivery_state: Arc::new(Mutex::new(None)),
+            delivery_state_path: PathBuf::from(data_dir).join("delivery-state.json"),
+            product_coordinator_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }

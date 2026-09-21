@@ -1,33 +1,74 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod agentic_manager;
 mod agent_brain;
+mod agent_reach;
+mod agentic_manager;
 mod blueprint_store;
 mod browser_backend;
+mod browser_harness;
+mod browser_lifecycle;
+mod candidate_review;
 mod capability_registry;
+mod checkpoint;
 mod commands;
+pub mod consultation;
+pub mod consultation_broker;
+mod consultation_runtime;
 mod context_manager;
+mod credentials;
+mod critical_transport;
 mod db_helpers;
+mod delivery;
+mod diagnostics_retention;
+mod doc_drift;
+mod dsh_worker;
 mod errors;
+pub mod evidence_gates;
+mod execution_profiles;
+mod external_browser;
+mod functional_contract;
+mod git_runtime;
+mod hackathon;
 mod memory_store;
+mod opencode_adapter;
 mod orchestrator;
 mod persona_manager;
+pub mod pipeline_contract;
+mod pipeline_ids;
+mod pipeline_integrity;
+pub mod product_os;
+mod product_os_coordinator;
+mod product_os_runtime;
 mod proxy_manager;
+mod quality_workflows;
+mod repo_intelligence;
 mod resource_monitor;
 mod response_router;
 mod session_runner;
+mod session_runtime;
 mod session_vault;
 mod settings_store;
 mod signals;
 mod token_budget;
 mod transcript_store;
 mod turn_manager;
+mod verification;
+mod work_graph;
 
 use orchestrator::AppState;
 use tauri::{Emitter, Manager};
 
 fn main() {
+    #[cfg(unix)]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--arena-internal-process-group-guard"))
+    {
+        loop {
+            std::thread::park();
+        }
+    }
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -37,16 +78,25 @@ fn main() {
                 .expect("could not resolve app data directory");
             std::fs::create_dir_all(&data_dir)
                 .expect("could not create app data directory");
+            if let Err(error) = crate::diagnostics_retention::prune_diagnostic_logs(
+                &data_dir,
+                std::time::SystemTime::now(),
+            ) {
+                eprintln!("[DIAGNOSTICS] Could not prune expired app logs: {error}");
+            }
 
             // ── IMP-8: File-backed tracing (rolling daily log) ────────────────
-            let file_appender =
-                tracing_appender::rolling::daily(&data_dir, "consensus-arena.log");
+            let file_appender = tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("consensus-arena.log")
+                .max_log_files(15)
+                .build(&data_dir)?;
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
                 )
                 .with_writer(non_blocking)
                 .with_ansi(false) // no ANSI colour codes in log files
@@ -57,7 +107,7 @@ fn main() {
 
             // ── AppState ──────────────────────────────────────────────────────
             let data_dir_str = data_dir.to_string_lossy().into_owned();
-            let app_state = AppState::new(&data_dir_str);
+            let app_state = AppState::new(&data_dir_str, app.handle());
             if !app_state.last_memory_health.is_healthy
                 || app_state.last_memory_health.fts_needs_repair
             {
@@ -82,6 +132,33 @@ fn main() {
                     }),
                 );
             }
+            let consultation_db = app_state.transcript_store.clone();
+            let product_db = app_state.transcript_store.clone();
+            let product_runtime = app_state.session_runtime.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) =
+                    crate::consultation_runtime::reconcile_after_restart(consultation_db).await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "consultation restart reconciliation did not complete"
+                    );
+                }
+            });
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) =
+                    crate::product_os_coordinator::reconcile_latest_after_restart(
+                        product_db,
+                        product_runtime,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "Product OS restart reconciliation did not complete"
+                    );
+                }
+            });
             app.manage(app_state);
 
             Ok(())
@@ -89,6 +166,35 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             // Session management
             commands::start_session,
+            commands::start_delivery,
+            commands::get_dsh_prerequisite,
+            commands::get_delivery_state,
+            commands::get_delivery_recovery_state,
+            commands::create_product_research_work_order,
+            commands::run_product_research_work_order,
+            commands::create_product_web_research_work_order,
+            commands::run_product_web_research_work_order,
+            commands::create_product_fact_verifier_work_order,
+            commands::run_product_fact_verifier_work_order,
+            commands::create_product_web_fact_verifier_work_order,
+            commands::run_product_web_fact_verifier_work_order,
+            commands::cancel_product_work_order,
+            commands::get_product_os_snapshot,
+            commands::get_latest_product_os_snapshot,
+            commands::admit_product_ambiguity,
+            commands::provide_product_owner_decision,
+            commands::start_product_project,
+            commands::get_product_coordinator_status,
+            commands::get_product_functional_state,
+            commands::answer_product_question,
+            commands::inject_product_guidance,
+            commands::request_product_consultation,
+            commands::recover_product_consultation,
+            commands::cancel_product_project,
+            commands::resume_product_project,
+            commands::resume_delivery,
+            commands::abort_delivery,
+            commands::apply_delivery,
             // BUGFIX (Cline audit, post-Batch-D): pause_session and
             // resume_session were fully implemented in commands.rs but were
             // never registered here — the frontend could never actually call
@@ -116,9 +222,21 @@ fn main() {
             commands::get_secondary_brain_config,   // D-039
             commands::save_fallback_brain_config,   // Task 5 (HIGH-3)
             commands::get_fallback_brain_config,    // Task 5 (HIGH-3)
+            commands::clear_brain_credential,
+            commands::get_credential_storage_status,
+            commands::save_custom_participants,     // P1
+            commands::get_custom_participants,      // P1
+            commands::get_participants,             // P3 unified registry
             commands::save_prompt_template,
             commands::get_prompt_template,
+            commands::get_maintenance_mode,
+            commands::set_maintenance_mode,
+            commands::get_diagnostic_brief,
             commands::get_diagnostic_snapshot,
+            commands::get_browser_timeline,
+            commands::get_browser_reliability_report,
+            commands::export_browser_diagnostics,
+            commands::run_single_model_diagnostic,
             // Data retrieval
             commands::get_transcript,
             commands::get_session_list,
@@ -128,9 +246,16 @@ fn main() {
             commands::delete_session,
             commands::rename_session,
             commands::get_session_details,
+            commands::get_session_transcript,
+            commands::get_blueprint_sections,
+            commands::request_pause,
+            commands::get_session_checkpoint,
             // IMP-7: Session recovery
             commands::get_recovery_state,
             commands::recover_session,
+            // Connected Accounts Launch + Brain status
+            commands::launch_connected_account,
+            commands::get_brain_status,
             // Phase 1 memory
             commands::get_project_memory,
             commands::get_global_memory,
@@ -144,6 +269,13 @@ fn main() {
             commands::get_patterns,
             commands::export_memory,
             commands::restore_memory,
+            // Hackathon Mode
+            commands::get_hackathon_config,
+            commands::save_hackathon_config,
+            commands::get_hackathon_run_state,
+            commands::cancel_hackathon_run,
+            commands::send_hackathon_invitations,
+            commands::run_hackathon,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

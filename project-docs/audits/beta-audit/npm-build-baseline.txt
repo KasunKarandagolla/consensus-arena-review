@@ -1,0 +1,13 @@
+
+> consensus-arena@0.1.0 build
+> tsc && vite build
+
+vite v5.4.21 building for production...
+transforming...
+✓ 1710 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                   0.42 kB │ gzip:   0.28 kB
+dist/assets/index-BWKkQMup.css   50.90 kB │ gzip:  10.10 kB
+dist/assets/index-BTirHNRz.js   362.69 kB │ gzip: 110.25 kB
+✓ built in 35.96s

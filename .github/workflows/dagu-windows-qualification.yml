@@ -1,0 +1,25 @@
+name: Dagu standalone Windows qualification
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/arena-dev-temp
+    paths:
+      - .github/workflows/dagu-windows-qualification.yml
+      - scripts/qualify-dagu-windows.ps1
+
+permissions:
+  contents: read
+
+jobs:
+  dagu-windows-runtime:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Qualify Dagu 2.16.6 standalone runtime
+        shell: pwsh
+        run: ./scripts/qualify-dagu-windows.ps1

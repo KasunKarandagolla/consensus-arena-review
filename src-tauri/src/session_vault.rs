@@ -1,9 +1,12 @@
 use crate::errors::AgentError;
-use ring::aead::{self, BoundKey, Nonce, NonceSequence, SealingKey, OpeningKey, UnboundKey, AES_256_GCM, NONCE_LEN};
+use ring::aead::{
+    self, AES_256_GCM, BoundKey, NONCE_LEN, Nonce, NonceSequence, OpeningKey, SealingKey,
+    UnboundKey,
+};
 use ring::error::Unspecified;
 use ring::pbkdf2;
 use ring::rand::{SecureRandom, SystemRandom};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::num::NonZeroU32;
 
 const SALT: &[u8] = b"consensus-arena-v1-salt-2024";
@@ -23,6 +26,9 @@ pub struct SessionVault {
 }
 
 impl SessionVault {
+    /// Test/fallback constructor. Production startup uses `open()` with the
+    /// app-data `session_vault.db` path so conversation continuity survives a
+    /// restart.
     pub fn new() -> Self {
         let conn = Connection::open_in_memory().expect("vault db failed");
         let key_bytes = Self::derive_key();
@@ -52,8 +58,9 @@ impl SessionVault {
     }
 
     fn init_schema(&self) -> Result<(), AgentError> {
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS cookies (
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS cookies (
                 agent_id TEXT PRIMARY KEY,
                 data BLOB NOT NULL,
                 saved_at INTEGER NOT NULL
@@ -64,8 +71,8 @@ impl SessionVault {
                 url TEXT NOT NULL,
                 PRIMARY KEY (session_id, agent_id)
             );",
-        )
-        .map_err(AgentError::from)
+            )
+            .map_err(AgentError::from)
     }
 
     pub fn save_conversation_url(
@@ -161,7 +168,9 @@ impl SessionVault {
 
     fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, AgentError> {
         if data.len() < NONCE_LEN {
-            return Err(AgentError::UnknownError("encrypted data too short".to_string()));
+            return Err(AgentError::UnknownError(
+                "encrypted data too short".to_string(),
+            ));
         }
         let (nonce_bytes, ciphertext) = data.split_at(NONCE_LEN);
         let mut nonce = [0u8; NONCE_LEN];
@@ -176,5 +185,30 @@ impl SessionVault {
             .open_in_place(aead::Aad::empty(), &mut in_out)
             .map_err(|_| AgentError::UnknownError("decryption failed".to_string()))?;
         Ok(decrypted.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionVault;
+
+    #[test]
+    fn conversation_url_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("consensus-arena-vault-{}.db", std::process::id()));
+        let path_string = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut vault = SessionVault::open(&path_string).unwrap();
+            vault
+                .save_conversation_url("session", "claude", "https://claude.ai/chat/1")
+                .unwrap();
+        }
+        let reopened = SessionVault::open(&path_string).unwrap();
+        assert_eq!(
+            reopened.get_conversation_url("session", "claude").unwrap(),
+            Some("https://claude.ai/chat/1".to_string())
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

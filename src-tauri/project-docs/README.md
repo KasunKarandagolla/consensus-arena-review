@@ -1,50 +1,321 @@
-# Consensus Arena Project Documentation
+# Consensus Arena — Project Documentation Index
 
-## Current status
+**Last refreshed:** 2026-09-19
+**Purpose:** Small, modular source-of-truth documents for humans, ChatGPT, and Codex working on Consensus Arena.
 
-The backend is feature-complete for the documented scope. The production
-React frontend has been rebuilt from
-`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/mockup/preview.html`
-while preserving the existing Tauri IPC contract. The preview design is the
-current implemented baseline and must not be replaced without explicit
-approval.
+## Current product in one paragraph
 
-The backend and frontend builds passed during the Phase 1 post-audit. Phase 1
-Memory is implemented and checkpointed at `f0847c0`. A real interactive Tauri
-memory test remains before Phase 2 Skills: exercise Route, RouteCompare,
-Blueprint, AskUser, export, and restore. Evidence is recorded in
-`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/phase1-memory-post.md`.
+Consensus Arena is a native Tauri 2 desktop application evolving from an AI expert-panel blueprint tool into a **product-authority and delivery system for a nontechnical product owner**. It now has two deliberately separate lanes:
 
-## AGENTS.md
-Current path: `/home/kasun/Music/arena/consensus-arena/AGENTS.md`.
+1. **Consult** — the existing leader-driven frontier-model consultation system using authenticated consumer web chats and an OpenAI-compatible orchestration brain.
+2. **Build / Delivery** — a new parallel lane whose current source can take bounded product work into an isolated Git worktree, author and freeze executable acceptance material, verify independently, repair with bounded attempts, persist owner questions, and apply only a verified candidate under strict Git preconditions. The legacy DSH worker prerequisite remains materially challenged; the production Product OS coordinator uses the separately qualified Arena-owned OpenCode path for bounded Linux work.
 
-Codex reads this automatically at the start of every session in that
-project folder (per the Codex CLI guide's section 9). It bakes in every
-non-negotiable constraint, named risk, and design ground truth from this
-project so you don't have to repeat them by hand in every prompt.
+The long-term direction is not to turn Arena into another coding-agent platform. Arena should own **product intent, owner decisions, progression policy, and acceptance authority**, while reusing external workers, workflow engines, Git, test runners, browser/native automation, deployment tools, and other commodity infrastructure.
 
-## PROCESS-md-codex-patch.md
-Historical patch retained for context. Its Codex CLI workflow is now
-incorporated into PROCESS.md.
+## Milestone 05A historical boundary
 
-## CLAUDE-PROJECT-INSTRUCTIONS.md
-Project context, constraints, current state, and named risks for Claude.
+The 2026-09-18 preflight adds typed research provenance to the existing
+Product OS evidence records and a canonical-checkout `HEAD`/complete-status
+snapshot around external Delivery workers. Research proposals are unverified
+until Arena records an independent verifier work-order and source metadata;
+contradicted or stale claims cannot satisfy research gates. A candidate
+working directory remains non-authoritative and is not an OS/security sandbox.
 
-## Development launch
+The narrow real research capability at that checkpoint was direct read-only
+official GitHub/web-source retrieval outside the Product OS runtime. Later
+milestones closed the durable Product OS and OpenCode WebDiscovery seams; this
+paragraph remains the historical 05A boundary. See
+`audits/product-os-transition/05A-research-runtime-release-preflight.md`.
 
-```bash
-cd /home/kasun/Music/arena/consensus-arena
-npm run tauri dev
-```
+## Milestone 05B current status
 
-## Verification
+Milestone 05B now admits the narrow real research path through an
+Arena-owned, durable Product OS work order. The existing `TranscriptStore`
+holds authoritative Product OS records and work-order metadata; `SessionRuntime`
+remains the live ownership authority. Researcher output is persisted only as
+unverified evidence. A distinct current Fact Verifier work order must
+independently recheck the primary source before Arena can record
+`IndependentlyVerified`.
 
-```bash
-cd /home/kasun/Music/arena/consensus-arena/src && npm run build
-cd /home/kasun/Music/arena/consensus-arena/src-tauri && cargo check
-cd /home/kasun/Music/arena/consensus-arena && git diff --check
-```
+The Linux runtime dogfood survives store reopen, preserves verifier and owner
+decision identity, rejects wrong-role/cancelled/stale results, and reconciles
+pending work without fabricating completion. Ambiguity admission is
+Arena-owned and conservatively owner-required; renderer and worker payloads
+cannot downgrade that classification. Delivery displays the resulting
+evidence/ambiguity state through the existing calm view.
 
-Read real source before changing status claims. As of the Phase 1 Memory
-post-audit, the verified counts are 16 AppState fields and 38 Tauri commands
-defined/registered; recount from source whenever a task depends on them.
+M05C closes the narrow BuildPackage-backed gate criterion on a clearly marked
+internal validation project: real official-source research and independent
+verification survive reopen; Arena-owned scope, review, reuse, architecture,
+and owner-direction operations assemble a current package; Vision,
+ProblemResearch, Positioning, Ambiguity, Reuse, Architecture, and
+BuildReadiness pass. A later material scope change makes the prior package and
+gate evaluation stale. This is not market validation or final founder dogfood.
+See
+`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/05C-research-buildpackage-gate-handoff.md`.
+
+M05D now qualifies the bounded Linux web-discovery prerequisite. The existing
+OpenCode installation was upgraded by owner authorization from 1.17.18 to
+1.18.31 using the same curl method. Muse Spark executed real websearch through
+the hosted Exa path, and Arena admitted the result as Unverified before a
+distinct FactVerifier work order independently finalized claims. Arena must
+not manually relay web results into Product OS evidence. This does not claim
+Windows, packaging, broad provider portability, or final founder-dogfood
+readiness; see
+`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/05D-durable-web-research.md`.
+
+## Milestone 06 historical harness closure
+
+The fresh M06 dogfood uses a new internal founder idea, not the earlier
+validation fixtures. The production path admitted real UserProblem and
+CompetitorStatusQuo WebDiscovery work orders, persisted source-backed claims as
+Unverified, independently checked claims through distinct FactVerifier work
+orders, reopened the store, assembled the current Build Package, passed the
+applicable pre-implementation gates, and ran two bounded OpenCode engineering
+roles in parallel before Arena's independent Delivery verifier produced a
+current Verified candidate. The run recorded one owner decision intervention;
+routine research transport, role execution, candidate integration, and
+verification required no manual relay.
+
+The integrated provenance is deliberately search-level:
+`observation=search_result; OpenCode tools=websearch;
+webfetch=not_used_in_production_path`. The separate M05D webfetch probe proves
+that capability exists in the installed runtime, not that M06 claims fetched
+source content. Search evidence is not market validation and unresolved or
+contradicted claims remain gate-blocking.
+
+This is runtime-proven on Linux with OpenCode 1.18.31, Muse Spark free tier,
+and hosted Exa WebDiscovery. It is not Windows runtime parity, native GUI
+qualification, hostile same-user filesystem isolation, full SSRF isolation,
+Git-object isolation, broad provider portability, or an external OpenCode
+installer. The detailed evidence is in
+`audits/product-os-transition/06-week-one-dogfood-release.md`.
+
+## Milestone 07 current production-coordinator closure
+
+The production entry point is now the narrow coordinator API:
+`start_product_project`, `get_product_coordinator_status`,
+`answer_product_question`, `cancel_product_project`, and
+`resume_product_project`. It persists only coordinator progress references in
+the existing `TranscriptStore`; ProductAuthorityRecords, SessionRuntime, and
+DeliveryState remain the respective authorities for product truth, live work,
+and implementation.
+
+The fresh M07 Linux dogfood used only the production start/status/owner-answer
+boundary. Arena autonomously ran three bounded WebDiscovery work orders,
+distinct FactVerifier work, Product Director review, two independent
+architecture sessions, reuse/constraints/red-team/dissent review, a real local
+feasibility check, current pre-implementation gates, Build Package admission,
+OpenCode candidate execution, and the independent Delivery verifier. The run
+returned a current Verified candidate while the canonical checkout remained
+unchanged. The only owner intervention was the genuine bounded direction
+answer; no research relay, role sequencing, library selection, terminal
+coordination, or manual package/Delivery construction was used.
+
+This is runtime-proven on Linux with OpenCode 1.18.31, Muse Spark
+(`opencode/muse-spark-1.2-contributor-free`), and hosted Exa WebDiscovery. The
+roles are separate real sessions but are currently serialized by the existing
+SessionRuntime/resource boundary rather than proven overlapping. Production
+coordinator restart/reconciliation through every in-flight phase, Windows,
+packaging/install, native GUI launch, explicit Apply, hostile same-user
+filesystem isolation, and broad provider portability remain unproven. See
+`audits/product-os-transition/07-production-autonomous-coordinator.md`.
+
+## Reality hierarchy
+
+When sources disagree, use this order:
+
+1. **Current source and runtime evidence**
+2. **Latest permanent audit in `audits/`**
+3. **These project docs**
+4. Historical prompts/specifications/research
+
+Do not preserve a doc claim because it is written here. Correct the docs when current source proves otherwise.
+
+The current programme audits through 2026-09-17 supersede older consultation-
+only status language and earlier provisional substrate assumptions.
+
+## Read only what the task needs
+
+Always read `DECISIONS.md` first after this index, then use this map.
+
+| Task | Read next |
+|---|---|
+| Product direction / scope / user experience | `PRODUCT.md`, `DECISIONS.md`, `SUBSTRATE_RESEARCH.md` |
+| Overall system architecture | `ARCHITECTURE.md`, then lane-specific doc |
+| Legacy expert-panel / browser consultation | `CONSULTATION.md`, `BACKEND.md`, `IPC.md`, `RELIABILITY.md` |
+| Build / Delivery work | `DELIVERY.md`, `BACKEND.md`, `IPC.md`, `RELIABILITY.md` |
+| Dagu / DSH / substrate decisions | `SUBSTRATE_RESEARCH.md`, `DELIVERY.md`, `DECISIONS.md` |
+| Frontend / UX | `FRONTEND.md`, `PRODUCT.md`, `IPC.md` |
+| IPC / Tauri commands / events | `IPC.md`, then real Rust command/event source |
+| Memory | `MEMORY.md`, `BACKEND.md` |
+| Reliability / audits / recovery | `RELIABILITY.md`, relevant lane doc, latest audit |
+| Coding or implementation | `PROCESS.md`, root `AGENTS.md`, plus relevant technical docs |
+
+Do **not** load every project document for a narrow task. This documentation is intentionally modular to save context.
+
+## Current verified transition point
+
+### Worker gate update — 2026-09-16
+
+Two fresh npm installs from the newly preserved manifest/lock reproduced the
+same dependency graph, DSH version, and root help output. Both then hung on
+Arena's exact five-second `headless --help` prerequisite probe and were killed
+by the bounded probe. The new lock is not the irrecoverable historical lock;
+no model-backed task ran. The current worker decision is **DSH materially
+challenged — Astra Trigger A**. The consultation packet is in
+`audits/dsh-runtime-reproducibility/dsh-runtime-reproducibility.md`; no Astra
+consultation response is claimed. Do not treat DSH as a qualified or durable
+V1 prerequisite while this decision is open.
+
+The final standalone Dagu closure also remains **INCONCLUSIVE — post-V1**.
+Linux hard-interruption testing found an at-least-once side-effect risk and
+required explicit recovery; Windows execution and DSH composition remain
+unproven. No Dagu integration or Astra Trigger B consultation is justified.
+
+The Linux host probe still reports no `/dev/dri`, llvmpipe, and no running
+Arena/Vite process. Use the graphics-capable desktop procedure in
+`RELIABILITY.md`; no GUI E2E is claimed.
+
+The latest local post-implementation audit establishes a first Build vertical slice with these invariants at source/test level:
+
+- Consult mode remains separate and unchanged.
+- Build mode does not require leader/participants or model WebViews.
+- Work occurs in an isolated `arena-delivery/<short-id>` Git worktree created from a clean base.
+- The default DSH bounded-worker path remains materially challenged and blocked before admission; an opt-in OpenCode path now provides bounded Linux candidate execution behind an Arena-owned authority adapter.
+- Executable acceptance material is authored **before implementation**, frozen, protected by hashes, and verified independently from worker narration.
+- Required checks are rerun after repair; attempts are bounded.
+- `needs_user` is persisted before the existing AskUser event is emitted; the source recovery path can re-present a persisted question after restart, but a separate production-service restart/answer runtime has not been qualified.
+- Apply is explicit and source guards reject dirty, moved, or non-fast-forward bases; the successful production Apply path has not been runtime-qualified.
+- DSH is not yet bundled/installed by Arena.
+- Build setup performs a read-only DSH prerequisite check and blocks
+  Delivery admission unless the expected `0.1.5-rc.1` executable exposes the
+  `headless` profile. A newly preserved manifest/lock reproduces across two
+  clean installs, but both hit the probe timeout. This runtime is not
+  worker-qualified and the exact historical lock remains unavailable.
+- Native Linux Tauri launch was reconfirmed, but the managed WebView was blank
+  during the latest qualification session, so no Delivery UI dogfood run was
+  started in that session.
+
+See `DELIVERY.md`, `audits/delivery-loop-v1-linux-runtime-qualification.md`,
+and the current qualification record in
+`audits/delivery-dsh-v4-worker-and-e2e.md`.
+
+The current OpenCode authority-adapter and walking-skeleton evidence is in
+`audits/product-os-transition/02-product-os-authority-walking-skeleton.md`.
+It qualifies only the installed Linux OpenCode 1.18.31 + Muse Spark path for
+bounded candidate execution. Windows, packaging, unrestricted authority, and
+production-scale performance remain unproven.
+
+Milestone 04 adds a source-level evidence-gate evaluator and a minimal
+founder-facing Intent → Build → Verify → Apply summary. The evaluator is a
+pure Arena-owned contract with stale/missing-evidence fail-closed behavior;
+it is not yet a durable journey store or a replacement for Delivery and
+SessionRuntime. GitHub MCP, pinned ECC/gstack procedures, and external
+consultation execution remain research capabilities rather than runtime-
+qualified features.
+
+Milestone 05 adds the bounded Arena-owned Build Package handoff: current
+authority records are assembled and fingerprinted in existing Delivery state,
+then rechecked before OpenCode admission. Existing SessionRuntime, candidate
+worktree, frozen acceptance, independent verifier, repair, and Safe Apply
+remain authoritative. The candidate directory is non-authoritative, not an OS
+or security sandbox. Windows, packaging, hostile same-user isolation, broad
+provider portability, GitHub MCP, ECC/gstack, and external consultation
+execution remain unproven.
+
+Milestone 05B extends the same authority boundary to durable Product OS
+research. Existing TranscriptStore tables persist ProductAuthority records
+and Arena work orders; SessionRuntime owns the live lease. Research proposals
+are always unverified until a distinct current Arena Fact Verifier work order
+rechecks the source. Owner-required ambiguities and adopted decisions are
+bound to question IDs and authority revisions. M05C now proves the complete
+research-to-accepted-BuildPackage pre-implementation gate handoff on an
+internal Linux validation slice; final founder dogfood remains separate.
+
+The current qualification record adds a direct DeepSeek V4 Flash provider
+sanity check and a real DSH comparison. V4 Flash reached model listing but
+bounded inference timed out; its standalone DSH task did not change a
+repository or emit a worker receipt. The single permitted Muse Glimmer control
+did change a repository and emit a schema-1 receipt, but that is historical
+single-run evidence: the documented lock could not be reconstructed in the
+latest pass, and neither of the two required independent Muse runs was
+attempted. DSH repeatability, the complete Arena Delivery runtime path, and
+reliability branches therefore remain unproven.
+
+The 2026-09-16 programme qualification fixed the INCONCLUSIVE resume
+candidate-preservation defect, hardened evidence receipt IDs and DSH timeout
+cleanup, and added a stale Delivery-event guard. A follow-up backend/runtime
+closure pass added a production-path dogfood boundary, bounded Git execution,
+immutable verifier/candidate correlation, real-Git admission/Apply/protected
+restoration tests, and a host qualification script. Its model-backed Delivery
+test remains opt-in and has not passed: the exact documented DSH lockfile could
+not be reconstructed, and two independent Muse runs were therefore not
+attempted. This is backend runtime evidence, not GUI E2E.
+
+Native WebKitGTK still renders blank on the current Linux session because
+`/dev/dri` is absent and EGL DRI2 authentication fails; prior software-rendering
+and compositing flags did not restore the Arena surface. The host script is at
+`/home/kasun/Music/arena/consensus-arena/scripts/qualify-linux-native-runtime.sh`.
+No UI-to-Apply run was claimed. See
+`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/delivery-v1-programme-qualification-2026-09-16.md`.
+
+The standalone Dagu closure remains **INCONCLUSIVE — post-V1**. After hard
+interruption, the active attempt required explicit reconciliation and repeated
+an external side effect. Human-task recovery also needed explicit retry after
+restart. DSH composition and Windows execution remain unproven. See
+`audits/dagu-runtime-closure-2026-09-16.md`.
+
+The follow-up prerequisite qualification is recorded in
+`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/delivery-v1-prerequisite-qualification-2026-09-16.md`.
+
+See `audits/delivery-dsh-v4-worker-and-e2e.md` for the permanent evidence.
+
+## Current strategic boundary
+
+After the substrate gates and prior Astra consultation, the accepted
+architecture is **not** a monolithic agent substrate. Arena keeps product
+authority, frozen acceptance, independent verification, and safe Apply; its
+bounded worker selection is now open under required Astra Trigger A.
+
+> Arena product authority + reusable execution/workflow mechanics where proven useful + a bounded worker + independent deterministic verification.
+
+**Dagu** remains a post-V1 workflow-engine candidate because it offers local durable runs, retries/history, root human tasks, and REST/CLI control. Its standalone result is **INCONCLUSIVE**: a hard interruption required explicit reconciliation and repeated an external side effect; DSH composition and Windows execution remain unproven. **Dagu is not part of the current Build lane.** Do not spend further V1 release effort on Dagu integration. The current DSH failure independently triggers the targeted Astra consultation recorded in its audit.
+
+## Documentation maintenance
+
+After a meaningful milestone:
+
+1. verify source/runtime first;
+2. update only affected modular docs;
+3. add or retain a permanent audit under `src-tauri/project-docs/audits/`;
+4. update `DECISIONS.md` if a durable architecture/product decision changed;
+5. update this index only if the document map/current transition point changed.
+
+## Current 08A transition point
+
+The Q1 runtime closure and 08A reliability audit now record executed
+low-memory tests, Safe Apply guards, bounded cancellation/reconciliation,
+light semantic-role concurrency, OpenCode 1.18.31 plain/Implementation/
+DebugRepair proofs, native Rust/TypeScript LSP qualification, selected
+Superpowers runtime influence, and exploratory Playwright MCP qualification.
+CandidateReview's current free-tier background-path 403 and native Tauri
+WebdriverIO's host graphics/driver limitation are explicitly classified in the
+08A audit; neither changes Arena's verifier or Apply authority.
+
+## Current 08B platform and capability closure
+
+The 08B audit at
+`/home/kasun/Music/arena/consensus-arena/src-tauri/project-docs/audits/product-os-transition/08B-platform-capability-closure-v2.md`
+records the platform and packaging boundary at the current checkpoint.
+Current-HEAD Linux packaging, formatting, frontend, and backend evidence are
+separated from Windows-only evidence; the current Linux host has no Windows
+runner, WebView2, NSIS toolchain, or native `/dev/dri` graphics device.
+
+OpenCode remains an explicit external prerequisite with bounded version health
+and remediation reporting. Repository intelligence, selected skills, LSP,
+Context7, and browser helpers remain optional-degradable or target-specific;
+they are not silently bundled or allowed to become product authority. The
+official GitHub MCP server is read-only interoperable but rejected as a
+default V1 dependency because direct GitHub/OpenCode retrieval already covers
+the required path. ECC, gstack, DSH, and Dagu remain rejected for active V1.
