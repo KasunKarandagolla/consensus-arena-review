@@ -121,10 +121,12 @@ impl ResolvedModelPolicy {
         self.resolved_model.is_none()
     }
 
-    pub fn inherit(&self, root_work_order_id: &str) -> Self {
-        let mut inherited = self.clone();
-        inherited.inheritance_root_work_order_id = root_work_order_id.to_string();
-        inherited
+    pub fn inherit(&self, _parent_work_order_id: &str) -> Self {
+        // Descendants inherit the original first-level policy snapshot. The
+        // immediate parent changes at every delegation level, but the policy
+        // root must remain stable so restart/recovery and audit can always
+        // identify the owner-configured first-level role that supplied it.
+        self.clone()
     }
 }
 
@@ -426,12 +428,12 @@ pub async fn test_custom_model(
         .and_then(|message| message.get("content"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let passed = !content.trim().is_empty();
+    let passed = content.trim() == "ARENA_CUSTOM_PROBE_OK";
     Ok(CustomModelTestResult {
         passed,
         status: if passed { "healthy" } else { "degraded" }.to_string(),
         latency_ms,
-        error_classification: (!passed).then(|| "empty_or_malformed_response".to_string()),
+        error_classification: (!passed).then(|| "probe_marker_mismatch".to_string()),
     })
 }
 
@@ -716,9 +718,10 @@ pub fn parse_agent_reach_doctor(
         .get("version")
         .and_then(Value::as_str)
         .map(ToString::to_string);
-    let Some(registry) = value.get("channels") else {
-        return Err("Agent Reach doctor JSON has no channel registry".to_string());
-    };
+    // Current Agent Reach prints check_all() directly for doctor --json, so
+    // the top-level object itself is the channel map. Older/fixture wrappers
+    // may still place that map under "channels"; accept both shapes.
+    let registry = value.get("channels").unwrap_or(&value);
     let mut channels = Vec::new();
     match registry {
         Value::Array(entries) => {
@@ -730,6 +733,9 @@ pub fn parse_agent_reach_doctor(
         }
         Value::Object(entries) => {
             for (name, entry) in entries {
+                if name == "version" || name == "channels" {
+                    continue;
+                }
                 if let Some(channel) = parse_agent_reach_channel(entry, Some(name), observed_at) {
                     channels.push(channel);
                 }
@@ -748,11 +754,13 @@ fn parse_agent_reach_channel(
     fallback_name: Option<&str>,
     observed_at: i64,
 ) -> Option<AgentReachDoctorChannel> {
+    // In current upstream doctor JSON the map key is the stable channel ID and
+    // "name" is a human-readable description. Prefer the key when present.
     let channel = entry
         .get("channel")
-        .or_else(|| entry.get("name"))
         .and_then(Value::as_str)
         .or(fallback_name)
+        .or_else(|| entry.get("name").and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())?
         .to_ascii_lowercase();
@@ -763,7 +771,7 @@ fn parse_agent_reach_channel(
             entry
                 .get("status")
                 .and_then(Value::as_str)
-                .is_some_and(|status| matches!(status, "healthy" | "ready" | "available"))
+                .is_some_and(|status| matches!(status, "ok" | "healthy" | "ready" | "available"))
         });
     let active_backend = entry
         .get("active_backend")
@@ -773,6 +781,7 @@ fn parse_agent_reach_channel(
     let reason = entry
         .get("reason")
         .or_else(|| entry.get("error"))
+        .or_else(|| entry.get("message"))
         .and_then(Value::as_str)
         .map(|value| value.chars().take(400).collect());
     Some(AgentReachDoctorChannel {
@@ -858,7 +867,11 @@ pub fn parse_opencode_model_catalog(raw: &str) -> Vec<(String, String, bool)> {
     for line in raw.lines() {
         let lower = line.to_ascii_lowercase();
         if let Some(model) = line.split_whitespace().find_map(candidate_model_id) {
-            let free = lower.contains("free") || lower.contains("zen");
+            // Fail closed. "Zen"/"OpenCode" identifies a provider, not a
+            // pricing tier; paid and free models can coexist there. Text-mode
+            // discovery is considered free only when the emitted model line
+            // explicitly says so. Structured metadata remains preferred.
+            let free = lower.contains("free");
             result
                 .entry(model)
                 .or_insert(("opencode".to_string(), free));
@@ -1111,6 +1124,52 @@ mod tests {
         assert!(report.channels.iter().any(|channel| {
             channel.channel == "web" && channel.active_backend.as_deref() == Some("exa")
         }));
+    }
+
+    #[test]
+    fn doctor_json_accepts_current_upstream_direct_map_and_ok_status() {
+        let report = parse_agent_reach_doctor(
+            r#"{"github":{"status":"ok","name":"GitHub repositories","message":"gh available","tier":0,"backends":["gh"],"active_backend":"gh"},"reddit":{"status":"warn","name":"Reddit","message":"login required","tier":1,"backends":["rdt"],"active_backend":null}}"#,
+            12,
+        )
+        .expect("current upstream doctor channel map");
+        let github = report
+            .channels
+            .iter()
+            .find(|channel| channel.channel == "github")
+            .expect("github channel id must come from the map key");
+        assert_eq!(github.health_status, "healthy");
+        assert_eq!(github.active_backend.as_deref(), Some("gh"));
+        let reddit = report
+            .channels
+            .iter()
+            .find(|channel| channel.channel == "reddit")
+            .expect("reddit channel");
+        assert_eq!(reddit.health_status, "unavailable");
+        assert_eq!(reddit.unavailable_reason.as_deref(), Some("login required"));
+    }
+
+    #[test]
+    fn inherited_policy_keeps_first_level_root_identity() {
+        let catalog = healthy_catalog();
+        let root = catalog.resolve(
+            &ModelPolicyConfig {
+                role_family: RoleFamily::ResearchLead,
+                preferred_model: Some("zen/model-a-free".to_string()),
+                fallback_models: Vec::new(),
+                custom_model_id: None,
+                enabled: true,
+            },
+            "root-work-order",
+            1,
+            10,
+        );
+        let child = root.inherit("child-work-order");
+        let grandchild = child.inherit("grandchild-parent");
+        assert_eq!(
+            grandchild.inheritance_root_work_order_id,
+            "root-work-order"
+        );
     }
 
     #[test]
