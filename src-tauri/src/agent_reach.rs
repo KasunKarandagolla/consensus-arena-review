@@ -100,11 +100,14 @@ pub async fn runtime_status(cwd: &Path) -> AgentReachRuntimeStatus {
                 .split_whitespace()
                 .map(|part| part.trim_start_matches('v'))
                 .find(|part| {
-                    part.chars().next().is_some_and(|character| character.is_ascii_digit())
+                    part.chars()
+                        .next()
+                        .is_some_and(|character| character.is_ascii_digit())
                 })
                 .map(ToString::to_string);
-            let version_matches_qualification =
-                expected.as_deref().is_some_and(|value| observed.as_deref() == Some(value));
+            let version_matches_qualification = expected
+                .as_deref()
+                .is_some_and(|value| observed.as_deref() == Some(value));
             AgentReachRuntimeStatus {
                 executable: executable().to_string_lossy().into_owned(),
                 observed_version: observed.clone(),
@@ -238,7 +241,11 @@ async fn research_youtube(cwd: &Path, query: &str) -> Result<ChannelResearchResu
         let Some(url) = value
             .get("webpage_url")
             .and_then(serde_json::Value::as_str)
-            .or_else(|| value.get("original_url").and_then(serde_json::Value::as_str))
+            .or_else(|| {
+                value
+                    .get("original_url")
+                    .and_then(serde_json::Value::as_str)
+            })
         else {
             continue;
         };
@@ -333,10 +340,7 @@ mod tests {
 
     #[test]
     fn explicit_unqualified_channels_fail_closed() {
-        let unavailable = unsupported(
-            ResearchChannel::Tiktok,
-            "not qualified",
-        );
+        let unavailable = unsupported(ResearchChannel::Tiktok, "not qualified");
         assert_eq!(unavailable.channel, ResearchChannel::Tiktok);
         assert!(unavailable.reason.contains("qualified"));
     }

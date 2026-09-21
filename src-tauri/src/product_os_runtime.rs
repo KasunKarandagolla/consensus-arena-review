@@ -849,7 +849,10 @@ pub async fn create_delegated_product_role_work_order(
     {
         return Err("delegated work requires project, parent, and subject".to_string());
     }
-    if matches!(role, ProductWorkOrderRole::Researcher | ProductWorkOrderRole::FactVerifier) {
+    if matches!(
+        role,
+        ProductWorkOrderRole::Researcher | ProductWorkOrderRole::FactVerifier
+    ) {
         return Err("delegated research uses the channel-research admission path".to_string());
     }
     let model_id = model_id
@@ -918,7 +921,9 @@ pub async fn create_delegated_channel_research_work_order(
         let records = load_records(&store, &project_id).map_err(AgentError::DatabaseError)?;
         let parent = store
             .get_product_work_order(&parent_work_order_id)?
-            .ok_or_else(|| AgentError::DatabaseError("research delegation parent is unknown".to_string()))?;
+            .ok_or_else(|| {
+                AgentError::DatabaseError("research delegation parent is unknown".to_string())
+            })?;
         if parent.project_id != project_id
             || parent.status != ProductWorkOrderStatus::Completed
             || parent.delegation_depth >= crate::work_graph::MAX_DELEGATION_DEPTH
@@ -975,7 +980,9 @@ pub async fn run_channel_research_work_order(
             .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
         let mut order = store
             .get_product_work_order(&id_for_preflight)?
-            .ok_or_else(|| AgentError::DatabaseError("channel research work order is unknown".to_string()))?;
+            .ok_or_else(|| {
+                AgentError::DatabaseError("channel research work order is unknown".to_string())
+            })?;
         let records = load_records(&store, &order.project_id).map_err(AgentError::DatabaseError)?;
         if order.role != ProductWorkOrderRole::Researcher
             || order.research_mode != Some(ProductResearchMode::ChannelResearch)
@@ -2270,9 +2277,9 @@ pub async fn invalidate_for_owner_guidance(
     reason: String,
 ) -> Result<ProductAuthorityRecords, String> {
     db_helpers::run_blocking(move || {
-        let mut store = db.lock().map_err(|_| {
-            AgentError::DatabaseError("transcript store lock poisoned".to_string())
-        })?;
+        let mut store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
         let mut records = load_records(&store, &project_id).map_err(AgentError::DatabaseError)?;
         product_os::invalidate_downstream_for_owner_guidance(&mut records);
         let timestamp = now();

@@ -367,9 +367,7 @@ pub fn admit_product_scope(
 /// newly-required evidence changes the decision basis. Current research
 /// evidence remains inspectable; architecture, build direction and frozen
 /// acceptance must be re-established against the new revision.
-pub fn invalidate_downstream_for_owner_guidance(
-    records: &mut ProductAuthorityRecords,
-) {
+pub fn invalidate_downstream_for_owner_guidance(records: &mut ProductAuthorityRecords) {
     records.decision_outcome = None;
     records.product_direction_decision_id = None;
     for ambiguity in &mut records.ambiguities {
@@ -377,8 +375,7 @@ pub fn invalidate_downstream_for_owner_guidance(
             && ambiguity.status == AmbiguityStatus::Open
         {
             ambiguity.status = AmbiguityStatus::Deferred;
-            ambiguity.mitigation =
-                Some("superseded by newer durable owner guidance".to_string());
+            ambiguity.mitigation = Some("superseded by newer durable owner guidance".to_string());
             ambiguity.revisit_trigger =
                 Some("re-open only if the newer owner guidance requires this choice".to_string());
         }
@@ -1403,6 +1400,8 @@ mod tests {
         let mut records = records();
         records.ambiguities.clear();
         records.owner_required_ambiguity_ids.clear();
+        records.decision_outcome = None;
+        records.product_direction_decision_id = None;
         let starting_revision = records.project_revision;
         admit_ambiguity(
             &mut records,
@@ -1420,8 +1419,10 @@ mod tests {
             adopt_owner_decision(&mut records, "a2", "wrong-question", "proceed".to_string(),)
                 .is_err()
         );
-        adopt_owner_decision(&mut records, "a2", "q2", "proceed".to_string())
+        adopt_owner_decision(&mut records, "a2", "q2", "narrow_build".to_string())
             .expect("current owner decision");
+        adopt_product_direction(&mut records, "narrow_build".to_string())
+            .expect("current owner decision authorizes product direction");
         assert!(assemble_build_package(&records).is_ok());
     }
 

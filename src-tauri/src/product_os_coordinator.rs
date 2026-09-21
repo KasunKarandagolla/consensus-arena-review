@@ -452,9 +452,9 @@ async fn remember_derived_product_event(
     let bounded = content.chars().take(2_000).collect::<String>();
     let source_type = source_type.to_string();
     let _ = db_helpers::run_blocking(move || {
-        let mut store = memory.lock().map_err(|_| {
-            AgentError::DatabaseError("memory store lock poisoned".to_string())
-        })?;
+        let mut store = memory
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("memory store lock poisoned".to_string()))?;
         store.add_project_memory_with_source(
             &project_brief,
             &category,
@@ -578,13 +578,12 @@ async fn verify_campaign_evidence(
     run: &mut ProductCoordinatorRun,
     evidence_ids: &[String],
 ) -> Result<(), String> {
-    let snapshot = product_os_runtime::snapshot(
-        ctx.db.clone(),
-        ctx.runtime.clone(),
-        run.project_id.clone(),
-    )
-    .await?
-    .ok_or_else(|| "Product OS project disappeared during campaign verification".to_string())?;
+    let snapshot =
+        product_os_runtime::snapshot(ctx.db.clone(), ctx.runtime.clone(), run.project_id.clone())
+            .await?
+            .ok_or_else(|| {
+                "Product OS project disappeared during campaign verification".to_string()
+            })?;
     let mut selected = evidence_ids
         .iter()
         .filter(|evidence_id| {
@@ -625,11 +624,16 @@ async fn verify_campaign_evidence(
                 run.project_id.clone(),
             )
             .await?
-            .ok_or_else(|| "Product OS project disappeared during campaign verification".to_string())?;
+            .ok_or_else(|| {
+                "Product OS project disappeared during campaign verification".to_string()
+            })?;
             if current.records.evidence.iter().any(|item| {
                 item.evidence_id == evidence_id
                     && item.verification == Some(EvidenceVerification::IndependentlyVerified)
-            }) && !run.verified_evidence_ids.iter().any(|id| id == &evidence_id)
+            }) && !run
+                .verified_evidence_ids
+                .iter()
+                .any(|id| id == &evidence_id)
             {
                 run.verified_evidence_ids.push(evidence_id);
             }
@@ -643,13 +647,12 @@ async fn distinct_current_source_count(
     run: &ProductCoordinatorRun,
     evidence_ids: &[String],
 ) -> Result<usize, String> {
-    let snapshot = product_os_runtime::snapshot(
-        ctx.db.clone(),
-        ctx.runtime.clone(),
-        run.project_id.clone(),
-    )
-    .await?
-    .ok_or_else(|| "Product OS project disappeared while counting research sources".to_string())?;
+    let snapshot =
+        product_os_runtime::snapshot(ctx.db.clone(), ctx.runtime.clone(), run.project_id.clone())
+            .await?
+            .ok_or_else(|| {
+                "Product OS project disappeared while counting research sources".to_string()
+            })?;
     let wanted = evidence_ids.iter().collect::<BTreeSet<_>>();
     let distinct = snapshot
         .records
@@ -706,7 +709,8 @@ async fn run_dynamic_research_campaigns(
     run: &mut ProductCoordinatorRun,
 ) -> Result<bool, String> {
     if let Some(question) = run.remediation_question.take() {
-        run.research_mandates.push(remediation_research_mandate(question));
+        run.research_mandates
+            .push(remediation_research_mandate(question));
     }
     if !pending_research_mandate(run) {
         return Ok(false);
@@ -786,15 +790,9 @@ async fn run_dynamic_research_campaigns(
                     "You manage a bounded evidence campaign, not ProductAuthority. Current mandate: {mandate_json}. Current research evidence:\n{recent_evidence}\nPropose the next small set of channel specialists only where they could materially improve the decision. You may revisit or deepen a channel. The owner-mandatory channels may not be silently omitted; Arena enforces them. Model IDs are hints only and Arena policy decides the actual model. Return JSON: {{\"complete\":false,\"completion_reason\":\"...\",\"tasks\":[{{\"channel\":\"web|github|youtube|reddit|x|rss|research_papers|douyin|tiktok\",\"question\":\"...\",\"model_id\":null}}],\"follow_up_focus\":null}}. Set complete=true only when further research is unlikely to change the bounded decision."
                 ),
             );
-            let lead_execution = run_scheduled_role(
-                ctx,
-                run,
-                lead.work_order_id.clone(),
-                prompt,
-            )
-            .await?;
-            let mut plan: crate::work_graph::ResearchLeadPlan =
-                parse_json(&lead_execution.output)?;
+            let lead_execution =
+                run_scheduled_role(ctx, run, lead.work_order_id.clone(), prompt).await?;
+            let mut plan: crate::work_graph::ResearchLeadPlan = parse_json(&lead_execution.output)?;
             plan.validate()?;
 
             let mut represented = plan
@@ -855,7 +853,8 @@ async fn run_dynamic_research_campaigns(
                     child_model,
                 )
                 .await?;
-                run.research_work_order_ids.push(child.work_order_id.clone());
+                run.research_work_order_ids
+                    .push(child.work_order_id.clone());
                 run.research_mandates[mandate_index]
                     .child_work_order_ids
                     .push(child.work_order_id.clone());
@@ -1515,8 +1514,7 @@ async fn run_architecture(
         snapshot.records.interfaces.join(" | "),
         snapshot.records.constraints.join(" | "),
     );
-    let planning_mode =
-        pipeline_contract::architecture_planning_mode(run.route, &planning_context);
+    let planning_mode = pipeline_contract::architecture_planning_mode(run.route, &planning_context);
     let roles = match planning_mode {
         pipeline_contract::ArchitecturePlanningMode::EstablishedPattern => {
             vec![(ProductWorkOrderRole::ArchitectA, "Architect A")]
@@ -2914,10 +2912,12 @@ pub async fn start(
     let timestamp = now();
     let initial_directive =
         crate::work_graph::owner_directive_from_text(&founder_idea, 1, timestamp)?;
-    let initial_mandate = crate::work_graph::research_mandate_for(&initial_directive).or_else(|| {
-        (route == ProductRoute::NewProduct)
-            .then(|| crate::work_graph::default_new_product_research_mandate(&initial_directive))
-    });
+    let initial_mandate =
+        crate::work_graph::research_mandate_for(&initial_directive).or_else(|| {
+            (route == ProductRoute::NewProduct).then(|| {
+                crate::work_graph::default_new_product_research_mandate(&initial_directive)
+            })
+        });
     let initial_phase = match route {
         ProductRoute::Incident => CoordinatorPhase::ReproduceDiagnose,
         ProductRoute::ExistingFeature => CoordinatorPhase::ProductReview,
@@ -3031,13 +3031,10 @@ pub async fn inject_owner_guidance(
         );
     }
 
-    let snapshot = product_os_runtime::snapshot(
-        ctx.db.clone(),
-        ctx.runtime.clone(),
-        run.project_id.clone(),
-    )
-    .await?
-    .ok_or_else(|| "Product OS authority snapshot is missing".to_string())?;
+    let snapshot =
+        product_os_runtime::snapshot(ctx.db.clone(), ctx.runtime.clone(), run.project_id.clone())
+            .await?
+            .ok_or_else(|| "Product OS authority snapshot is missing".to_string())?;
     let directive = crate::work_graph::owner_directive_from_text(
         &guidance,
         snapshot.records.project_revision,
@@ -3092,8 +3089,7 @@ pub async fn inject_owner_guidance(
         && let Some(mut delivery) = load_delivery_state(&ctx, &delivery_id).await?
         && !matches!(
             delivery.phase,
-            crate::delivery::DeliveryPhase::Applied
-                | crate::delivery::DeliveryPhase::Cancelled
+            crate::delivery::DeliveryPhase::Applied | crate::delivery::DeliveryPhase::Cancelled
         )
     {
         delivery.phase = crate::delivery::DeliveryPhase::Cancelled;

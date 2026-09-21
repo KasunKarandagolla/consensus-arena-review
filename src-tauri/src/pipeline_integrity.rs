@@ -194,8 +194,7 @@ mod tests {
 
     #[test]
     fn scenario_vision_failure_routes_to_owner_clarification_not_compile_probe() {
-        let remediation =
-            route_gate_remediation(GateId::Vision, GateStatus::MissingEvidence, 0);
+        let remediation = route_gate_remediation(GateId::Vision, GateStatus::MissingEvidence, 0);
         assert_eq!(
             remediation.outcome,
             GateRemediationOutcome::NeedsOwnerDecision
@@ -216,8 +215,16 @@ mod tests {
             .transition(ConsultationTransactionState::UnknownOutcome)
             .expect("restart reconciliation");
         assert!(order.state.is_post_arm());
-        assert!(order.transition(ConsultationTransactionState::Staged).is_err());
-        assert!(order.transition(ConsultationTransactionState::Armed).is_err());
+        assert!(
+            order
+                .transition(ConsultationTransactionState::Staged)
+                .is_err()
+        );
+        assert!(
+            order
+                .transition(ConsultationTransactionState::Armed)
+                .is_err()
+        );
     }
 
     #[test]

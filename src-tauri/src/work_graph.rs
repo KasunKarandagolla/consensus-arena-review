@@ -111,7 +111,9 @@ impl ResearchMandate {
             || self.max_cycles > MAX_RESEARCH_CYCLES
             || self.minimum_distinct_sources == 0
         {
-            return Err("research mandate is missing bounded identity, scope, or budget".to_string());
+            return Err(
+                "research mandate is missing bounded identity, scope, or budget".to_string(),
+            );
         }
         if self
             .mandatory_channels
@@ -187,7 +189,10 @@ fn mentions_any(lower: &str, values: &[&str]) -> bool {
 pub fn explicit_research_channels(text: &str) -> Vec<ResearchChannel> {
     let lower = text.to_ascii_lowercase();
     let mut channels = BTreeSet::new();
-    if mentions_any(&lower, &["github", "open source", "opensource", "repository", "repos"]) {
+    if mentions_any(
+        &lower,
+        &["github", "open source", "opensource", "repository", "repos"],
+    ) {
         channels.insert(ResearchChannel::Github);
     }
     if mentions_any(&lower, &["youtube", "you tube"]) {
@@ -223,7 +228,13 @@ pub fn explicit_research_channels(text: &str) -> Vec<ResearchChannel> {
     }
     if mentions_any(
         &lower,
-        &["web search", "normal web", "websites", "internet", "online research"],
+        &[
+            "web search",
+            "normal web",
+            "websites",
+            "internet",
+            "online research",
+        ],
     ) {
         channels.insert(ResearchChannel::Web);
     }
@@ -237,7 +248,9 @@ pub fn owner_directive_from_text(
 ) -> Result<OwnerDirective, String> {
     let text = text.trim();
     if text.is_empty() || text.len() > 16 * 1024 || text.chars().any(char::is_control) {
-        return Err("owner guidance is empty, oversized, or contains invalid control text".to_string());
+        return Err(
+            "owner guidance is empty, oversized, or contains invalid control text".to_string(),
+        );
     }
     let lower = text.to_ascii_lowercase();
     let channels = explicit_research_channels(text);
@@ -263,16 +276,31 @@ pub fn owner_directive_from_text(
     } else {
         OwnerDirectiveKind::GeneralGuidance
     };
-    let research_depth = research_requested.then_some(if mentions_any(
-        &lower,
-        &["exhaustive", "as much as needed", "thorough", "comprehensive"],
-    ) {
-        ResearchDepth::Exhaustive
-    } else if mentions_any(&lower, &["deep", "proper research", "properly research", "serious research"]) {
-        ResearchDepth::Deep
-    } else {
-        ResearchDepth::Standard
-    });
+    let research_depth = research_requested.then_some(
+        if mentions_any(
+            &lower,
+            &[
+                "exhaustive",
+                "as much as needed",
+                "thorough",
+                "comprehensive",
+            ],
+        ) {
+            ResearchDepth::Exhaustive
+        } else if mentions_any(
+            &lower,
+            &[
+                "deep",
+                "proper research",
+                "properly research",
+                "serious research",
+            ],
+        ) {
+            ResearchDepth::Deep
+        } else {
+            ResearchDepth::Standard
+        },
+    );
     let must_complete_before_decision = research_requested
         && mentions_any(
             &lower,
@@ -300,7 +328,10 @@ pub fn owner_directive_from_text(
 }
 
 fn env_model(name: &str) -> Result<Option<String>, String> {
-    match std::env::var(name).ok().filter(|value| !value.trim().is_empty()) {
+    match std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
         Some(value) => crate::opencode_adapter::validate_model_identifier(&value).map(Some),
         None => Ok(None),
     }
@@ -376,9 +407,7 @@ pub fn research_mandate_for(directive: &OwnerDirective) -> Option<ResearchMandat
     mandate.validate().ok().map(|_| mandate)
 }
 
-pub fn default_new_product_research_mandate(
-    directive: &OwnerDirective,
-) -> ResearchMandate {
+pub fn default_new_product_research_mandate(directive: &OwnerDirective) -> ResearchMandate {
     ResearchMandate {
         mandate_id: format!("research-mandate:{}", uuid::Uuid::new_v4()),
         directive_id: directive.directive_id.clone(),
@@ -427,10 +456,26 @@ mod tests {
         )
         .expect("directive");
         assert_eq!(directive.kind, OwnerDirectiveKind::Research);
-        assert!(directive.requested_channels.contains(&ResearchChannel::Youtube));
-        assert!(directive.requested_channels.contains(&ResearchChannel::Tiktok));
-        assert!(directive.requested_channels.contains(&ResearchChannel::Github));
-        assert!(directive.requested_channels.contains(&ResearchChannel::Reddit));
+        assert!(
+            directive
+                .requested_channels
+                .contains(&ResearchChannel::Youtube)
+        );
+        assert!(
+            directive
+                .requested_channels
+                .contains(&ResearchChannel::Tiktok)
+        );
+        assert!(
+            directive
+                .requested_channels
+                .contains(&ResearchChannel::Github)
+        );
+        assert!(
+            directive
+                .requested_channels
+                .contains(&ResearchChannel::Reddit)
+        );
         assert!(directive.must_complete_before_decision);
         let mandate = research_mandate_for(&directive).expect("mandate");
         assert_eq!(mandate.mandatory_channels, directive.requested_channels);

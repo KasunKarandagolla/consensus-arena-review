@@ -386,9 +386,7 @@ pub fn build_functional_state(
         satisfied: run
             .research_mandates
             .iter()
-            .filter(|mandate| {
-                mandate.status == crate::work_graph::ResearchMandateStatus::Satisfied
-            })
+            .filter(|mandate| mandate.status == crate::work_graph::ResearchMandateStatus::Satisfied)
             .count(),
         blocked_or_partial: run
             .research_mandates

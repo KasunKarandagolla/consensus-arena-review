@@ -75,8 +75,10 @@ pub fn architecture_planning_mode(route: ProductRoute, intent: &str) -> Architec
     ]
     .iter()
     .any(|marker| lower.contains(marker));
-    if matches!(route, ProductRoute::ExistingFeature | ProductRoute::Incident)
-        && !material_architecture_signal
+    if matches!(
+        route,
+        ProductRoute::ExistingFeature | ProductRoute::Incident
+    ) && !material_architecture_signal
     {
         // Existing feature work and incidents already begin from an admitted
         // product/repository context. Use one bounded established-pattern
