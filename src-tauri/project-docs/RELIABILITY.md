@@ -345,3 +345,22 @@ uses `Cancelling` before `Cancelled`, and stop/pivot/block states are not
 overloaded as successful completion. Stale packet hashes and execution epochs
 fail closed. Bounded experiments are admitted only through a typed contract
 with protected paths and deterministic result semantics.
+
+## M10 specialist and capability reliability
+
+Verified model selection is fail-closed: only free catalog entries with a
+successful bounded response probe are selectable, and fallback resolution
+never crosses into a paid or unknown model. Custom API model tests return only
+public status/latency/classification; the key is held by OS credential storage.
+
+Agent Reach and `tt` are optional external capabilities. Doctor/backend
+observations and TikTok exit statuses are capability/evidence inputs, not
+authority. Agent Reach absence, malformed doctor output, TikTok walled
+responses, and probe failures degrade honestly. External installation is never
+implicit.
+
+Continuity fences bind work-order identity, authority revision, and execution
+epoch. Restarted in-flight work is reconciled rather than auto-completed;
+owner guidance advances the epoch, and stale results cannot overwrite newer
+guidance. These deterministic tests do not prove external binaries or a live
+model account are installed.

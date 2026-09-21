@@ -165,3 +165,13 @@ not:
 > “Ask Arena another question and manually move the answer to the next tool.”
 
 This north star does **not** imply Arena itself must own every technical subsystem.
+
+### M10 progressive-disclosure additions
+
+Settings exposes compact first-level role-family model assignment only:
+preferred verified free model, ordered fallback choices, health state, a
+refresh/test action, and a custom API model surface. Descendant specialist
+model selectors are intentionally absent because descendants inherit the root
+policy snapshot. Research capability health shows Agent Reach
+presence/version, healthy-channel count, and TikTok availability without raw
+logs or transcripts becoming primary content.

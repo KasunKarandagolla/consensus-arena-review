@@ -86,3 +86,14 @@ Only move a learned procedure into Arena-owned durable product knowledge if it i
 ## No generic vector database requirement
 
 There is currently no justified requirement to add a vector database or broad autonomous memory stack. Reuse the implemented SQLite/FTS architecture unless measured needs prove otherwise.
+
+## M10 continuity boundary
+
+M10 extends the existing durable boundary without adding a vector store.
+`ProductWorkOrder` carries root role family, resolved model-policy snapshot,
+specialist template/skill references, bounded execution context, and execution
+epoch. Model health/catalog observations and research capability health are
+configuration/reliability records, not product truth. API keys remain in the
+OS credential store and are not included in these records. Restarted running
+work is reconciliation-required; a fresh bounded worker can use the persisted
+context bundle when an exact external runtime session is unavailable.

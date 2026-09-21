@@ -221,3 +221,57 @@ resource claim layer carrying work-order IDs and execution epochs. Snapshots
 are pure reads; restart/resume reconciliation is explicit. Do not introduce a
 workflow DSL, second task authority, worker-selected profiles, or any quality
 tool as ProductAuthority, acceptance, verification, or Apply authority.
+
+## D-2026-24 — First-level model policy is the routing authority
+
+**Accepted for M10.** Owners configure only the five first-level role
+families: Research Lead, Product Director, Architecture Lead, Implementation
+Engineer, and QA/Review Lead. Each admitted semantic work order persists a
+`ResolvedModelPolicy` snapshot containing the root role, preferred/fallback
+references, selected model, policy revision, inheritance root, timestamp, and
+health observations. Delegated descendants inherit that snapshot; worker model
+hints are advisory and cannot replace it. A role setting change affects new
+work only.
+
+## D-2026-25 — Model dropdowns require verified health
+
+**Accepted for M10.** Normal model choices come from the persisted catalog only
+after a bounded real response probe succeeds. Preferred-to-fallback resolution
+is free-only and fails closed when every candidate is unhealthy; Arena never
+silently chooses an unknown or paid model. Custom API models use OS credential
+storage and become selectable only after a bounded response probe passes. Keys
+are excluded from Product OS records, evidence, memory, and ordinary DTOs.
+
+## D-2026-26 — Agent Reach is the research capability layer
+
+**Accepted for M10.** Arena owns mandates, channel requirements, work-order
+identity, budgets, provenance, evidence admission, and independent
+verification. Agent Reach owns capability installation/status and backend
+health/routing advice. Arena consumes bounded `agent-reach doctor --json`
+reports, preserves backend and unavailable reasons, and never silently
+installs dependencies. Unsupported mandatory channels cannot become evidence.
+
+## D-2026-27 — TikTok uses a bounded `tt` adapter
+
+**Accepted for M10.** TikTok is a dedicated capability invoked through a
+bounded direct `tt` process. JSONL output, query/result/output limits, timeout,
+and cleanup are Arena-controlled. Exit 3 means valid empty data; exit 4 means
+walled/unavailable and is never treated as no evidence; exit 6 means not found.
+
+## D-2026-28 — ECC is curated Arena resource material
+
+**Accepted for M10.** Arena imports only an allowlisted, versioned ECC subset
+with upstream attribution. Imported text is untrusted procedural content and
+cannot become workflow, ProductAuthority, verification, or Apply authority.
+ECC descendants inherit their root first-level model policy.
+
+## D-2026-29 — Execution continuity uses bounded durable context
+
+**Accepted for M10.** Product truth remains in `MemoryStore`; the run/work
+graph ledger remains in `TranscriptStore` ProductCoordinatorRun and
+ProductWorkOrder records; evidence and model reliability remain distinct.
+Arena persists bounded execution context, policy snapshots, epochs, lineage,
+templates, skills, and optional correlated runtime-session identity. Restarted
+running work becomes reconciliation-required, and owner guidance fences older
+epochs. Exact session reuse is an optimization; fresh workers reconstruct the
+same logical context. No vector database or competing task authority exists.

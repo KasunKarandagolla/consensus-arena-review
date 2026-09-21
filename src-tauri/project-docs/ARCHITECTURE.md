@@ -342,3 +342,25 @@ hygiene is never risk-experiment evidence. Existing-feature extensions may use
 a single established-pattern adoption, while material forks retain A/B review.
 Browser MCP and semantic review remain advisory and cannot grant Product OS,
 verification, or Apply authority.
+
+### M10 specialist runtime and continuity foundation
+
+First-level specialist routing is persisted in `SettingsStore` as a verified
+model catalog plus role-family policies. Before a semantic role executes,
+Product OS snapshots the resolved free model policy onto its durable
+`ProductWorkOrder`; delegated role and channel orders inherit the root
+snapshot. Model child-work proposals are validated for capability, depth,
+count, revision, and lineage before Arena creates a child.
+
+Agent Reach doctor JSON supplies research channel/backend health, while TikTok
+uses the direct `tt` adapter. Neither capability can mark ProductAuthority or
+verification state. ECC is packaged as allowlisted resource metadata under
+`/home/kasun/Music/arena/consensus-arena-rebuild/src-tauri/resources/specialists/ecc/`.
+
+Continuity is ledger-oriented rather than transcript-dump-oriented.
+`ExecutionContextBundle` is bounded to 32 KiB and contains relevant identity,
+objective, lineage, decisions, evidence references, blockers, skills, and
+inherited policy. `ExecutionContinuityState` rejects stale epoch or authority
+results and converts uncertain restart state to explicit reconciliation.
+Delivery, independent verification, Safe Apply, and `SessionRuntime` remain
+unchanged.
