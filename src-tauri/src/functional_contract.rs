@@ -80,6 +80,17 @@ pub struct EvidenceState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchActivity {
+    pub owner_directives: usize,
+    pub mandates_total: usize,
+    pub active: usize,
+    pub satisfied: usize,
+    pub blocked_or_partial: usize,
+    pub unavailable_channels: Vec<String>,
+    pub mandatory_unavailable_channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchitectureState {
     pub selected: Option<String>,
     pub rationale: Option<String>,
@@ -169,6 +180,7 @@ pub struct ProductFunctionalState {
     pub internal_stage: FunctionalStage,
     pub lifecycle: FunctionalLifecycle,
     pub active_work_wave: Vec<String>,
+    pub research: ResearchActivity,
     pub evidence: EvidenceState,
     pub architecture: ArchitectureState,
     pub experiment: ExperimentState,
@@ -335,6 +347,62 @@ pub fn build_functional_state(
     tool_receipts: &[ToolUseReceipt],
 ) -> ProductFunctionalState {
     let internal_stage = stage(run, delivery);
+    let mut unavailable_channels = run
+        .research_mandates
+        .iter()
+        .flat_map(|mandate| mandate.unavailable_channels.iter())
+        .map(|channel| channel.as_str().to_string())
+        .collect::<Vec<_>>();
+    unavailable_channels.sort();
+    unavailable_channels.dedup();
+    let mut mandatory_unavailable_channels = run
+        .research_mandates
+        .iter()
+        .flat_map(|mandate| {
+            mandate
+                .mandatory_channels
+                .iter()
+                .filter(|channel| mandate.unavailable_channels.contains(channel))
+        })
+        .map(|channel| channel.as_str().to_string())
+        .collect::<Vec<_>>();
+    mandatory_unavailable_channels.sort();
+    mandatory_unavailable_channels.dedup();
+    let research = ResearchActivity {
+        owner_directives: run.owner_directives.len(),
+        mandates_total: run.research_mandates.len(),
+        active: run
+            .research_mandates
+            .iter()
+            .filter(|mandate| {
+                matches!(
+                    mandate.status,
+                    crate::work_graph::ResearchMandateStatus::Pending
+                        | crate::work_graph::ResearchMandateStatus::Running
+                )
+            })
+            .count(),
+        satisfied: run
+            .research_mandates
+            .iter()
+            .filter(|mandate| {
+                mandate.status == crate::work_graph::ResearchMandateStatus::Satisfied
+            })
+            .count(),
+        blocked_or_partial: run
+            .research_mandates
+            .iter()
+            .filter(|mandate| {
+                matches!(
+                    mandate.status,
+                    crate::work_graph::ResearchMandateStatus::Blocked
+                        | crate::work_graph::ResearchMandateStatus::PartiallyUnavailable
+                )
+            })
+            .count(),
+        unavailable_channels,
+        mandatory_unavailable_channels,
+    };
     let evidence = EvidenceState {
         total: records.evidence.len(),
         independently_verified: records
@@ -557,6 +625,12 @@ pub fn build_functional_state(
             tools.unavailable_count
         ));
     }
+    if !research.mandatory_unavailable_channels.is_empty() {
+        degraded_notices.push(format!(
+            "Owner-requested research channel(s) are unavailable: {}.",
+            research.mandatory_unavailable_channels.join(", ")
+        ));
+    }
     if run.status == CoordinatorStatus::Failed {
         degraded_notices.push(
             "Internal coordinator failure is exposed as a blocked lifecycle state until recovery."
@@ -572,6 +646,7 @@ pub fn build_functional_state(
         internal_stage,
         lifecycle: lifecycle(&run.status),
         active_work_wave,
+        research,
         evidence,
         architecture,
         experiment,
