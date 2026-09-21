@@ -1509,12 +1509,105 @@ fn is_semantic_review_role(role: &ProductWorkOrderRole) -> bool {
     )
 }
 
+fn specialist_execution_candidates(
+    policy: &crate::specialist_runtime::ResolvedModelPolicy,
+) -> Result<Vec<String>, String> {
+    let resolved = policy
+        .resolved_model
+        .clone()
+        .ok_or_else(|| "specialist model policy has no resolved model".to_string())?;
+    let mut candidates = vec![resolved.clone()];
+    for fallback in &policy.fallback_models {
+        if candidates.iter().any(|candidate| candidate == fallback) {
+            continue;
+        }
+        let healthy_free_snapshot = policy.health_snapshot.iter().any(|health| {
+            health.model_id == *fallback
+                && health.free
+                && health.status == crate::specialist_runtime::ModelHealthStatus::Healthy
+        });
+        if healthy_free_snapshot {
+            candidates.push(fallback.clone());
+        }
+    }
+    Ok(candidates)
+}
+
+async fn specialist_runtime_model(
+    settings: Arc<tokio::sync::Mutex<crate::settings_store::SettingsStore>>,
+    public_model_id: &str,
+) -> Result<crate::opencode_adapter::OpenCodeRuntimeModel, String> {
+    if !public_model_id.starts_with("custom:") {
+        return crate::opencode_adapter::OpenCodeRuntimeModel::catalog(public_model_id);
+    }
+    let mut store = settings.lock().await;
+    let specialist = store
+        .get_specialist_settings()
+        .map_err(|error| error.to_string())?;
+    let custom = specialist
+        .custom_models
+        .iter()
+        .find(|model| model.custom_model_id == public_model_id)
+        .cloned()
+        .ok_or_else(|| "custom specialist model metadata is unavailable".to_string())?;
+    if !custom.test_passed || !custom.api_key_configured {
+        return Err("custom specialist model is no longer qualified".to_string());
+    }
+    let account = format!("specialist.custom.{}.api_key", custom.custom_model_id);
+    let api_key = store
+        .get(&account)
+        .map_err(|error| error.to_string())?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "custom specialist model credential is unavailable".to_string())?;
+    crate::opencode_adapter::OpenCodeRuntimeModel::custom(
+        &custom.custom_model_id,
+        custom.display_name,
+        custom.base_url,
+        custom.model_name,
+        api_key,
+    )
+}
+
+async fn record_specialist_runtime_failure(
+    settings: Arc<tokio::sync::Mutex<crate::settings_store::SettingsStore>>,
+    model_id: &str,
+    error: &str,
+) {
+    let classification = error
+        .strip_prefix("model_availability:")
+        .unwrap_or(if error.contains("timed out") {
+            "timeout"
+        } else {
+            "runtime_unavailable"
+        })
+        .to_string();
+    let mut store = settings.lock().await;
+    let Ok(mut specialist) = store.get_specialist_settings() else {
+        return;
+    };
+    let Some(existing) = specialist.catalog.find(model_id).cloned() else {
+        return;
+    };
+    specialist.catalog.record_probe(
+        model_id,
+        &existing.provider,
+        "runtime_execution",
+        existing.free,
+        false,
+        None,
+        Some(classification),
+        now(),
+    );
+    let _ = store.save_specialist_settings(&specialist);
+}
+
 /// Execute a semantic role through SessionRuntime and persist only bounded
 /// correlation metadata. The model text is returned to the caller for strict
 /// parsing and typed Arena admission; it is not durable authority by itself.
 pub async fn run_product_role_work_order(
     db: Arc<Mutex<TranscriptStore>>,
     runtime: Arc<SessionRuntime>,
+    settings: Arc<tokio::sync::Mutex<crate::settings_store::SettingsStore>>,
     work_order_id: String,
     prompt: String,
 ) -> Result<ProductRoleExecution, String> {
@@ -1565,7 +1658,12 @@ pub async fn run_product_role_work_order(
         .map_err(db_error)?
     };
     let execution_profile = ExecutionProfile::for_product_role(&preflight.role);
-    let model_id = preflight.model_id.clone();
+    let model_policy = preflight
+        .resolved_model_policy
+        .as_ref()
+        .ok_or_else(|| "semantic specialist has no resolved model policy".to_string())?
+        .clone();
+    let model_candidates = specialist_execution_candidates(&model_policy)?;
     let durable_context = preflight
         .execution_context
         .as_ref()
@@ -1580,6 +1678,8 @@ pub async fn run_product_role_work_order(
         let db = db_for_task.clone();
         let id = id_for_task.clone();
         let prompt = prompt.clone();
+        let settings = settings.clone();
+        let model_candidates = model_candidates.clone();
         async move {
             db_helpers::run_blocking({
                 let db = db.clone();
@@ -1606,17 +1706,83 @@ pub async fn run_product_role_work_order(
             .await
             .map_err(db_error)?;
             let started_at = now();
-            let result = crate::opencode_adapter::run_profile_prompt_with_model(
-                prompt,
-                execution_profile,
-                model_id.as_deref(),
-            )
-            .await;
+            let mut successful_model = None;
+            let mut successful_output = None;
+            let mut terminal_error = None;
+            for (index, candidate_model_id) in model_candidates.iter().enumerate() {
+                let runtime_model = match specialist_runtime_model(
+                    settings.clone(),
+                    candidate_model_id,
+                )
+                .await
+                {
+                    Ok(model) => model,
+                    Err(error) => {
+                        let wrapped = format!("model_availability:configuration:{error}");
+                        record_specialist_runtime_failure(
+                            settings.clone(),
+                            candidate_model_id,
+                            &wrapped,
+                        )
+                        .await;
+                        if index + 1 < model_candidates.len() {
+                            continue;
+                        }
+                        terminal_error = Some(wrapped);
+                        break;
+                    }
+                };
+                match crate::opencode_adapter::run_profile_prompt_with_runtime_model(
+                    prompt.clone(),
+                    execution_profile,
+                    &runtime_model,
+                )
+                .await
+                {
+                    Ok(output) => {
+                        successful_model = Some(candidate_model_id.clone());
+                        successful_output = Some(output);
+                        break;
+                    }
+                    Err(error)
+                        if crate::opencode_adapter::is_model_availability_error(&error)
+                            && index + 1 < model_candidates.len() =>
+                    {
+                        record_specialist_runtime_failure(
+                            settings.clone(),
+                            candidate_model_id,
+                            &error,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        if crate::opencode_adapter::is_model_availability_error(&error) {
+                            record_specialist_runtime_failure(
+                                settings.clone(),
+                                candidate_model_id,
+                                &error,
+                            )
+                            .await;
+                        }
+                        terminal_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            let result = match (successful_output, terminal_error) {
+                (Some(output), _) => Ok(output),
+                (None, Some(error)) => Err(error),
+                (None, None) => Err("specialist model fallback chain produced no execution".to_string()),
+            };
             match result {
                 Ok(output) => {
+                    let successful_model = successful_model.ok_or_else(|| {
+                        "specialist result has no correlated model identity".to_string()
+                    })?;
                     let completed_at = now();
                     let root_session_id = output.root_session_id.clone();
                     let root_session_id_for_db = root_session_id.clone();
+                    let successful_model_for_db = successful_model.clone();
                     let tool_names = output.tool_names.clone();
                     let tool_receipt =
                         crate::quality_workflows::ToolUseReceipt::from_observed_tools(
@@ -1646,6 +1812,16 @@ pub async fn run_product_role_work_order(
                             ));
                         }
                         order.status = ProductWorkOrderStatus::Completed;
+                        order.model_id = Some(successful_model_for_db.clone());
+                        if let Some(policy) = order.resolved_model_policy.as_mut() {
+                            policy.resolved_model = Some(successful_model_for_db.clone());
+                            policy.blocked_reason = None;
+                        }
+                        if let Some(context) = order.execution_context.as_mut() {
+                            context.inherited_model_policy.resolved_model =
+                                Some(successful_model_for_db.clone());
+                            context.inherited_model_policy.blocked_reason = None;
+                        }
                         order.runtime_session_id = Some(root_session_id_for_db.clone());
                         order.result_ref = Some(format!(
                             "bounded semantic result retained in memory; observed tool receipt {}",
