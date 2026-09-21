@@ -3052,6 +3052,7 @@ pub async fn save_specialist_model_policy(
     role_family: crate::specialist_runtime::RoleFamily,
     preferred_model: Option<String>,
     fallback_models: Vec<String>,
+    custom_model_id: Option<String>,
     enabled: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
@@ -3059,7 +3060,7 @@ pub async fn save_specialist_model_policy(
         role_family,
         preferred_model,
         fallback_models,
-        custom_model_id: None,
+        custom_model_id,
         enabled,
     };
     crate::specialist_runtime::validate_policy(&policy)?;
@@ -3069,6 +3070,12 @@ pub async fn save_specialist_model_policy(
         .await
         .get_specialist_settings()
         .map_err(|error| error.to_string())?;
+    if policy.preferred_model.is_some() && policy.custom_model_id.is_some() {
+        return Err(
+            "choose either a verified free preferred model or a tested custom model, not both"
+                .to_string(),
+        );
+    }
     for model in policy
         .preferred_model
         .iter()
@@ -3084,6 +3091,23 @@ pub async fn save_specialist_model_policy(
             return Err(format!(
                 "model {model} is not a verified healthy free model"
             ));
+        }
+    }
+    if let Some(custom_model_id) = policy.custom_model_id.as_deref() {
+        let custom = settings
+            .custom_models
+            .iter()
+            .find(|model| model.custom_model_id == custom_model_id)
+            .ok_or_else(|| "custom specialist model is unknown".to_string())?;
+        if !custom.test_passed || !custom.api_key_configured {
+            return Err("custom specialist model has not passed a real secured probe".to_string());
+        }
+        let entry = settings
+            .catalog
+            .find(custom_model_id)
+            .ok_or_else(|| "custom specialist model has no health record".to_string())?;
+        if entry.health.status != crate::specialist_runtime::ModelHealthStatus::Healthy {
+            return Err("custom specialist model is not currently healthy".to_string());
         }
     }
     settings.update_policy(policy)?;
@@ -3229,28 +3253,42 @@ pub async fn save_custom_specialist_model(
         &custom_model_id,
         "custom",
         "custom_api_response_probe",
-        true,
+        false,
         true,
         test.latency_ms,
         None,
         chrono::Utc::now().timestamp(),
     );
+    if let Some(entry) = settings
+        .catalog
+        .models
+        .iter_mut()
+        .find(|entry| entry.model_id == custom_model_id)
+    {
+        entry.display_name = metadata.display_name.clone();
+    }
     settings
         .custom_models
         .retain(|existing| existing.custom_model_id != custom_model_id);
     settings.custom_models.push(metadata.clone());
-    state
-        .settings_store
-        .lock()
-        .await
-        .save_custom_specialist_model(&metadata, &input.api_key)
-        .map_err(|error| error.to_string())?;
-    let mut public = serde_json::to_value(&settings).map_err(|error| error.to_string())?;
-    if let Some(object) = public.as_object_mut() {
-        let test_value = serde_json::to_value(test).map_err(|error| error.to_string())?;
-        object.insert("last_test".to_string(), test_value);
+    {
+        let mut store = state.settings_store.lock().await;
+        store
+            .save_custom_specialist_model(&metadata, &input.api_key)
+            .map_err(|error| error.to_string())?;
+        // save_custom_specialist_model owns the secure credential + metadata
+        // update. Persist the command's probed catalog snapshot afterwards so
+        // the successful health record is not lost by the helper's reload.
+        store
+            .save_specialist_settings(&settings)
+            .map_err(|error| error.to_string())?;
     }
-    serde_json::to_string(&public).map_err(|error| error.to_string())
+    serde_json::to_string(&serde_json::json!({
+        "settings": settings,
+        "custom_model_id": custom_model_id,
+        "last_test": test
+    }))
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
