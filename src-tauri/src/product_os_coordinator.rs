@@ -14,8 +14,8 @@ use crate::pipeline_contract::{
     self, GateRemediation, OwnerDecisionKind, PipelineStage, ProductRoute,
 };
 use crate::product_os::{
-    ProductAuthorityRecords, ProductResearchCategory, ProductScopeAdmission, ProductWorkOrder,
-    ProductWorkOrderRole, ReuseClassification,
+    ProductAuthorityRecords, ProductResearchCategory, ProductResearchMode, ProductScopeAdmission,
+    ProductWorkOrder, ProductWorkOrderRole, ReuseClassification,
 };
 use crate::product_os_runtime::{self, ArchitectureAdmission, ProductReviewAdmission};
 use crate::session_runtime::SessionRuntime;
