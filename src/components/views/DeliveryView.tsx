@@ -100,8 +100,8 @@ export default function DeliveryView() {
   }, [coordinatorRunId, setState])
 
   const terminal =
-    ['verified', 'applied', 'cancelled', 'failed'].includes(state?.phase ?? '') ||
-    ['completed', 'stopped', 'pivoted', 'blocked', 'cancelled'].includes(coordinator?.status ?? '')
+    ['applied', 'cancelled'].includes(state?.phase ?? '') ||
+    ['completed', 'stopped', 'pivoted', 'cancelled'].includes(coordinator?.status ?? '')
   const canResume =
     ['failed', 'blocked', 'reconciling'].includes(coordinator?.status ?? '') ||
     ['cancelled', 'failed'].includes(state?.phase ?? '')
