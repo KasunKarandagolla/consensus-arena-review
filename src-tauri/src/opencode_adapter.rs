@@ -598,6 +598,8 @@ async fn run_candidate_reviews(
         ReviewLens::ErrorHandling,
         ReviewLens::TypeApiDesign,
         ReviewLens::Maintainability,
+        ReviewLens::CommentDocsAccuracy,
+        ReviewLens::Simplification,
     ] {
         let prompt = context.bounded_prompt(lens);
         match run_profile_prompt_in_workspace(prompt, ExecutionProfile::CandidateReview, candidate)
@@ -658,10 +660,13 @@ fn browser_impacting_candidate(paths: &[String]) -> bool {
         let lower = path.to_ascii_lowercase();
         lower.ends_with(".tsx")
             || lower.ends_with(".jsx")
+            || lower.ends_with(".vue")
+            || lower.ends_with(".svelte")
             || lower.ends_with(".css")
             || lower.ends_with(".html")
             || lower.contains("/frontend/")
-            || lower.starts_with("src/")
+            || lower.contains("/web/")
+            || lower.contains("/ui/")
             || lower.contains("browser_backend")
             || lower.contains("browser_lifecycle")
             || lower.contains("response_router")
