@@ -374,7 +374,11 @@ export default function DeliveryView() {
                     />
                     <button
                       className="sv-btn"
-                      disabled={ownerActionBusy || !consultQuestion.trim()}
+                      disabled={
+                        ownerActionBusy ||
+                        !consultQuestion.trim() ||
+                        coordinator.status === 'failed'
+                      }
                       onClick={() => void requestConsultation()}
                       style={{ marginTop: 8 }}
                     >
