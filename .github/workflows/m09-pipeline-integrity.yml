@@ -8,6 +8,7 @@ on:
   push:
     branches:
       - chatgpt/arena-m09cd-rebuild
+      - chatgpt/arena-m10-review-fixes
 
 permissions:
   contents: read
