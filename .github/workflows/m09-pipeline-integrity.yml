@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: m09-pipeline-integrity-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux-integrity:
     runs-on: ubuntu-latest
