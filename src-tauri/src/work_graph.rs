@@ -127,7 +127,10 @@ impl ResearchMandate {
         if !self.must_complete_before_decision {
             return true;
         }
-        self.status == ResearchMandateStatus::Satisfied
+        matches!(
+            self.status,
+            ResearchMandateStatus::Satisfied | ResearchMandateStatus::Superseded
+        )
     }
 }
 
@@ -322,6 +325,22 @@ pub fn configured_channel_model(channel: ResearchChannel) -> Result<Option<Strin
     env_model(key)
 }
 
+pub fn guidance_supersedes_prior_research(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "instead",
+        "skip ",
+        "do not research",
+        "don't research",
+        "stop researching",
+        "ignore previous research",
+        "replace the research",
+        "change the research",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 pub fn research_mandate_for(directive: &OwnerDirective) -> Option<ResearchMandate> {
     if directive.kind != OwnerDirectiveKind::Research {
         return None;
@@ -384,6 +403,19 @@ pub fn default_new_product_research_mandate(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_owner_override_supersedes_prior_research_direction() {
+        assert!(guidance_supersedes_prior_research(
+            "Skip Reddit and research GitHub instead before deciding."
+        ));
+        assert!(guidance_supersedes_prior_research(
+            "Stop researching YouTube; continue with the evidence we already have."
+        ));
+        assert!(!guidance_supersedes_prior_research(
+            "Also research YouTube before deciding."
+        ));
+    }
+
     use super::*;
 
     #[test]
