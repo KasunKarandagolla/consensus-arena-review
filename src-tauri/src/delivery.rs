@@ -130,6 +130,13 @@ pub struct OpenCodeWorkOrder {
     pub build_package_revision: Option<u64>,
     #[serde(default)]
     pub build_package_fingerprint: Option<String>,
+    /// Immutable first-level Implementation Engineer model policy snapshot.
+    /// Repairs inherit the same chain; settings changes affect only future
+    /// Delivery admissions.
+    #[serde(default)]
+    pub resolved_model_policy: Option<crate::specialist_runtime::ResolvedModelPolicy>,
+    #[serde(default)]
+    pub active_model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
