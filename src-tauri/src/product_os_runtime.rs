@@ -1737,8 +1737,6 @@ pub async fn run_product_github_risk_spike(
     execute_owned(runtime, work_order_id, move |generation| {
         let db = db_for_task.clone();
         async move {
-            let model_id = preflight.model_id.clone();
-            let model_id = preflight.model_id.clone();
             let mut running = preflight;
             running.run_generation = generation;
             let id = id_for_task.clone();
@@ -2987,6 +2985,7 @@ pub async fn run_web_discovery_work_order(
         .research_category
         .clone()
         .ok_or_else(|| "web research category disappeared before execution".to_string())?;
+    let model_id = preflight.model_id.clone();
     let db_for_task = db.clone();
     let id_for_task = work_order_id.clone();
     execute_owned(runtime, work_order_id, move |generation| {
@@ -3491,6 +3490,7 @@ pub async fn run_web_fact_verifier_work_order(
     .map_err(db_error)?;
     let (preflight, claim, source_reference) = preflight;
     let category = preflight.research_category.clone();
+    let model_id = preflight.model_id.clone();
     let db_for_task = db.clone();
     let id_for_task = work_order_id.clone();
     execute_owned(runtime, work_order_id, move |generation| {
