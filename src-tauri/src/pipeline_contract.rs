@@ -351,8 +351,7 @@ pub fn route_gate_remediation(gate: GateId, status: GateStatus, attempt: u8) -> 
                 GateRemediationOutcome::NeedsArchitectureRevision
             }
             GateId::BuildReadiness | GateId::Implementation => GateRemediationOutcome::NeedsRepair,
-            GateId::Release => GateRemediationOutcome::NeedsOwnerDecision,
-            GateId::Vision => GateRemediationOutcome::NeedsExperiment,
+            GateId::Release | GateId::Vision => GateRemediationOutcome::NeedsOwnerDecision,
         }
     };
     GateRemediation {
@@ -835,6 +834,15 @@ impl ResourceScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vision_failure_requires_owner_clarification_not_fake_compile_experiment() {
+        let remediation = route_gate_remediation(GateId::Vision, GateStatus::MissingEvidence, 0);
+        assert_eq!(
+            remediation.outcome,
+            GateRemediationOutcome::NeedsOwnerDecision
+        );
+    }
 
     #[test]
     fn routes_have_explicit_omission_reasons() {
