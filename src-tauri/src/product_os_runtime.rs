@@ -867,43 +867,163 @@ pub async fn bind_specialist_model_policy(
             .ok_or_else(|| {
                 AgentError::DatabaseError("specialist work order is unknown".to_string())
             })?;
-        if order.resolved_model_policy.is_some() {
-            return Ok(order);
+        let records =
+            load_records(&store, &order.project_id).map_err(AgentError::DatabaseError)?;
+        if records.project_revision != order.project_revision {
+            return Err(AgentError::DatabaseError(
+                "specialist work order is stale for current ProductAuthority".to_string(),
+            ));
         }
-        let root_role = order.root_role_family.unwrap_or_else(|| {
-            crate::specialist_runtime::RoleFamily::from_product_role(&order.role)
-        });
-        let config = specialist_settings.policy_for(root_role);
-        let policy = specialist_settings.catalog.resolve(
-            &config,
-            &order.work_order_id,
-            specialist_settings.policy_revision,
-            observed_at,
-        );
-        order.model_id = policy.resolved_model.clone();
+        let policy = if let Some(policy) = order.resolved_model_policy.clone() {
+            // A descendant or resumed work order keeps the exact first-level
+            // snapshot it inherited when admitted. Settings changes affect
+            // only newly-admitted root work.
+            policy
+        } else {
+            let root_role = order.root_role_family.unwrap_or_else(|| {
+                crate::specialist_runtime::RoleFamily::from_product_role(&order.role)
+            });
+            let config = specialist_settings.policy_for(root_role);
+            specialist_settings.catalog.resolve(
+                &config,
+                &order.work_order_id,
+                specialist_settings.policy_revision,
+                observed_at,
+            )
+        };
+        let resolved_model = policy.resolved_model.clone().ok_or_else(|| {
+            AgentError::DatabaseError(
+                policy
+                    .blocked_reason
+                    .clone()
+                    .unwrap_or_else(|| "specialist model policy has no healthy model".to_string()),
+            )
+        })?;
+        let root_role = policy.root_role_family;
+        order.root_role_family = Some(root_role);
+        order.model_id = Some(resolved_model);
         order.resolved_model_policy = Some(policy.clone());
         order.execution_epoch = execution_epoch;
+
+        let owner_directives = records
+            .owner_decisions
+            .iter()
+            .filter(|decision| {
+                matches!(
+                    &decision.status,
+                    crate::product_os::DecisionStatus::Adopted
+                ) && matches!(
+                    &decision.authority,
+                    crate::product_os::DecisionAuthority::Owner
+                )
+            })
+            .rev()
+            .take(8)
+            .map(|decision| {
+                format!(
+                    "{}={}@revision:{}",
+                    decision.question_id, decision.selected_option, decision.revision
+                )
+            })
+            .collect::<Vec<_>>();
+        let adopted_decisions = records
+            .owner_decisions
+            .iter()
+            .filter(|decision| {
+                matches!(
+                    &decision.status,
+                    crate::product_os::DecisionStatus::Adopted
+                )
+            })
+            .rev()
+            .take(8)
+            .map(|decision| {
+                format!(
+                    "{}:{}={}",
+                    decision.decision_id, decision.question_id, decision.selected_option
+                )
+            })
+            .collect::<Vec<_>>();
+        let evidence_references = records
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.current)
+            .rev()
+            .take(12)
+            .map(|evidence| {
+                format!(
+                    "{} | {} | {}",
+                    evidence.evidence_id,
+                    evidence.source_reference,
+                    evidence.summary.chars().take(320).collect::<String>()
+                )
+            })
+            .collect::<Vec<_>>();
+        let unresolved_blockers = records
+            .ambiguities
+            .iter()
+            .filter(|ambiguity| {
+                matches!(
+                    &ambiguity.status,
+                    crate::evidence_gates::AmbiguityStatus::Open
+                        | crate::evidence_gates::AmbiguityStatus::Deferred
+                )
+            })
+            .take(8)
+            .map(|ambiguity| {
+                format!(
+                    "{} | {} | {}",
+                    ambiguity.ambiguity_id, ambiguity.question, ambiguity.affected_commitment
+                )
+            })
+            .collect::<Vec<_>>();
+        let ancestor_summaries = order
+            .parent_work_order_id
+            .as_deref()
+            .and_then(|parent_id| store.get_product_work_order(parent_id).ok().flatten())
+            .map(|parent| {
+                vec![format!(
+                    "parent={} role={:?} result={}",
+                    parent.work_order_id,
+                    parent.role,
+                    parent.result_ref.unwrap_or_else(|| "no durable result ref".to_string())
+                )]
+            })
+            .unwrap_or_default();
+        let objective = order
+            .question
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| records.objective.clone());
+        let founder_intent = if records.objective.trim().is_empty() {
+            objective.clone()
+        } else {
+            records.objective.clone()
+        };
         order.execution_context = Some(crate::specialist_runtime::ExecutionContextBundle {
             project_id: order.project_id.clone(),
             run_id: order.session_id.clone(),
             authority_revision: order.project_revision,
-            founder_intent: order.question.clone().unwrap_or_default(),
-            owner_directives: Vec::new(),
-            objective: order.question.clone().unwrap_or_default(),
+            founder_intent,
+            owner_directives,
+            objective,
             root_work_order_id: policy.inheritance_root_work_order_id.clone(),
             parent_work_order_id: order.parent_work_order_id.clone(),
-            ancestor_summaries: Vec::new(),
-            adopted_decisions: Vec::new(),
-            evidence_references: order.evidence_ids.clone(),
-            unresolved_blockers: Vec::new(),
-            repository_identity: order.project_id.clone(),
+            ancestor_summaries,
+            adopted_decisions,
+            evidence_references,
+            unresolved_blockers,
+            repository_identity: format!("project:{}", order.project_id),
             specialist_template_id: order
                 .specialist_template_id
                 .clone()
                 .unwrap_or_else(|| format!("role:{}", root_role.as_str())),
             skill_ids: order.skill_ids.clone(),
             inherited_model_policy: policy,
-            previous_attempt_summary: None,
+            previous_attempt_summary: order
+                .cancellation_reason
+                .clone()
+                .or_else(|| order.result_ref.clone()),
             output_contract: "bounded typed specialist proposal; Arena admits all authority"
                 .to_string(),
         });
@@ -972,6 +1092,7 @@ pub async fn create_delegated_product_role_work_order(
         order.delegation_depth = parent.delegation_depth.saturating_add(1);
         if let Some(policy) = parent.resolved_model_policy.as_ref() {
             order.resolved_model_policy = Some(policy.inherit(&parent.work_order_id));
+            order.root_role_family = Some(policy.root_role_family);
             order.model_id = order
                 .resolved_model_policy
                 .as_ref()
@@ -1048,6 +1169,7 @@ pub async fn create_delegated_channel_research_work_order(
         order.delegation_depth = parent.delegation_depth.saturating_add(1);
         if let Some(policy) = parent.resolved_model_policy.as_ref() {
             order.resolved_model_policy = Some(policy.inherit(&parent.work_order_id));
+            order.root_role_family = Some(policy.root_role_family);
             order.model_id = order
                 .resolved_model_policy
                 .as_ref()
@@ -1444,6 +1566,14 @@ pub async fn run_product_role_work_order(
     };
     let execution_profile = ExecutionProfile::for_product_role(&preflight.role);
     let model_id = preflight.model_id.clone();
+    let durable_context = preflight
+        .execution_context
+        .as_ref()
+        .ok_or_else(|| "semantic specialist has no durable execution context".to_string())?
+        .render_for_prompt()?;
+    let prompt = format!(
+        "{durable_context}\n\n=== CURRENT BOUNDED TASK ===\n{prompt}\n=== END CURRENT BOUNDED TASK ==="
+    );
     let db_for_task = db.clone();
     let id_for_task = work_order_id.clone();
     let execution = execute_owned(runtime, work_order_id, move |generation| {
