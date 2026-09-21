@@ -32,7 +32,7 @@ interface Health { agent_id: string; is_available: boolean; error_count: number;
 interface CredentialStorageStatus { available: boolean; migration_pending: boolean; message: string }
 type SpecialistRole = 'research_lead' | 'product_director' | 'architecture_lead' | 'implementation_engineer' | 'qa_review_lead'
 interface SpecialistModel { model_id: string; display_name: string; provider: string; free: boolean; health: { status: string; last_probe_at?: number | null; latency_ms?: number | null } }
-interface SpecialistSettings { policy_revision: number; policies: Record<SpecialistRole, { preferred_model: string | null; fallback_models: string[]; enabled: boolean }>; catalog: { models: SpecialistModel[] }; custom_models: { custom_model_id: string; display_name: string; model_name: string; api_key_configured: boolean; test_passed: boolean }[] }
+interface SpecialistSettings { policy_revision: number; policies: Record<SpecialistRole, { preferred_model: string | null; fallback_models: string[]; custom_model_id?: string | null; enabled: boolean }>; catalog: { models: SpecialistModel[] }; custom_models: { custom_model_id: string; display_name: string; model_name: string; api_key_configured: boolean; test_passed: boolean }[] }
 interface ResearchHealth { agent_reach?: { observed_version?: string | null; message: string; version_matches_qualification: boolean }; healthy_channels: number; tiktok: { available: boolean } }
 interface Props { open: boolean; onClose: () => void }
 interface LastSettingsError { kind: string; command: string; message: string }
@@ -102,6 +102,7 @@ export default function SettingsPanel({ open, onClose }: Props) {
   const [specialistSettings, setSpecialistSettings] = useState<SpecialistSettings | null>(null)
   const [researchHealth, setResearchHealth] = useState<ResearchHealth | null>(null)
   const [customModelOpen, setCustomModelOpen] = useState(false)
+  const [customModelRole, setCustomModelRole] = useState<SpecialistRole | null>(null)
   const [customModel, setCustomModel] = useState({ display_name: '', base_url: '', api_key: '', model_name: '' })
 
   const load = useCallback(async () => {
@@ -250,15 +251,22 @@ export default function SettingsPanel({ open, onClose }: Props) {
     await save('project-context', 'save_project_config', { project_brief: projectBrief, content: projectContext }, 'Project Context saved')
   }
 
-  async function saveSpecialistPolicy(role: SpecialistRole, preferred: string, fallback: string) {
-    if (!specialistSettings) return
+  async function saveSpecialistPolicy(
+    role: SpecialistRole,
+    preferred: string,
+    fallback: string,
+    customModelId: string | null = null,
+    sourceSettings: SpecialistSettings | null = specialistSettings,
+  ) {
+    if (!sourceSettings) return
     setBusy(`specialist-${role}`)
     try {
       const raw = await invoke<string>('save_specialist_model_policy', {
         role_family: role,
-        preferred_model: preferred || null,
+        preferred_model: customModelId ? null : (preferred || null),
         fallback_models: fallback ? [fallback] : [],
-        enabled: specialistSettings.policies[role]?.enabled ?? true,
+        custom_model_id: customModelId,
+        enabled: sourceSettings.policies[role]?.enabled ?? true,
       })
       setSpecialistSettings(JSON.parse(raw) as SpecialistSettings)
       addToast(`${role.replace(/_/g, ' ')} routing saved`)
@@ -281,11 +289,32 @@ export default function SettingsPanel({ open, onClose }: Props) {
     setBusy('specialist-custom')
     try {
       const raw = await invoke<string>('save_custom_specialist_model', customModel)
-      const result = JSON.parse(raw) as SpecialistSettings & { passed?: boolean; status?: string }
-      if (result.passed === false) { addToast(`Custom model test failed: ${result.status || 'unavailable'}`, 6000); return }
+      const result = JSON.parse(raw) as {
+        settings?: SpecialistSettings
+        custom_model_id?: string
+        last_test?: { passed: boolean; status: string }
+        passed?: boolean
+        status?: string
+      }
+      const passed = result.last_test?.passed ?? result.passed
+      const status = result.last_test?.status ?? result.status
+      if (passed === false) {
+        addToast(`Custom model test failed: ${status || 'unavailable'}`, 6000)
+        return
+      }
+      const savedSettings = result.settings
+      const customModelId = result.custom_model_id
+      const targetRole = customModelRole
       setCustomModel({ display_name: '', base_url: '', api_key: '', model_name: '' })
       setCustomModelOpen(false)
-      await load()
+      setCustomModelRole(null)
+      if (savedSettings) setSpecialistSettings(savedSettings)
+      if (targetRole && savedSettings && customModelId) {
+        const fallback = savedSettings.policies[targetRole]?.fallback_models[0] || ''
+        await saveSpecialistPolicy(targetRole, '', fallback, customModelId, savedSettings)
+      } else {
+        await load()
+      }
       addToast('Custom model tested and saved securely')
     } catch (error) { reportError('specialist', 'save_custom_specialist_model', error) }
     finally { setBusy('') }
@@ -501,23 +530,39 @@ export default function SettingsPanel({ open, onClose }: Props) {
             {busy === 'specialist-refresh' ? 'Testing catalog…' : 'Refresh and test free models'}
           </button>
           {specialistSettings && (['research_lead', 'product_director', 'architecture_lead', 'implementation_engineer', 'qa_review_lead'] as SpecialistRole[]).map((role) => {
-            const policy = specialistSettings.policies[role] || { preferred_model: null, fallback_models: [], enabled: true }
+            const policy = specialistSettings.policies[role] || { preferred_model: null, fallback_models: [], custom_model_id: null, enabled: true }
             const verified = specialistSettings.catalog.models.filter(model => model.free && model.health.status === 'healthy')
-            const health = specialistSettings.catalog.models.find(model => model.model_id === policy.preferred_model)?.health.status || 'unknown'
+            const healthyCustom = specialistSettings.custom_models.filter(custom =>
+              custom.test_passed
+              && custom.api_key_configured
+              && specialistSettings.catalog.models.some(model => model.model_id === custom.custom_model_id && model.health.status === 'healthy')
+            )
+            const selectedModel = policy.custom_model_id || policy.preferred_model || ''
+            const health = specialistSettings.catalog.models.find(model => model.model_id === selectedModel)?.health.status || 'unknown'
             return <div key={role} style={{ borderTop: '1px solid var(--border)', paddingTop: 10, marginTop: 10 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
                 <span style={{ fontSize: 12.5, fontWeight: 600, textTransform: 'capitalize' }}>{role.replace(/_/g, ' ')}</span>
                 <span style={{ fontSize: 11, color: health === 'healthy' ? 'var(--green)' : 'var(--t3)' }}>{health}</span>
               </div>
-              <select className="si2" value={policy.preferred_model || ''} onChange={(event) => void saveSpecialistPolicy(role, event.target.value, policy.fallback_models[0] || '')}>
+              <select className="si2" value={selectedModel} onChange={(event) => {
+                const value = event.target.value
+                if (value === '__configure_custom__') {
+                  setCustomModelRole(role)
+                  setCustomModelOpen(true)
+                  return
+                }
+                const custom = healthyCustom.find(model => model.custom_model_id === value)
+                void saveSpecialistPolicy(role, custom ? '' : value, policy.fallback_models[0] || '', custom?.custom_model_id || null)
+              }}>
                 <option value="">No verified model selected</option>
                 {verified.map(model => <option value={model.model_id} key={model.model_id}>{model.display_name || model.model_id}</option>)}
+                {healthyCustom.map(model => <option value={model.custom_model_id} key={model.custom_model_id}>{model.display_name} · custom API ✓</option>)}
+                <option value="__configure_custom__">Configure custom API model…</option>
               </select>
-              <select className="si2" value={policy.fallback_models[0] || ''} onChange={(event) => void saveSpecialistPolicy(role, policy.preferred_model || '', event.target.value)} style={{ marginTop: 6 }}>
+              <select className="si2" value={policy.fallback_models[0] || ''} onChange={(event) => void saveSpecialistPolicy(role, policy.preferred_model || '', event.target.value, policy.custom_model_id || null)} style={{ marginTop: 6 }}>
                 <option value="">No fallback</option>
                 {verified.filter(model => model.model_id !== policy.preferred_model).map(model => <option value={model.model_id} key={model.model_id}>{model.display_name || model.model_id}</option>)}
               </select>
-              <button className="sv-btn" style={{ marginTop: 6 }} onClick={() => setCustomModelOpen(true)}>Configure custom API model…</button>
             </div>
           })}
           {!specialistSettings?.catalog.models.some(model => model.free && model.health.status === 'healthy') && <div style={{ color: 'var(--t3)', fontSize: 11.5, marginTop: 8 }}>No model is selectable until a bounded response probe passes.</div>}
@@ -526,7 +571,7 @@ export default function SettingsPanel({ open, onClose }: Props) {
             <input className="si2" placeholder="Base URL" value={customModel.base_url} onChange={(event) => setCustomModel({ ...customModel, base_url: event.target.value })} />
             <input className="si2" placeholder="Model name / ID" value={customModel.model_name} onChange={(event) => setCustomModel({ ...customModel, model_name: event.target.value })} />
             <input className="si2" type="password" placeholder="API key (stored in OS credential storage)" value={customModel.api_key} onChange={(event) => setCustomModel({ ...customModel, api_key: event.target.value })} />
-            <div className="sact"><button className="sv-btn" disabled={busy === 'specialist-custom'} onClick={() => void saveCustomSpecialistModel()}>{busy === 'specialist-custom' ? 'Testing…' : 'Test and save'}</button><button className="sv-btn" onClick={() => setCustomModelOpen(false)}>Cancel</button></div>
+            <div className="sact"><button className="sv-btn" disabled={busy === 'specialist-custom'} onClick={() => void saveCustomSpecialistModel()}>{busy === 'specialist-custom' ? 'Testing…' : 'Test and save'}</button><button className="sv-btn" onClick={() => { setCustomModelOpen(false); setCustomModelRole(null) }}>Cancel</button></div>
           </div>}
         </Section>
         <Section icon={<Wifi size={12} />} title="Research capabilities">
