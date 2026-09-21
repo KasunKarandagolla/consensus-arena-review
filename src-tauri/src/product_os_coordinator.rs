@@ -262,6 +262,7 @@ async fn run_scheduled_role(
     let result = product_os_runtime::run_product_role_work_order(
         ctx.db.clone(),
         ctx.runtime.clone(),
+        ctx.settings.clone(),
         work_order_id,
         prompt,
     )
@@ -849,7 +850,6 @@ async fn run_dynamic_research_campaigns(
             plan.validate()?;
 
             for task in plan.tasks {
-                let child_model = crate::work_graph::configured_channel_model(task.channel)?;
                 let child = product_os_runtime::create_delegated_channel_research_work_order(
                     ctx.db.clone(),
                     run.project_id.clone(),
@@ -857,7 +857,7 @@ async fn run_dynamic_research_campaigns(
                     task.question,
                     task.channel,
                     ProductResearchCategory::TechnicalCurrentFact,
-                    child_model,
+                    None,
                 )
                 .await?;
                 run.research_work_order_ids
@@ -1299,6 +1299,7 @@ async fn run_product_review(
     let execution = product_os_runtime::run_product_role_work_order(
         ctx.db.clone(),
         ctx.runtime.clone(),
+        ctx.settings.clone(),
         order.work_order_id.clone(),
         prompt,
     )
@@ -1434,6 +1435,7 @@ async fn run_product_review(
     let question_execution = product_os_runtime::run_product_role_work_order(
         ctx.db.clone(),
         ctx.runtime.clone(),
+        ctx.settings.clone(),
         question_order.work_order_id,
         role_prompt(
             "Product Director",
