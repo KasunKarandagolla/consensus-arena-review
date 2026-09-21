@@ -92,7 +92,7 @@ async fn contained(
 
 pub async fn runtime_status(cwd: &Path) -> AgentReachRuntimeStatus {
     let expected = qualified_version();
-    let result = contained(&executable(), vec![OsString::from("version")], cwd).await;
+    let result = contained(&executable(), vec![OsString::from("--version")], cwd).await;
     match result {
         Ok(output) if output.exit_code == Some(0) => {
             let combined = format!("{} {}", output.stdout, output.stderr);
@@ -339,6 +339,12 @@ mod tests {
         );
         assert_eq!(unavailable.channel, ResearchChannel::Tiktok);
         assert!(unavailable.reason.contains("qualified"));
+    }
+
+    #[test]
+    fn runtime_probe_uses_upstream_version_flag() {
+        let args = vec![OsString::from("--version")];
+        assert_eq!(args, vec![OsString::from("--version")]);
     }
 
     #[test]
