@@ -60,7 +60,28 @@ pub enum ArchitecturePlanningMode {
 /// proposal competition.
 pub fn architecture_planning_mode(route: ProductRoute, intent: &str) -> ArchitecturePlanningMode {
     let lower = intent.to_ascii_lowercase();
-    if route == ProductRoute::ExistingFeature
+    let material_architecture_signal = [
+        "architecture change",
+        "architectural change",
+        "redesign",
+        "migration",
+        "new subsystem",
+        "cross-cutting",
+        "cross cutting",
+        "multiple services",
+        "security boundary",
+        "breaking interface",
+        "new data model",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if route == ProductRoute::Incident && !material_architecture_signal {
+        // Incidents already passed through reproduction/diagnosis. A bounded
+        // repair should not be forced through greenfield A/B architecture
+        // ceremony unless the owner/diagnosis actually identifies a material
+        // architecture change.
+        ArchitecturePlanningMode::EstablishedPattern
+    } else if route == ProductRoute::ExistingFeature
         && [
             "csv export",
             "straightforward",
@@ -70,6 +91,7 @@ pub fn architecture_planning_mode(route: ProductRoute, intent: &str) -> Architec
         ]
         .iter()
         .any(|marker| lower.contains(marker))
+        && !material_architecture_signal
     {
         ArchitecturePlanningMode::EstablishedPattern
     } else {
@@ -960,6 +982,24 @@ mod tests {
         );
         assert_eq!(
             architecture_planning_mode(ProductRoute::ExistingFeature, "add a new billing model"),
+            ArchitecturePlanningMode::CompetingProposals
+        );
+    }
+
+    #[test]
+    fn incident_uses_bounded_repair_pattern_unless_architecture_is_material() {
+        assert_eq!(
+            architecture_planning_mode(
+                ProductRoute::Incident,
+                "Production regression: invoice import crashes after the latest change"
+            ),
+            ArchitecturePlanningMode::EstablishedPattern
+        );
+        assert_eq!(
+            architecture_planning_mode(
+                ProductRoute::Incident,
+                "Production failure requires a cross-cutting architecture change across multiple services"
+            ),
             ArchitecturePlanningMode::CompetingProposals
         );
     }
