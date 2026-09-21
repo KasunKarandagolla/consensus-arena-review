@@ -826,7 +826,7 @@ pub async fn create_product_role_work_order_with_model(
             None,
             None,
         );
-        order.model_id = model_id;
+        order.model_id = model_id.clone();
         persist_records_and_order(&mut store, &records, &order)
             .map_err(AgentError::DatabaseError)?;
         Ok(order)
@@ -874,15 +874,15 @@ pub async fn create_delegated_product_role_work_order(
         }
         let mut order = new_work_order(
             &project_id,
-            Some(subject),
-            role,
+            Some(subject.clone()),
+            role.clone(),
             records.project_revision,
-            Some(parent_work_order_id),
+            Some(parent_work_order_id.clone()),
             None,
             None,
             None,
         );
-        order.model_id = model_id;
+        order.model_id = model_id.clone();
         order.delegation_depth = parent.delegation_depth.saturating_add(1);
         persist_records_and_order(&mut store, &records, &order)
             .map_err(AgentError::DatabaseError)?;
@@ -939,16 +939,16 @@ pub async fn create_delegated_channel_research_work_order(
         };
         let mut order = new_work_order(
             &project_id,
-            Some(question),
+            Some(question.clone()),
             ProductWorkOrderRole::Researcher,
             records.project_revision,
-            Some(parent_work_order_id),
+            Some(parent_work_order_id.clone()),
             None,
             Some(mode),
-            Some(category),
+            Some(category.clone()),
         );
         order.research_channel = Some(channel);
-        order.model_id = model_id;
+        order.model_id = model_id.clone();
         order.delegation_depth = parent.delegation_depth.saturating_add(1);
         persist_records_and_order(&mut store, &records, &order)
             .map_err(AgentError::DatabaseError)?;
@@ -1089,7 +1089,7 @@ pub async fn run_channel_research_work_order(
                             ));
                         }
                         let mut evidence_ids = Vec::new();
-                        for (index, source) in result.sources.into_iter().enumerate() {
+                        for (index, source) in result.sources.clone().into_iter().enumerate() {
                             let evidence_id =
                                 format!("{}:channel-claim:{}", order.work_order_id, index + 1);
                             let origin = if channel == crate::work_graph::ResearchChannel::Github {
@@ -1614,7 +1614,7 @@ pub async fn admit_packet_review_batch(
         let mut packet_hash: Option<String> = None;
         let mut completed_orders = Vec::with_capacity(admissions.len());
 
-        for (work_order_id, admission) in admissions {
+        for (work_order_id, admission) in admissions.clone() {
             if !seen_orders.insert(work_order_id.clone()) {
                 return Err(AgentError::DatabaseError(
                     "packet review batch repeated a work-order identity".to_string(),
@@ -1737,6 +1737,8 @@ pub async fn run_product_github_risk_spike(
     execute_owned(runtime, work_order_id, move |generation| {
         let db = db_for_task.clone();
         async move {
+            let model_id = preflight.model_id.clone();
+            let model_id = preflight.model_id.clone();
             let mut running = preflight;
             running.run_generation = generation;
             let id = id_for_task.clone();
@@ -2365,7 +2367,7 @@ pub async fn admit_consultation_result(
                 "revisit when product authority, the decision question, or provider advice changes"
                     .to_string(),
             ),
-            decision_question: Some(order.decision_id),
+            decision_question: Some(order.decision_id.clone()),
         };
         records.evidence.push(evidence.clone());
         let next_revision = records.project_revision.saturating_add(1);
@@ -3006,7 +3008,7 @@ pub async fn run_web_discovery_work_order(
             })
             .await
             .map_err(db_error)?;
-            let output = match run_opencode_web_prompt(prompt, preflight.model_id.as_deref()).await {
+            let output = match run_opencode_web_prompt(prompt, model_id.as_deref()).await {
                 Ok(output) => output,
                 Err(error) => {
                     mark_failed(db.clone(), &id, generation, &error).await;
@@ -3510,7 +3512,7 @@ pub async fn run_web_fact_verifier_work_order(
             })
             .await
             .map_err(db_error)?;
-            let output = match run_opencode_web_prompt(prompt, preflight.model_id.as_deref()).await {
+            let output = match run_opencode_web_prompt(prompt, model_id.as_deref()).await {
                 Ok(output) => output,
                 Err(error) => {
                     mark_failed(db.clone(), &id, generation, &error).await;
