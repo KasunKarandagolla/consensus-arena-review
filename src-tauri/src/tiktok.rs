@@ -156,12 +156,9 @@ pub async fn run(cwd: &Path, request: TiktokRequest) -> Result<TiktokResult, Str
         }
         TiktokOperation::Replies => {
             args.push(OsString::from(request.query.clone()));
-            args.push(OsString::from(
-                request
-                    .secondary
-                    .as_deref()
-                    .ok_or_else(|| "TikTok replies comment ID disappeared".to_string())?,
-            ));
+            args.push(OsString::from(request.secondary.as_deref().ok_or_else(
+                || "TikTok replies comment ID disappeared".to_string(),
+            )?));
         }
         _ => {
             if !request.query.trim().is_empty() {

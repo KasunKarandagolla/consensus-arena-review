@@ -867,8 +867,7 @@ pub async fn bind_specialist_model_policy(
             .ok_or_else(|| {
                 AgentError::DatabaseError("specialist work order is unknown".to_string())
             })?;
-        let records =
-            load_records(&store, &order.project_id).map_err(AgentError::DatabaseError)?;
+        let records = load_records(&store, &order.project_id).map_err(AgentError::DatabaseError)?;
         if records.project_revision != order.project_revision {
             return Err(AgentError::DatabaseError(
                 "specialist work order is stale for current ProductAuthority".to_string(),
@@ -909,13 +908,11 @@ pub async fn bind_specialist_model_policy(
             .owner_decisions
             .iter()
             .filter(|decision| {
-                matches!(
-                    &decision.status,
-                    crate::product_os::DecisionStatus::Adopted
-                ) && matches!(
-                    &decision.authority,
-                    crate::product_os::DecisionAuthority::Owner
-                )
+                matches!(&decision.status, crate::product_os::DecisionStatus::Adopted)
+                    && matches!(
+                        &decision.authority,
+                        crate::product_os::DecisionAuthority::Owner
+                    )
             })
             .rev()
             .take(8)
@@ -930,10 +927,7 @@ pub async fn bind_specialist_model_policy(
             .owner_decisions
             .iter()
             .filter(|decision| {
-                matches!(
-                    &decision.status,
-                    crate::product_os::DecisionStatus::Adopted
-                )
+                matches!(&decision.status, crate::product_os::DecisionStatus::Adopted)
             })
             .rev()
             .take(8)
@@ -986,7 +980,9 @@ pub async fn bind_specialist_model_policy(
                     "parent={} role={:?} result={}",
                     parent.work_order_id,
                     parent.role,
-                    parent.result_ref.unwrap_or_else(|| "no durable result ref".to_string())
+                    parent
+                        .result_ref
+                        .unwrap_or_else(|| "no durable result ref".to_string())
                 )]
             })
             .unwrap_or_default();
@@ -1710,28 +1706,24 @@ pub async fn run_product_role_work_order(
             let mut successful_output = None;
             let mut terminal_error = None;
             for (index, candidate_model_id) in model_candidates.iter().enumerate() {
-                let runtime_model = match specialist_runtime_model(
-                    settings.clone(),
-                    candidate_model_id,
-                )
-                .await
-                {
-                    Ok(model) => model,
-                    Err(error) => {
-                        let wrapped = format!("model_availability:configuration:{error}");
-                        record_specialist_runtime_failure(
-                            settings.clone(),
-                            candidate_model_id,
-                            &wrapped,
-                        )
-                        .await;
-                        if index + 1 < model_candidates.len() {
-                            continue;
+                let runtime_model =
+                    match specialist_runtime_model(settings.clone(), candidate_model_id).await {
+                        Ok(model) => model,
+                        Err(error) => {
+                            let wrapped = format!("model_availability:configuration:{error}");
+                            record_specialist_runtime_failure(
+                                settings.clone(),
+                                candidate_model_id,
+                                &wrapped,
+                            )
+                            .await;
+                            if index + 1 < model_candidates.len() {
+                                continue;
+                            }
+                            terminal_error = Some(wrapped);
+                            break;
                         }
-                        terminal_error = Some(wrapped);
-                        break;
-                    }
-                };
+                    };
                 match crate::opencode_adapter::run_profile_prompt_with_runtime_model(
                     prompt.clone(),
                     execution_profile,
@@ -1772,7 +1764,9 @@ pub async fn run_product_role_work_order(
             let result = match (successful_output, terminal_error) {
                 (Some(output), _) => Ok(output),
                 (None, Some(error)) => Err(error),
-                (None, None) => Err("specialist model fallback chain produced no execution".to_string()),
+                (None, None) => {
+                    Err("specialist model fallback chain produced no execution".to_string())
+                }
             };
             match result {
                 Ok(output) => {
@@ -5901,6 +5895,8 @@ mod tests {
                 build_package_id: Some(package.package_id.clone()),
                 build_package_revision: Some(package.package_revision),
                 build_package_fingerprint: Some(package.authority_fingerprint.clone()),
+                resolved_model_policy: None,
+                active_model_id: None,
             };
         let mut role_a_order = role_order("research-implementation", &role_a);
         let mut role_b_order = role_order("security-review", &role_b);

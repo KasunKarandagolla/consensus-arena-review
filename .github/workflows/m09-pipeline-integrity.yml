@@ -9,6 +9,7 @@ on:
     branches:
       - chatgpt/arena-m09cd-rebuild
       - chatgpt/arena-m10-review-fixes
+      - opencode/arena-m11-pre-gui-finalization
 
 permissions:
   contents: read

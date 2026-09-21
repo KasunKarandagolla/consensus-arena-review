@@ -263,7 +263,8 @@ impl ModelCatalog {
             health_snapshot,
             blocked_reason: resolved.is_none().then(|| {
                 if explicit_custom.is_some() {
-                    "configured custom model and free fallbacks are not currently healthy".to_string()
+                    "configured custom model and free fallbacks are not currently healthy"
+                        .to_string()
                 } else {
                     "configured preferred and fallback models are not healthy verified free models"
                         .to_string()
@@ -1183,10 +1184,7 @@ mod tests {
         );
         let child = root.inherit("child-work-order");
         let grandchild = child.inherit("grandchild-parent");
-        assert_eq!(
-            grandchild.inheritance_root_work_order_id,
-            "root-work-order"
-        );
+        assert_eq!(grandchild.inheritance_root_work_order_id, "root-work-order");
     }
 
     #[test]

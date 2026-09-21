@@ -515,7 +515,8 @@ pub(crate) async fn run_profile_prompt_in_workspace_with_model(
 ) -> Result<SemanticExecution, String> {
     let model = resolved_model_identifier(model_override)?;
     let runtime_model = OpenCodeRuntimeModel::catalog(&model)?;
-    run_profile_prompt_in_workspace_with_runtime_model(prompt, profile, workdir, &runtime_model).await
+    run_profile_prompt_in_workspace_with_runtime_model(prompt, profile, workdir, &runtime_model)
+        .await
 }
 
 pub(crate) async fn run_profile_prompt_in_workspace_with_runtime_model(
@@ -1777,7 +1778,9 @@ async fn delivery_runtime_model(
         .iter()
         .find(|model| model.custom_model_id == public_model_id)
         .cloned()
-        .ok_or_else(|| "custom Implementation Engineer model metadata is unavailable".to_string())?;
+        .ok_or_else(|| {
+            "custom Implementation Engineer model metadata is unavailable".to_string()
+        })?;
     if !custom.test_passed || !custom.api_key_configured {
         return Err("custom Implementation Engineer model is no longer qualified".to_string());
     }
@@ -1804,7 +1807,8 @@ async fn resolve_delivery_model_policy(
     let specialist = store
         .get_specialist_settings()
         .map_err(|error| error.to_string())?;
-    let config = specialist.policy_for(crate::specialist_runtime::RoleFamily::ImplementationEngineer);
+    let config =
+        specialist.policy_for(crate::specialist_runtime::RoleFamily::ImplementationEngineer);
     let policy = specialist.catalog.resolve(
         &config,
         work_order_id,
@@ -1812,12 +1816,9 @@ async fn resolve_delivery_model_policy(
         chrono::Utc::now().timestamp(),
     );
     if policy.resolved_model.is_none() {
-        return Err(
-            policy
-                .blocked_reason
-                .clone()
-                .unwrap_or_else(|| "Implementation Engineer has no healthy configured model".to_string()),
-        );
+        return Err(policy.blocked_reason.clone().unwrap_or_else(|| {
+            "Implementation Engineer has no healthy configured model".to_string()
+        }));
     }
     Ok(policy)
 }
@@ -2000,29 +2001,28 @@ pub async fn run_delivery(
         .and_then(|work_order| work_order.resolved_model_policy.clone())
     {
         Some(policy) => policy,
-        None => match resolve_delivery_model_policy(
-            settings.clone(),
-            &implementation_work_order_id,
-        )
-        .await
-        {
-            Ok(policy) => policy,
-            Err(error) => {
-                state.phase = DeliveryPhase::Failed;
-                state.last_worker_summary = Some(format!(
-                    "Implementation Engineer model routing is blocked: {error}"
-                ));
-                crate::delivery::persist_emit(
-                    app,
-                    &state_path,
-                    &delivery_slot,
-                    &transcript,
-                    &mut state,
-                )
-                .await?;
-                return Ok(state);
+        None => {
+            match resolve_delivery_model_policy(settings.clone(), &implementation_work_order_id)
+                .await
+            {
+                Ok(policy) => policy,
+                Err(error) => {
+                    state.phase = DeliveryPhase::Failed;
+                    state.last_worker_summary = Some(format!(
+                        "Implementation Engineer model routing is blocked: {error}"
+                    ));
+                    crate::delivery::persist_emit(
+                        app,
+                        &state_path,
+                        &delivery_slot,
+                        &transcript,
+                        &mut state,
+                    )
+                    .await?;
+                    return Ok(state);
+                }
             }
-        },
+        }
     };
     if state.work_order.is_none() {
         state.work_order = Some(OpenCodeWorkOrder {
@@ -2221,23 +2221,27 @@ pub async fn run_delivery(
             .as_ref()
             .and_then(|work_order| work_order.resolved_model_policy.as_ref())
             .cloned()
-            .ok_or_else(|| "OpenCode work order has no Implementation Engineer model policy".to_string())?;
+            .ok_or_else(|| {
+                "OpenCode work order has no Implementation Engineer model policy".to_string()
+            })?;
         let model_candidates = delivery_model_candidates(&model_policy)?;
         let mut execution_result = None;
         let mut successful_model = None;
         for (index, candidate_model_id) in model_candidates.iter().enumerate() {
-            let runtime_model = match delivery_runtime_model(settings.clone(), candidate_model_id).await {
-                Ok(model) => model,
-                Err(error) => {
-                    let error = format!("model_availability:configuration:{error}");
-                    record_delivery_model_failure(settings.clone(), candidate_model_id, &error).await;
-                    if index + 1 < model_candidates.len() {
-                        continue;
+            let runtime_model =
+                match delivery_runtime_model(settings.clone(), candidate_model_id).await {
+                    Ok(model) => model,
+                    Err(error) => {
+                        let error = format!("model_availability:configuration:{error}");
+                        record_delivery_model_failure(settings.clone(), candidate_model_id, &error)
+                            .await;
+                        if index + 1 < model_candidates.len() {
+                            continue;
+                        }
+                        execution_result = Some(Err(error));
+                        break;
                     }
-                    execution_result = Some(Err(error));
-                    break;
-                }
-            };
+                };
             let result = {
                 let work_order = state
                     .work_order
@@ -2266,29 +2270,22 @@ pub async fn run_delivery(
                     if is_model_availability_error(&error)
                         && index + 1 < model_candidates.len() =>
                 {
-                    record_delivery_model_failure(
-                        settings.clone(),
-                        candidate_model_id,
-                        &error,
-                    )
-                    .await;
+                    record_delivery_model_failure(settings.clone(), candidate_model_id, &error)
+                        .await;
                 }
                 Err(error) => {
                     if is_model_availability_error(&error) {
-                        record_delivery_model_failure(
-                            settings.clone(),
-                            candidate_model_id,
-                            &error,
-                        )
-                        .await;
+                        record_delivery_model_failure(settings.clone(), candidate_model_id, &error)
+                            .await;
                     }
                     execution_result = Some(Err(error));
                     break;
                 }
             }
         }
-        let execution_result = execution_result
-            .unwrap_or_else(|| Err("Implementation Engineer fallback chain produced no execution".to_string()));
+        let execution_result = execution_result.unwrap_or_else(|| {
+            Err("Implementation Engineer fallback chain produced no execution".to_string())
+        });
         if let Some(successful_model) = successful_model {
             if let Some(work_order) = state.work_order.as_mut() {
                 work_order.active_model_id = Some(successful_model.clone());
