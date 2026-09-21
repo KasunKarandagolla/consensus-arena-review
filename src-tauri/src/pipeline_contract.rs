@@ -75,24 +75,14 @@ pub fn architecture_planning_mode(route: ProductRoute, intent: &str) -> Architec
     ]
     .iter()
     .any(|marker| lower.contains(marker));
-    if route == ProductRoute::Incident && !material_architecture_signal {
-        // Incidents already passed through reproduction/diagnosis. A bounded
-        // repair should not be forced through greenfield A/B architecture
-        // ceremony unless the owner/diagnosis actually identifies a material
-        // architecture change.
-        ArchitecturePlanningMode::EstablishedPattern
-    } else if route == ProductRoute::ExistingFeature
-        && [
-            "csv export",
-            "straightforward",
-            "established",
-            "localized",
-            "existing utility",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    if matches!(route, ProductRoute::ExistingFeature | ProductRoute::Incident)
         && !material_architecture_signal
     {
+        // Existing feature work and incidents already begin from an admitted
+        // product/repository context. Use one bounded established-pattern
+        // proposal unless the current admitted scope actually reveals a
+        // material architecture choice. Greenfield NewProduct work keeps
+        // independent proposal competition by default.
         ArchitecturePlanningMode::EstablishedPattern
     } else {
         ArchitecturePlanningMode::CompetingProposals
@@ -981,7 +971,14 @@ mod tests {
             ArchitecturePlanningMode::EstablishedPattern
         );
         assert_eq!(
-            architecture_planning_mode(ProductRoute::ExistingFeature, "add a new billing model"),
+            architecture_planning_mode(ProductRoute::ExistingFeature, "add a dark mode toggle"),
+            ArchitecturePlanningMode::EstablishedPattern
+        );
+        assert_eq!(
+            architecture_planning_mode(
+                ProductRoute::ExistingFeature,
+                "add a new billing model with a new data model and cross-cutting migration"
+            ),
             ArchitecturePlanningMode::CompetingProposals
         );
     }
