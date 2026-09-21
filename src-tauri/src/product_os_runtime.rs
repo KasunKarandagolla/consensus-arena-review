@@ -596,6 +596,14 @@ fn new_work_order(
         parent_work_order_id,
         model_id: None,
         delegation_depth: 0,
+        root_role_family: Some(crate::specialist_runtime::RoleFamily::from_product_role(
+            &role,
+        )),
+        resolved_model_policy: None,
+        specialist_template_id: None,
+        skill_ids: Vec::new(),
+        execution_context: None,
+        execution_epoch: 0,
         evidence_id: None,
         evidence_ids: Vec::new(),
         input_manifest: Some(ResolvedInputManifest {
@@ -835,6 +843,81 @@ pub async fn create_product_role_work_order_with_model(
     .map_err(db_error)
 }
 
+/// Resolve and persist the first-level model policy immediately before a
+/// semantic specialist starts. This keeps the policy snapshot durable and
+/// makes a settings change affect only work admitted after the change.
+pub async fn bind_specialist_model_policy(
+    db: Arc<Mutex<TranscriptStore>>,
+    settings: Arc<tokio::sync::Mutex<crate::settings_store::SettingsStore>>,
+    work_order_id: String,
+    execution_epoch: u64,
+) -> Result<ProductWorkOrder, String> {
+    let specialist_settings = settings
+        .lock()
+        .await
+        .get_specialist_settings()
+        .map_err(|error| error.to_string())?;
+    let observed_at = now();
+    db_helpers::run_blocking(move || {
+        let mut store = db
+            .lock()
+            .map_err(|_| AgentError::DatabaseError("transcript store lock poisoned".to_string()))?;
+        let mut order = store
+            .get_product_work_order(&work_order_id)?
+            .ok_or_else(|| {
+                AgentError::DatabaseError("specialist work order is unknown".to_string())
+            })?;
+        if order.resolved_model_policy.is_some() {
+            return Ok(order);
+        }
+        let root_role = order.root_role_family.unwrap_or_else(|| {
+            crate::specialist_runtime::RoleFamily::from_product_role(&order.role)
+        });
+        let config = specialist_settings.policy_for(root_role);
+        let policy = specialist_settings.catalog.resolve(
+            &config,
+            &order.work_order_id,
+            specialist_settings.policy_revision,
+            observed_at,
+        );
+        order.model_id = policy.resolved_model.clone();
+        order.resolved_model_policy = Some(policy.clone());
+        order.execution_epoch = execution_epoch;
+        order.execution_context = Some(crate::specialist_runtime::ExecutionContextBundle {
+            project_id: order.project_id.clone(),
+            run_id: order.session_id.clone(),
+            authority_revision: order.project_revision,
+            founder_intent: order.question.clone().unwrap_or_default(),
+            owner_directives: Vec::new(),
+            objective: order.question.clone().unwrap_or_default(),
+            root_work_order_id: policy.inheritance_root_work_order_id.clone(),
+            parent_work_order_id: order.parent_work_order_id.clone(),
+            ancestor_summaries: Vec::new(),
+            adopted_decisions: Vec::new(),
+            evidence_references: order.evidence_ids.clone(),
+            unresolved_blockers: Vec::new(),
+            repository_identity: order.project_id.clone(),
+            specialist_template_id: order
+                .specialist_template_id
+                .clone()
+                .unwrap_or_else(|| format!("role:{}", root_role.as_str())),
+            skill_ids: order.skill_ids.clone(),
+            inherited_model_policy: policy,
+            previous_attempt_summary: None,
+            output_contract: "bounded typed specialist proposal; Arena admits all authority"
+                .to_string(),
+        });
+        if let Some(context) = order.execution_context.as_ref() {
+            context.validate().map_err(AgentError::DatabaseError)?;
+        }
+        order.updated_at = observed_at;
+        store.save_product_work_order(&order)?;
+        Ok(order)
+    })
+    .await
+    .map_err(db_error)
+}
+
 pub async fn create_delegated_product_role_work_order(
     db: Arc<Mutex<TranscriptStore>>,
     project_id: String,
@@ -887,6 +970,13 @@ pub async fn create_delegated_product_role_work_order(
         );
         order.model_id = model_id.clone();
         order.delegation_depth = parent.delegation_depth.saturating_add(1);
+        if let Some(policy) = parent.resolved_model_policy.as_ref() {
+            order.resolved_model_policy = Some(policy.inherit(&parent.work_order_id));
+            order.model_id = order
+                .resolved_model_policy
+                .as_ref()
+                .and_then(|policy| policy.resolved_model.clone());
+        }
         persist_records_and_order(&mut store, &records, &order)
             .map_err(AgentError::DatabaseError)?;
         Ok(order)
@@ -936,6 +1026,7 @@ pub async fn create_delegated_channel_research_work_order(
         let mode = if matches!(
             channel,
             crate::work_graph::ResearchChannel::Web
+                | crate::work_graph::ResearchChannel::ExaWeb
                 | crate::work_graph::ResearchChannel::ResearchPapers
         ) {
             ProductResearchMode::WebDiscovery
@@ -955,6 +1046,13 @@ pub async fn create_delegated_channel_research_work_order(
         order.research_channel = Some(channel);
         order.model_id = model_id.clone();
         order.delegation_depth = parent.delegation_depth.saturating_add(1);
+        if let Some(policy) = parent.resolved_model_policy.as_ref() {
+            order.resolved_model_policy = Some(policy.inherit(&parent.work_order_id));
+            order.model_id = order
+                .resolved_model_policy
+                .as_ref()
+                .and_then(|policy| policy.resolved_model.clone());
+        }
         persist_records_and_order(&mut store, &records, &order)
             .map_err(AgentError::DatabaseError)?;
         Ok(order)

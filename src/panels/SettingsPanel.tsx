@@ -30,6 +30,10 @@ interface Brain { api_key: string; base_url: string; model: string; system_promp
 interface Fallback { api_key: string; base_url: string; model: string }
 interface Health { agent_id: string; is_available: boolean; error_count: number; last_error: string | null }
 interface CredentialStorageStatus { available: boolean; migration_pending: boolean; message: string }
+type SpecialistRole = 'research_lead' | 'product_director' | 'architecture_lead' | 'implementation_engineer' | 'qa_review_lead'
+interface SpecialistModel { model_id: string; display_name: string; provider: string; free: boolean; health: { status: string; last_probe_at?: number | null; latency_ms?: number | null } }
+interface SpecialistSettings { policy_revision: number; policies: Record<SpecialistRole, { preferred_model: string | null; fallback_models: string[]; enabled: boolean }>; catalog: { models: SpecialistModel[] }; custom_models: { custom_model_id: string; display_name: string; model_name: string; api_key_configured: boolean; test_passed: boolean }[] }
+interface ResearchHealth { agent_reach?: { observed_version?: string | null; message: string; version_matches_qualification: boolean }; healthy_channels: number; tiktok: { available: boolean } }
 interface Props { open: boolean; onClose: () => void }
 interface LastSettingsError { kind: string; command: string; message: string }
 const emptyBrain: Brain = { api_key: '', base_url: '', model: '', system_prompt: '' }
@@ -95,6 +99,10 @@ export default function SettingsPanel({ open, onClose }: Props) {
   const [customError, setCustomError] = useState('')
   const [customBusy, setCustomBusy] = useState('')
   const [launchBusy, setLaunchBusy] = useState('')
+  const [specialistSettings, setSpecialistSettings] = useState<SpecialistSettings | null>(null)
+  const [researchHealth, setResearchHealth] = useState<ResearchHealth | null>(null)
+  const [customModelOpen, setCustomModelOpen] = useState(false)
+  const [customModel, setCustomModel] = useState({ display_name: '', base_url: '', api_key: '', model_name: '' })
 
   const load = useCallback(async () => {
     const results = await Promise.allSettled([
@@ -107,6 +115,8 @@ export default function SettingsPanel({ open, onClose }: Props) {
       invoke<string>('get_participants'),
       invoke<string>('get_maintenance_mode'),
       invoke<string>('get_credential_storage_status'),
+      invoke<string>('get_specialist_model_settings'),
+      invoke<string>('get_research_capability_health'),
     ])
     if (results[0].status === 'fulfilled') try {
       const value = JSON.parse(results[0].value) as Brain & { api_key_configured?: boolean }
@@ -132,6 +142,8 @@ export default function SettingsPanel({ open, onClose }: Props) {
     } catch (error) { console.error(error) }
     if (results[7].status === 'fulfilled') try { setMaintenanceMode(JSON.parse(results[7].value) as boolean) } catch { setMaintenanceMode(results[7].value === 'true') }
     if (results[8].status === 'fulfilled') try { setCredentialStorageStatus(JSON.parse(results[8].value) as CredentialStorageStatus) } catch (error) { console.error(error) }
+    if (results[9].status === 'fulfilled') try { setSpecialistSettings(JSON.parse(results[9].value) as SpecialistSettings) } catch (error) { console.error(error) }
+    if (results[10].status === 'fulfilled') try { setResearchHealth(JSON.parse(results[10].value) as ResearchHealth) } catch (error) { console.error(error) }
     setTheme(loadStoredTheme())
   }, [setParticipants])
 
@@ -236,6 +248,47 @@ export default function SettingsPanel({ open, onClose }: Props) {
   async function saveProjectContext() {
     if (!projectBrief) { addToast('Select or start a project before saving Project Context'); return }
     await save('project-context', 'save_project_config', { project_brief: projectBrief, content: projectContext }, 'Project Context saved')
+  }
+
+  async function saveSpecialistPolicy(role: SpecialistRole, preferred: string, fallback: string) {
+    if (!specialistSettings) return
+    setBusy(`specialist-${role}`)
+    try {
+      const raw = await invoke<string>('save_specialist_model_policy', {
+        role_family: role,
+        preferred_model: preferred || null,
+        fallback_models: fallback ? [fallback] : [],
+        enabled: specialistSettings.policies[role]?.enabled ?? true,
+      })
+      setSpecialistSettings(JSON.parse(raw) as SpecialistSettings)
+      addToast(`${role.replace(/_/g, ' ')} routing saved`)
+    } catch (error) {
+      reportError('specialist', 'save_specialist_model_policy', error)
+    } finally { setBusy('') }
+  }
+
+  async function refreshSpecialistCatalog() {
+    setBusy('specialist-refresh')
+    try {
+      const raw = await invoke<string>('refresh_specialist_model_catalog')
+      setSpecialistSettings(JSON.parse(raw) as SpecialistSettings)
+      addToast('Verified free model catalog refreshed')
+    } catch (error) { reportError('specialist', 'refresh_specialist_model_catalog', error) }
+    finally { setBusy('') }
+  }
+
+  async function saveCustomSpecialistModel() {
+    setBusy('specialist-custom')
+    try {
+      const raw = await invoke<string>('save_custom_specialist_model', customModel)
+      const result = JSON.parse(raw) as SpecialistSettings & { passed?: boolean; status?: string }
+      if (result.passed === false) { addToast(`Custom model test failed: ${result.status || 'unavailable'}`, 6000); return }
+      setCustomModel({ display_name: '', base_url: '', api_key: '', model_name: '' })
+      setCustomModelOpen(false)
+      await load()
+      addToast('Custom model tested and saved securely')
+    } catch (error) { reportError('specialist', 'save_custom_specialist_model', error) }
+    finally { setBusy('') }
   }
 
   async function toggleMaintenanceMode() {
@@ -439,6 +492,47 @@ export default function SettingsPanel({ open, onClose }: Props) {
           <Save busy={busy === 'primary'} label="Save changes" onClick={() => void save('primary', 'save_agent_brain_config', { api_key: brain.api_key, base_url: brain.base_url, model: brain.model, system_prompt: brain.system_prompt }, 'Agent brain saved')} />
           {credentialConfigured.primary && <button className="sv-btn" disabled={busy !== ''} onClick={() => void clearCredential('primary')}>Remove saved API key</button>}
           <ErrorDetails error={lastSettingsError} kinds={['primary']} onCopy={(text) => void copyText(text, 'Error details copied')} />
+        </Section>
+        <Section icon={<Route size={12} />} title="Product OS specialist models">
+          <p style={{ fontSize: 11.5, lineHeight: 1.5, color: 'var(--t3)', marginTop: 0 }}>
+            Configure first-level roles only. Descendant specialists inherit the root role snapshot.
+          </p>
+          <button className="sv-btn" disabled={busy !== ''} onClick={() => void refreshSpecialistCatalog()}>
+            {busy === 'specialist-refresh' ? 'Testing catalog…' : 'Refresh and test free models'}
+          </button>
+          {specialistSettings && (['research_lead', 'product_director', 'architecture_lead', 'implementation_engineer', 'qa_review_lead'] as SpecialistRole[]).map((role) => {
+            const policy = specialistSettings.policies[role] || { preferred_model: null, fallback_models: [], enabled: true }
+            const verified = specialistSettings.catalog.models.filter(model => model.free && model.health.status === 'healthy')
+            const health = specialistSettings.catalog.models.find(model => model.model_id === policy.preferred_model)?.health.status || 'unknown'
+            return <div key={role} style={{ borderTop: '1px solid var(--border)', paddingTop: 10, marginTop: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <span style={{ fontSize: 12.5, fontWeight: 600, textTransform: 'capitalize' }}>{role.replace(/_/g, ' ')}</span>
+                <span style={{ fontSize: 11, color: health === 'healthy' ? 'var(--green)' : 'var(--t3)' }}>{health}</span>
+              </div>
+              <select className="si2" value={policy.preferred_model || ''} onChange={(event) => void saveSpecialistPolicy(role, event.target.value, policy.fallback_models[0] || '')}>
+                <option value="">No verified model selected</option>
+                {verified.map(model => <option value={model.model_id} key={model.model_id}>{model.display_name || model.model_id}</option>)}
+              </select>
+              <select className="si2" value={policy.fallback_models[0] || ''} onChange={(event) => void saveSpecialistPolicy(role, policy.preferred_model || '', event.target.value)} style={{ marginTop: 6 }}>
+                <option value="">No fallback</option>
+                {verified.filter(model => model.model_id !== policy.preferred_model).map(model => <option value={model.model_id} key={model.model_id}>{model.display_name || model.model_id}</option>)}
+              </select>
+              <button className="sv-btn" style={{ marginTop: 6 }} onClick={() => setCustomModelOpen(true)}>Configure custom API model…</button>
+            </div>
+          })}
+          {!specialistSettings?.catalog.models.some(model => model.free && model.health.status === 'healthy') && <div style={{ color: 'var(--t3)', fontSize: 11.5, marginTop: 8 }}>No model is selectable until a bounded response probe passes.</div>}
+          {customModelOpen && <div className="sif" style={{ marginTop: 10 }}>
+            <input className="si2" placeholder="Display name" value={customModel.display_name} onChange={(event) => setCustomModel({ ...customModel, display_name: event.target.value })} />
+            <input className="si2" placeholder="Base URL" value={customModel.base_url} onChange={(event) => setCustomModel({ ...customModel, base_url: event.target.value })} />
+            <input className="si2" placeholder="Model name / ID" value={customModel.model_name} onChange={(event) => setCustomModel({ ...customModel, model_name: event.target.value })} />
+            <input className="si2" type="password" placeholder="API key (stored in OS credential storage)" value={customModel.api_key} onChange={(event) => setCustomModel({ ...customModel, api_key: event.target.value })} />
+            <div className="sact"><button className="sv-btn" disabled={busy === 'specialist-custom'} onClick={() => void saveCustomSpecialistModel()}>{busy === 'specialist-custom' ? 'Testing…' : 'Test and save'}</button><button className="sv-btn" onClick={() => setCustomModelOpen(false)}>Cancel</button></div>
+          </div>}
+        </Section>
+        <Section icon={<Wifi size={12} />} title="Research capabilities">
+          <div style={{ fontSize: 12, color: 'var(--t2)' }}>Agent Reach: {researchHealth?.agent_reach?.observed_version || 'unavailable'} · healthy channels: {researchHealth?.healthy_channels ?? 0}</div>
+          <div style={{ fontSize: 12, color: researchHealth?.tiktok.available ? 'var(--green)' : 'var(--t3)', marginTop: 5 }}>TikTok tt: {researchHealth?.tiktok.available ? 'available' : 'unavailable'}</div>
+          <p style={{ fontSize: 11.5, lineHeight: 1.5, color: 'var(--t3)', marginTop: 8 }}>Unavailable mandatory channels remain inconclusive; Arena never treats them as empty evidence.</p>
         </Section>
         <Section icon={<LifeBuoy size={12} />} title="Fallback brain">
           <div className="sif"><input className="si2" placeholder="Fallback API base URL" value={fallback.base_url} onChange={(event) => setFallback({ ...fallback, base_url: event.target.value })} /><input className="si2" type="password" placeholder={credentialConfigured.fallback ? 'Saved securely; leave blank to keep this key' : 'Fallback API key'} value={fallback.api_key} onChange={(event) => setFallback({ ...fallback, api_key: event.target.value })} /><input className="si2" placeholder="Fallback model name" value={fallback.model} onChange={(event) => setFallback({ ...fallback, model: event.target.value })} /></div>

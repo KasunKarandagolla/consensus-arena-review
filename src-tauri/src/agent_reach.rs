@@ -16,6 +16,7 @@ use std::time::Duration;
 const MAX_RESULT_BYTES: usize = 512 * 1024;
 const MAX_SOURCES: usize = 12;
 const RESEARCH_TIMEOUT_SECONDS: u64 = 180;
+const DOCTOR_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentReachRuntimeStatus {
@@ -142,6 +143,34 @@ pub async fn runtime_status(cwd: &Path) -> AgentReachRuntimeStatus {
             message: format!("Agent Reach is unavailable: {error}"),
         },
     }
+}
+
+pub async fn doctor_report(
+    cwd: &Path,
+) -> Result<crate::specialist_runtime::AgentReachDoctorReport, String> {
+    let args = [OsString::from("doctor"), OsString::from("--json")];
+    let output = dsh_worker::run_contained_command(
+        &executable(),
+        &args,
+        cwd,
+        Duration::from_secs(DOCTOR_TIMEOUT_SECONDS),
+    )
+    .await?;
+    if output.timed_out {
+        return Err("Agent Reach doctor timed out".to_string());
+    }
+    // Upstream deliberately returns non-zero when any channel is down. The
+    // JSON is still authoritative for the healthy/unavailable split.
+    if output.stdout.trim().is_empty() {
+        return Err(format!(
+            "Agent Reach doctor returned no JSON (exit {:?})",
+            output.exit_code
+        ));
+    }
+    crate::specialist_runtime::parse_agent_reach_doctor(
+        &output.stdout,
+        chrono::Utc::now().timestamp(),
+    )
 }
 
 fn unsupported(channel: ResearchChannel, reason: &str) -> ChannelUnavailable {
@@ -307,6 +336,12 @@ pub async fn research_channel(
     match channel {
         ResearchChannel::Github => research_github(cwd, &query).await.map(Ok),
         ResearchChannel::Youtube => research_youtube(cwd, &query).await.map(Ok),
+        ResearchChannel::Web | ResearchChannel::ExaWeb | ResearchChannel::ResearchPapers => {
+            Ok(Err(unsupported(
+                channel,
+                "Web discovery is handled by Arena's bounded OpenCode research path",
+            )))
+        }
         ResearchChannel::Tiktok => Ok(Err(unsupported(
             channel,
             "Global TikTok is not an Arena-qualified Agent Reach channel; Agent Reach documents Douyin separately",
@@ -327,9 +362,16 @@ pub async fn research_channel(
             channel,
             "RSS research requires an explicit feed URL rather than a free-text search query",
         ))),
-        ResearchChannel::Web | ResearchChannel::ResearchPapers => Ok(Err(unsupported(
+        ResearchChannel::Bilibili
+        | ResearchChannel::XiaohongShu
+        | ResearchChannel::Facebook
+        | ResearchChannel::Instagram
+        | ResearchChannel::Linkedin
+        | ResearchChannel::V2ex
+        | ResearchChannel::Xiaoyuzhou
+        | ResearchChannel::Xueqiu => Ok(Err(unsupported(
             channel,
-            "This channel is handled by Arena's existing web-research path, not the Agent Reach adapter",
+            "Agent Reach reported this channel but Arena has not qualified a read-only backend for it",
         ))),
     }
 }

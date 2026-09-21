@@ -3034,6 +3034,254 @@ pub async fn get_credential_storage_status(
     .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn get_specialist_model_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let settings = state
+        .settings_store
+        .lock()
+        .await
+        .get_specialist_settings()
+        .map_err(|error| error.to_string())?;
+    serde_json::to_string(&settings).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_specialist_model_policy(
+    role_family: crate::specialist_runtime::RoleFamily,
+    preferred_model: Option<String>,
+    fallback_models: Vec<String>,
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let policy = crate::specialist_runtime::ModelPolicyConfig {
+        role_family,
+        preferred_model,
+        fallback_models,
+        custom_model_id: None,
+        enabled,
+    };
+    crate::specialist_runtime::validate_policy(&policy)?;
+    let mut settings = state
+        .settings_store
+        .lock()
+        .await
+        .get_specialist_settings()
+        .map_err(|error| error.to_string())?;
+    for model in policy
+        .preferred_model
+        .iter()
+        .chain(policy.fallback_models.iter())
+    {
+        let entry = settings
+            .catalog
+            .find(model)
+            .ok_or_else(|| format!("model {model} is not in the verified catalog"))?;
+        if !entry.free
+            || entry.health.status != crate::specialist_runtime::ModelHealthStatus::Healthy
+        {
+            return Err(format!(
+                "model {model} is not a verified healthy free model"
+            ));
+        }
+    }
+    settings.update_policy(policy)?;
+    let encoded = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
+    state
+        .settings_store
+        .lock()
+        .await
+        .save_specialist_settings(&settings)
+        .map_err(|error| error.to_string())?;
+    Ok(encoded)
+}
+
+#[tauri::command]
+pub async fn refresh_specialist_model_catalog(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let cwd =
+        std::env::current_dir().map_err(|error| format!("resolve probe directory: {error}"))?;
+    let output = crate::dsh_worker::run_contained_command(
+        &crate::opencode_adapter::executable(),
+        &["models".into(), "--refresh".into()],
+        &cwd,
+        std::time::Duration::from_secs(45),
+    )
+    .await
+    .map_err(|error| format!("OpenCode model catalog refresh failed: {error}"))?;
+    if output.timed_out || output.exit_code != Some(0) {
+        return Err("OpenCode model catalog refresh was unavailable".to_string());
+    }
+    let mut settings = state
+        .settings_store
+        .lock()
+        .await
+        .get_specialist_settings()
+        .map_err(|error| error.to_string())?;
+    for (model, provider, free) in
+        crate::specialist_runtime::parse_opencode_model_catalog(&output.stdout)
+    {
+        if !free {
+            continue;
+        }
+        let probe = crate::specialist_runtime::probe_opencode_model(&model, &cwd).await?;
+        settings.catalog.record_probe(
+            &probe.model_id,
+            &provider,
+            &probe.source,
+            free,
+            probe.last_success,
+            probe.latency_ms,
+            probe.error_classification,
+            chrono::Utc::now().timestamp(),
+        );
+    }
+    let encoded = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
+    state
+        .settings_store
+        .lock()
+        .await
+        .save_specialist_settings(&settings)
+        .map_err(|error| error.to_string())?;
+    Ok(encoded)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn probe_specialist_model(
+    model_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let cwd =
+        std::env::current_dir().map_err(|error| format!("resolve probe directory: {error}"))?;
+    let mut settings = state
+        .settings_store
+        .lock()
+        .await
+        .get_specialist_settings()
+        .map_err(|error| error.to_string())?;
+    let existing = settings
+        .catalog
+        .find(&model_id)
+        .ok_or_else(|| "model must come from the current catalog before probing".to_string())?;
+    if !existing.free {
+        return Err(
+            "paid model candidates cannot be probed through this free catalog action".to_string(),
+        );
+    }
+    let probe = crate::specialist_runtime::probe_opencode_model(&model_id, &cwd).await?;
+    settings.catalog.record_probe(
+        &probe.model_id,
+        &probe.provider,
+        &probe.source,
+        existing.free,
+        probe.last_success,
+        probe.latency_ms,
+        probe.error_classification,
+        chrono::Utc::now().timestamp(),
+    );
+    let encoded = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
+    state
+        .settings_store
+        .lock()
+        .await
+        .save_specialist_settings(&settings)
+        .map_err(|error| error.to_string())?;
+    Ok(encoded)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_custom_specialist_model(
+    display_name: String,
+    base_url: String,
+    api_key: String,
+    model_name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let input = crate::specialist_runtime::CustomApiModelInput {
+        display_name,
+        base_url,
+        api_key,
+        model_name,
+    };
+    let test = crate::specialist_runtime::test_custom_model(&input).await?;
+    if !test.passed {
+        return serde_json::to_string(&test).map_err(|error| error.to_string());
+    }
+    let custom_model_id = crate::specialist_runtime::custom_model_id(&input);
+    let metadata = crate::specialist_runtime::CustomApiModelConfig {
+        custom_model_id: custom_model_id.clone(),
+        display_name: input.display_name.clone(),
+        base_url: input.base_url.clone(),
+        model_name: input.model_name.clone(),
+        tested_at: Some(chrono::Utc::now().timestamp()),
+        test_passed: true,
+        api_key_configured: true,
+    };
+    let mut settings = state
+        .settings_store
+        .lock()
+        .await
+        .get_specialist_settings()
+        .map_err(|error| error.to_string())?;
+    settings.catalog.record_probe(
+        &custom_model_id,
+        "custom",
+        "custom_api_response_probe",
+        true,
+        true,
+        test.latency_ms,
+        None,
+        chrono::Utc::now().timestamp(),
+    );
+    settings
+        .custom_models
+        .retain(|existing| existing.custom_model_id != custom_model_id);
+    settings.custom_models.push(metadata.clone());
+    state
+        .settings_store
+        .lock()
+        .await
+        .save_custom_specialist_model(&metadata, &input.api_key)
+        .map_err(|error| error.to_string())?;
+    let mut public = serde_json::to_value(&settings).map_err(|error| error.to_string())?;
+    if let Some(object) = public.as_object_mut() {
+        let test_value = serde_json::to_value(test).map_err(|error| error.to_string())?;
+        object.insert("last_test".to_string(), test_value);
+    }
+    serde_json::to_string(&public).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_research_capability_health(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("resolve capability directory: {error}"))?;
+    let agent_reach = crate::agent_reach::runtime_status(&cwd).await;
+    let doctor_result = crate::agent_reach::doctor_report(&cwd).await;
+    let doctor_error = doctor_result.as_ref().err().cloned();
+    let doctor = doctor_result.as_ref().ok();
+    let tiktok_available = crate::tiktok::runtime_status(&cwd).await.unwrap_or(false);
+    let health = json!({
+        "agent_reach": agent_reach,
+        "doctor": doctor,
+        "doctor_error": doctor_error,
+        "healthy_channels": doctor.as_ref().map(|report| report.channels.iter().filter(|channel| channel.health_status == "healthy").count()).unwrap_or(0),
+        "tiktok": {"available": tiktok_available, "executable": crate::tiktok::executable()},
+        "observed_at": chrono::Utc::now().timestamp(),
+    });
+    let raw = serde_json::to_string(&health).map_err(|error| error.to_string())?;
+    state
+        .settings_store
+        .lock()
+        .await
+        .set("research_capability_health", &raw)
+        .map_err(|error| error.to_string())?;
+    Ok(raw)
+}
+
 /// P1: return the persisted custom participants as a JSON array string.
 /// Follows the IPC.json-string convention (callers JSON.parse the result).
 #[tauri::command]

@@ -247,6 +247,13 @@ async fn run_scheduled_role(
     work_order_id: String,
     prompt: String,
 ) -> Result<product_os_runtime::ProductRoleExecution, String> {
+    product_os_runtime::bind_specialist_model_policy(
+        ctx.db.clone(),
+        ctx.settings.clone(),
+        work_order_id.clone(),
+        run.execution_epoch,
+    )
+    .await?;
     let claim = ctx.role_scheduler.try_claim(
         work_order_id.clone(),
         run.execution_epoch,
@@ -1261,6 +1268,13 @@ async fn run_product_review(
             .to_string(),
     )
     .await?;
+    product_os_runtime::bind_specialist_model_policy(
+        ctx.db.clone(),
+        ctx.settings.clone(),
+        order.work_order_id.clone(),
+        run.execution_epoch,
+    )
+    .await?;
     run.product_director_work_order_id = Some(order.work_order_id.clone());
     save_run(ctx, run).await?;
     let intelligence = bounded_repo_intelligence(
@@ -1408,6 +1422,13 @@ async fn run_product_review(
         ctx.db.clone(),
         run.project_id.clone(),
         "Product Director: formulate the owner question for the proposed direction".to_string(),
+    )
+    .await?;
+    product_os_runtime::bind_specialist_model_policy(
+        ctx.db.clone(),
+        ctx.settings.clone(),
+        question_order.work_order_id.clone(),
+        run.execution_epoch,
     )
     .await?;
     let question_execution = product_os_runtime::run_product_role_work_order(

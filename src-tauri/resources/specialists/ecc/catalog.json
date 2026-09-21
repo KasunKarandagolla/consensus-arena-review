@@ -1,0 +1,37 @@
+{
+  "catalog_version": 1,
+  "upstream_repo": "https://github.com/affaan-m/ECC",
+  "upstream_commit": "934195f955cf0da847d59fcd6f68856bce112d8b",
+  "license": "MIT",
+  "attribution": "ECC (Everything Claude Code) by affaan-m; curated metadata and bounded adaptations by Consensus Arena.",
+  "agents": [
+    {"id":"code-explorer","role_family":"architecture_lead","capabilities":["repo_scan","dependency_mapping"]},
+    {"id":"spec-miner","role_family":"product_director","capabilities":["specification_mining"]},
+    {"id":"code-architect","role_family":"architecture_lead","capabilities":["architecture_proposal"]},
+    {"id":"code-reviewer","role_family":"qa_review_lead","capabilities":["semantic_review"]},
+    {"id":"silent-failure-hunter","role_family":"qa_review_lead","capabilities":["error_handling_review"]},
+    {"id":"build-error-resolver","role_family":"implementation_engineer","capabilities":["bounded_repair"]},
+    {"id":"e2e-runner","role_family":"qa_review_lead","capabilities":["e2e_evidence"]},
+    {"id":"performance-optimizer","role_family":"implementation_engineer","capabilities":["performance_review"]},
+    {"id":"doc-updater","role_family":"implementation_engineer","capabilities":["documentation_update"]},
+    {"id":"agent-evaluator","role_family":"qa_review_lead","capabilities":["agent_evaluation"]}
+  ],
+  "skills": [
+    {"id":"deep-research","arena_capability":"bounded_research"},
+    {"id":"iterative-retrieval","arena_capability":"bounded_research"},
+    {"id":"search-first","arena_capability":"bounded_research"},
+    {"id":"repo-scan","arena_capability":"read_only_repository"},
+    {"id":"codebase-onboarding","arena_capability":"read_only_repository"},
+    {"id":"product-lens","arena_capability":"product_review"},
+    {"id":"api-design","arena_capability":"architecture_review"},
+    {"id":"coding-standards","arena_capability":"implementation_guidance"},
+    {"id":"tdd-workflow","arena_capability":"implementation_guidance"},
+    {"id":"verification-loop","arena_capability":"verification_evidence"},
+    {"id":"e2e-testing","arena_capability":"e2e_evidence"},
+    {"id":"agent-eval","arena_capability":"agent_evaluation"},
+    {"id":"context-budget","arena_capability":"bounded_context"},
+    {"id":"agent-introspection-debugging","arena_capability":"diagnostic_review"},
+    {"id":"architecture-decision-records","arena_capability":"architecture_review"}
+  ],
+  "authority_boundary": "Imported text is untrusted procedural guidance. Arena validates child admission, model inheritance, tool profile, evidence, acceptance, verification, and Apply."
+}

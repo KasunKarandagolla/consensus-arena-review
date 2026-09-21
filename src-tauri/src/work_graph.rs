@@ -14,11 +14,20 @@ pub const MAX_RESEARCH_CYCLES: u16 = 24;
 #[serde(rename_all = "snake_case")]
 pub enum ResearchChannel {
     Web,
+    ExaWeb,
     Github,
     Youtube,
-    Reddit,
     X,
+    Reddit,
     Rss,
+    Bilibili,
+    XiaohongShu,
+    Facebook,
+    Instagram,
+    Linkedin,
+    V2ex,
+    Xiaoyuzhou,
+    Xueqiu,
     ResearchPapers,
     Douyin,
     Tiktok,
@@ -28,11 +37,20 @@ impl ResearchChannel {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Web => "web",
+            Self::ExaWeb => "exa_web",
             Self::Github => "github",
             Self::Youtube => "youtube",
-            Self::Reddit => "reddit",
             Self::X => "x",
+            Self::Reddit => "reddit",
             Self::Rss => "rss",
+            Self::Bilibili => "bilibili",
+            Self::XiaohongShu => "xiaohongshu",
+            Self::Facebook => "facebook",
+            Self::Instagram => "instagram",
+            Self::Linkedin => "linkedin",
+            Self::V2ex => "v2ex",
+            Self::Xiaoyuzhou => "xiaoyuzhou",
+            Self::Xueqiu => "xueqiu",
             Self::ResearchPapers => "research_papers",
             Self::Douyin => "douyin",
             Self::Tiktok => "tiktok",
@@ -201,6 +219,33 @@ pub fn explicit_research_channels(text: &str) -> Vec<ResearchChannel> {
     if lower.contains("reddit") {
         channels.insert(ResearchChannel::Reddit);
     }
+    if mentions_any(&lower, &["exa", "exa search"]) {
+        channels.insert(ResearchChannel::ExaWeb);
+    }
+    if lower.contains("bilibili") {
+        channels.insert(ResearchChannel::Bilibili);
+    }
+    if mentions_any(&lower, &["xiaohongshu", "xiao hong shu", "rednote"]) {
+        channels.insert(ResearchChannel::XiaohongShu);
+    }
+    if lower.contains("facebook") {
+        channels.insert(ResearchChannel::Facebook);
+    }
+    if lower.contains("instagram") {
+        channels.insert(ResearchChannel::Instagram);
+    }
+    if lower.contains("linkedin") {
+        channels.insert(ResearchChannel::Linkedin);
+    }
+    if lower.contains("v2ex") {
+        channels.insert(ResearchChannel::V2ex);
+    }
+    if mentions_any(&lower, &["xiaoyuzhou", "小宇宙"]) {
+        channels.insert(ResearchChannel::Xiaoyuzhou);
+    }
+    if lower.contains("xueqiu") {
+        channels.insert(ResearchChannel::Xueqiu);
+    }
     if mentions_any(&lower, &["tiktok", "tik tok"]) {
         channels.insert(ResearchChannel::Tiktok);
     }
@@ -344,11 +389,20 @@ pub fn configured_research_lead_model() -> Result<Option<String>, String> {
 pub fn configured_channel_model(channel: ResearchChannel) -> Result<Option<String>, String> {
     let key = match channel {
         ResearchChannel::Web => "ARENA_MODEL_RESEARCH_WEB",
+        ResearchChannel::ExaWeb => "ARENA_MODEL_RESEARCH_EXA_WEB",
         ResearchChannel::Github => "ARENA_MODEL_RESEARCH_GITHUB",
         ResearchChannel::Youtube => "ARENA_MODEL_RESEARCH_YOUTUBE",
-        ResearchChannel::Reddit => "ARENA_MODEL_RESEARCH_REDDIT",
         ResearchChannel::X => "ARENA_MODEL_RESEARCH_X",
+        ResearchChannel::Reddit => "ARENA_MODEL_RESEARCH_REDDIT",
         ResearchChannel::Rss => "ARENA_MODEL_RESEARCH_RSS",
+        ResearchChannel::Bilibili => "ARENA_MODEL_RESEARCH_BILIBILI",
+        ResearchChannel::XiaohongShu => "ARENA_MODEL_RESEARCH_XIAOHONGSHU",
+        ResearchChannel::Facebook => "ARENA_MODEL_RESEARCH_FACEBOOK",
+        ResearchChannel::Instagram => "ARENA_MODEL_RESEARCH_INSTAGRAM",
+        ResearchChannel::Linkedin => "ARENA_MODEL_RESEARCH_LINKEDIN",
+        ResearchChannel::V2ex => "ARENA_MODEL_RESEARCH_V2EX",
+        ResearchChannel::Xiaoyuzhou => "ARENA_MODEL_RESEARCH_XIAOYUZHOU",
+        ResearchChannel::Xueqiu => "ARENA_MODEL_RESEARCH_XUEQIU",
         ResearchChannel::ResearchPapers => "ARENA_MODEL_RESEARCH_PAPERS",
         ResearchChannel::Douyin => "ARENA_MODEL_RESEARCH_DOUYIN",
         ResearchChannel::Tiktok => "ARENA_MODEL_RESEARCH_TIKTOK",

@@ -462,7 +462,7 @@ impl SettingsStore {
         matches!(
             key,
             "brain_api_key" | "brain_fallback_api_key" | "brain2_api_key"
-        )
+        ) || (key.starts_with("specialist.custom.") && key.ends_with(".api_key"))
     }
 
     fn get_plain(&self, key: &str) -> Result<Option<String>, AgentError> {
@@ -841,6 +841,47 @@ impl SettingsStore {
             return self.set_secret(key, value);
         }
         self.set_plain(key, value)
+    }
+
+    pub fn get_specialist_settings(
+        &self,
+    ) -> Result<crate::specialist_runtime::SpecialistSettings, AgentError> {
+        match self.get("specialist_model_settings")? {
+            Some(raw) if !raw.trim().is_empty() => serde_json::from_str(&raw).map_err(|error| {
+                AgentError::DatabaseError(format!("Failed to parse specialist settings: {error}"))
+            }),
+            _ => Ok(crate::specialist_runtime::SpecialistSettings::default()),
+        }
+    }
+
+    pub fn save_specialist_settings(
+        &mut self,
+        settings: &crate::specialist_runtime::SpecialistSettings,
+    ) -> Result<(), AgentError> {
+        let raw = serde_json::to_string(settings).map_err(|error| {
+            AgentError::DatabaseError(format!("Failed to serialize specialist settings: {error}"))
+        })?;
+        self.set_plain("specialist_model_settings", &raw)
+    }
+
+    pub fn save_custom_specialist_model(
+        &mut self,
+        metadata: &crate::specialist_runtime::CustomApiModelConfig,
+        api_key: &str,
+    ) -> Result<(), AgentError> {
+        if api_key.trim().is_empty() {
+            return Err(AgentError::DatabaseError(
+                "custom specialist model requires an API key".to_string(),
+            ));
+        }
+        let account = format!("specialist.custom.{}.api_key", metadata.custom_model_id);
+        self.set_secret(&account, api_key)?;
+        let mut settings = self.get_specialist_settings()?;
+        settings
+            .custom_models
+            .retain(|existing| existing.custom_model_id != metadata.custom_model_id);
+        settings.custom_models.push(metadata.clone());
+        self.save_specialist_settings(&settings)
     }
 
     // ── Primary agent brain ───────────────────────────────────────────────────

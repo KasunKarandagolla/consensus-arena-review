@@ -153,6 +153,18 @@ pub struct ProductWorkOrder {
     /// delegation. Arena, not the model, creates the actual child work order.
     #[serde(default)]
     pub delegation_depth: u8,
+    #[serde(default)]
+    pub root_role_family: Option<crate::specialist_runtime::RoleFamily>,
+    #[serde(default)]
+    pub resolved_model_policy: Option<crate::specialist_runtime::ResolvedModelPolicy>,
+    #[serde(default)]
+    pub specialist_template_id: Option<String>,
+    #[serde(default)]
+    pub skill_ids: Vec<String>,
+    #[serde(default)]
+    pub execution_context: Option<crate::specialist_runtime::ExecutionContextBundle>,
+    #[serde(default)]
+    pub execution_epoch: u64,
     pub evidence_id: Option<String>,
     #[serde(default)]
     pub evidence_ids: Vec<String>,

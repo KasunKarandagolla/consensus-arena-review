@@ -50,6 +50,8 @@ mod session_runtime;
 mod session_vault;
 mod settings_store;
 mod signals;
+mod specialist_runtime;
+mod tiktok;
 mod token_budget;
 mod transcript_store;
 mod turn_manager;
@@ -224,6 +226,12 @@ fn main() {
             commands::get_fallback_brain_config,    // Task 5 (HIGH-3)
             commands::clear_brain_credential,
             commands::get_credential_storage_status,
+            commands::get_specialist_model_settings,
+            commands::save_specialist_model_policy,
+            commands::refresh_specialist_model_catalog,
+            commands::probe_specialist_model,
+            commands::save_custom_specialist_model,
+            commands::get_research_capability_health,
             commands::save_custom_participants,     // P1
             commands::get_custom_participants,      // P1
             commands::get_participants,             // P3 unified registry
