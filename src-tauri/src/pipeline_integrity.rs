@@ -165,6 +165,83 @@ mod tests {
     }
 
     #[test]
+    fn scenario_research_mandate_cannot_advance_when_owner_required_channel_is_unavailable() {
+        let mut mandate = crate::work_graph::ResearchMandate {
+            mandate_id: "mandate".to_string(),
+            directive_id: "directive".to_string(),
+            topic: "research required platform evidence".to_string(),
+            channels: vec![
+                crate::work_graph::ResearchChannel::Web,
+                crate::work_graph::ResearchChannel::Github,
+            ],
+            mandatory_channels: vec![crate::work_graph::ResearchChannel::Github],
+            depth: crate::work_graph::ResearchDepth::Deep,
+            must_complete_before_decision: true,
+            minimum_distinct_sources: 2,
+            max_cycles: 4,
+            status: crate::work_graph::ResearchMandateStatus::PartiallyUnavailable,
+            cycles_completed: 1,
+            child_work_order_ids: Vec::new(),
+            evidence_ids: Vec::new(),
+            completed_channels: vec![crate::work_graph::ResearchChannel::Web],
+            unavailable_channels: vec![crate::work_graph::ResearchChannel::Github],
+        };
+        assert!(mandate.validate().is_ok());
+        assert!(!mandate.can_advance());
+        mandate.must_complete_before_decision = false;
+        assert!(mandate.can_advance());
+    }
+
+    #[test]
+    fn scenario_vision_failure_routes_to_owner_clarification_not_compile_probe() {
+        let remediation =
+            route_gate_remediation(GateId::Vision, GateStatus::MissingEvidence, 0);
+        assert_eq!(
+            remediation.outcome,
+            GateRemediationOutcome::NeedsOwnerDecision
+        );
+        assert!(remediation.action.contains("owner"));
+    }
+
+    #[test]
+    fn fault_restart_after_armed_never_restores_staging_or_send_authority() {
+        let mut order = consultation_order();
+        order
+            .transition(ConsultationTransactionState::Staged)
+            .expect("stage");
+        order
+            .transition(ConsultationTransactionState::Armed)
+            .expect("arm");
+        order
+            .transition(ConsultationTransactionState::UnknownOutcome)
+            .expect("restart reconciliation");
+        assert!(order.state.is_post_arm());
+        assert!(order.transition(ConsultationTransactionState::Staged).is_err());
+        assert!(order.transition(ConsultationTransactionState::Armed).is_err());
+    }
+
+    #[test]
+    fn owner_guidance_parser_preserves_explicit_research_channels_and_blocking_intent() {
+        let directive = crate::work_graph::owner_directive_from_text(
+            "Research GitHub and YouTube first before deciding whether to build this.",
+            7,
+            now(),
+        )
+        .expect("owner directive");
+        assert!(directive.must_complete_before_decision);
+        assert!(
+            directive
+                .requested_channels
+                .contains(&crate::work_graph::ResearchChannel::Github)
+        );
+        assert!(
+            directive
+                .requested_channels
+                .contains(&crate::work_graph::ResearchChannel::Youtube)
+        );
+    }
+
+    #[test]
     fn fault_resource_saturation_rejects_second_exclusive_owner() {
         let scheduler = ResourceScheduler::default();
         let first = scheduler
