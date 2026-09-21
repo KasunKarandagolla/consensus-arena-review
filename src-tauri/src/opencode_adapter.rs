@@ -173,6 +173,9 @@ fn profile_workspace_with_custom_provider(
         .map_err(|error| format!("create OpenCode profile config: {error}"))?;
     let mut config = profile.authority_free_config();
     if let Some(provider) = custom_provider {
+        if config.get("provider").is_none() {
+            config["provider"] = serde_json::json!({});
+        }
         let mut base_url = provider.base_url.trim_end_matches('/').to_string();
         if let Some(stripped) = base_url.strip_suffix("/chat/completions") {
             base_url = stripped.trim_end_matches('/').to_string();
