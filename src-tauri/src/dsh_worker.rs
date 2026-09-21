@@ -26,12 +26,34 @@ const OUTPUT_READER_CLEANUP_TIMEOUT_SECONDS: u64 = 1;
 
 /// Explicit, non-secret configuration values Arena may inject into an
 /// OpenCode child. Ambient variables with these names are never inherited.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct OpenCodeEnvironmentOverrides {
     pub config: Option<PathBuf>,
     pub config_dir: Option<PathBuf>,
     pub disable_lsp_download: bool,
     pub experimental_lsp_tool: bool,
+    /// Explicit secret environment entries supplied by Arena for this one
+    /// child process (for example a custom specialist provider API key).
+    /// Values are never rendered by Debug or inherited from ambient state.
+    pub secret_environment: Vec<(OsString, OsString)>,
+}
+
+impl std::fmt::Debug for OpenCodeEnvironmentOverrides {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secret_keys = self
+            .secret_environment
+            .iter()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("OpenCodeEnvironmentOverrides")
+            .field("config", &self.config)
+            .field("config_dir", &self.config_dir)
+            .field("disable_lsp_download", &self.disable_lsp_download)
+            .field("experimental_lsp_tool", &self.experimental_lsp_tool)
+            .field("secret_environment_keys", &secret_keys)
+            .finish()
+    }
 }
 
 impl OpenCodeEnvironmentOverrides {
@@ -41,6 +63,7 @@ impl OpenCodeEnvironmentOverrides {
             config_dir: Some(config_dir),
             disable_lsp_download: true,
             experimental_lsp_tool: lsp,
+            secret_environment: Vec::new(),
         }
     }
 }
@@ -429,6 +452,9 @@ fn apply_sanitized_environment_with_overrides(
     }
     if overrides.experimental_lsp_tool {
         command.env("OPENCODE_EXPERIMENTAL_LSP_TOOL", "true");
+    }
+    for (key, value) in &overrides.secret_environment {
+        command.env(key, value);
     }
 }
 
@@ -1316,6 +1342,15 @@ mod tests {
         assert!(debug.contains("OPENCODE_CONFIG"));
         assert!(debug.contains("OPENCODE_CONFIG_DIR"));
         assert!(!debug.contains("ARENA_ARBITRARY_SECRET"));
+
+        let mut overrides = overrides;
+        overrides.secret_environment.push((
+            OsString::from("ARENA_SPECIALIST_API_KEY"),
+            OsString::from("specialist-secret-must-not-debug"),
+        ));
+        let debug = format!("{overrides:?}");
+        assert!(debug.contains("ARENA_SPECIALIST_API_KEY"));
+        assert!(!debug.contains("specialist-secret-must-not-debug"));
     }
 
     #[cfg(windows)]
